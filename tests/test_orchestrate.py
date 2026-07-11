@@ -108,6 +108,41 @@ class CommitTest(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             commit_all("/tmp/project", "message")
 
+    @patch("forge.orchestrate.git")
+    def test_commit_pushes_current_branch_when_enabled(self, git: Mock) -> None:
+        git.side_effect = [
+            Mock(),                                              # add -A
+            subprocess.CompletedProcess([], 1, "", ""),         # diff --cached (są zmiany)
+            Mock(),                                              # commit
+            subprocess.CompletedProcess([], 0, "origin\n", ""), # remote
+            subprocess.CompletedProcess([], 0, "main\n", ""),   # rev-parse HEAD
+            subprocess.CompletedProcess([], 0, "", ""),         # push
+        ]
+        commit_all("/tmp/project", "message", Config(git_push=True))
+        self.assertEqual(git.call_args_list[-1].args,
+                         ("/tmp/project", "push", "-u", "origin", "main"))
+
+    @patch("forge.orchestrate.git")
+    def test_no_push_without_remote(self, git: Mock) -> None:
+        git.side_effect = [
+            Mock(),                                             # add -A
+            subprocess.CompletedProcess([], 1, "", ""),        # diff --cached
+            Mock(),                                             # commit
+            subprocess.CompletedProcess([], 0, "", ""),        # remote (pusty → brak push)
+        ]
+        commit_all("/tmp/project", "message", Config(git_push=True))
+        self.assertEqual(git.call_count, 4)
+
+    @patch("forge.orchestrate.git")
+    def test_no_push_when_disabled(self, git: Mock) -> None:
+        git.side_effect = [
+            Mock(),                                             # add -A
+            subprocess.CompletedProcess([], 1, "", ""),        # diff --cached
+            Mock(),                                             # commit
+        ]
+        commit_all("/tmp/project", "message", Config(git_push=False))
+        self.assertEqual(git.call_count, 3)
+
 
 class IterationTest(unittest.TestCase):
     @patch("forge.orchestrate.rollback")

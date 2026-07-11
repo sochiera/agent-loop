@@ -46,7 +46,7 @@ def ensure_repo(project: str) -> None:
         git(project, "config", "user.email", "forge@localhost", check=False)
         log("Zainicjowano repozytorium git.")
     gi = os.path.join(project, ".gitignore")
-    needed = [".forge/", "STOP", "__pycache__/", "*.pyc"]
+    needed = [".forge/", "STOP", "STATE.json", "__pycache__/", "*.pyc"]
     existing = ""
     if os.path.exists(gi):
         with open(gi, "r", encoding="utf-8") as f:
@@ -63,12 +63,30 @@ def has_changes(project: str) -> bool:
     return bool(out)
 
 
-def commit_all(project: str, message: str) -> None:
+def commit_all(project: str, message: str, cfg: "Config | None" = None) -> None:
     git(project, "add", "-A")
     if git(project, "diff", "--cached", "--quiet", check=False).returncode != 0:
         # Bez trailera Co-Authored-By (zgodnie z preferencją użytkownika).
         git(project, "commit", "-q", "-m", message)
         log(f"Commit: {message}")
+        if cfg and cfg.git_push:
+            push(project, cfg)
+
+
+def push(project: str, cfg: Config) -> None:
+    """Wypchnij bieżący branch do remote. Niekrytyczne — błąd (sieć/auth) tylko
+    loguje, nie wywala pętli. Wypchnięta historia nigdy nie jest przepisywana
+    (rollback dotyka tylko niezacommitowanych zmian)."""
+    if not git(project, "remote", check=False).stdout.strip():
+        return  # brak remote — nic nie pushujemy
+    branch = git(project, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip()
+    if not branch or branch == "HEAD":
+        branch = "main"
+    res = git(project, "push", "-u", cfg.git_remote, branch, check=False)
+    if res.returncode != 0:
+        log(f"PUSH nieudany (niekrytyczne): {(res.stderr or '').strip()[:200]}")
+    else:
+        log(f"Push → {cfg.git_remote}/{branch}")
 
 
 def rollback(project: str) -> None:
@@ -177,7 +195,7 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     state.run_cmd = data.get("run_cmd", "")
     state.bootstrapped = True
     log(f"Stack: {state.stack or '(nieokreślony)'} | test_cmd: {state.test_cmd or '(brak!)'}")
-    commit_all(project, "chore: bootstrap projektu (design, architektura, backlog, szkielet)")
+    commit_all(project, "chore: bootstrap projektu (design, architektura, backlog, szkielet)", cfg)
 
 
 def phase_plan(cfg: Config, project: str, logf) -> dict:
@@ -188,7 +206,7 @@ def phase_plan(cfg: Config, project: str, logf) -> dict:
     except FileNotFoundError:
         pass
     out = run_claude(prompts.plan_prompt(), cfg, project, logf("plan"))
-    commit_all(project, "docs: aktualizacja planu i backlogu")  # plan może dotknąć docs/backlog
+    commit_all(project, "docs: aktualizacja planu i backlogu", cfg)  # plan może dotknąć docs/backlog
     return extract_json(out) or {"task_title": "(nieznane)", "no_more_tasks": False}
 
 
@@ -252,7 +270,7 @@ def _one_iteration(cfg: Config, project: str, state: State) -> bool:
         green = build_then_test(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
 
     if approved:
-        commit_all(project, f"feat: {title}")
+        commit_all(project, f"feat: {title}", cfg)
         state.last_done = title
     else:
         reason = "testy czerwone" if not green else "review nie zaakceptował po limicie poprawek"

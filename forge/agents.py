@@ -161,9 +161,14 @@ def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:
     argv = a.argv + ["exec", prompt]
     if a.model:  # pusty → Codex użyje modelu z własnego config.toml
         argv += ["-m", a.model]
+    if cfg.codex_sandbox == "danger-full-access":
+        # Pełny dostęp: pomiń zatwierdzanie i sandbox (dedykowany przełącznik
+        # automatyzacji — pewniejszy w headless niż samo -s).
+        argv += ["--dangerously-bypass-approvals-and-sandbox"]
+    else:
+        argv += ["-s", cfg.codex_sandbox]
     argv += [
         "-C", project_dir,
-        "-s", cfg.codex_sandbox,
         "--skip-git-repo-check",
         "-o", last_msg,
         "--color", "never",

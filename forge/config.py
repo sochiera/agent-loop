@@ -65,9 +65,16 @@ class Config:
     codex_bin: str = os.environ.get("FORGE_CODEX_BIN", "codex")
 
     # Tryb sandboxa Codeksa: read-only | workspace-write | danger-full-access.
-    # workspace-write pozwala pisać w katalogu projektu; jeśli instalacja
-    # zależności wymaga sieci, może być potrzebny danger-full-access.
-    codex_sandbox: str = os.environ.get("FORGE_CODEX_SANDBOX", "workspace-write")
+    # Domyślnie PEŁNY DOSTĘP (cały FS + sieć, bez zatwierdzania) — pod parę z
+    # Claude'em na --dangerously-skip-permissions. Zawęź przez FORGE_CODEX_SANDBOX
+    # (np. workspace-write), jeśli chcesz ograniczyć agenta do katalogu projektu.
+    codex_sandbox: str = os.environ.get("FORGE_CODEX_SANDBOX", "danger-full-access")
+
+    # --- Push do zdalnego repo gry -----------------------------------------
+    # Po każdym udanym commicie orkiestrator pcha bieżący branch do remote.
+    # Wyłącz przez FORGE_GIT_PUSH=0 (np. gdy chcesz najpierw obejrzeć lokalnie).
+    git_push: bool = os.environ.get("FORGE_GIT_PUSH", "1") != "0"
+    git_remote: str = os.environ.get("FORGE_GIT_REMOTE", "origin")
 
     # --- Sterowanie pętlą ---------------------------------------------------
     max_iterations: int = int(os.environ.get("FORGE_MAX_ITERS", "0"))  # 0 = bez limitu

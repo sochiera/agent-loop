@@ -47,11 +47,27 @@ python3 -m forge.orchestrate --check
 ## Uruchomienie
 
 ```bash
-python3 -m forge.orchestrate --brief game_brief.md --project game
+python3 -m forge.orchestrate --brief game.md --project game
 ```
 
 Zostaw działające — pętla leci sama. Zatrzymanie: utwórz plik `game/STOP`
 albo Ctrl-C (stan zostaje zapisany).
+
+### Repo gry i push
+
+Katalog `--project` może być **klonem repo gry** (osobnym od tego narzędzia):
+
+```bash
+git clone git@github.com:<user>/<repo>.git game     # SSH → push bez tokenów
+python3 -m forge.orchestrate --brief game.md --project game
+```
+
+Orkiestrator wykrywa istniejące `.git` (nie robi `init`), commituje jako Twoja
+globalna tożsamość git i po **każdym udanym commicie pcha bieżący branch** do
+`origin`. Push jest niekrytyczny — błąd sieci/auth tylko się loguje, pętla leci
+dalej; wypchnięta historia nigdy nie jest przepisywana (rollback dotyka tylko
+niezacommitowanych zmian). Wyłącznik: `FORGE_GIT_PUSH=0`. `STATE.json` i `.forge/`
+są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 
 ## Pokrętła (zmienne środowiskowe / flagi)
 
@@ -59,10 +75,11 @@ albo Ctrl-C (stan zostaje zapisany).
 |---|---|---|
 | Model Claude | `opus` | `--claude-model sonnet` lub `FORGE_CLAUDE_MODEL` |
 | Model Codex | z `~/.codex/config.toml` | `--codex-model ...` lub `FORGE_CODEX_MODEL` |
-| Sandbox Codeksa | `workspace-write` | `FORGE_CODEX_SANDBOX=danger-full-access` (gdy testy potrzebują sieci) |
+| Sandbox Codeksa | `danger-full-access` (pełny dostęp) | zawęź: `FORGE_CODEX_SANDBOX=workspace-write` |
 | Ścieżka do Claude | `claude` | `FORGE_CLAUDE_BIN=/path/claude` |
 | Limit iteracji | bez limitu | `--max-iters 20` |
 | Timeout agenta | 3600 s | `FORGE_AGENT_TIMEOUT=...` |
+| Push do remote | włączony (`origin`) | `FORGE_GIT_PUSH=0`, `FORGE_GIT_REMOTE=...` |
 
 > **Uwaga o Opusie na Pro $20:** Opus w każdej fazie wyczerpie tygodniowy limit
 > bardzo szybko. Gdy zacznie boleć, zejdź na `--claude-model sonnet` — pętla
