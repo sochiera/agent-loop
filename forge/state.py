@@ -25,18 +25,22 @@ class State:
     failures: list[str] = field(default_factory=list)
     # Ostatnio ukończone zadanie (dla kontekstu plannera).
     last_done: str = ""
-    # Faza wznowienia W OBRĘBIE iteracji — dzięki niej restart wie, kto następny:
-    #   "plan"      → następny jest Claude (planowanie),
-    #   "implement" → następny jest Codex (implementacja bieżącego zadania).
-    # Plan jest commitowany, więc nigdy nie jest powtarzany po awarii Codeksa.
-    phase: str = "plan"
-    current_title: str = ""   # tytuł bieżącego zadania (dla wznowienia i commita)
+    # Checkpoint bieżącej iteracji. ``phase`` wskazuje następną fazę do wykonania,
+    # dzięki czemu limit agenta nie kasuje pracy i restart nie zaczyna od planu.
+    phase: str = "idle"
+    current_task_title: str = ""
+    fix_attempt: int = 0
+    tests_green: bool = False
+    review_notes: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: str) -> "State":
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            # Migracja checkpointu ze starszej wersji (phase + current_title).
+            if "current_task_title" not in data and "current_title" in data:
+                data["current_task_title"] = data["current_title"]
             known = {k: data[k] for k in data if k in cls.__annotations__}
             return cls(**known)
         return cls()

@@ -13,6 +13,21 @@ import os
 from dataclasses import dataclass, field
 
 
+_DEFAULT_PLANNER_AGENT = os.environ.get("FORGE_PLANNER_AGENT", "claude")
+_DEFAULT_PLANNER_MODEL = os.environ.get(
+    "FORGE_PLANNER_MODEL",
+    os.environ.get("FORGE_CLAUDE_MODEL", "opus")
+    if _DEFAULT_PLANNER_AGENT == "claude"
+    else os.environ.get("FORGE_CODEX_MODEL", ""),
+)
+_DEFAULT_PLANNER_EFFORT = os.environ.get(
+    "FORGE_PLANNER_EFFORT",
+    os.environ.get("FORGE_CLAUDE_EFFORT", "high")
+    if _DEFAULT_PLANNER_AGENT == "claude"
+    else os.environ.get("FORGE_CODEX_EFFORT", "medium"),
+)
+
+
 # --- Wykrywanie wyczerpanych limitów / błędów przejściowych -----------------
 # Gdy trafimy na którykolwiek z tych wzorców w wyjściu CLI (przy niezerowym
 # kodzie wyjścia), traktujemy to jako "limit/błąd przejściowy" i robimy backoff
@@ -41,6 +56,8 @@ class AgentCmd:
     argv: list[str]
     # Model dla tego agenta (nazwa przekazywana do -m/--model danego CLI).
     model: str
+    # Poziom namysłu przekazywany jawnie do CLI.
+    effort: str
 
 
 @dataclass
@@ -48,15 +65,18 @@ class Config:
     # Katalog projektu gry (tam powstaje kod, docs, git repo).
     project_dir: str = "game"
     # Plik z briefem gry (wejście od użytkownika).
-    brief_path: str = "game_brief.md"
+    brief_path: str = "game.md"
 
     # --- Modele -------------------------------------------------------------
-    # Opus do wszystkiego po stronie Claude (decyzja użytkownika). Zmień na
-    # "sonnet" gdy limit Pro zacznie boleć.
-    claude_model: str = os.environ.get("FORGE_CLAUDE_MODEL", "opus")
+    # Planista obsługuje bootstrap, planowanie i review; może nim być Claude
+    # albo Codex, niezależnie od Codex-implementatora.
+    planner_agent: str = _DEFAULT_PLANNER_AGENT
+    planner_model: str = _DEFAULT_PLANNER_MODEL
+    planner_effort: str = _DEFAULT_PLANNER_EFFORT
     # Pusty = użyj modelu skonfigurowanego w ~/.codex/config.toml (Twój: gpt-5.6-sol).
     # Nadpisz tylko jeśli chcesz świadomie zmienić model dla tej pętli.
     codex_model: str = os.environ.get("FORGE_CODEX_MODEL", "")
+    codex_effort: str = os.environ.get("FORGE_CODEX_EFFORT", "medium")
 
     # --- Komendy bazowe CLI (bez shella) ------------------------------------
     # Claude Code headless. Jeśli 'claude' nie jest na PATH, ustaw FORGE_CLAUDE_BIN.
@@ -95,8 +115,6 @@ class Config:
     # Katalog runtime orkiestratora wewnątrz projektu (logi, bieżące zadanie).
     runtime_dir: str = ".forge"
 
-    def claude(self) -> AgentCmd:
-        return AgentCmd(argv=[self.claude_bin], model=self.claude_model)
-
     def codex(self) -> AgentCmd:
-        return AgentCmd(argv=[self.codex_bin], model=self.codex_model)
+        return AgentCmd(argv=[self.codex_bin], model=self.codex_model,
+                        effort=self.codex_effort)

@@ -133,10 +133,11 @@ def _append_log(log_path: str, argv: list[str], output: str, code: int) -> None:
 
 def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:
     """Claude Code headless. Zwraca końcowy tekst odpowiedzi (pole .result)."""
-    a = cfg.claude()
-    argv = a.argv + [
-        "-p", prompt,
-        "--model", a.model,
+    argv = [cfg.claude_bin, "-p", prompt]
+    if cfg.planner_model:
+        argv += ["--model", cfg.planner_model]
+    argv += [
+        "--effort", cfg.planner_effort,
         "--output-format", "json",
         "--dangerously-skip-permissions",  # pełna autonomia — edytuje pliki bez pytań
     ]
@@ -153,14 +154,20 @@ def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str
         return raw  # awaryjnie surowy tekst
 
 
-def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:
+def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
+              *, model: str | None = None, effort: str | None = None) -> str:
     """Codex exec (non-interactive). Zwraca ostatnią wiadomość agenta."""
     a = cfg.codex()
+    if model is not None:
+        a.model = model
+    if effort is not None:
+        a.effort = effort
     last_msg = os.path.join(project_dir, cfg.runtime_dir, "codex_last.txt")
     os.makedirs(os.path.dirname(last_msg), exist_ok=True)
     argv = a.argv + ["exec", prompt]
     if a.model:  # pusty → Codex użyje modelu z własnego config.toml
         argv += ["-m", a.model]
+    argv += ["-c", f'model_reasoning_effort="{a.effort}"']
     if cfg.codex_sandbox == "danger-full-access":
         # Pełny dostęp: pomiń zatwierdzanie i sandbox (dedykowany przełącznik
         # automatyzacji — pewniejszy w headless niż samo -s).
@@ -179,3 +186,13 @@ def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:
             return f.read()
     except OSError:
         return ""
+
+
+def run_planner(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:
+    """Uruchom wybranego planistę z jego niezależnym modelem i effort."""
+    if cfg.planner_agent == "claude":
+        return run_claude(prompt, cfg, project_dir, log_path)
+    if cfg.planner_agent == "codex":
+        return run_codex(prompt, cfg, project_dir, log_path,
+                         model=cfg.planner_model, effort=cfg.planner_effort)
+    raise AgentError(f"Nieznany agent planujący: {cfg.planner_agent}")

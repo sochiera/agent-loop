@@ -4,8 +4,8 @@ Orkiestrator, który w kółko odpala dwóch agentów CLI, aż skończą się li
 subskrypcji:
 
 ```
-PLAN (Claude/Opus)  →  IMPLEMENT-TDD (Codex)  →  [bramka testów]
-   →  REVIEW (Claude/Opus)  →  FIX (Codex)  →  commit  ↺   (albo rollback)
+PLAN (Claude lub Codex)  →  IMPLEMENT-TDD (Codex)  →  [bramka testów]
+   →  REVIEW (wybrany planista)  →  FIX (Codex)  →  commit  ↺   (albo rollback)
 ```
 
 **Stack-agnostyczny.** Nie zna Pythona ani Wesnotha. Podajesz prosty opis gry
@@ -22,8 +22,9 @@ buduje grę małymi, przetestowanymi przyrostami.
 - **Guardraile pełnej autonomii.** Każda iteracja kończy się commitem tylko gdy
   testy są zielone **i** review zaakceptował; inaczej `git reset --hard`. Rano
   oglądasz czytelną historię commitów zamiast sieczki.
-- **Wznawialność.** Limity zatrzymają pracę — stan siedzi w `STATE.json` + repo,
-  więc kolejne uruchomienie kontynuuje dokładnie tam, gdzie stanęło.
+- **Wznawialność faz.** Przed każdą fazą zapisywany jest checkpoint w `STATE.json`.
+  Limit lub Ctrl-C zachowuje bieżące zmiany, więc kolejne uruchomienie wznawia
+  `plan`, `implement`, `review` albo `fix` zamiast zaczynać iterację od początku.
 
 ## Wymagania
 
@@ -50,6 +51,25 @@ python3 -m forge.orchestrate --check
 python3 -m forge.orchestrate --brief game.md --project game
 ```
 
+Start można opóźnić parametrem `--sleep`; liczba bez sufiksu oznacza sekundy,
+a dostępne sufiksy to `s`, `m` i `h`:
+
+```bash
+python3 -m forge.orchestrate --sleep 45m
+```
+
+Przy starcie program kolejno pyta, czy planistą ma być Claude czy Codex, następnie
+o jego model i effort, a potem o model i effort implementatora (Codex). Wybrany
+planista wykonuje bootstrap, planowanie i review. Enter zachowuje pokazaną wartość
+domyślną. W skryptach i zadaniach bez terminala pytania można wyłączyć flagą
+`--non-interactive` i podać ustawienia flagami, np.:
+
+```bash
+python3 -m forge.orchestrate --non-interactive \
+  --planner-agent codex --planner-model gpt-5.6-sol --planner-effort high \
+  --codex-model gpt-5.6-sol --codex-effort high
+```
+
 Zostaw działające — pętla leci sama. Zatrzymanie: utwórz plik `game/STOP`
 albo Ctrl-C (stan zostaje zapisany).
 
@@ -73,11 +93,15 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 
 | Co | Domyślnie | Jak zmienić |
 |---|---|---|
-| Model Claude | `opus` | `--claude-model sonnet` lub `FORGE_CLAUDE_MODEL` |
+| Agent planujący | `claude` | `--planner-agent codex` lub `FORGE_PLANNER_AGENT` |
+| Model planisty | `opus` dla Claude | `--planner-model ...` lub `FORGE_PLANNER_MODEL` |
+| Effort planisty | `high` dla Claude | `--planner-effort medium` lub `FORGE_PLANNER_EFFORT` |
 | Model Codex | z `~/.codex/config.toml` | `--codex-model ...` lub `FORGE_CODEX_MODEL` |
+| Effort Codex | `medium` | `--codex-effort high` lub `FORGE_CODEX_EFFORT` |
 | Sandbox Codeksa | `danger-full-access` (pełny dostęp) | zawęź: `FORGE_CODEX_SANDBOX=workspace-write` |
 | Ścieżka do Claude | `claude` | `FORGE_CLAUDE_BIN=/path/claude` |
 | Limit iteracji | bez limitu | `--max-iters 20` |
+| Opóźnienie startu | brak | `--sleep 30s`, `--sleep 5m`, `--sleep 2h` |
 | Timeout agenta | 3600 s | `FORGE_AGENT_TIMEOUT=...` |
 | Push do remote | włączony (`origin`) | `FORGE_GIT_PUSH=0`, `FORGE_GIT_REMOTE=...` |
 

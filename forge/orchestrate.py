@@ -12,14 +12,16 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 from . import prompts
-from .agents import (AgentError, LimitExhausted, extract_json, run_claude,
-                     run_codex)
+from .agents import (AgentError, LimitExhausted, extract_json, run_codex,
+                     run_planner)
 from .config import Config
 from .state import State
 
@@ -30,6 +32,101 @@ def ts() -> str:
 
 def log(msg: str) -> None:
     print(f"[{ts()}] {msg}", flush=True)
+
+
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+PLANNER_AGENTS = ("claude", "codex")
+_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)([smh]?)$", re.IGNORECASE)
+
+
+def parse_start_delay(value: str) -> float:
+    """Zamień np. 30, 30s, 5m lub 2h na sekundy."""
+    match = _DURATION_RE.fullmatch(value.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(
+            "czas musi mieć format liczby z opcjonalnym sufiksem s, m lub h"
+        )
+    amount = float(match.group(1))
+    multiplier = {"": 1, "s": 1, "m": 60, "h": 3600}[match.group(2).lower()]
+    return amount * multiplier
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{seconds:.1f}s"
+
+
+def wait_before_start(delay_s: float) -> None:
+    """Odczekaj przed startem, raportując planowany i rzeczywisty czas."""
+    if delay_s <= 0:
+        return
+    started_at = _dt.datetime.now()
+    expected_at = started_at + _dt.timedelta(seconds=delay_s)
+    log(f"Opóźniony start: początek {started_at.strftime('%Y-%m-%d %H:%M:%S')}, "
+        f"czekam {_format_elapsed(delay_s)}, "
+        f"oczekiwany start ~{expected_at.strftime('%Y-%m-%d %H:%M:%S')}.")
+    started = time.monotonic()
+    completed = False
+    try:
+        time.sleep(delay_s)
+        completed = True
+    finally:
+        elapsed = time.monotonic() - started
+        status = "zakończone" if completed else "przerwane"
+        log(f"Oczekiwanie {status}: faktyczny czas {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, "
+            f"actual elapsed: {_format_elapsed(elapsed)}.")
+
+
+def _ask_value(label: str, default: str, *, display_default: str | None = None) -> str:
+    shown = display_default if display_default is not None else default
+    return input(f"{label} [{shown}]: ").strip() or default
+
+
+def _ask_effort(label: str, default: str, allowed: tuple[str, ...]) -> str:
+    choices = "/".join(allowed)
+    while True:
+        value = _ask_value(f"{label} ({choices})", default).lower()
+        if value in allowed:
+            return value
+        print(f"Niepoprawny effort: {value!r}. Wybierz jedną z: {choices}.")
+
+
+def prompt_agent_settings(cfg: Config) -> None:
+    """Pobierz modele i effort obu ról przed uruchomieniem pętli."""
+    print("\nKonfiguracja agentów (Enter zachowuje wartość domyślną):")
+    previous_agent = cfg.planner_agent
+    cfg.planner_agent = _ask_effort(
+        "Agent do planowania", cfg.planner_agent, PLANNER_AGENTS
+    )
+    if cfg.planner_agent != previous_agent:
+        if cfg.planner_agent == "claude":
+            cfg.planner_model, cfg.planner_effort = "opus", "high"
+        else:
+            cfg.planner_model, cfg.planner_effort = cfg.codex_model, cfg.codex_effort
+    cfg.planner_model = _ask_value(
+        f"Model do planowania ({cfg.planner_agent})", cfg.planner_model,
+        display_default=cfg.planner_model or "z konfiguracji CLI",
+    )
+    planner_efforts = (CLAUDE_EFFORTS if cfg.planner_agent == "claude"
+                       else CODEX_EFFORTS)
+    cfg.planner_effort = _ask_effort(
+        "Effort planowania", cfg.planner_effort, planner_efforts
+    )
+    cfg.codex_model = _ask_value(
+        "Model do implementacji (Codex)", cfg.codex_model,
+        display_default=cfg.codex_model or "z config.toml",
+    )
+    cfg.codex_effort = _ask_effort(
+        "Effort implementacji", cfg.codex_effort, CODEX_EFFORTS
+    )
+    print()
 
 
 # --- Git ---------------------------------------------------------------------
@@ -74,17 +171,15 @@ def commit_all(project: str, message: str, cfg: "Config | None" = None) -> None:
 
 
 def push(project: str, cfg: Config) -> None:
-    """Wypchnij bieżący branch do remote. Niekrytyczne — błąd (sieć/auth) tylko
-    loguje, nie wywala pętli. Wypchnięta historia nigdy nie jest przepisywana
-    (rollback dotyka tylko niezacommitowanych zmian)."""
+    """Wypchnij bieżący branch; błąd remote jest niekrytyczny dla pętli."""
     if not git(project, "remote", check=False).stdout.strip():
-        return  # brak remote — nic nie pushujemy
+        return
     branch = git(project, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip()
     if not branch or branch == "HEAD":
         branch = "main"
-    res = git(project, "push", "-u", cfg.git_remote, branch, check=False)
-    if res.returncode != 0:
-        log(f"PUSH nieudany (niekrytyczne): {(res.stderr or '').strip()[:200]}")
+    result = git(project, "push", "-u", cfg.git_remote, branch, check=False)
+    if result.returncode != 0:
+        log(f"PUSH nieudany (niekrytyczne): {(result.stderr or '').strip()[:200]}")
     else:
         log(f"Push → {cfg.git_remote}/{branch}")
 
@@ -160,7 +255,7 @@ def preflight(cfg: Config) -> list[str]:
     problems = []
     if shutil.which("git") is None:
         problems.append("Brak 'git' na PATH.")
-    if shutil.which(cfg.claude_bin) is None:
+    if cfg.planner_agent == "claude" and shutil.which(cfg.claude_bin) is None:
         problems.append(
             f"Nie znaleziono Claude CLI ('{cfg.claude_bin}'). Zainstaluj Claude Code "
             "jako standalone CLI albo ustaw FORGE_CLAUDE_BIN na pełną ścieżkę.")
@@ -177,7 +272,7 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     log("=== BOOTSTRAP ===")
     with open(cfg.brief_path, "r", encoding="utf-8") as f:
         brief = f.read()
-    out = run_claude(prompts.bootstrap_prompt(brief), cfg, project, logf("bootstrap"))
+    out = run_planner(prompts.bootstrap_prompt(brief), cfg, project, logf("bootstrap"))
     data = extract_json(out)
     if not data:
         raise AgentError("Bootstrap nie zwrócił poprawnego obiektu JSON.")
@@ -199,13 +294,13 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
 
 
 def phase_plan(cfg: Config, project: str, logf) -> dict:
-    log("--- PLAN (Claude) ---")
+    log(f"--- PLAN ({cfg.planner_agent}) ---")
     current_task = os.path.join(project, cfg.runtime_dir, "current_task.md")
     try:
         os.remove(current_task)
     except FileNotFoundError:
         pass
-    out = run_claude(prompts.plan_prompt(), cfg, project, logf("plan"))
+    out = run_planner(prompts.plan_prompt(), cfg, project, logf("plan"))
     commit_all(project, "docs: aktualizacja planu i backlogu", cfg)  # plan może dotknąć docs/backlog
     return extract_json(out) or {"task_title": "(nieznane)", "no_more_tasks": False}
 
@@ -217,8 +312,8 @@ def phase_implement(cfg: Config, project: str, test_cmd: str, logf) -> dict:
 
 
 def phase_review(cfg: Config, project: str, test_cmd: str, green: bool, logf) -> dict:
-    log("--- REVIEW (Claude) ---")
-    out = run_claude(prompts.review_prompt(test_cmd, green), cfg, project, logf("review"))
+    log(f"--- REVIEW ({cfg.planner_agent}) ---")
+    out = run_planner(prompts.review_prompt(test_cmd, green), cfg, project, logf("review"))
     return extract_json(out) or {"verdict": "changes", "notes": ["Brak werdyktu JSON — wymagam poprawek."]}
 
 
@@ -238,92 +333,135 @@ def record_failure(project: str, cfg: Config, state: State, title: str, reason: 
 
 # --- Pętla główna ------------------------------------------------------------
 
-def _one_iteration(cfg: Config, project: str, state: State,
-                   state_path: str | None = None) -> bool:
-    """Jedna iteracja, WZNAWIALNA po fazach. Zwraca False gdy nie ma już zadań.
+def save_checkpoint(project: str, state: State) -> None:
+    state.save(os.path.join(project, "STATE.json"))
 
-    Faza jest zapisywana po planie, więc po awarii/limicie restart wie, kto
-    następny: Claude (plan) czy Codex (implement). Plan jest commitowany, więc
-    nie jest powtarzany."""
-    def _save() -> None:
-        if state_path:
-            state.save(state_path)
 
+def clear_checkpoint(state: State) -> None:
+    state.phase = "idle"
+    state.current_task_title = ""
+    state.fix_attempt = 0
+    state.tests_green = False
+    state.review_notes = []
+
+
+def _one_iteration(cfg: Config, project: str, state: State) -> bool:
+    """Jedna wznawialna iteracja. Zwraca False po ukończeniu MVP."""
     n = state.iteration + 1
+    log(f"########## ITERACJA {n} ##########")
 
     def logf(phase: str) -> str:
         return os.path.join(project, cfg.runtime_dir, "logs", f"iter-{n:04d}-{phase}.log")
 
-    # --- FAZA PLAN (Claude) — pomijana przy wznowieniu w trakcie implementacji.
-    if state.phase in ("", "plan"):
-        log(f"########## ITERACJA {n} ##########")
+    starting_phase = state.phase
+    if starting_phase == "idle":
+        state.phase = "plan"
+        save_checkpoint(project, state)
+    else:
+        log(f"WZNAWIAM fazę '{starting_phase}' zadania: "
+            f"{state.current_task_title or '(jeszcze bez tytułu)'}")
+
+    if state.phase == "plan":
         plan = phase_plan(cfg, project, logf)
         if plan.get("no_more_tasks"):
+            clear_checkpoint(state)
+            save_checkpoint(project, state)
             log("PLAN: brak dalszych zadań — MVP ukończone. 🎉")
-            state.phase = "plan"
             return False
-        state.current_title = plan.get("task_title", "(zadanie)")
+        state.current_task_title = plan.get("task_title", "(zadanie)")
         state.phase = "implement"
-        _save()  # od teraz restart wznawia u Codeksa (implement), nie u Claude'a
-    else:
-        log(f"########## ITERACJA {n} — wznowienie od fazy: {state.phase} ##########")
+        save_checkpoint(project, state)
 
-    title = state.current_title or "(zadanie)"
+    title = state.current_task_title or "(zadanie)"
     log(f"Zadanie: {title}")
 
-    # --- FAZA IMPLEMENT (Codex) + bramka + review/fix.
-    phase_implement(cfg, project, state.test_cmd, logf)
-    green = build_then_test(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+    if state.phase == "implement":
+        phase_implement(cfg, project, state.test_cmd, logf)
+        state.tests_green = build_then_test(
+            project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s
+        )
+        state.phase = "review"
+        save_checkpoint(project, state)
+    elif state.phase == "review":
+        # Po restarcie nie ufamy staremu wynikowi: kod lub środowisko mogły się
+        # zmienić, więc przed ponownym review odtwarzamy bramkę build/test.
+        state.tests_green = build_then_test(
+            project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s
+        )
+        save_checkpoint(project, state)
 
     approved = False
-    for attempt in range(cfg.max_fix_attempts + 1):
-        review = phase_review(cfg, project, state.test_cmd, green, logf)
-        if review.get("verdict") == "approve" and green:
+    while state.phase in {"review", "fix"}:
+        if state.phase == "fix":
+            phase_fix(cfg, project, state.review_notes, state.test_cmd, logf)
+            state.tests_green = build_then_test(
+                project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s
+            )
+            state.fix_attempt += 1
+            state.review_notes = []
+            state.phase = "review"
+            save_checkpoint(project, state)
+
+        review = phase_review(cfg, project, state.test_cmd, state.tests_green, logf)
+        if review.get("verdict") == "approve" and state.tests_green:
             approved = True
             break
-        if attempt >= cfg.max_fix_attempts:
+        if state.fix_attempt >= cfg.max_fix_attempts:
             break
-        notes = review.get("notes") or []
-        log(f"REVIEW: changes ({len(notes)} uwag) — runda poprawek {attempt + 1}/{cfg.max_fix_attempts}")
-        phase_fix(cfg, project, notes, state.test_cmd, logf)
-        green = build_then_test(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+        state.review_notes = review.get("notes") or []
+        log(f"REVIEW: changes ({len(state.review_notes)} uwag) — runda poprawek "
+            f"{state.fix_attempt + 1}/{cfg.max_fix_attempts}")
+        state.phase = "fix"
+        save_checkpoint(project, state)
 
     if approved:
-        commit_all(project, f"feat: {title}", cfg)
         state.last_done = title
+        state.iteration = n
+        clear_checkpoint(state)
+        save_checkpoint(project, state)
+        commit_all(project, f"feat: {title}", cfg)
     else:
-        reason = "testy czerwone" if not green else "review nie zaakceptował po limicie poprawek"
+        reason = ("testy czerwone" if not state.tests_green
+                  else "review nie zaakceptował po limicie poprawek")
         log(f"NIEPOWODZENIE zadania '{title}': {reason}")
         record_failure(project, cfg, state, title, reason)
         rollback(project)
+        state.iteration = n
+        clear_checkpoint(state)
+        save_checkpoint(project, state)
 
-    state.iteration = n
-    state.phase = "plan"        # zadanie zamknięte → następna iteracja od nowa
-    state.current_title = ""
     return True
 
 
-def one_iteration(cfg: Config, project: str, state: State,
-                  state_path: str | None = None) -> bool:
-    """Wykonaj iterację transakcyjnie względem ostatniego dobrego commita.
-
-    Przy wyjątku odrzucamy niezacommitowaną pracę (rollback). Faza w `state`
-    (już utrwalona po planie) wskazuje, kto wznawia: plan→Claude, implement→Codex
-    — czyli po awarii Codeksa NIE powtarzamy planowania Claude'a."""
+def one_iteration(cfg: Config, project: str, state: State) -> bool:
+    """Wykonaj iterację transakcyjnie względem ostatniego dobrego commita."""
     try:
-        return _one_iteration(cfg, project, state, state_path)
-    except (AgentError, LimitExhausted, subprocess.CalledProcessError, KeyboardInterrupt):
+        return _one_iteration(cfg, project, state)
+    except (AgentError, LimitExhausted, KeyboardInterrupt):
+        log(f"Checkpoint zachowany: faza '{state.phase}'.")
+        save_checkpoint(project, state)
+        raise
+    except subprocess.CalledProcessError:
         rollback(project)
+        clear_checkpoint(state)
+        save_checkpoint(project, state)
         raise
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Orkiestrator agentów budujących grę.")
-    ap.add_argument("--brief", default="game_brief.md", help="Plik z opisem gry.")
+    ap.add_argument("--brief", default="game.md", help="Plik z opisem gry.")
     ap.add_argument("--project", default="game", help="Katalog projektu gry.")
     ap.add_argument("--max-iters", type=int, default=None, help="Limit iteracji (0=bez).")
-    ap.add_argument("--claude-model", default=None)
+    ap.add_argument("--sleep", type=parse_start_delay, default=0.0, metavar="CZAS",
+                    help="Opóźnij start, np. 30, 30s, 5m albo 2h.")
+    ap.add_argument("--planner-agent", choices=PLANNER_AGENTS, default=None)
+    ap.add_argument("--planner-model", "--claude-model", dest="planner_model", default=None)
+    ap.add_argument("--planner-effort", "--claude-effort", dest="planner_effort", default=None)
     ap.add_argument("--codex-model", default=None)
+    ap.add_argument("--codex-effort", default=None, choices=CODEX_EFFORTS)
+    ap.add_argument("--non-interactive", action="store_true",
+                    help="Nie pytaj o modele i effort; użyj flag/env/dom wartości.")
     ap.add_argument("--check", action="store_true", help="Tylko preflight i wyjście.")
     args = ap.parse_args(argv)
 
@@ -332,10 +470,31 @@ def main(argv: list[str] | None = None) -> int:
     cfg.project_dir = args.project
     if args.max_iters is not None:
         cfg.max_iterations = args.max_iters
-    if args.claude_model:
-        cfg.claude_model = args.claude_model
+    if args.planner_agent and args.planner_agent != cfg.planner_agent:
+        cfg.planner_agent = args.planner_agent
+        if not args.planner_model:
+            cfg.planner_model = "opus" if args.planner_agent == "claude" else cfg.codex_model
+        if not args.planner_effort:
+            cfg.planner_effort = "high" if args.planner_agent == "claude" else cfg.codex_effort
+    if args.planner_model:
+        cfg.planner_model = args.planner_model
+    if args.planner_effort:
+        cfg.planner_effort = args.planner_effort
     if args.codex_model:
         cfg.codex_model = args.codex_model
+    if args.codex_effort:
+        cfg.codex_effort = args.codex_effort
+
+    allowed_planner_efforts = (CLAUDE_EFFORTS if cfg.planner_agent == "claude"
+                               else CODEX_EFFORTS)
+    if cfg.planner_effort not in allowed_planner_efforts:
+        ap.error(f"effort {cfg.planner_effort!r} nie jest obsługiwany przez {cfg.planner_agent}")
+
+    if not args.check and not args.non_interactive:
+        if sys.stdin.isatty():
+            prompt_agent_settings(cfg)
+        else:
+            log("Brak interaktywnego terminala — używam konfiguracji z flag/env/defaultów.")
 
     problems = preflight(cfg)
     if problems:
@@ -349,6 +508,12 @@ def main(argv: list[str] | None = None) -> int:
         log("PREFLIGHT OK.")
     if args.check:
         return 0
+
+    try:
+        wait_before_start(args.sleep)
+    except KeyboardInterrupt:
+        log("Przerwano oczekiwanie przed startem.")
+        return 130
 
     project = os.path.abspath(cfg.project_dir)
     os.makedirs(project, exist_ok=True)
@@ -369,7 +534,7 @@ def main(argv: list[str] | None = None) -> int:
             if cfg.max_iterations and state.iteration >= cfg.max_iterations:
                 log(f"Osiągnięto limit iteracji ({cfg.max_iterations}).")
                 break
-            cont = one_iteration(cfg, project, state, state_path)
+            cont = one_iteration(cfg, project, state)
             state.save(state_path)
             if not cont:
                 break

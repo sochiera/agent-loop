@@ -4,12 +4,14 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
-from forge.agents import AgentError
+from forge.agents import AgentError, LimitExhausted
 from forge.config import Config
 from forge.orchestrate import (build_then_test, commit_all, one_iteration,
-                                phase_bootstrap, run_tests)
+                                parse_start_delay, phase_bootstrap,
+                                prompt_agent_settings, run_tests,
+                                wait_before_start)
 from forge.state import State
 
 
@@ -39,6 +41,52 @@ class RunTestsTest(unittest.TestCase):
         self.assertFalse(run_tests("/tmp/project", "python 'unterminated", 10))
         run.assert_not_called()
 
+
+class DelayedStartTest(unittest.TestCase):
+    def test_duration_units_are_converted_to_seconds(self) -> None:
+        self.assertEqual(parse_start_delay("30"), 30)
+        self.assertEqual(parse_start_delay("1.5m"), 90)
+        self.assertEqual(parse_start_delay("2h"), 7200)
+
+    def test_invalid_duration_is_rejected(self) -> None:
+        with self.assertRaisesRegex(Exception, "format"):
+            parse_start_delay("tomorrow")
+
+    @patch("forge.orchestrate.log")
+    @patch("forge.orchestrate.time.monotonic", side_effect=[100.0, 165.0])
+    @patch("forge.orchestrate.time.sleep")
+    def test_wait_uses_requested_delay_and_reports_elapsed_time(
+        self, sleep: Mock, _monotonic: Mock, log: Mock
+    ) -> None:
+        wait_before_start(60)
+
+        sleep.assert_called_once_with(60)
+        self.assertIn("actual elapsed: 1m05s", log.call_args_list[-1].args[0])
+
+class AgentSettingsTest(unittest.TestCase):
+    @patch("builtins.input", side_effect=["claude", "opus", "high", "gpt-test", "xhigh"])
+    def test_prompts_for_planner_then_implementer(self, _input: Mock) -> None:
+        cfg = Config()
+
+        prompt_agent_settings(cfg)
+
+        self.assertEqual(cfg.planner_agent, "claude")
+        self.assertEqual(cfg.planner_model, "opus")
+        self.assertEqual(cfg.planner_effort, "high")
+        self.assertEqual(cfg.codex_model, "gpt-test")
+        self.assertEqual(cfg.codex_effort, "xhigh")
+
+    @patch("builtins.input", side_effect=["", "", "wrong", "medium", "", "high"])
+    def test_enter_uses_defaults_and_invalid_effort_is_retried(self, _input: Mock) -> None:
+        cfg = Config(planner_agent="claude", planner_model="sonnet", planner_effort="high",
+                     codex_model="", codex_effort="medium")
+
+        prompt_agent_settings(cfg)
+
+        self.assertEqual(cfg.planner_model, "sonnet")
+        self.assertEqual(cfg.planner_effort, "medium")
+        self.assertEqual(cfg.codex_model, "")
+        self.assertEqual(cfg.codex_effort, "high")
 
 class BuildGateTest(unittest.TestCase):
     @patch("forge.orchestrate.run_tests")
@@ -75,7 +123,7 @@ class BootstrapTest(unittest.TestCase):
         self.cfg = Config(brief_path=str(self.brief), agent_timeout_s=10)
         self.state = State()
 
-    @patch("forge.orchestrate.run_claude", return_value="bez werdyktu")
+    @patch("forge.orchestrate.run_planner", return_value="bez werdyktu")
     def test_invalid_agent_result_does_not_mark_bootstrap_complete(self, _run: Mock) -> None:
         with self.assertRaisesRegex(AgentError, "JSON"):
             phase_bootstrap(self.cfg, self.tmp.name, self.state, lambda _: "agent.log")
@@ -85,7 +133,7 @@ class BootstrapTest(unittest.TestCase):
     @patch("forge.orchestrate.commit_all")
     @patch("forge.orchestrate.run_tests", return_value=False)
     @patch(
-        "forge.orchestrate.run_claude",
+        "forge.orchestrate.run_planner",
         return_value='{"stack":"Python","test_cmd":"python -m unittest",'
                      '"build_cmd":"","run_cmd":"python game.py"}',
     )
@@ -147,30 +195,73 @@ class CommitTest(unittest.TestCase):
 class IterationTest(unittest.TestCase):
     @patch("forge.orchestrate.rollback")
     @patch("forge.orchestrate._one_iteration", side_effect=AgentError("awaria"))
-    def test_agent_failure_rolls_back_partial_iteration(
-        self, _iteration: Mock, rollback: Mock
+    @patch("forge.orchestrate.save_checkpoint")
+    def test_agent_failure_keeps_phase_for_retry(
+        self, save: Mock, _iteration: Mock, rollback: Mock
     ) -> None:
+        state = State(phase="implement", current_task_title="Walka")
         with self.assertRaisesRegex(AgentError, "awaria"):
-            one_iteration(Config(), "/tmp/project", State())
+            one_iteration(Config(), "/tmp/project", state)
 
-        rollback.assert_called_once_with("/tmp/project")
+        rollback.assert_not_called()
+        save.assert_called_once_with("/tmp/project", state)
+        self.assertEqual(state.phase, "implement")
+
+    @patch("forge.orchestrate.rollback")
+    @patch("forge.orchestrate._one_iteration", side_effect=LimitExhausted("limit"))
+    @patch("forge.orchestrate.save_checkpoint")
+    def test_limit_keeps_checkpoint_without_rollback(
+        self, save: Mock, _iteration: Mock, rollback: Mock
+    ) -> None:
+        state = State(phase="review", current_task_title="Walka")
+
+        with self.assertRaisesRegex(LimitExhausted, "limit"):
+            one_iteration(Config(), "/tmp/project", state)
+
+        save.assert_called_once_with("/tmp/project", state)
+        rollback.assert_not_called()
+        self.assertEqual(state.phase, "review")
+
+    @patch("forge.orchestrate.commit_all")
+    @patch("forge.orchestrate.phase_review", return_value={"verdict": "approve"})
+    @patch("forge.orchestrate.build_then_test", return_value=True)
+    @patch("forge.orchestrate.phase_implement")
+    @patch("forge.orchestrate.phase_plan")
+    def test_resume_at_review_skips_plan_and_implementation(
+        self, plan: Mock, implement: Mock, _tests: Mock, review: Mock, commit: Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as project:
+            state = State(bootstrapped=True, iteration=4, test_cmd="pytest",
+                          phase="review", current_task_title="Walka",
+                          tests_green=True)
+
+            self.assertTrue(one_iteration(Config(), project, state))
+
+        plan.assert_not_called()
+        implement.assert_not_called()
+        review.assert_called_once()
+        commit.assert_called_once_with(project, "feat: Walka", ANY)
+        self.assertEqual(state.iteration, 5)
+        self.assertEqual(state.phase, "idle")
 
 
 class PhaseResumeTest(unittest.TestCase):
     @patch("forge.orchestrate.rollback")
+    @patch("forge.orchestrate.save_checkpoint")
     @patch("forge.orchestrate.phase_implement", side_effect=AgentError("codex padł"))
     @patch("forge.orchestrate.phase_plan",
            return_value={"task_title": "C1.1", "no_more_tasks": False})
     def test_codex_crash_leaves_phase_implement_for_restart(
-        self, plan: Mock, impl: Mock, rb: Mock
+        self, plan: Mock, impl: Mock, save: Mock, rb: Mock
     ) -> None:
         state = State(bootstrapped=True, phase="plan", test_cmd="pytest")
         with self.assertRaises(AgentError):
             one_iteration(Config(), "/tmp/p", state)
         # Kto następny po restarcie? Codex (implement), nie Claude (plan).
         self.assertEqual(state.phase, "implement")
-        self.assertEqual(state.current_title, "C1.1")
-        rb.assert_called_once_with("/tmp/p")
+        self.assertEqual(state.current_task_title, "C1.1")
+        self.assertGreaterEqual(save.call_count, 2)
+        rb.assert_not_called()
 
     @patch("forge.orchestrate.rollback")
     @patch("forge.orchestrate.commit_all")
@@ -183,12 +274,12 @@ class PhaseResumeTest(unittest.TestCase):
         self, plan: Mock, impl: Mock, review: Mock, bt: Mock, commit: Mock, rb: Mock
     ) -> None:
         state = State(bootstrapped=True, phase="implement",
-                      current_title="C1.1", test_cmd="pytest")
+                      current_task_title="C1.1", test_cmd="pytest")
         cont = one_iteration(Config(), "/tmp/p", state)
         self.assertTrue(cont)
         plan.assert_not_called()            # Claude NIE planuje ponownie
         impl.assert_called_once()           # Codex wznawia implementację
-        self.assertEqual(state.phase, "plan")   # po sukcesie następna iteracja od nowa
+        self.assertEqual(state.phase, "idle")   # po sukcesie następna iteracja od nowa
 
 
 if __name__ == "__main__":
