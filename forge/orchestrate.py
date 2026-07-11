@@ -238,21 +238,40 @@ def record_failure(project: str, cfg: Config, state: State, title: str, reason: 
 
 # --- Pętla główna ------------------------------------------------------------
 
-def _one_iteration(cfg: Config, project: str, state: State) -> bool:
-    """Jedna iteracja. Zwraca False gdy nie ma już zadań (koniec MVP)."""
+def _one_iteration(cfg: Config, project: str, state: State,
+                   state_path: str | None = None) -> bool:
+    """Jedna iteracja, WZNAWIALNA po fazach. Zwraca False gdy nie ma już zadań.
+
+    Faza jest zapisywana po planie, więc po awarii/limicie restart wie, kto
+    następny: Claude (plan) czy Codex (implement). Plan jest commitowany, więc
+    nie jest powtarzany."""
+    def _save() -> None:
+        if state_path:
+            state.save(state_path)
+
     n = state.iteration + 1
-    log(f"########## ITERACJA {n} ##########")
 
     def logf(phase: str) -> str:
         return os.path.join(project, cfg.runtime_dir, "logs", f"iter-{n:04d}-{phase}.log")
 
-    plan = phase_plan(cfg, project, logf)
-    if plan.get("no_more_tasks"):
-        log("PLAN: brak dalszych zadań — MVP ukończone. 🎉")
-        return False
-    title = plan.get("task_title", "(zadanie)")
+    # --- FAZA PLAN (Claude) — pomijana przy wznowieniu w trakcie implementacji.
+    if state.phase in ("", "plan"):
+        log(f"########## ITERACJA {n} ##########")
+        plan = phase_plan(cfg, project, logf)
+        if plan.get("no_more_tasks"):
+            log("PLAN: brak dalszych zadań — MVP ukończone. 🎉")
+            state.phase = "plan"
+            return False
+        state.current_title = plan.get("task_title", "(zadanie)")
+        state.phase = "implement"
+        _save()  # od teraz restart wznawia u Codeksa (implement), nie u Claude'a
+    else:
+        log(f"########## ITERACJA {n} — wznowienie od fazy: {state.phase} ##########")
+
+    title = state.current_title or "(zadanie)"
     log(f"Zadanie: {title}")
 
+    # --- FAZA IMPLEMENT (Codex) + bramka + review/fix.
     phase_implement(cfg, project, state.test_cmd, logf)
     green = build_then_test(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
 
@@ -279,13 +298,20 @@ def _one_iteration(cfg: Config, project: str, state: State) -> bool:
         rollback(project)
 
     state.iteration = n
+    state.phase = "plan"        # zadanie zamknięte → następna iteracja od nowa
+    state.current_title = ""
     return True
 
 
-def one_iteration(cfg: Config, project: str, state: State) -> bool:
-    """Wykonaj iterację transakcyjnie względem ostatniego dobrego commita."""
+def one_iteration(cfg: Config, project: str, state: State,
+                  state_path: str | None = None) -> bool:
+    """Wykonaj iterację transakcyjnie względem ostatniego dobrego commita.
+
+    Przy wyjątku odrzucamy niezacommitowaną pracę (rollback). Faza w `state`
+    (już utrwalona po planie) wskazuje, kto wznawia: plan→Claude, implement→Codex
+    — czyli po awarii Codeksa NIE powtarzamy planowania Claude'a."""
     try:
-        return _one_iteration(cfg, project, state)
+        return _one_iteration(cfg, project, state, state_path)
     except (AgentError, LimitExhausted, subprocess.CalledProcessError, KeyboardInterrupt):
         rollback(project)
         raise
@@ -343,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
             if cfg.max_iterations and state.iteration >= cfg.max_iterations:
                 log(f"Osiągnięto limit iteracji ({cfg.max_iterations}).")
                 break
-            cont = one_iteration(cfg, project, state)
+            cont = one_iteration(cfg, project, state, state_path)
             state.save(state_path)
             if not cont:
                 break

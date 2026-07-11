@@ -156,5 +156,40 @@ class IterationTest(unittest.TestCase):
         rollback.assert_called_once_with("/tmp/project")
 
 
+class PhaseResumeTest(unittest.TestCase):
+    @patch("forge.orchestrate.rollback")
+    @patch("forge.orchestrate.phase_implement", side_effect=AgentError("codex padł"))
+    @patch("forge.orchestrate.phase_plan",
+           return_value={"task_title": "C1.1", "no_more_tasks": False})
+    def test_codex_crash_leaves_phase_implement_for_restart(
+        self, plan: Mock, impl: Mock, rb: Mock
+    ) -> None:
+        state = State(bootstrapped=True, phase="plan", test_cmd="pytest")
+        with self.assertRaises(AgentError):
+            one_iteration(Config(), "/tmp/p", state)
+        # Kto następny po restarcie? Codex (implement), nie Claude (plan).
+        self.assertEqual(state.phase, "implement")
+        self.assertEqual(state.current_title, "C1.1")
+        rb.assert_called_once_with("/tmp/p")
+
+    @patch("forge.orchestrate.rollback")
+    @patch("forge.orchestrate.commit_all")
+    @patch("forge.orchestrate.build_then_test", return_value=True)
+    @patch("forge.orchestrate.phase_review",
+           return_value={"verdict": "approve", "notes": []})
+    @patch("forge.orchestrate.phase_implement", return_value={})
+    @patch("forge.orchestrate.phase_plan")
+    def test_resume_at_implement_skips_planning(
+        self, plan: Mock, impl: Mock, review: Mock, bt: Mock, commit: Mock, rb: Mock
+    ) -> None:
+        state = State(bootstrapped=True, phase="implement",
+                      current_title="C1.1", test_cmd="pytest")
+        cont = one_iteration(Config(), "/tmp/p", state)
+        self.assertTrue(cont)
+        plan.assert_not_called()            # Claude NIE planuje ponownie
+        impl.assert_called_once()           # Codex wznawia implementację
+        self.assertEqual(state.phase, "plan")   # po sukcesie następna iteracja od nowa
+
+
 if __name__ == "__main__":
     unittest.main()

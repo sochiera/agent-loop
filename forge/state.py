@@ -25,6 +25,12 @@ class State:
     failures: list[str] = field(default_factory=list)
     # Ostatnio ukończone zadanie (dla kontekstu plannera).
     last_done: str = ""
+    # Faza wznowienia W OBRĘBIE iteracji — dzięki niej restart wie, kto następny:
+    #   "plan"      → następny jest Claude (planowanie),
+    #   "implement" → następny jest Codex (implementacja bieżącego zadania).
+    # Plan jest commitowany, więc nigdy nie jest powtarzany po awarii Codeksa.
+    phase: str = "plan"
+    current_title: str = ""   # tytuł bieżącego zadania (dla wznowienia i commita)
 
     @classmethod
     def load(cls, path: str) -> "State":
