@@ -17,6 +17,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 from . import prompts
@@ -608,6 +609,154 @@ def run_gate(project: str, build_cmd: str, test_cmd: str, timeout: int) -> tuple
     return green, "" if green else ((proc.stdout or "") + (proc.stderr or ""))[-1500:]
 
 
+# --- Dziennik zadania i odzyskiwanie sesji ----------------------------------
+# Ciągły kontekst per zadanie żyje w sesjach Codeksa (~/.codex/sessions). Gdy
+# sesji nie da się wznowić (świeży kontener, sprzątnięte sesje), fallbackiem
+# jest dziennik zadania: zwięzły zapis przebiegu, doklejany do promptu świeżej
+# sesji zamiast utraconego kontekstu.
+
+_SESSION_LOSS_RE = re.compile(
+    r"(session|thread|conversation|rollout)[^\n]{0,80}"
+    r"(not found|no such|does not exist|doesn't exist|missing|unknown|"
+    r"failed to (load|read|resume))",
+    re.IGNORECASE)
+
+
+def _looks_like_session_loss(text: str) -> bool:
+    return bool(_SESSION_LOSS_RE.search(text or ""))
+
+
+def _journal_path(project: str, cfg: Config) -> str:
+    return os.path.join(project, cfg.runtime_dir, "task_journal.md")
+
+
+def journal_reset(project: str, cfg: Config, title: str) -> None:
+    path = _journal_path(project, cfg)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# Dziennik zadania: {title}\n")
+
+
+def journal_append(project: str, cfg: Config, text: str) -> None:
+    try:
+        path = _journal_path(project, cfg)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"- [{ts()}] {text}\n")
+    except OSError:
+        pass  # dziennik jest best-effort
+
+
+def journal_tail(project: str, cfg: Config, max_chars: int = 3000) -> str:
+    try:
+        with open(_journal_path(project, cfg), "r", encoding="utf-8") as f:
+            return f.read()[-max_chars:]
+    except OSError:
+        return ""
+
+
+def _session_call(cfg: Config, project: str, state: State, role: str,
+                  prompt: str, log_path: str) -> str:
+    """Wywołaj rolę Codeksa z jej sesją; po utracie sesji — świeża + dziennik.
+
+    role: "tester" | "coder". Aktualizuje id sesji w stanie."""
+    attr = "tester_session" if role == "tester" else "coder_session"
+    model, effort = cfg.tester() if role == "tester" else cfg.coder()
+    sid = getattr(state, attr) or None
+    try:
+        out, new_sid = run_codex_session(prompt, cfg, project, log_path,
+                                         session_id=sid, model=model, effort=effort)
+    except AgentError as exc:
+        if not (sid and _looks_like_session_loss(str(exc))):
+            raise
+        log(f"Sesja roli '{role}' nieodtwarzalna — świeża sesja z dziennikiem zadania.")
+        setattr(state, attr, "")
+        save_checkpoint(project, state)
+        tail = journal_tail(project, cfg)
+        preamble = ("KONTEKST ODTWORZONY Z DZIENNIKA (Twoja poprzednia sesja przepadła; "
+                    "to skrót dotychczasowego przebiegu zadania):\n"
+                    f"{tail}\n--- KONIEC DZIENNIKA ---\n\n") if tail else ""
+        out, new_sid = run_codex_session(preamble + prompt, cfg, project, log_path,
+                                         session_id=None, model=model, effort=effort)
+    if new_sid:
+        setattr(state, attr, new_sid)
+    return out
+
+
+def _cycle_snapshot_dir(project: str, cfg: Config) -> str:
+    return os.path.join(project, cfg.runtime_dir, "cycle_tests")
+
+
+def snapshot_cycle_tests(project: str, cfg: Config, files: list[str]) -> None:
+    """Zachowaj wersje testów testera z chwili bramki czerwonej.
+
+    Nowe testy cyklu nie mają jeszcze wersji w HEAD, więc to jedyny sposób, by
+    po niedozwolonej edycji kodera przywrócić TEST, a nie skasować go."""
+    root = _cycle_snapshot_dir(project, cfg)
+    shutil.rmtree(root, ignore_errors=True)
+    for rel in files:
+        src = os.path.join(project, rel)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def restore_test_changes(project: str, cfg: Config, files: list[str],
+                         cycle_files: list[str]) -> None:
+    """Cofnij zmiany kodera w testach: pliki cyklu → ze snapshotu testera,
+    pozostałe → z HEAD (checkout; nowe pliki kodera są usuwane)."""
+    snapshot = set(cycle_files)
+    root = _cycle_snapshot_dir(project, cfg)
+    for rel in files:
+        if rel in snapshot:
+            saved = os.path.join(root, rel)
+            if os.path.exists(saved):
+                dst = os.path.join(project, rel)
+                os.makedirs(os.path.dirname(dst) or project, exist_ok=True)
+                shutil.copy2(saved, dst)
+                continue
+        revert_paths(project, [rel])
+
+
+def anti_weakening_ok(project: str, test_files: list[str], build_cmd: str,
+                      test_cmd: str, timeout: int) -> bool:
+    """Bramka anty-osłabiania: testy cyklu w bieżącej postaci MUSZĄ failować
+    na kodzie sprzed cyklu (HEAD).
+
+    Koder zadeklarował zmiany w testach — sprawdzamy mechanicznie, czy po tych
+    zmianach testy nadal cokolwiek specyfikują: kopiujemy ich bieżące wersje do
+    tymczasowego worktree na HEAD (kod bez pracy kodera) i odpalamy bramkę.
+    Zielona = testy przechodzą bez implementacji = zostały rozwodnione → False.
+    Brak plików / worktree niedostępny → True (nie blokuj — rozstrzygnie recenzja)."""
+    test_files = [p for p in test_files if p]
+    if not test_files:
+        return True
+    tmp = tempfile.mkdtemp(prefix="forge-antiweak-")
+    wt = os.path.join(tmp, "wt")
+    try:
+        if git(project, "worktree", "add", "--detach", wt, "HEAD",
+               check=False).returncode != 0:
+            return True
+        copied = False
+        for rel in test_files:
+            src = os.path.join(project, rel)
+            if not os.path.exists(src):
+                continue
+            dst = os.path.join(wt, rel)
+            os.makedirs(os.path.dirname(dst) or wt, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied = True
+        if not copied:
+            return True
+        green, _ = run_gate(wt, build_cmd, test_cmd, timeout)
+        return not green
+    finally:
+        git(project, "worktree", "remove", "--force", wt, check=False)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # --- Fazy nowego modelu ------------------------------------------------------
 
 def _next_task_index(project: str) -> int:
@@ -677,6 +826,7 @@ def _start_task(cfg: Config, project: str, state: State) -> None:
     state.fix_attempt = 0
     state.phase = "micro"
     _write_current_task_pointer(project, task)
+    journal_reset(project, cfg, state.current_task_title)
     log(f"START zadania: {state.current_task_title} (tag {state.task_start_tag})")
 
 
@@ -704,8 +854,6 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
     task = state.current_task
     task_file = task.get("file", "")
     test_globs = task.get("test_globs") or []
-    tm, te = cfg.tester()
-    cm, ce = cfg.coder()
 
     while True:
         if state.micro_cycle >= cfg.max_micro_cycles:
@@ -715,14 +863,14 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
 
         if state.micro_sub == "test":
             log(f"[cykl {c}] TESTER pisze test / ocenia ukończenie")
-            out, sid = run_codex_session(
-                prompts.write_test_prompt(task_file, state.test_cmd),
-                cfg, project, logf(f"c{c:02d}-test"),
-                session_id=state.tester_session or None, model=tm, effort=te)
-            if sid:
-                state.tester_session = sid
+            out = _session_call(cfg, project, state, "tester",
+                                prompts.write_test_prompt(task_file, state.test_cmd),
+                                logf(f"c{c:02d}-test"))
             verdict = extract_json(out) or {"action": "no_test", "reason": "brak werdyktu JSON"}
             action = verdict.get("action")
+            journal_append(project, cfg,
+                           f"cykl {c}, tester: {action} "
+                           f"({verdict.get('about') or verdict.get('reason') or ''})".rstrip())
 
             if action == "done":
                 if not criteria_fully_mapped(task.get("criteria") or [],
@@ -768,6 +916,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
                 tests_here = [p for p in changed if _match_any(p, test_globs)] if test_globs \
                     else [p for p in changed if _looks_like_test(p)]
                 state.cycle_test_files = tests_here
+                snapshot_cycle_tests(project, cfg, tests_here)  # do przywracania po koderze
                 state.pending_no_test = False
                 state.micro_sub = "code"
                 save_checkpoint(project, state)
@@ -787,17 +936,18 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
         green, tail = False, ""
         verdict: dict = {}
         for attempt in range(cfg.max_green_retries + 1):
-            out, sid = run_codex_session(
-                prompts.code_and_refactor_prompt(task_file, state.test_cmd, no_test, tail),
-                cfg, project, logf(f"c{c:02d}-code{attempt}"),
-                session_id=state.coder_session or None, model=cm, effort=ce)
-            if sid:
-                state.coder_session = sid
+            out = _session_call(cfg, project, state, "coder",
+                                prompts.code_and_refactor_prompt(
+                                    task_file, state.test_cmd, no_test, tail),
+                                logf(f"c{c:02d}-code{attempt}"))
             verdict = extract_json(out) or {}
             green, tail = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
             if green:
                 break
             log(f"[cykl {c}] bramka CZERWONA (próba {attempt + 1}/{cfg.max_green_retries + 1})")
+        journal_append(project, cfg,
+                       f"cykl {c}, koder: {'zielony' if green else 'czerwony'} "
+                       f"({verdict.get('notes') or ''})".rstrip())
         if not green:
             log("Koder nie zazielenił bramki w limicie prób — porażka zadania.")
             return False
@@ -815,6 +965,16 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
                 log("Po wycofaniu niedozwolonych zmian testów bramka czerwona — porażka.")
                 return False
 
+        if declared and not anti_weakening_ok(project, declared, state.build_cmd,
+                                              state.test_cmd, cfg.agent_timeout_s):
+            log(f"ANTY-OSŁABIANIE: zadeklarowane testy {declared} przechodzą na kodzie "
+                "sprzed cyklu — zmiana je rozwodniła. Przywracam wersje testów.")
+            restore_test_changes(project, cfg, declared, state.cycle_test_files)
+            green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+            if not green:
+                log("Po przywróceniu testów bramka czerwona — porażka zadania.")
+                return False
+
         _commit_cycle(project, f"tdd: {state.current_task_title} (cykl {c})")
         state.micro_cycle = c
         state.micro_sub = "test"
@@ -829,18 +989,13 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf) -> bool:
     Zwraca True gdy approve, False gdy limit poprawek / trwała czerwień."""
     task = state.current_task
     task_file = task.get("file", "")
-    tm, te = cfg.tester()
-    cm, ce = cfg.coder()
 
     while True:
         if state.phase == "fix_review":
             log(f"--- POPRAWKI PO RECENZJI (koder) runda {state.fix_attempt + 1} ---")
-            out, sid = run_codex_session(
-                prompts.fix_review_prompt(state.review_notes, state.test_cmd),
-                cfg, project, logf(f"review-fix{state.fix_attempt + 1}"),
-                session_id=state.coder_session or None, model=cm, effort=ce)
-            if sid:
-                state.coder_session = sid
+            out = _session_call(cfg, project, state, "coder",
+                                prompts.fix_review_prompt(state.review_notes, state.test_cmd),
+                                logf(f"review-fix{state.fix_attempt + 1}"))
             green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
             if green:
                 _commit_cycle(project, f"fix: {state.current_task_title} (recenzja {state.fix_attempt + 1})")
@@ -862,13 +1017,12 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf) -> bool:
             continue
 
         log("--- RECENZJA CAŁOŚCI (Codex-tester) ---")
-        out, sid = run_codex_session(
-            prompts.review_task_prompt(task_file, state.test_cmd),
-            cfg, project, logf(f"review-r{state.fix_attempt}"),
-            session_id=state.tester_session or None, model=tm, effort=te)
-        if sid:
-            state.tester_session = sid
+        out = _session_call(cfg, project, state, "tester",
+                            prompts.review_task_prompt(task_file, state.test_cmd),
+                            logf(f"review-r{state.fix_attempt}"))
         review = extract_json(out) or {"verdict": "changes", "notes": ["Brak werdyktu JSON."]}
+        journal_append(project, cfg,
+                       f"recenzja: {review.get('verdict')} ({len(review.get('notes') or [])} uwag)")
         if review.get("verdict") == "approve":
             log("RECENZJA: approve.")
             return True
@@ -965,6 +1119,15 @@ def one_iteration(cfg: Config, project: str, state: State) -> bool:
         clear_checkpoint(state)
         save_checkpoint(project, state)
         raise
+
+
+def _print_usage(project: str) -> None:
+    """Podsumowanie zużycia tokenów na koniec biegu (best-effort)."""
+    try:
+        from .report import usage_summary
+        print("\nZużycie tokenów w tym projekcie:\n" + usage_summary(project))
+    except Exception:  # raport nigdy nie psuje kodu wyjścia pętli
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1091,6 +1254,7 @@ def main(argv: list[str] | None = None) -> int:
         log(f"LIMITY WYCZERPANE: {e}")
         log("Stan zapisany — uruchom ponownie później, by kontynuować.")
         state.save(state_path)
+        _print_usage(project)
         return 3
     except KeyboardInterrupt:
         log("Przerwano ręcznie. Stan zapisany.")
@@ -1103,6 +1267,7 @@ def main(argv: list[str] | None = None) -> int:
 
     state.save(state_path)
     log("Koniec pracy.")
+    _print_usage(project)
     return 0
 
 

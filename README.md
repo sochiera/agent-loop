@@ -62,7 +62,15 @@ buduje grę małymi, przetestowanymi przyrostami.
 Sprawdź gotowość bez uruchamiania pętli:
 
 ```bash
-python3 -m forge.orchestrate --check
+python3 -m forge.orchestrate --check   # preflight konfiguracji
+python3 -m forge.smoke --dry           # binarki + wsparcie `codex exec resume` (0 tokenów)
+python3 -m forge.smoke                 # żywy test sesji/resume/pomiaru (2 najtańsze wywołania)
+```
+
+Zużycie tokenów obejrzysz po każdym biegu (drukowane na końcu) albo ręcznie:
+
+```bash
+python3 -m forge.report game
 ```
 
 ## Uruchomienie

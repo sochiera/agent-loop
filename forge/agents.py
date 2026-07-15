@@ -62,21 +62,28 @@ def _balanced_objects(text: str) -> list[str]:
     return out
 
 
-_SESSION_ID_RE = re.compile(r'"session[_-]?id"\s*:\s*"([^"]+)"')
+# Format strumienia `codex exec --json` (potwierdzony w dokumentacji, 2026-07):
+#   {"type":"thread.started","thread_id":"<uuid>"}
+#   {"type":"turn.completed","usage":{"input_tokens":N,"cached_input_tokens":N,"output_tokens":N}}
+#   {"type":"turn.failed","error":{"message":"..."}} / {"type":"error","message":"..."}
+# Wznowienie: `codex exec resume <THREAD_ID> "<prompt>"`.
+# Starsze wersje CLI emitowały session_id — parser rozumie oba warianty.
+_SESSION_ID_RE = re.compile(r'"(?:session[_-]?id|thread[_-]?id)"\s*:\s*"([^"]+)"')
 
 
 def _find_session_id(obj) -> str | None:
-    """Zejdź rekurencyjnie po sparsowanym evencie i znajdź pierwsze session id."""
+    """Zejdź rekurencyjnie po sparsowanym evencie i znajdź pierwsze id wątku/sesji."""
     if isinstance(obj, dict):
-        for key in ("session_id", "sessionId"):
+        for key in ("thread_id", "threadId", "session_id", "sessionId"):
             val = obj.get(key)
             if isinstance(val, str) and val:
                 return val
-        sess = obj.get("session")
-        if isinstance(sess, dict):
-            val = sess.get("id")
-            if isinstance(val, str) and val:
-                return val
+        for parent in ("thread", "session"):
+            sub = obj.get(parent)
+            if isinstance(sub, dict):
+                val = sub.get("id")
+                if isinstance(val, str) and val:
+                    return val
         for val in obj.values():
             found = _find_session_id(val)
             if found:
@@ -90,10 +97,10 @@ def _find_session_id(obj) -> str | None:
 
 
 def extract_session_id(stream: str) -> str | None:
-    """Wyłuskaj id sesji Codeksa ze strumienia zdarzeń `codex exec --json`.
+    """Wyłuskaj id wątku/sesji Codeksa ze strumienia zdarzeń `codex exec --json`.
 
-    Najpierw parsuje JSONL linia po linii (zdarzenie startu sesji niesie
-    session_id), awaryjnie skanuje regexem — odporne na drobne zmiany formatu."""
+    Preferuje zdarzenie `thread.started` (thread_id); rozumie też starszy wariant
+    session_id. Awaryjnie skanuje regexem — odporne na drobne zmiany formatu."""
     for line in (stream or "").splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -110,8 +117,13 @@ def extract_session_id(stream: str) -> str | None:
 
 
 def extract_codex_usage(stream: str) -> dict:
-    """Best-effort: zsumuj tokeny z JSONL Codeksa (klucze input/output/total)."""
-    usage: dict = {}
+    """Zużycie tokenów z JSONL Codeksa.
+
+    Ścieżka główna: sumuj pola `usage` ze zdarzeń `turn.completed` (jedno
+    wywołanie exec może mieć wiele tur). Fallback dla starszych formatów:
+    generyczny skan znanych kluczy (ostatnia wartość wygrywa)."""
+    turn_totals: dict = {}
+    fallback: dict = {}
     for line in (stream or "").splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -120,12 +132,17 @@ def extract_codex_usage(stream: str) -> dict:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if obj.get("type") == "turn.completed" and isinstance(obj.get("usage"), dict):
+            for key, val in obj["usage"].items():
+                if isinstance(val, (int, float)):
+                    turn_totals[key] = turn_totals.get(key, 0) + val
+            continue
         for key in ("input_tokens", "output_tokens", "cached_input_tokens",
                     "total_tokens", "reasoning_output_tokens"):
             val = _find_number(obj, key)
             if val is not None:
-                usage[key] = val  # ostatnia (skumulowana) wartość zdarzenia
-    return usage
+                fallback[key] = val  # ostatnia (skumulowana) wartość zdarzenia
+    return turn_totals or fallback
 
 
 def _find_number(obj, key: str):

@@ -60,6 +60,25 @@ class PureGateTest(unittest.TestCase):
 
 
 class SessionParsingTest(unittest.TestCase):
+    def test_thread_started_real_format(self) -> None:
+        # Dokładny kształt z dokumentacji codex exec --json (2026).
+        stream = ('{"type":"thread.started","thread_id":"019bd457-0bfc-7272-9f80-2c709bc6a6bb"}\n'
+                  '{"type":"turn.started"}\n'
+                  '{"type":"item.completed","item":{"id":"i1","item_type":"agent_message","text":"ok"}}')
+        self.assertEqual(extract_session_id(stream),
+                         "019bd457-0bfc-7272-9f80-2c709bc6a6bb")
+
+    def test_turn_completed_usage_real_format(self) -> None:
+        stream = ('{"type":"thread.started","thread_id":"x"}\n'
+                  '{"type":"turn.completed","usage":{"input_tokens":24763,'
+                  '"cached_input_tokens":24448,"output_tokens":122}}\n'
+                  '{"type":"turn.completed","usage":{"input_tokens":100,'
+                  '"cached_input_tokens":0,"output_tokens":10}}')
+        usage = extract_codex_usage(stream)
+        self.assertEqual(usage["input_tokens"], 24863)   # suma tur
+        self.assertEqual(usage["output_tokens"], 132)
+        self.assertEqual(usage["cached_input_tokens"], 24448)
+
     def test_session_id_from_jsonl_event(self) -> None:
         stream = '{"type":"session.created","session_id":"abc-123"}\n{"type":"item"}'
         self.assertEqual(extract_session_id(stream), "abc-123")
@@ -232,6 +251,124 @@ class MicroLoopTest(unittest.TestCase):
 
             self.assertFalse(reached)  # nie osiągnięto DONE — bramka czerwona nie zaszła
             self.assertFalse(Path(project, "tests", "test_a.py").exists())  # test wycofany
+
+
+class SmokeDryTest(unittest.TestCase):
+    def test_dry_reports_missing_codex_with_nonzero_exit(self) -> None:
+        from forge import smoke
+        with patch("forge.smoke.shutil.which",
+                   side_effect=lambda name: None if "codex" in name else f"/bin/{name}"):
+            self.assertEqual(smoke.main(["--dry"]), 1)
+
+    def test_dry_passes_when_binaries_present(self) -> None:
+        from forge import smoke
+        ver = subprocess.CompletedProcess([], 0, "codex 0.142.3", "")
+        with patch("forge.smoke.shutil.which", return_value="/bin/x"), \
+             patch("forge.smoke._run", return_value=ver):
+            self.assertEqual(smoke.main(["--dry"]), 0)
+
+
+class SessionLossFallbackTest(unittest.TestCase):
+    def test_lost_session_retries_fresh_with_journal_preamble(self) -> None:
+        from forge.agents import AgentError
+        from forge.orchestrate import _session_call, journal_append, journal_reset
+        with tempfile.TemporaryDirectory() as project:
+            cfg = Config()
+            state = State(tester_session="stary-id")
+            journal_reset(project, cfg, "Ruch")
+            journal_append(project, cfg, "cykl 1, tester: wrote_test (ruch po heksach)")
+
+            seen = []
+
+            def fake(prompt, cfg_, proj, log, *, session_id=None, model=None, effort=None):
+                seen.append((prompt, session_id))
+                if session_id:  # pierwsza próba: wznowienie znikniętej sesji
+                    raise AgentError("error: thread 'stary-id' not found")
+                return "wynik", "nowy-id"
+
+            with patch("forge.orchestrate.run_codex_session", side_effect=fake):
+                out = _session_call(cfg, project, state, "tester", "PROMPT", "/tmp/log")
+
+            self.assertEqual(out, "wynik")
+            self.assertEqual(state.tester_session, "nowy-id")
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(seen[0][1], "stary-id")          # próba wznowienia
+            self.assertIsNone(seen[1][1])                     # świeża sesja
+            self.assertIn("DZIENNIKA", seen[1][0])            # z preambułą dziennika
+            self.assertIn("ruch po heksach", seen[1][0])
+            self.assertTrue(seen[1][0].endswith("PROMPT"))
+
+    def test_unrelated_agent_error_is_not_swallowed(self) -> None:
+        from forge.agents import AgentError
+        from forge.orchestrate import _session_call
+        with tempfile.TemporaryDirectory() as project:
+            state = State(coder_session="id")
+            with patch("forge.orchestrate.run_codex_session",
+                       side_effect=AgentError("agent zwrócił kod 1. Ogon:\nSyntaxError")):
+                with self.assertRaisesRegex(AgentError, "SyntaxError"):
+                    _session_call(Config(), project, state, "coder", "P", "/tmp/log")
+            self.assertEqual(state.coder_session, "id")  # sesja nieskasowana
+
+
+class AntiWeakeningTest(unittest.TestCase):
+    """Snapshot HEAD w worktree: zmodyfikowane testy muszą tam failować."""
+
+    def _repo_with_uncommitted_impl(self, project: str, test_body: str) -> None:
+        subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=project, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=project, check=True)
+        # HEAD: implementacja "sprzed cyklu" (f() == 1, test by na niej padł).
+        Path(project, "mod.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=project, check=True)
+        subprocess.run(["git", "commit", "-qm", "przed cyklem"], cwd=project, check=True)
+        # Katalog roboczy: praca kodera (niezacommitowana) + test w bieżącej postaci.
+        Path(project, "mod.py").write_text("def f():\n    return 2\n", encoding="utf-8")
+        Path(project, "test_mod.py").write_text(test_body, encoding="utf-8")
+
+    def test_honest_test_change_still_fails_on_old_code(self) -> None:
+        from forge.orchestrate import anti_weakening_ok
+        with tempfile.TemporaryDirectory() as project:
+            self._repo_with_uncommitted_impl(
+                project,
+                "import unittest, mod\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_f(self):\n"
+                "        self.assertEqual(mod.f(), 2)\n")
+            self.assertTrue(anti_weakening_ok(
+                project, ["test_mod.py"], "", "python3 -m unittest -q test_mod", 60))
+
+    def test_gutted_test_passing_on_old_code_is_flagged(self) -> None:
+        from forge.orchestrate import anti_weakening_ok
+        with tempfile.TemporaryDirectory() as project:
+            self._repo_with_uncommitted_impl(
+                project,
+                "import unittest\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_f(self):\n"
+                "        self.assertTrue(True)\n")  # rozwodniony — nic nie specyfikuje
+            self.assertFalse(anti_weakening_ok(
+                project, ["test_mod.py"], "", "python3 -m unittest -q test_mod", 60))
+
+    def test_no_files_never_blocks(self) -> None:
+        from forge.orchestrate import anti_weakening_ok
+        self.assertTrue(anti_weakening_ok("/tmp", [], "", "pytest", 5))
+
+
+class CycleSnapshotRestoreTest(unittest.TestCase):
+    def test_cycle_test_is_restored_not_deleted(self) -> None:
+        from forge.orchestrate import restore_test_changes, snapshot_cycle_tests
+        with tempfile.TemporaryDirectory() as project:
+            subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+            cfg = Config()
+            test = Path(project, "tests", "test_a.py")
+            test.parent.mkdir()
+            test.write_text("wersja testera", encoding="utf-8")
+            snapshot_cycle_tests(project, cfg, ["tests/test_a.py"])
+            test.write_text("rozwodnione przez kodera", encoding="utf-8")
+
+            restore_test_changes(project, cfg, ["tests/test_a.py"], ["tests/test_a.py"])
+
+            self.assertEqual(test.read_text(encoding="utf-8"), "wersja testera")
 
 
 class TaskIterationEndToEndTest(unittest.TestCase):
