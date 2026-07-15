@@ -130,7 +130,9 @@ PLAN (Claude)                        — kontrakt zadania + kolejka wsadowa
        └→ BRAMKA CZERWONA            — orkiestrator: nowe testy MUSZĄ failować
             └→ KOD (Codex-koder)     — pisze WYŁĄCZNIE kod, testów nie dotyka
                  └→ BRAMKA ZIELONA   — pełny pakiet musi przejść
-                      └→ commit  ↺   (albo arbitraż → patrz 3.5)
+                      └→ REFAKTOR (Codex-koder) — sprzątanie pod zielonymi testami
+                           └→ BRAMKA ZIELONA (ponownie)
+                                └→ commit  ↺   (albo arbitraż, opisany niżej)
 ```
 
 Zalety: brak konfliktów (jedna kopia repo), prosta maszyna stanów, każda faza ma
@@ -155,7 +157,7 @@ czyli *więcej* tokenów. Sprzeczne z celem.
 
 ### 3.3. Nowa maszyna stanów (wariant A)
 
-Fazy w `State.phase`: `idle → plan → write_tests → implement → (arbitrate) → idle`.
+Fazy w `State.phase`: `idle → plan → write_tests → implement → refactor → (arbitrate) → idle`.
 
 - **plan** (Claude, opus/high, wsadowo): produkuje `.forge/task-NNN.md` × 3–5. Format
   zadania rozszerzony o sekcję **„Kontrakt API"** (sygnatury/nazwy modułów, które tester
@@ -182,7 +184,43 @@ Fazy w `State.phase`: `idle → plan → write_tests → implement → (arbitrat
 Committ i rollback bez zmian koncepcyjnych: commit po zielonej bramce (można commitować
 testy i kod osobno — czytelniejsza historia: `test:` + `feat:`), rollback przy porażce.
 
-### 3.4. Egzekwowanie podziału ról
+### 3.4. Faza REFAKTOR — brakujący trzeci krok TDD
+
+Ani obecna pętla, ani goły ping-pong tester↔koder nie mają odpowiednika kroku
+*refactor* z cyklu red→green→refactor. To realny dług: prompt każe koderowi pisać
+„minimalny kod spełniający kryteria", więc bez fazy sprzątania pętla **systemowo
+akumuluje duplikację i doraźne rozwiązania**. Dziś częściowo łatał to recenzent
+(mógł zażądać uproszczeń w notes) — w nowym modelu review znika, więc refaktor musi
+dostać własne, jawne miejsce.
+
+Argument tokenowy jest nieoczywisty, ale gra **na korzyść** refaktoru: każdy agent
+jest bezstanowy i czyta kod od zera, więc rosnący, zduplikowany kod podraża *każde
+przyszłe wywołanie* (ten sam mechanizm co wzrost BACKLOG-u w 2.3 pkt 2). Jedno
+wywołanie sprzątające amortyzuje się w kolejnych iteracjach.
+
+Proponuję refaktor na dwóch poziomach:
+
+- **Mikro-refaktor po każdej zielonej bramce** (Codex-koder, osobne wywołanie, nie
+  doklejone do implementacji — doklejone „przy okazji zrefaktoruj" model notorycznie
+  pomija, gdy walczy o zielone testy). Zakres: tylko pliki dotknięte w zadaniu +
+  ich bezpośrednie sąsiedztwo. Bramki mechaniczne: testy nadal zielone, **zero zmian
+  w plikach testowych**, zero nowego publicznego API (kontrola diffu tą samą
+  maszynerią co w 3.5). Jeśli refaktor psuje testy → `git checkout` zmian refaktoru
+  i commit wersji sprzed niego — refaktor jest *opcjonalnym bonusem*, nigdy nie
+  blokuje ukończenia zadania.
+- **Makro-refaktor co N iteracji** (domyślnie N=5–8) jako zwykłe zadanie z kolejki:
+  planista przy planowaniu wsadowym ma obowiązek ocenić stan kodu i w razie potrzeby
+  wstawić zadanie refaktoryzacyjne (duplikacja międzymodułowa, rozjazd z
+  ARCHITECTURE.md — rzeczy niewidoczne z perspektywy jednego zadania). Takie zadanie
+  przechodzi normalny cykl, z jedną różnicą: **bramka czerwona jest pominięta**
+  (refaktor z definicji nie zmienia zachowania, więc nie ma nowych testów), a rolę
+  specyfikacji pełni istniejący pakiet — musi być zielony przed i po.
+
+Refaktor **testów** (wspólne fixtures, helpery) to osobny przypadek: wolno go robić
+tylko testerowi i tylko w ramach zadania makro-refaktoru, z bramką „pakiet nadal
+zielony". Koderowi zakaz dotykania testów pozostaje bezwzględny.
+
+### 3.5. Egzekwowanie podziału ról
 
 Kluczowe: podziału **nie pilnuje prompt, tylko orkiestrator** (prompty się „nie słuchają"
 wystarczająco niezawodnie):
@@ -199,18 +237,18 @@ muszą być mierzalne (odpowiedzialność planisty); opcjonalny **audyt co N ite
 (planista przegląda ostatnie N commitów jednym wywołaniem — dużo taniej niż review
 co iterację).
 
-### 3.5. Zmiany w plikach (mapa implementacji)
+### 3.6. Zmiany w plikach (mapa implementacji)
 
 | Plik | Zmiana |
 |---|---|
-| `forge/prompts.py` | nowy `plan_batch_prompt` (kolejka + kontrakt API + ścieżki), `write_tests_prompt`, `implement_against_tests_prompt`, `arbitrate_prompt`; usunięcie `review_prompt`/`fix_prompt` (lub zostawienie za flagą legacy) |
+| `forge/prompts.py` | nowy `plan_batch_prompt` (kolejka + kontrakt API + ścieżki), `write_tests_prompt`, `implement_against_tests_prompt`, `refactor_prompt`, `arbitrate_prompt`; usunięcie `review_prompt`/`fix_prompt` (lub zostawienie za flagą legacy) |
 | `forge/config.py` | pokrętła: `tester_model/effort`, `coder_model/effort`, `arbiter_model/effort`, `batch_size`, `legacy_mode` |
 | `forge/orchestrate.py` | nowe fazy + bramka czerwona + kontrola diffu per rola; review-tylko-przy-zielonym (jeśli legacy zostaje); logowanie usage |
 | `forge/state.py` | kolejka zadań (`task_queue: list[str]`), nowe wartości `phase`, licznik naruszeń ról |
 | `forge/agents.py` | wyciągnięcie `usage` z JSON-a Claude'a i (na ile się da) z wyjścia Codeksa → `.forge/usage.jsonl` |
 | `tests/` | testy bramki czerwonej, kontroli diffu, konsumpcji kolejki, wznawialności nowych faz |
 
-### 3.6. Kolejność wdrożenia
+### 3.7. Kolejność wdrożenia
 
 1. **Etap 0 — pomiar** (niezależny od reszty): `.forge/usage.jsonl` + proste podsumowanie
    na koniec biegu. Daje bazę do porównań przed/po.
@@ -218,8 +256,10 @@ co iterację).
    tańszy model review, bogatszy `failures.md`. Małe diffy, od razu zwracają tokeny.
 3. **Etap 2 — planowanie wsadowe + kolejka zadań w STATE.json.** Potrzebne i staremu,
    i nowemu modelowi — naturalny wspólny fundament.
-4. **Etap 3 — rozdział tester/koder (wariant A)** z bramką czerwoną i kontrolą diffu;
-   stary tryb za flagą `legacy_mode` na czas porównania.
+4. **Etap 3 — rozdział tester/koder (wariant A)** z bramką czerwoną, kontrolą diffu
+   i mikro-refaktorem po zielonej bramce; stary tryb za flagą `legacy_mode` na czas
+   porównania. Makro-refaktor co N iteracji dochodzi jako obowiązek planisty w
+   promptcie wsadowym (etap 2/3, bez osobnego mechanizmu).
 5. **Etap 4 (opcjonalny) — pipelining (wariant B)** przez `git worktree`, tylko jeśli
    po etapie 3 wąskim gardłem okaże się czas zegarowy, nie tokeny.
 
