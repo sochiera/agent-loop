@@ -235,7 +235,7 @@ class IterationTest(unittest.TestCase):
                           phase="review", current_task_title="Walka",
                           tests_green=True)
 
-            self.assertTrue(one_iteration(Config(), project, state))
+            self.assertTrue(one_iteration(Config(legacy_mode=True), project, state))
 
         plan.assert_not_called()
         implement.assert_not_called()
@@ -256,7 +256,7 @@ class PhaseResumeTest(unittest.TestCase):
     ) -> None:
         state = State(bootstrapped=True, phase="plan", test_cmd="pytest")
         with self.assertRaises(AgentError):
-            one_iteration(Config(), "/tmp/p", state)
+            one_iteration(Config(legacy_mode=True), "/tmp/p", state)
         # Kto następny po restarcie? Codex (implement), nie Claude (plan).
         self.assertEqual(state.phase, "implement")
         self.assertEqual(state.current_task_title, "C1.1")
@@ -275,7 +275,7 @@ class PhaseResumeTest(unittest.TestCase):
     ) -> None:
         state = State(bootstrapped=True, phase="implement",
                       current_task_title="C1.1", test_cmd="pytest")
-        cont = one_iteration(Config(), "/tmp/p", state)
+        cont = one_iteration(Config(legacy_mode=True), "/tmp/p", state)
         self.assertTrue(cont)
         plan.assert_not_called()            # Claude NIE planuje ponownie
         impl.assert_called_once()           # Codex wznawia implementację

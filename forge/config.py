@@ -78,6 +78,33 @@ class Config:
     codex_model: str = os.environ.get("FORGE_CODEX_MODEL", "")
     codex_effort: str = os.environ.get("FORGE_CODEX_EFFORT", "medium")
 
+    # --- Nowy model: mikro-TDD ping-pong (Codex-tester ↔ Codex-koder) -------
+    # legacy_mode=False → pętla docelowa (plan wsadowy → mikro-TDD → review Codeksa).
+    # legacy_mode=True  → stary przebieg plan→implement→review(Claude)→fix.
+    legacy_mode: bool = os.environ.get("FORGE_LEGACY_MODE", "0") == "1"
+    # Ile zadań planista produkuje jednym wywołaniem (koszt stały planisty ÷ batch).
+    batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "5"))
+    # Twardy sufit mikro-cykli (test→kod→refaktor) na jedno zadanie: chroni budżet
+    # i rozmiar rosnącej sesji. Po przekroczeniu — porażka zadania i podział przez planistę.
+    max_micro_cycles: int = int(os.environ.get("FORGE_MAX_MICRO_CYCLES", "12"))
+    # Ile dogrywek „zazielenienia" w obrębie jednego mikro-cyklu, zanim zadanie padnie.
+    max_green_retries: int = int(os.environ.get("FORGE_MAX_GREEN_RETRIES", "2"))
+    # Model/effort ról Codeksa. Puste → dziedziczą z codex_model/codex_effort.
+    tester_model: str = os.environ.get("FORGE_TESTER_MODEL", "")
+    tester_effort: str = os.environ.get("FORGE_TESTER_EFFORT", "")
+    coder_model: str = os.environ.get("FORGE_CODER_MODEL", "")
+    coder_effort: str = os.environ.get("FORGE_CODER_EFFORT", "")
+
+    def tester(self) -> tuple[str, str]:
+        """(model, effort) dla Codeksa-testera; pusty model → z config.toml."""
+        return (self.tester_model or self.codex_model,
+                self.tester_effort or self.codex_effort)
+
+    def coder(self) -> tuple[str, str]:
+        """(model, effort) dla Codeksa-kodera; pusty model → z config.toml."""
+        return (self.coder_model or self.codex_model,
+                self.coder_effort or self.codex_effort)
+
     # --- Komendy bazowe CLI (bez shella) ------------------------------------
     # Claude Code headless. Jeśli 'claude' nie jest na PATH, ustaw FORGE_CLAUDE_BIN.
     claude_bin: str = os.environ.get("FORGE_CLAUDE_BIN", "claude")

@@ -1,9 +1,26 @@
 # forge — pętla agentów budujących grę
 
-Orkiestrator, który w kółko odpala dwóch agentów CLI, aż skończą się limity
-subskrypcji:
+Orkiestrator, który w kółko odpala agentów CLI, aż skończą się limity subskrypcji.
+
+**Domyślny model (mikro-TDD ping-pong).** Claude planuje wsadowo (kilka zadań w
+przód), a każde zadanie realizuje para instancji Codeksa w rytmie red→green→refactor:
 
 ```
+PLAN WSADOWY (Claude)              →  N zadań w kolejce (.forge/tasks/)
+  dla każdego zadania po kolei (ciągły kontekst sesji per rola):
+    TESTER (Codex-1)  → jeden failujący test  → [bramka CZERWONA]
+    KODER  (Codex-2)  → kod → zieleń → refaktor → [bramka ZIELONA] → commit cyklu
+    ↺ aż TESTER orzeknie DONE (kryteria pokryte)
+  RECENZJA całości (Codex-1)  →  poprawki (Codex-2)  →  commit + push zadania
+```
+
+Podziału ról pilnuje **orkiestrator mechanicznie** (bramka czerwona/zielona,
+kontrola diffu `git`, mapa kryterium→test przy DONE) — nie same prompty. Stary
+przebieg `plan → implement → review(Claude) → fix` jest wciąż dostępny pod
+`--legacy` (albo `FORGE_LEGACY_MODE=1`).
+
+```
+# legacy:
 PLAN (Claude lub Codex)  →  IMPLEMENT-TDD (Codex)  →  [bramka testów]
    →  REVIEW (wybrany planista)  →  FIX (Codex)  →  commit  ↺   (albo rollback)
 ```
@@ -29,6 +46,9 @@ buduje grę małymi, przetestowanymi przyrostami.
 ## Wymagania
 
 1. **Codex CLI** (masz: `codex` 0.142.3). Zalogowany kontem ChatGPT: `codex login`.
+   Nowy model używa sesji `codex exec --json` (przechwycenie session id) i
+   `codex exec resume <id>` dla ciągłego kontekstu per zadanie — potrzebna wersja
+   wspierająca `resume` (nowsze 0.14x mają).
 2. **Claude Code jako CLI** — u Ciebie **jeszcze go nie ma na PATH** (działasz przez
    rozszerzenie VSCode). Doinstaluj standalone, np.:
    ```bash
@@ -100,6 +120,12 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 | Effort Codex | `medium` | `--codex-effort high` lub `FORGE_CODEX_EFFORT` |
 | Sandbox Codeksa | `danger-full-access` (pełny dostęp) | zawęź: `FORGE_CODEX_SANDBOX=workspace-write` |
 | Ścieżka do Claude | `claude` | `FORGE_CLAUDE_BIN=/path/claude` |
+| Tryb pętli | mikro-TDD (nowy) | `--legacy` lub `FORGE_LEGACY_MODE=1` |
+| Rozmiar wsadu planowania | `5` | `--batch-size N` lub `FORGE_BATCH_SIZE` |
+| Sufit mikro-cykli/zadanie | `12` | `--max-micro-cycles N` lub `FORGE_MAX_MICRO_CYCLES` |
+| Dogrywki „zazielenienia"/cykl | `2` | `FORGE_MAX_GREEN_RETRIES` |
+| Model/effort Codeksa-testera | z `codex_model`/`effort` | `--tester-model/--tester-effort` lub `FORGE_TESTER_*` |
+| Model/effort Codeksa-kodera | z `codex_model`/`effort` | `--coder-model/--coder-effort` lub `FORGE_CODER_*` |
 | Limit iteracji | bez limitu | `--max-iters 20` |
 | Opóźnienie startu | brak | `--sleep 30s`, `--sleep 5m`, `--sleep 2h` |
 | Timeout agenta | 3600 s | `FORGE_AGENT_TIMEOUT=...` |
@@ -114,15 +140,20 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 
 ```
 game/
-  STATE.json            # stan pętli + ustalone komendy test/build/run
-  BACKLOG.md            # kolejka zadań (planista pisze, implementator zjada)
+  STATE.json            # stan pętli (kolejka zadań, sesje ról, mikro-cykl) + komendy test/build/run
+  BACKLOG.md            # kolejka zadań wysokiego poziomu (planista pisze)
+  BACKLOG-ARCHIVE.md    # ukończone pozycje (odciąża rosnący BACKLOG)
   docs/DESIGN.md        # żywy projekt gry
   docs/ARCHITECTURE.md  # decyzje techniczne
+  .forge/tasks/         # task-NNN.md — zadania z planowania wsadowego (kryteria, ścieżki)
+  .forge/usage.jsonl    # pomiar zużycia tokenów per faza/agent
   .forge/               # logi każdej fazy, bieżące zadanie, lista niepowodzeń
   <kod gry>             # w TDD
 ```
 
-Każdy commit = jeden ukończony, przetestowany przyrost.
+W nowym modelu każdy mikro-cykl (test+kod+refaktor) to jeden lokalny commit; push
+całego, zielonego zadania następuje raz — po recenzji. Porażka zadania cofa się do
+taga startu zadania (lokalnie; nic niezielonego nie trafia na remote).
 
 Testy samego orkiestratora:
 

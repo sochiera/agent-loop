@@ -1,7 +1,18 @@
 # Analiza: zużycie tokenów i nowy model pracy (planista + 2× Codex)
 
 Data: 2026-07-15. Stan repo: commit `c2f392b` (feat: add configurable agents and resumable execution).
-Dokument jest analizą i planem — **nie zmienia kodu**.
+
+> **Status implementacji (aktualizacja).** Model docelowy z sekcji 3 został
+> zaimplementowany i jest teraz **domyślny** (stary przebieg pod `--legacy`).
+> Kod: `forge/orchestrate.py` (maszyna stanów mikro-TDD, bramki czerwona/zielona,
+> kontrola diffu, tag+rollback per zadanie), `forge/agents.py`
+> (`run_codex_session` z sesjami `codex exec resume`, `.forge/usage.jsonl`),
+> `forge/prompts.py` (prompty ról), `forge/config.py`/`state.py` (pokrętła, kolejka,
+> sesje). Testy mechaniki: `tests/test_new_model.py`. Świadome uproszczenia
+> względem planu: anty-osłabianie testów egzekwowane deklaracją + kontrolą diffu
+> (bez worktree-snapshotu); fallback dziennika zadania (3.2) jeszcze nie wpięty —
+> po utracie sesji Codeksa zadanie startuje od taga. Reszta sekcji poniżej to
+> oryginalny plan/uzasadnienie.
 
 ---
 

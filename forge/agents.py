@@ -62,6 +62,100 @@ def _balanced_objects(text: str) -> list[str]:
     return out
 
 
+_SESSION_ID_RE = re.compile(r'"session[_-]?id"\s*:\s*"([^"]+)"')
+
+
+def _find_session_id(obj) -> str | None:
+    """Zejdź rekurencyjnie po sparsowanym evencie i znajdź pierwsze session id."""
+    if isinstance(obj, dict):
+        for key in ("session_id", "sessionId"):
+            val = obj.get(key)
+            if isinstance(val, str) and val:
+                return val
+        sess = obj.get("session")
+        if isinstance(sess, dict):
+            val = sess.get("id")
+            if isinstance(val, str) and val:
+                return val
+        for val in obj.values():
+            found = _find_session_id(val)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for val in obj:
+            found = _find_session_id(val)
+            if found:
+                return found
+    return None
+
+
+def extract_session_id(stream: str) -> str | None:
+    """Wyłuskaj id sesji Codeksa ze strumienia zdarzeń `codex exec --json`.
+
+    Najpierw parsuje JSONL linia po linii (zdarzenie startu sesji niesie
+    session_id), awaryjnie skanuje regexem — odporne na drobne zmiany formatu."""
+    for line in (stream or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        found = _find_session_id(obj)
+        if found:
+            return found
+    match = _SESSION_ID_RE.search(stream or "")
+    return match.group(1) if match else None
+
+
+def extract_codex_usage(stream: str) -> dict:
+    """Best-effort: zsumuj tokeny z JSONL Codeksa (klucze input/output/total)."""
+    usage: dict = {}
+    for line in (stream or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for key in ("input_tokens", "output_tokens", "cached_input_tokens",
+                    "total_tokens", "reasoning_output_tokens"):
+            val = _find_number(obj, key)
+            if val is not None:
+                usage[key] = val  # ostatnia (skumulowana) wartość zdarzenia
+    return usage
+
+
+def _find_number(obj, key: str):
+    if isinstance(obj, dict):
+        if isinstance(obj.get(key), (int, float)):
+            return obj[key]
+        for val in obj.values():
+            found = _find_number(val, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for val in obj:
+            found = _find_number(val, key)
+            if found is not None:
+                return found
+    return None
+
+
+def log_usage(project_dir: str, cfg: Config, record: dict) -> None:
+    """Dopisz jeden wiersz pomiaru zużycia do .forge/usage.jsonl (best-effort)."""
+    try:
+        path = os.path.join(project_dir, cfg.runtime_dir, "usage.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        record = {"ts": _dt.datetime.now().isoformat(timespec="seconds"), **record}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass  # pomiar nigdy nie wywraca pętli
+
+
 def extract_json(text: str) -> dict | None:
     """Wyłuskaj OSTATNI poprawny blok JSON z odpowiedzi agenta.
 
@@ -122,6 +216,14 @@ def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
     raise LimitExhausted(f"Wyczerpano ponowienia. Ostatnie:\n{last_output[-800:]}")
 
 
+def _phase_from_log(log_path: str) -> str:
+    """Wyłuskaj nazwę fazy z ścieżki logu 'iter-0001-plan.log' → 'plan'."""
+    base = os.path.basename(log_path or "")
+    stem = base[:-4] if base.endswith(".log") else base
+    parts = stem.split("-")
+    return parts[-1] if parts and parts[-1] else "unknown"
+
+
 def _append_log(log_path: str, argv: list[str], output: str, code: int) -> None:
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
@@ -149,6 +251,12 @@ def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str
             if _looks_like_limit(json.dumps(obj)):
                 raise LimitExhausted("Claude zgłosił błąd limitu w JSON.")
             raise AgentError(f"Claude is_error: {obj.get('result') or obj}")
+        if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
+            log_usage(project_dir, cfg, {"agent": "claude",
+                                         "phase": _phase_from_log(log_path),
+                                         "model": cfg.planner_model,
+                                         "effort": cfg.planner_effort,
+                                         "usage": obj["usage"]})
         return obj.get("result", raw) if isinstance(obj, dict) else raw
     except json.JSONDecodeError:
         return raw  # awaryjnie surowy tekst
@@ -186,6 +294,50 @@ def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
             return f.read()
     except OSError:
         return ""
+
+
+def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
+                      *, session_id: str | None = None, model: str | None = None,
+                      effort: str | None = None) -> tuple[str, str | None]:
+    """Codex exec w trybie sesyjnym (ciągły kontekst per zadanie).
+
+    Gdy ``session_id`` podany — wznawia sesję (``codex exec resume <id>``);
+    inaczej startuje nową i przechwytuje jej id ze strumienia ``--json``.
+    Zwraca (ostatnia wiadomość agenta, session_id). Loguje zużycie tokenów."""
+    a = cfg.codex()
+    if model is not None:
+        a.model = model
+    if effort is not None:
+        a.effort = effort
+    last_msg = os.path.join(project_dir, cfg.runtime_dir, "codex_last.txt")
+    os.makedirs(os.path.dirname(last_msg), exist_ok=True)
+
+    argv = a.argv + ["exec"]
+    if session_id:
+        argv += ["resume", session_id]
+    argv += ["--json"]
+    if a.model:  # pusty → Codex użyje modelu z własnego config.toml
+        argv += ["-m", a.model]
+    argv += ["-c", f'model_reasoning_effort="{a.effort}"']
+    if cfg.codex_sandbox == "danger-full-access":
+        argv += ["--dangerously-bypass-approvals-and-sandbox"]
+    else:
+        argv += ["-s", cfg.codex_sandbox]
+    argv += ["-C", project_dir, "--skip-git-repo-check", "-o", last_msg,
+             "--color", "never", prompt]  # prompt jako ostatni pozycyjny
+
+    stream = _run_with_backoff(argv, project_dir, cfg, log_path)
+    sid = session_id or extract_session_id(stream)
+    usage = extract_codex_usage(stream)
+    if usage:
+        log_usage(project_dir, cfg, {"agent": "codex", "phase": _phase_from_log(log_path),
+                                     "model": a.model, "effort": a.effort,
+                                     "resumed": bool(session_id), "usage": usage})
+    try:
+        with open(last_msg, "r", encoding="utf-8") as f:
+            return f.read(), sid
+    except OSError:
+        return "", sid
 
 
 def run_planner(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:

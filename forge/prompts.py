@@ -166,3 +166,158 @@ Na końcu zwróć WYŁĄCZNIE:
 ```json
 {{"fixed": true, "tests_pass": <true|false>, "notes": "<co zmienione>"}}
 ```"""
+
+
+# =====================================================================
+# NOWY MODEL: mikro-TDD ping-pong (Codex-tester ↔ Codex-koder), plan wsadowy.
+# =====================================================================
+
+def plan_batch_prompt(batch_size: int, start_index: int) -> str:
+    return f"""{SHARED_PRINCIPLES}
+
+ROLA: Planista wsadowy. Jednym wywołaniem przygotuj KOLEJKĘ najbliższych zadań —
+to obniża koszt stały planowania na zadanie.
+
+Przeczytaj: docs/DESIGN.md, docs/ARCHITECTURE.md, BACKLOG.md, `git log --oneline -20`
+oraz .forge/failures.md jeśli istnieje (zadania, które padły — rozbij je drobniej).
+
+Zaplanuj do {batch_size} NASTĘPNYCH zadań w stronę grywalnego MVP, każde =
+najmniejszy wartościowy, testowalny przyrost. Oceń też stan kodu: jeśli narósł
+dług (duplikacja międzymodułowa, rozjazd z ARCHITECTURE.md), wstaw zadanie
+REFAKTORYZACYJNE (przechodzi tę samą pętlę, tylko bez nowych testów).
+
+Numeruj zadania od {start_index:03d}. Dla KAŻDEGO zadania zapisz plik
+.forge/tasks/task-NNN.md w formacie:
+# Zadanie NNN: <tytuł>
+## Cel
+<1-3 zdania: po co, jak pasuje do MVP>
+## Kryteria akceptacji
+- [ ] <konkretne, MIERZALNE, testowalne warunki — to kontrakt zadania>
+## Kontrakt API
+<publiczne sygnatury/nazwy modułów, które tester i koder MUSZĄ współdzielić>
+## Ścieżki testów
+<globy plików testowych, np. tests/test_walka.py>
+## Ścieżki kodu
+<globy plików implementacji>
+## Poza zakresem
+<czego świadomie NIE robimy w tym zadaniu>
+
+Zaktualizuj BACKLOG.md (statusy) i rozwiń docs/DESIGN.md, jeśli decyzja projektowa
+tego wymaga. Ukończone pozycje przenoś do BACKLOG-ARCHIVE.md, by BACKLOG nie puchł.
+
+Na końcu zwróć WYŁĄCZNIE (globy MUSZĄ zgadzać się z plikami zadań):
+```json
+{{"no_more_tasks": false, "tasks": [
+  {{"id": "task-{start_index:03d}", "title": "<tytuł>", "file": ".forge/tasks/task-{start_index:03d}.md",
+   "criteria": ["<kryterium 1>", "<kryterium 2>"],
+   "test_globs": ["tests/..."], "code_globs": ["src/..."]}}
+]}}
+```
+Ustaw "no_more_tasks": true i pustą listę "tasks" TYLKO gdy MVP z DESIGN.md jest
+w pełni zaimplementowane i przetestowane, a BACKLOG nie ma sensownych kroków."""
+
+
+def write_test_prompt(task_file: str, test_cmd: str) -> str:
+    return f"""{SHARED_PRINCIPLES}
+
+ROLA: Codex-TESTER. Dyktujesz specyfikację przez testy. NIE piszesz kodu produkcyjnego.
+
+Bieżące zadanie: {task_file} (przeczytaj: cel, KRYTERIA AKCEPTACJI, Kontrakt API,
+Ścieżki testów). Przejrzyj istniejące testy i kod, ustal CZEGO JESZCZE BRAKUJE
+względem kryteriów.
+
+Wybierz DOKŁADNIE jedno:
+A) Napisz JEDEN nowy test na brakującą funkcjonalność. Wymogi twarde:
+   - dotykasz WYŁĄCZNIE plików ze "Ścieżek testów" zadania,
+   - test MUSI teraz FAILOWAĆ (bo implementacji brak) — sprawdź: `{test_cmd}`,
+   - test sprawdza realne zachowanie z kontraktu API, nie atrapę.
+B) Jeśli sensownego testu nie da się teraz napisać (np. czysto strukturalny krok),
+   zadeklaruj to jawnie — koder wykona krok bez testu.
+C) Jeśli WSZYSTKIE kryteria są już spełnione i cały pakiet zielony — zakończ zadanie.
+   Wtedy zmapuj KAŻDE kryterium akceptacji na test, który je pokrywa.
+
+Na końcu zwróć WYŁĄCZNIE jeden z bloków:
+```json
+{{"action": "wrote_test", "test_files": ["<ścieżka>"], "about": "<co sprawdza>"}}
+```
+```json
+{{"action": "no_test", "reason": "<dlaczego brak sensownego testu na ten krok>"}}
+```
+```json
+{{"action": "done", "criteria_map": [{{"criterion": "<dokładny tekst kryterium>", "test": "<ścieżka::nazwa>", "status": "covered"}}]}}
+```"""
+
+
+def code_and_refactor_prompt(task_file: str, test_cmd: str,
+                             no_test: bool, test_tail: str = "") -> str:
+    goal = ("Zaimplementuj brakującą funkcjonalność kroku (tester nie dodał testu — "
+            "kieruj się kryteriami zadania)." if no_test else
+            "Doprowadź NOWY (czerwony) test do zieleni najprostszym kodem.")
+    tail = f"\n\nOgon ostatniej bramki testów (jeśli był czerwony):\n{test_tail}\n" if test_tail else ""
+    return f"""{SHARED_PRINCIPLES}
+
+ROLA: Codex-KODER. Piszesz kod produkcyjny. {goal}
+
+Bieżące zadanie: {task_file} (cel, Kontrakt API, Ścieżki kodu). Test(y) napisane
+przez testera są Twoją wykonywalną specyfikacją — przeczytaj je i spełnij.
+
+Procedura: kod → `{test_cmd}` ZIELONY → REFAKTOR pod zielonymi testami (usuń
+duplikację, popraw nazwy; testy nadal zielone). Zaktualizuj docs/ jeśli trzeba.{tail}
+
+ZASADY twarde:
+- Piszesz w "Ścieżkach kodu". Plików TESTOWYCH zasadniczo NIE ruszasz.
+- Dozwolone zmiany w testach: adaptacyjne (rename/importy po refaktorze) — muszą
+  nadal specyfikować to samo. Jeśli uważasz test za BŁĘDNY, popraw go i ZADEKLARUJ
+  to poniżej z uzasadnieniem (rozstrzygnie recenzja). Nie osłabiaj testu, by przeszedł.
+- NIE commituj.
+
+Na końcu zwróć WYŁĄCZNIE:
+```json
+{{"made_green": <true|false>, "refactored": <true|false>,
+  "test_changes": [{{"file": "<ścieżka>", "reason": "<czemu zmieniony>"}}],
+  "notes": "<co zrobione / co blokuje>"}}
+```"""
+
+
+def review_task_prompt(task_file: str, test_cmd: str) -> str:
+    return f"""{SHARED_PRINCIPLES}
+
+ROLA: Codex-RECENZENT. Zadanie przeszło mikro-cykle TDD. Oceń CAŁOŚĆ, szczególnie
+kod kodera. NIE piszesz teraz kodu — oceniasz.
+
+Bieżące zadanie: {task_file}. Obejrzyj zmiany całego zadania: `git diff` względem
+punktu startu zadania (tag na HEAD sprzed pierwszego mikro-commita) oraz nowe pliki.
+
+Oceń:
+- Czy WSZYSTKIE kryteria akceptacji są realnie spełnione i pokryte testami?
+- Czy testy sprawdzają zachowanie (nie tautologie/atrapy)? Czy któryś test został
+  osłabiony, żeby kod przeszedł?
+- Poprawność, prostota, brak wyjścia poza zakres, aktualność docs/.
+Możesz uruchomić `{test_cmd}`.
+
+Na końcu zwróć WYŁĄCZNIE:
+```json
+{{"verdict": "approve", "notes": []}}
+```
+lub
+```json
+{{"verdict": "changes", "notes": ["<konkretna, wykonalna poprawka>", "..."]}}
+```"""
+
+
+def fix_review_prompt(notes: list[str], test_cmd: str) -> str:
+    bullet = "\n".join(f"- {n}" for n in notes) or "- (brak konkretów — utwardź testy i kod)"
+    return f"""{SHARED_PRINCIPLES}
+
+ROLA: Codex-KODER (poprawki po recenzji). Zastosuj WSZYSTKIE uwagi recenzenta.
+
+Uwagi:
+{bullet}
+
+Po poprawkach `{test_cmd}` musi być ZIELONY. Trzymaj się zakresu zadania.
+Poprawki testów tylko jeśli recenzent tego wymaga (i zadeklaruj je). NIE commituj.
+
+Na końcu zwróć WYŁĄCZNIE:
+```json
+{{"fixed": true, "test_changes": [{{"file": "<ścieżka>", "reason": "<czemu>"}}], "notes": "<co zmienione>"}}
+```"""

@@ -21,7 +21,7 @@ import time
 
 from . import prompts
 from .agents import (AgentError, LimitExhausted, extract_json, run_codex,
-                     run_planner)
+                     run_codex_session, run_planner)
 from .config import Config
 from .state import State
 
@@ -345,7 +345,7 @@ def clear_checkpoint(state: State) -> None:
     state.review_notes = []
 
 
-def _one_iteration(cfg: Config, project: str, state: State) -> bool:
+def _legacy_iteration(cfg: Config, project: str, state: State) -> bool:
     """Jedna wznawialna iteracja. Zwraca False po ukończeniu MVP."""
     n = state.iteration + 1
     log(f"########## ITERACJA {n} ##########")
@@ -433,6 +433,525 @@ def _one_iteration(cfg: Config, project: str, state: State) -> bool:
     return True
 
 
+# =====================================================================
+# NOWY MODEL: mikro-TDD ping-pong (plan wsadowy → tester ↔ koder → recenzja).
+# =====================================================================
+
+# Ścieżki, które KAŻDA rola może dotknąć bez naruszenia podziału (dokumentacja,
+# backlog, metadane orkiestratora). Reszta jest pilnowana per rola.
+_SHARED_WRITABLE = ["docs/**", "BACKLOG.md", "BACKLOG-ARCHIVE.md", ".forge/**"]
+
+
+# --- Czyste bramki (testowalne bez agentów) ---------------------------------
+
+def _path_matches(path: str, glob: str) -> bool:
+    """Dopasuj ścieżkę do globa z obsługą ** (przez separatory) i * (w segmencie)."""
+    path = path.replace("\\", "/").lstrip("./")
+    glob = glob.replace("\\", "/").lstrip("./")
+    if not any(ch in glob for ch in "*?["):
+        return path == glob or path.startswith(glob.rstrip("/") + "/")
+    out, i = [], 0
+    while i < len(glob):
+        ch = glob[i]
+        if ch == "*":
+            if glob[i:i + 2] == "**":
+                out.append(".*")
+                i += 2
+                if glob[i:i + 1] == "/":
+                    i += 1  # wchłoń ukośnik po **
+                continue
+            out.append("[^/]*")
+        elif ch == "?":
+            out.append("[^/]")
+        else:
+            out.append(re.escape(ch))
+        i += 1
+    return re.fullmatch("".join(out), path) is not None
+
+
+def _match_any(path: str, globs: list[str]) -> bool:
+    return any(_path_matches(path, g) for g in globs)
+
+
+def _looks_like_test(path: str) -> bool:
+    """Heurystyka pliku testowego, gdy zadanie nie podało test_globs."""
+    low = path.replace("\\", "/").lower()
+    base = os.path.basename(low)
+    return ("test" in base or "spec" in base or low.startswith("tests/")
+            or "/tests/" in low)
+
+
+def red_gate_ok(suite_green_after_test: bool) -> bool:
+    """Bramka czerwona: po dopisaniu testu pakiet MUSI być czerwony (test failuje)."""
+    return not suite_green_after_test
+
+
+def role_paths_ok(changed: list[str], allowed_globs: list[str]) -> tuple[bool, list[str]]:
+    """Czy wszystkie zmienione pliki mieszczą się w dozwolonych globach roli.
+
+    Puste globy → nie ma czego egzekwować (brak deklaracji ścieżek)."""
+    if not allowed_globs:
+        return True, []
+    offending = [p for p in changed if not _match_any(p, allowed_globs)]
+    return (not offending), offending
+
+
+def coder_test_violations(changed: list[str], test_globs: list[str],
+                          cycle_test_files: list[str], declared: list[str]) -> list[str]:
+    """Pliki testowe zmienione przez kodera niedozwolenie (nie z tego cyklu, niezadeklarowane)."""
+    allowed = set(cycle_test_files) | {d for d in declared if d}
+    is_test = (lambda p: _match_any(p, test_globs)) if test_globs else _looks_like_test
+    return [p for p in changed if is_test(p) and p not in allowed]
+
+
+def criteria_fully_mapped(criteria: list[str], criteria_map: list[dict]) -> bool:
+    """DONE tylko gdy każde kryterium ma pokrycie (test) albo jawne uzasadnienie."""
+    if not criteria:
+        return True
+    valid = [m for m in criteria_map if isinstance(m, dict) and m.get("criterion")
+             and ((m.get("status") == "covered" and m.get("test"))
+                  or m.get("status") == "justified")]
+    return len(valid) >= len(criteria)
+
+
+# --- Git: tag/rollback/diff per zadanie -------------------------------------
+
+def _tag(project: str, tag: str) -> None:
+    if tag:
+        git(project, "tag", "-f", tag, check=False)
+
+
+def _delete_tag(project: str, tag: str) -> None:
+    if tag:
+        git(project, "tag", "-d", tag, check=False)
+
+
+def _reset_to_tag(project: str, tag: str) -> None:
+    if tag:
+        git(project, "reset", "--hard", tag, check=False)
+    git(project, "clean", "-fd", check=False)
+
+
+# Artefakty runtime orkiestratora — nigdy nie podlegają kontroli podziału ról
+# ani rollbackowi plikowemu (w prod są w .gitignore, ale filtrujemy też jawnie).
+_RUNTIME_ARTIFACTS = ("STATE.json", "STATE.json.tmp", "STOP")
+
+
+def _is_runtime_artifact(path: str) -> bool:
+    p = path.replace("\\", "/")
+    return p in _RUNTIME_ARTIFACTS or p.startswith(".forge/")
+
+
+def changed_files(project: str, ref: str = "HEAD") -> list[str]:
+    """Pliki zmienione względem ref (śledzone) plus nowe nieśledzone.
+
+    Artefakty runtime (STATE.json, STOP, .forge/) są pomijane — nie są częścią
+    pracy agenta, więc nie mogą naruszać podziału ról ani być wycofane."""
+    tracked = git(project, "diff", "--name-only", ref, check=False).stdout.splitlines()
+    untracked = git(project, "ls-files", "--others", "--exclude-standard",
+                    check=False).stdout.splitlines()
+    return sorted({ln.strip() for ln in (tracked + untracked)
+                   if ln.strip() and not _is_runtime_artifact(ln.strip())})
+
+
+def revert_paths(project: str, paths: list[str]) -> None:
+    """Wycofaj wskazane pliki: śledzone → checkout, nieśledzone → usuń."""
+    for p in paths:
+        if git(project, "checkout", "--", p, check=False).returncode != 0:
+            try:
+                os.remove(os.path.join(project, p))
+            except OSError:
+                pass
+
+
+def _commit_cycle(project: str, msg: str) -> bool:
+    """Commit lokalny (BEZ push) — push całego zadania następuje dopiero po ukończeniu."""
+    git(project, "add", "-A")
+    if git(project, "diff", "--cached", "--quiet", check=False).returncode != 0:
+        git(project, "commit", "-q", "-m", msg)
+        log(f"Commit: {msg}")
+        return True
+    return False
+
+
+def run_gate(project: str, build_cmd: str, test_cmd: str, timeout: int) -> tuple[bool, str]:
+    """Bramka build+test zwracająca (zielona?, ogon wyjścia przy czerwieni)."""
+    if build_cmd:
+        try:
+            argv = shlex.split(build_cmd)
+        except ValueError as exc:
+            return False, f"build: niepoprawna składnia ({exc})"
+        if argv:
+            try:
+                proc = subprocess.run(argv, cwd=project, shell=False, text=True,
+                                      capture_output=True, timeout=timeout)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return False, f"build: nie uruchomiono ({exc})"
+            if proc.returncode != 0:
+                return False, ((proc.stdout or "") + (proc.stderr or ""))[-1500:]
+    if not test_cmd:
+        return False, "brak test_cmd"
+    try:
+        argv = shlex.split(test_cmd)
+    except ValueError as exc:
+        return False, f"test: niepoprawna składnia ({exc})"
+    if not argv:
+        return False, "pusta komenda testowa"
+    try:
+        proc = subprocess.run(argv, cwd=project, shell=False, text=True,
+                              capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "test: TIMEOUT"
+    except OSError as exc:
+        return False, f"test: nie uruchomiono ({exc})"
+    green = proc.returncode == 0
+    return green, "" if green else ((proc.stdout or "") + (proc.stderr or ""))[-1500:]
+
+
+# --- Fazy nowego modelu ------------------------------------------------------
+
+def _next_task_index(project: str) -> int:
+    """Kolejny numer zadania na podstawie istniejących .forge/tasks/task-*.md."""
+    tasks_dir = os.path.join(project, ".forge", "tasks")
+    top = 0
+    if os.path.isdir(tasks_dir):
+        for name in os.listdir(tasks_dir):
+            m = re.match(r"task-(\d+)\.md$", name)
+            if m:
+                top = max(top, int(m.group(1)))
+    return top + 1
+
+
+def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
+    log(f"--- PLAN WSADOWY ({cfg.planner_agent}) ---")
+    start = _next_task_index(project)
+    out = run_planner(prompts.plan_batch_prompt(cfg.batch_size, start), cfg, project, logf("plan"))
+    commit_all(project, "docs: plan wsadowy i backlog", cfg)  # pliki zadań, docs, backlog
+    data = extract_json(out) or {}
+    tasks = []
+    for t in (data.get("tasks") or []):
+        rel = t.get("file", "")
+        if rel and os.path.exists(os.path.join(project, rel)):
+            tasks.append({
+                "id": t.get("id") or os.path.splitext(os.path.basename(rel))[0],
+                "title": t.get("title", "(zadanie)"), "file": rel,
+                "criteria": t.get("criteria") or [],
+                "test_globs": t.get("test_globs") or [],
+                "code_globs": t.get("code_globs") or [],
+            })
+        else:
+            log(f"PLAN: pomijam zadanie bez pliku na dysku: {t.get('id') or rel!r}")
+    state.task_queue = tasks
+    log(f"PLAN: kolejka {len(tasks)} zadań.")
+    return {"no_more_tasks": bool(data.get("no_more_tasks")) and not tasks}
+
+
+def _write_current_task_pointer(project: str, task: dict) -> None:
+    """Skopiuj plik bieżącego zadania do .forge/current_task.md (zgodność z SHARED_PRINCIPLES)."""
+    src = os.path.join(project, task.get("file", ""))
+    dst = os.path.join(project, ".forge", "current_task.md")
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(src, "r", encoding="utf-8") as f:
+            body = f.read()
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(body)
+    except OSError:
+        pass
+
+
+def _start_task(cfg: Config, project: str, state: State) -> None:
+    task = state.task_queue.pop(0)
+    state.current_task = task
+    state.current_task_title = task.get("title", "(zadanie)")
+    state.task_start_tag = f"forge/{task.get('id', 'task')}-start"
+    _tag(project, state.task_start_tag)
+    state.tester_session = ""
+    state.coder_session = ""
+    state.micro_cycle = 0
+    state.micro_sub = "test"
+    state.cycle_test_files = []
+    state.pending_no_test = False
+    state.no_test_count = 0
+    state.review_notes = []
+    state.fix_attempt = 0
+    state.phase = "micro"
+    _write_current_task_pointer(project, task)
+    log(f"START zadania: {state.current_task_title} (tag {state.task_start_tag})")
+
+
+def _clear_task(state: State) -> None:
+    state.phase = "idle"
+    state.current_task = {}
+    state.current_task_title = ""
+    state.tester_session = ""
+    state.coder_session = ""
+    state.micro_cycle = 0
+    state.micro_sub = "test"
+    state.cycle_test_files = []
+    state.pending_no_test = False
+    state.no_test_count = 0
+    state.task_start_tag = ""
+    state.review_notes = []
+    state.fix_attempt = 0
+    state.tests_green = False
+
+
+def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
+    """Pętla b/c: tester dyktuje jeden test, koder zazielenia i refaktoryzuje.
+
+    Zwraca True gdy tester orzekł DONE (faza→review), False gdy zadanie padło."""
+    task = state.current_task
+    task_file = task.get("file", "")
+    test_globs = task.get("test_globs") or []
+    tm, te = cfg.tester()
+    cm, ce = cfg.coder()
+
+    while True:
+        if state.micro_cycle >= cfg.max_micro_cycles:
+            log(f"Limit mikro-cykli ({cfg.max_micro_cycles}) — zadanie nieukończone.")
+            return False
+        c = state.micro_cycle + 1
+
+        if state.micro_sub == "test":
+            log(f"[cykl {c}] TESTER pisze test / ocenia ukończenie")
+            out, sid = run_codex_session(
+                prompts.write_test_prompt(task_file, state.test_cmd),
+                cfg, project, logf(f"c{c:02d}-test"),
+                session_id=state.tester_session or None, model=tm, effort=te)
+            if sid:
+                state.tester_session = sid
+            verdict = extract_json(out) or {"action": "no_test", "reason": "brak werdyktu JSON"}
+            action = verdict.get("action")
+
+            if action == "done":
+                if not criteria_fully_mapped(task.get("criteria") or [],
+                                             verdict.get("criteria_map") or []):
+                    log("DONE odrzucony: niekompletna mapa kryterium→test — kolejny cykl.")
+                    state.micro_cycle = c  # zużyj cykl, by nie zapętlić w nieskończoność
+                    state.micro_sub = "test"
+                    save_checkpoint(project, state)
+                    continue
+                green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+                if not green:
+                    log("DONE zgłoszony przy CZERWONEJ bramce — naprawa kodem.")
+                    state.pending_no_test = True
+                    state.cycle_test_files = []
+                    state.micro_sub = "code"
+                    save_checkpoint(project, state)
+                    continue
+                log("TESTER: DONE — kryteria pokryte, bramka zielona.")
+                state.phase = "review"
+                save_checkpoint(project, state)
+                return True
+
+            if action == "no_test":
+                state.no_test_count += 1
+                if state.no_test_count > max(2, cfg.max_micro_cycles // 3):
+                    log(f"UWAGA: dużo 'no_test' ({state.no_test_count}) — możliwy smell testera.")
+                log(f"[cykl {c}] TESTER: brak sensownego testu — krok bez testu.")
+                state.pending_no_test = True
+                state.cycle_test_files = []
+                state.micro_sub = "code"
+                save_checkpoint(project, state)
+                continue
+
+            # action == "wrote_test"
+            changed = changed_files(project, "HEAD")
+            ok, offending = role_paths_ok(changed, test_globs + _SHARED_WRITABLE)
+            if not ok:
+                log(f"TESTER poza ścieżkami testów: {offending} — wycofuję.")
+                revert_paths(project, offending)
+                changed = changed_files(project, "HEAD")
+            green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+            if red_gate_ok(green):
+                tests_here = [p for p in changed if _match_any(p, test_globs)] if test_globs \
+                    else [p for p in changed if _looks_like_test(p)]
+                state.cycle_test_files = tests_here
+                state.pending_no_test = False
+                state.micro_sub = "code"
+                save_checkpoint(project, state)
+                continue
+            log("Bramka NIE zczerwieniała: nowy test przechodzi od razu → odrzucam.")
+            tests_here = [p for p in changed if _match_any(p, test_globs)] if test_globs \
+                else [p for p in changed if _looks_like_test(p)]
+            revert_paths(project, tests_here)
+            state.micro_cycle = c  # zużyj cykl (bounded retry)
+            state.micro_sub = "test"
+            save_checkpoint(project, state)
+            continue
+
+        # state.micro_sub == "code"
+        no_test = state.pending_no_test
+        log(f"[cykl {c}] KODER {'(krok bez testu)' if no_test else 'zazielenia test'} + refaktor")
+        green, tail = False, ""
+        verdict: dict = {}
+        for attempt in range(cfg.max_green_retries + 1):
+            out, sid = run_codex_session(
+                prompts.code_and_refactor_prompt(task_file, state.test_cmd, no_test, tail),
+                cfg, project, logf(f"c{c:02d}-code{attempt}"),
+                session_id=state.coder_session or None, model=cm, effort=ce)
+            if sid:
+                state.coder_session = sid
+            verdict = extract_json(out) or {}
+            green, tail = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+            if green:
+                break
+            log(f"[cykl {c}] bramka CZERWONA (próba {attempt + 1}/{cfg.max_green_retries + 1})")
+        if not green:
+            log("Koder nie zazielenił bramki w limicie prób — porażka zadania.")
+            return False
+
+        declared = [tc.get("file", "") for tc in (verdict.get("test_changes") or [])
+                    if isinstance(tc, dict)]
+        changed = changed_files(project, "HEAD")
+        violations = coder_test_violations(changed, test_globs,
+                                           state.cycle_test_files, declared)
+        if violations:
+            log(f"KODER zmienił testy niezadeklarowanie: {violations} — wycofuję, ponawiam bramkę.")
+            revert_paths(project, violations)
+            green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+            if not green:
+                log("Po wycofaniu niedozwolonych zmian testów bramka czerwona — porażka.")
+                return False
+
+        _commit_cycle(project, f"tdd: {state.current_task_title} (cykl {c})")
+        state.micro_cycle = c
+        state.micro_sub = "test"
+        state.cycle_test_files = []
+        state.pending_no_test = False
+        save_checkpoint(project, state)
+
+
+def _run_review_loop(cfg: Config, project: str, state: State, logf) -> bool:
+    """Faza d): recenzja całości przez Codeksa-testera + poprawki kodera.
+
+    Zwraca True gdy approve, False gdy limit poprawek / trwała czerwień."""
+    task = state.current_task
+    task_file = task.get("file", "")
+    tm, te = cfg.tester()
+    cm, ce = cfg.coder()
+
+    while True:
+        if state.phase == "fix_review":
+            log(f"--- POPRAWKI PO RECENZJI (koder) runda {state.fix_attempt + 1} ---")
+            out, sid = run_codex_session(
+                prompts.fix_review_prompt(state.review_notes, state.test_cmd),
+                cfg, project, logf(f"review-fix{state.fix_attempt + 1}"),
+                session_id=state.coder_session or None, model=cm, effort=ce)
+            if sid:
+                state.coder_session = sid
+            green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+            if green:
+                _commit_cycle(project, f"fix: {state.current_task_title} (recenzja {state.fix_attempt + 1})")
+            elif state.fix_attempt + 1 >= cfg.max_fix_attempts:
+                log("Poprawki recenzji nie zazieleniły bramki w limicie — porażka.")
+                return False
+            state.review_notes = []
+            state.fix_attempt += 1
+            state.phase = "review"
+            save_checkpoint(project, state)
+
+        green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+        if not green:
+            if state.fix_attempt >= cfg.max_fix_attempts:
+                return False
+            state.review_notes = ["Bramka testów czerwona — przywróć zieleń."]
+            state.phase = "fix_review"
+            save_checkpoint(project, state)
+            continue
+
+        log("--- RECENZJA CAŁOŚCI (Codex-tester) ---")
+        out, sid = run_codex_session(
+            prompts.review_task_prompt(task_file, state.test_cmd),
+            cfg, project, logf(f"review-r{state.fix_attempt}"),
+            session_id=state.tester_session or None, model=tm, effort=te)
+        if sid:
+            state.tester_session = sid
+        review = extract_json(out) or {"verdict": "changes", "notes": ["Brak werdyktu JSON."]}
+        if review.get("verdict") == "approve":
+            log("RECENZJA: approve.")
+            return True
+        if state.fix_attempt >= cfg.max_fix_attempts:
+            log("RECENZJA: changes, ale limit poprawek wyczerpany — porażka.")
+            return False
+        state.review_notes = review.get("notes") or []
+        log(f"RECENZJA: changes ({len(state.review_notes)} uwag) → runda {state.fix_attempt + 1}")
+        state.phase = "fix_review"
+        save_checkpoint(project, state)
+
+
+def _finish_task(cfg: Config, project: str, state: State, n: int) -> None:
+    _commit_cycle(project, f"feat: {state.current_task_title}")  # residuum (np. docs)
+    if cfg.git_push:
+        push(project, cfg)  # pojedynczy push całego, zielonego zadania
+    _delete_tag(project, state.task_start_tag)
+    state.last_done = state.current_task_title
+    state.iteration = n
+    log(f"ZADANIE UKOŃCZONE: {state.last_done} 🎉")
+    _clear_task(state)
+    save_checkpoint(project, state)
+
+
+def _fail_task(cfg: Config, project: str, state: State, n: int, reason: str) -> None:
+    title = state.current_task_title or "(zadanie)"
+    detail = reason
+    if state.review_notes:
+        detail += " | uwagi: " + "; ".join(state.review_notes[:5])
+    log(f"NIEPOWODZENIE zadania '{title}': {detail}")
+    record_failure(project, cfg, state, title, detail)
+    _reset_to_tag(project, state.task_start_tag)  # lokalnie — nic nie było pushowane
+    _delete_tag(project, state.task_start_tag)
+    state.iteration = n
+    _clear_task(state)
+    save_checkpoint(project, state)
+
+
+def _task_iteration(cfg: Config, project: str, state: State) -> bool:
+    """Jedno zadanie nowego modelu (plan wsadowy → mikro-TDD → recenzja). Wznawialne."""
+    n = state.iteration + 1
+    log(f"########## ZADANIE (iter {n}) ##########")
+
+    def logf(phase: str) -> str:
+        return os.path.join(project, cfg.runtime_dir, "logs", f"task-{n:04d}-{phase}.log")
+
+    if state.phase != "idle" and not state.current_task:
+        log("Faza zaawansowana bez bieżącego zadania — reset do planowania.")
+        _clear_task(state)
+
+    if state.phase == "idle":
+        if not state.task_queue:
+            plan = phase_plan_batch(cfg, project, state, logf)
+            save_checkpoint(project, state)
+            if not state.task_queue:
+                log("PLAN: brak dalszych zadań — MVP ukończone. 🎉" if plan.get("no_more_tasks")
+                    else "PLAN: planista nie zwrócił zadań — zatrzymuję.")
+                return False
+        _start_task(cfg, project, state)
+        save_checkpoint(project, state)
+    else:
+        log(f"WZNAWIAM fazę '{state.phase}': {state.current_task_title}")
+
+    if state.phase == "micro":
+        if not _run_micro_loop(cfg, project, state, logf):
+            _fail_task(cfg, project, state, n, f"mikro-TDD nieukończone (cykli={state.micro_cycle})")
+            return True
+
+    if state.phase in {"review", "fix_review"}:
+        if _run_review_loop(cfg, project, state, logf):
+            _finish_task(cfg, project, state, n)
+        else:
+            _fail_task(cfg, project, state, n, "recenzja nie zaakceptowała / bramka czerwona")
+    return True
+
+
+def _one_iteration(cfg: Config, project: str, state: State) -> bool:
+    """Dyspozytor: nowy model (mikro-TDD) albo stary przebieg za flagą legacy_mode."""
+    if cfg.legacy_mode:
+        return _legacy_iteration(cfg, project, state)
+    return _task_iteration(cfg, project, state)
+
+
 def one_iteration(cfg: Config, project: str, state: State) -> bool:
     """Wykonaj iterację transakcyjnie względem ostatniego dobrego commita."""
     try:
@@ -460,6 +979,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--planner-effort", "--claude-effort", dest="planner_effort", default=None)
     ap.add_argument("--codex-model", default=None)
     ap.add_argument("--codex-effort", default=None, choices=CODEX_EFFORTS)
+    ap.add_argument("--legacy", action="store_true", default=None,
+                    help="Stary przebieg plan→implement→review(Claude)→fix.")
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="Ile zadań planista przygotowuje jednym wywołaniem (nowy model).")
+    ap.add_argument("--max-micro-cycles", type=int, default=None,
+                    help="Sufit mikro-cykli TDD na zadanie (nowy model).")
+    ap.add_argument("--tester-model", default=None, help="Model Codeksa-testera (nowy model).")
+    ap.add_argument("--tester-effort", default=None, choices=CODEX_EFFORTS)
+    ap.add_argument("--coder-model", default=None, help="Model Codeksa-kodera (nowy model).")
+    ap.add_argument("--coder-effort", default=None, choices=CODEX_EFFORTS)
     ap.add_argument("--non-interactive", action="store_true",
                     help="Nie pytaj o modele i effort; użyj flag/env/dom wartości.")
     ap.add_argument("--check", action="store_true", help="Tylko preflight i wyjście.")
@@ -484,6 +1013,20 @@ def main(argv: list[str] | None = None) -> int:
         cfg.codex_model = args.codex_model
     if args.codex_effort:
         cfg.codex_effort = args.codex_effort
+    if args.legacy:
+        cfg.legacy_mode = True
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.max_micro_cycles is not None:
+        cfg.max_micro_cycles = args.max_micro_cycles
+    if args.tester_model:
+        cfg.tester_model = args.tester_model
+    if args.tester_effort:
+        cfg.tester_effort = args.tester_effort
+    if args.coder_model:
+        cfg.coder_model = args.coder_model
+    if args.coder_effort:
+        cfg.coder_effort = args.coder_effort
 
     allowed_planner_efforts = (CLAUDE_EFFORTS if cfg.planner_agent == "claude"
                                else CODEX_EFFORTS)
@@ -506,6 +1049,11 @@ def main(argv: list[str] | None = None) -> int:
         log("Kontynuuję mimo ostrzeżeń (ustaw FORGE_CLAUDE_BIN, jeśli Claude nie ruszy).")
     else:
         log("PREFLIGHT OK.")
+    if cfg.legacy_mode:
+        log("TRYB: legacy (plan → implement → review[Claude] → fix).")
+    else:
+        log(f"TRYB: mikro-TDD (plan wsadowy {cfg.batch_size} → tester↔koder → recenzja Codeksa); "
+            f"sufit mikro-cykli={cfg.max_micro_cycles}.")
     if args.check:
         return 0
 
