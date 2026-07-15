@@ -171,10 +171,10 @@ Fazy w `State.phase`: `idle → plan → write_tests → implement → refactor 
      brak implementacji, nie błąd składni — rozróżnialne po kodzie/komunikacie).
      Jeśli nowe testy od razu przechodzą → zadanie puste albo testy wydmuszki → arbitraż.
 - **implement** (Codex-koder): czyta zadanie + kontrakt + **treść testów** (to jest jego
-  specyfikacja wykonywalna); pisze wyłącznie poza ścieżkami testów. Orkiestrator:
-  kontrola diffu (dotknął testów → checkout plików testowych i jedno ponowienie z
-  adnotacją), potem **bramka zielona** na pełnym pakiecie. Czerwona → do 2 rund
-  poprawek kodera z ogonem testów (bez udziału drogiego modelu).
+  specyfikacja wykonywalna); pisze głównie poza ścieżkami testów — zmiany w testach są
+  dozwolone, ale tylko **zadeklarowane** i pod bramką anty-osłabiania (polityka w 3.5).
+  Potem **bramka zielona** na pełnym pakiecie. Czerwona → do 2 rund poprawek kodera
+  z ogonem testów (bez udziału drogiego modelu).
 - **arbitrate** (Claude, może być sonnet/medium): wchodzi **tylko** gdy koder po
   limicie rund twierdzi, że testy są błędne, albo bramka czerwona wykryła anomalię.
   Werdykt JSON: `{"blame": "tests"|"code"|"task", ...}` → poprawa testów przez
@@ -203,9 +203,9 @@ Proponuję refaktor na dwóch poziomach:
 - **Mikro-refaktor po każdej zielonej bramce** (Codex-koder, osobne wywołanie, nie
   doklejone do implementacji — doklejone „przy okazji zrefaktoruj" model notorycznie
   pomija, gdy walczy o zielone testy). Zakres: tylko pliki dotknięte w zadaniu +
-  ich bezpośrednie sąsiedztwo. Bramki mechaniczne: testy nadal zielone, **zero zmian
-  w plikach testowych**, zero nowego publicznego API (kontrola diffu tą samą
-  maszynerią co w 3.5). Jeśli refaktor psuje testy → `git checkout` zmian refaktoru
+  ich bezpośrednie sąsiedztwo. Bramki mechaniczne: testy nadal zielone, zmiany w
+  testach tylko adaptacyjne i zadeklarowane (polityka w 3.5), zero nowego publicznego
+  API. Jeśli refaktor psuje testy → `git checkout` zmian refaktoru
   i commit wersji sprzed niego — refaktor jest *opcjonalnym bonusem*, nigdy nie
   blokuje ukończenia zadania.
 - **Makro-refaktor co N iteracji** (domyślnie N=5–8) jako zwykłe zadanie z kolejki:
@@ -216,20 +216,41 @@ Proponuję refaktor na dwóch poziomach:
   (refaktor z definicji nie zmienia zachowania, więc nie ma nowych testów), a rolę
   specyfikacji pełni istniejący pakiet — musi być zielony przed i po.
 
-Refaktor **testów** (wspólne fixtures, helpery) to osobny przypadek: wolno go robić
-tylko testerowi i tylko w ramach zadania makro-refaktoru, z bramką „pakiet nadal
-zielony". Koderowi zakaz dotykania testów pozostaje bezwzględny.
+Głębszy refaktor **testów** (wspólne fixtures, helpery, przebudowa struktury) należy
+do testera, naturalnie w ramach zadania makro-refaktoru, z bramką „pakiet nadal
+zielony".
 
-### 3.5. Egzekwowanie podziału ról
+### 3.5. Egzekwowanie podziału ról i polityka zmian w testach
 
 Kluczowe: podziału **nie pilnuje prompt, tylko orkiestrator** (prompty się „nie słuchają"
-wystarczająco niezawodnie):
+wystarczająco niezawodnie). Ale niezmiennik, którego naprawdę bronimy, to **nie**
+„koder nie dotyka testów" — to zbyt sztywne (każda zmiana sygnatury przy refaktorze
+łamie importy w testach, a ewidentnie błędny test wymagałby wtedy pełnego arbitrażu).
+Prawdziwy niezmiennik brzmi: **specyfikacja nie może zostać osłabiona pod presją
+czerwonej bramki**. Niebezpieczna nie jest edycja testu, tylko jego *rozwadnianie*,
+żeby zły kod przeszedł.
 
-- `git diff --name-only` po każdej fazie, porównanie ze ścieżkami z zadania;
-- naruszenie → `git checkout -- <pliki spoza roli>` + jedno ponowienie fazy z ostrą
-  adnotacją; drugie naruszenie → porażka fazy;
-- bramka czerwona (testy muszą failować przed implementacją) jest mechanicznym
-  odpowiednikiem „czy jest TDD?" z obecnego review — i nie kosztuje ani tokena.
+Stąd polityka trójstopniowa dla kodera:
+
+1. **Zmiany niezadeklarowane — nigdy.** `git diff --name-only` po każdej fazie;
+   niezadeklarowana zmiana w ścieżkach testów → `git checkout -- <pliki>` + jedno
+   ponowienie fazy z ostrą adnotacją; drugie naruszenie → porażka fazy.
+2. **Zmiany adaptacyjne — zawsze wolno, pod bramką mechaniczną.** Renamy, importy,
+   sygnatury wynikające z refaktoru. Weryfikacja bez udziału modelu — **bramka
+   anty-osłabiania**: zmodyfikowane testy uruchamiane na snapszocie kodu *sprzed
+   implementacji* (osobny `git worktree` na commicie bazowym) muszą **nadal failować**.
+   Jeśli po edycji przechodzą na starym kodzie, to znaczy, że przestały cokolwiek
+   specyfikować → odrzucenie.
+3. **Zmiany merytoryczne — wolno z deklaracją i tanim audytem.** Koder uważa test za
+   błędny → poprawia go i deklaruje w werdykcie JSON
+   (`"test_changes": [{"file": ..., "reason": ...}]`). Orkiestrator wysyła **sam diff
+   testów + uzasadnienie** (nie cały kontekst) do taniego arbitra (sonnet/medium).
+   Zaakceptowane → faza biegnie dalej; odrzucone → checkout zmian w testach i
+   ponowienie. To jest lekka ścieżka zamiast ciężkiego arbitrażu z 3.3 — tamten
+   zostaje na spory, których diff-audyt nie rozstrzygnął.
+
+Do tego bramka czerwona (testy muszą failować przed implementacją) — mechaniczny
+odpowiednik „czy jest TDD?" z obecnego review, nie kosztuje ani tokena.
 
 Ryzyko modelu: **słabe testy** (tester pisze wydmuszki, koder trywialnie je przechodzi).
 Mitygacje: bramka czerwona odsiewa testy-tautologie; kryteria akceptacji w zadaniu
