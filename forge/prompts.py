@@ -234,7 +234,10 @@ A) Napisz JEDEN nowy test na brakującą funkcjonalność. Wymogi twarde:
 B) Jeśli sensownego testu nie da się teraz napisać (np. czysto strukturalny krok),
    zadeklaruj to jawnie — koder wykona krok bez testu.
 C) Jeśli WSZYSTKIE kryteria są już spełnione i cały pakiet zielony — zakończ zadanie.
-   Wtedy zmapuj KAŻDE kryterium akceptacji na test, który je pokrywa.
+   Wtedy zmapuj KAŻDE kryterium akceptacji (przepisz jego DOKŁADNY tekst z pliku
+   zadania) na test, który je pokrywa: status "covered" + pole "test". Kryterium
+   niesprawdzalne testem oznacz statusem "justified" i wyjaśnij w polu "why".
+   Mapa bez któregoś kryterium zostanie odrzucona.
 
 Na końcu zwróć WYŁĄCZNIE jeden z bloków:
 ```json
@@ -244,7 +247,10 @@ Na końcu zwróć WYŁĄCZNIE jeden z bloków:
 {{"action": "no_test", "reason": "<dlaczego brak sensownego testu na ten krok>"}}
 ```
 ```json
-{{"action": "done", "criteria_map": [{{"criterion": "<dokładny tekst kryterium>", "test": "<ścieżka::nazwa>", "status": "covered"}}]}}
+{{"action": "done", "criteria_map": [
+  {{"criterion": "<dokładny tekst kryterium>", "test": "<ścieżka::nazwa>", "status": "covered"}},
+  {{"criterion": "<kryterium bez testu>", "status": "justified", "why": "<uzasadnienie>"}}
+]}}
 ```"""
 
 

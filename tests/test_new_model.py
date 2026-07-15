@@ -58,6 +58,33 @@ class PureGateTest(unittest.TestCase):
         # "covered" bez testu nie liczy się jako pokrycie
         self.assertFalse(criteria_fully_mapped(["k"], [{"criterion": "k", "status": "covered"}]))
 
+    def test_criteria_mapping_rejects_duplicates_and_invented_criteria(self) -> None:
+        criteria = ["kryt1", "kryt2"]
+        # Duplikat pokrycia kryt1 nie zastępuje brakującego kryt2.
+        dup = [{"criterion": "kryt1", "test": "t::a", "status": "covered"},
+               {"criterion": "kryt1", "test": "t::b", "status": "covered"}]
+        self.assertFalse(criteria_fully_mapped(criteria, dup))
+        # Zmyślone kryterium spoza listy zadania też nie.
+        invented = [{"criterion": "kryt1", "test": "t::a", "status": "covered"},
+                    {"criterion": "WYMYŚLONE", "test": "t::x", "status": "covered"}]
+        self.assertFalse(criteria_fully_mapped(criteria, invented))
+
+    def test_criteria_matching_tolerates_case_and_whitespace(self) -> None:
+        criteria = ["Gracz może  ruszyć jednostkę"]
+        entry = [{"criterion": "gracz może ruszyć jednostkę",
+                  "test": "t::ruch", "status": "covered"}]
+        self.assertTrue(criteria_fully_mapped(criteria, entry))
+
+    def test_tester_may_write_tests_when_globs_missing(self) -> None:
+        from forge.orchestrate import tester_path_violations
+        # Bez test_globs obowiązuje heurystyka — test w tests/ jest legalny,
+        # a wyciek do src/ nadal łapany.
+        viol = tester_path_violations(["tests/test_x.py", "src/leak.py"], [])
+        self.assertEqual(viol, ["src/leak.py"])
+        # Z globami: glob wygrywa nad heurystyką.
+        viol = tester_path_violations(["spec/test_x.py", "docs/DESIGN.md"], ["spec/**"])
+        self.assertEqual(viol, [])
+
 
 class SessionParsingTest(unittest.TestCase):
     def test_thread_started_real_format(self) -> None:
@@ -251,6 +278,92 @@ class MicroLoopTest(unittest.TestCase):
 
             self.assertFalse(reached)  # nie osiągnięto DONE — bramka czerwona nie zaszła
             self.assertFalse(Path(project, "tests", "test_a.py").exists())  # test wycofany
+
+
+class PhaseRoundTripTest(unittest.TestCase):
+    def test_log_filenames_map_to_report_groups(self) -> None:
+        from forge.agents import _phase_from_log
+        from forge.report import normalize_phase
+        cases = {
+            "iter-0001-plan.log": "plan",
+            "iter-0000-bootstrap.log": "bootstrap",
+            "task-0001-c01-test.log": "micro-test",
+            "task-0001-c12-code0.log": "micro-code",
+            "task-0001-review-r0.log": "review",
+            "task-0001-review-fix1.log": "review-fix",
+        }
+        for filename, group in cases.items():
+            self.assertEqual(normalize_phase(_phase_from_log(filename)), group,
+                             f"{filename} → {_phase_from_log(filename)!r}")
+
+
+class StaleLastMessageTest(unittest.TestCase):
+    def test_previous_verdict_is_not_reread_when_run_writes_nothing(self) -> None:
+        from forge.agents import run_codex_session
+        with tempfile.TemporaryDirectory() as project:
+            cfg = Config()
+            stale = Path(project) / cfg.runtime_dir / "codex_last.txt"
+            stale.parent.mkdir(parents=True)
+            stale.write_text('{"action":"done"}', encoding="utf-8")  # werdykt POPRZEDNIEJ roli
+
+            with patch("forge.agents._run_with_backoff",
+                       return_value='{"type":"thread.started","thread_id":"t1"}'):
+                out, sid = run_codex_session("prompt", cfg, project, "/tmp/log")
+
+            self.assertEqual(out, "")          # nie werdykt poprzedniej roli
+            self.assertEqual(sid, "t1")
+
+
+class EmptyPlanQueueTest(unittest.TestCase):
+    def _state(self) -> State:
+        return State(bootstrapped=True, test_cmd="pytest", phase="idle")
+
+    @patch("forge.orchestrate.save_checkpoint")
+    @patch("forge.orchestrate.phase_plan_batch")
+    def test_empty_queue_without_no_more_tasks_raises(self, plan: Mock, _save: Mock) -> None:
+        from forge.agents import AgentError
+        from forge.orchestrate import _task_iteration
+        plan.return_value = {"no_more_tasks": False}
+        with self.assertRaisesRegex(AgentError, "wykonalnego zadania"):
+            _task_iteration(Config(), "/tmp/p", self._state())
+
+    @patch("forge.orchestrate.save_checkpoint")
+    @patch("forge.orchestrate.phase_plan_batch")
+    def test_empty_queue_with_no_more_tasks_finishes_cleanly(self, plan: Mock, _save: Mock) -> None:
+        from forge.orchestrate import _task_iteration
+        plan.return_value = {"no_more_tasks": True}
+        self.assertFalse(_task_iteration(Config(), "/tmp/p", self._state()))
+
+
+class CalledProcessErrorPathTest(unittest.TestCase):
+    @patch("forge.orchestrate.rollback")
+    @patch("forge.orchestrate._fail_task")
+    @patch("forge.orchestrate._task_iteration",
+           side_effect=subprocess.CalledProcessError(128, "git"))
+    def test_new_model_git_failure_goes_through_fail_task(
+        self, _iter: Mock, fail: Mock, rb: Mock
+    ) -> None:
+        from forge.orchestrate import one_iteration
+        state = State(current_task={"id": "task-001", "title": "Ruch"},
+                      current_task_title="Ruch", task_start_tag="forge/task-001-start")
+        with self.assertRaises(subprocess.CalledProcessError):
+            one_iteration(Config(), "/tmp/p", state)
+        fail.assert_called_once()          # reset do taga + failures.md + sprzątnięcie
+        rb.assert_not_called()             # NIE legacy rollback do HEAD
+
+    @patch("forge.orchestrate.save_checkpoint")
+    @patch("forge.orchestrate._fail_task")
+    @patch("forge.orchestrate.rollback")
+    @patch("forge.orchestrate._legacy_iteration",
+           side_effect=subprocess.CalledProcessError(128, "git"))
+    def test_legacy_mode_keeps_old_rollback(
+        self, _iter: Mock, rb: Mock, fail: Mock, _save: Mock
+    ) -> None:
+        from forge.orchestrate import one_iteration
+        with self.assertRaises(subprocess.CalledProcessError):
+            one_iteration(Config(legacy_mode=True), "/tmp/p", State())
+        rb.assert_called_once()
+        fail.assert_not_called()
 
 
 class SmokeDryTest(unittest.TestCase):

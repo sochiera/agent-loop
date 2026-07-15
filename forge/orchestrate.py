@@ -497,22 +497,50 @@ def role_paths_ok(changed: list[str], allowed_globs: list[str]) -> tuple[bool, l
     return (not offending), offending
 
 
+def _is_test_path(path: str, test_globs: list[str]) -> bool:
+    """Czy ścieżka jest plikiem testowym zadania: wg globów, a bez globów —
+    wg heurystyki nazwy. Jedno miejsce prawdy dla wszystkich bramek."""
+    return _match_any(path, test_globs) if test_globs else _looks_like_test(path)
+
+
+def tester_path_violations(changed: list[str], test_globs: list[str]) -> list[str]:
+    """Pliki, których tester nie miał prawa dotknąć (nie-test i nie-współdzielone).
+
+    Gdy zadanie nie deklaruje test_globs, obowiązuje heurystyka _looks_like_test —
+    brak globów NIE może oznaczać zakazu pisania testów."""
+    return [p for p in changed
+            if not (_is_test_path(p, test_globs) or _match_any(p, _SHARED_WRITABLE))]
+
+
 def coder_test_violations(changed: list[str], test_globs: list[str],
                           cycle_test_files: list[str], declared: list[str]) -> list[str]:
     """Pliki testowe zmienione przez kodera niedozwolenie (nie z tego cyklu, niezadeklarowane)."""
     allowed = set(cycle_test_files) | {d for d in declared if d}
-    is_test = (lambda p: _match_any(p, test_globs)) if test_globs else _looks_like_test
-    return [p for p in changed if is_test(p) and p not in allowed]
+    return [p for p in changed if _is_test_path(p, test_globs) and p not in allowed]
+
+
+def _norm_criterion(text: str) -> str:
+    """Normalizacja do porównań: LLM-y przekręcają wielkość liter i whitespace."""
+    return " ".join((text or "").split()).casefold()
 
 
 def criteria_fully_mapped(criteria: list[str], criteria_map: list[dict]) -> bool:
-    """DONE tylko gdy każde kryterium ma pokrycie (test) albo jawne uzasadnienie."""
-    if not criteria:
+    """DONE tylko gdy KAŻDE kryterium z listy zadania jest odhaczone w mapie
+    (pokryte testem albo jawnie uzasadnione).
+
+    Odhaczamy kryteria z listy, nie liczymy wpisów mapy — duplikaty i wpisy
+    o zmyślonych kryteriach nie mogą zastąpić brakującego pokrycia."""
+    remaining = {_norm_criterion(c) for c in criteria if _norm_criterion(c)}
+    if not remaining:
         return True
-    valid = [m for m in criteria_map if isinstance(m, dict) and m.get("criterion")
-             and ((m.get("status") == "covered" and m.get("test"))
-                  or m.get("status") == "justified")]
-    return len(valid) >= len(criteria)
+    for entry in criteria_map:
+        if not isinstance(entry, dict):
+            continue
+        satisfied = ((entry.get("status") == "covered" and entry.get("test"))
+                     or entry.get("status") == "justified")
+        if satisfied:
+            remaining.discard(_norm_criterion(entry.get("criterion", "")))
+    return not remaining
 
 
 # --- Git: tag/rollback/diff per zadanie -------------------------------------
@@ -906,15 +934,14 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
 
             # action == "wrote_test"
             changed = changed_files(project, "HEAD")
-            ok, offending = role_paths_ok(changed, test_globs + _SHARED_WRITABLE)
-            if not ok:
+            offending = tester_path_violations(changed, test_globs)
+            if offending:
                 log(f"TESTER poza ścieżkami testów: {offending} — wycofuję.")
                 revert_paths(project, offending)
                 changed = changed_files(project, "HEAD")
+            tests_here = [p for p in changed if _is_test_path(p, test_globs)]
             green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
             if red_gate_ok(green):
-                tests_here = [p for p in changed if _match_any(p, test_globs)] if test_globs \
-                    else [p for p in changed if _looks_like_test(p)]
                 state.cycle_test_files = tests_here
                 snapshot_cycle_tests(project, cfg, tests_here)  # do przywracania po koderze
                 state.pending_no_test = False
@@ -922,8 +949,6 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
                 save_checkpoint(project, state)
                 continue
             log("Bramka NIE zczerwieniała: nowy test przechodzi od razu → odrzucam.")
-            tests_here = [p for p in changed if _match_any(p, test_globs)] if test_globs \
-                else [p for p in changed if _looks_like_test(p)]
             revert_paths(project, tests_here)
             state.micro_cycle = c  # zużyj cykl (bounded retry)
             state.micro_sub = "test"
@@ -1078,9 +1103,15 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
             plan = phase_plan_batch(cfg, project, state, logf)
             save_checkpoint(project, state)
             if not state.task_queue:
-                log("PLAN: brak dalszych zadań — MVP ukończone. 🎉" if plan.get("no_more_tasks")
-                    else "PLAN: planista nie zwrócił zadań — zatrzymuję.")
-                return False
+                if plan.get("no_more_tasks"):
+                    log("PLAN: brak dalszych zadań — MVP ukończone. 🎉")
+                    return False
+                # Pusta kolejka BEZ deklaracji końca = usterka planisty (zły JSON,
+                # rozjechane ścieżki plików). To błąd do zgłoszenia, nie sukces:
+                # cichy return False zakończyłby nocny bieg z kodem 0.
+                raise AgentError(
+                    "Planista nie zwrócił żadnego wykonalnego zadania "
+                    "(pusta kolejka bez no_more_tasks) — sprawdź log fazy plan.")
         _start_task(cfg, project, state)
         save_checkpoint(project, state)
     else:
@@ -1114,10 +1145,18 @@ def one_iteration(cfg: Config, project: str, state: State) -> bool:
         log(f"Checkpoint zachowany: faza '{state.phase}'.")
         save_checkpoint(project, state)
         raise
-    except subprocess.CalledProcessError:
-        rollback(project)
-        clear_checkpoint(state)
-        save_checkpoint(project, state)
+    except subprocess.CalledProcessError as exc:
+        if cfg.legacy_mode or not state.current_task:
+            rollback(project)
+            clear_checkpoint(state)
+            save_checkpoint(project, state)
+        else:
+            # Nowy model: porażka MUSI wrócić do taga startu zadania — rollback
+            # do HEAD zostawiłby niezrecenzowane commity cykli, które poszłyby
+            # na remote przy pushu następnego zadania. _fail_task sprząta tag,
+            # zapisuje failures.md i czyści stan zadania.
+            _fail_task(cfg, project, state, state.iteration + 1,
+                       f"błąd polecenia zewnętrznego: {exc}")
         raise
 
 

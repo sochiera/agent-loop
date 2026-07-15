@@ -234,11 +234,15 @@ def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
 
 
 def _phase_from_log(log_path: str) -> str:
-    """Wyłuskaj nazwę fazy z ścieżki logu 'iter-0001-plan.log' → 'plan'."""
+    """Wyłuskaj nazwę fazy ze ścieżki logu, zdejmując tylko prefiks iteracji:
+    'iter-0001-plan.log' → 'plan', 'task-0003-c01-test.log' → 'c01-test'.
+
+    Pełna nazwa fazy musi przetrwać, bo report.normalize_phase grupuje po
+    wzorcach typu '^c\\d+-test' i '^review-fix'."""
     base = os.path.basename(log_path or "")
     stem = base[:-4] if base.endswith(".log") else base
-    parts = stem.split("-")
-    return parts[-1] if parts and parts[-1] else "unknown"
+    stem = re.sub(r"^(?:iter|task)-\d+-", "", stem)
+    return stem or "unknown"
 
 
 def _append_log(log_path: str, argv: list[str], output: str, code: int) -> None:
@@ -279,6 +283,21 @@ def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str
         return raw  # awaryjnie surowy tekst
 
 
+def _prepare_last_msg_file(project_dir: str, cfg: Config) -> str:
+    """Ścieżka pliku -o na ostatnią wiadomość agenta, wyczyszczona przed startem.
+
+    Plik jest współdzielony między wywołaniami (i rolami), więc stara zawartość
+    MUSI zniknąć przed uruchomieniem — inaczej run, który nic nie zapisze,
+    podsunąłby werdykt poprzedniego agenta jako swój."""
+    last_msg = os.path.join(project_dir, cfg.runtime_dir, "codex_last.txt")
+    os.makedirs(os.path.dirname(last_msg), exist_ok=True)
+    try:
+        os.remove(last_msg)
+    except OSError:
+        pass
+    return last_msg
+
+
 def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
               *, model: str | None = None, effort: str | None = None) -> str:
     """Codex exec (non-interactive). Zwraca ostatnią wiadomość agenta."""
@@ -287,8 +306,7 @@ def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
         a.model = model
     if effort is not None:
         a.effort = effort
-    last_msg = os.path.join(project_dir, cfg.runtime_dir, "codex_last.txt")
-    os.makedirs(os.path.dirname(last_msg), exist_ok=True)
+    last_msg = _prepare_last_msg_file(project_dir, cfg)
     argv = a.argv + ["exec", prompt]
     if a.model:  # pusty → Codex użyje modelu z własnego config.toml
         argv += ["-m", a.model]
@@ -326,8 +344,7 @@ def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
         a.model = model
     if effort is not None:
         a.effort = effort
-    last_msg = os.path.join(project_dir, cfg.runtime_dir, "codex_last.txt")
-    os.makedirs(os.path.dirname(last_msg), exist_ok=True)
+    last_msg = _prepare_last_msg_file(project_dir, cfg)
 
     argv = a.argv + ["exec"]
     if session_id:
