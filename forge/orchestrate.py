@@ -185,41 +185,51 @@ def push(project: str, cfg: Config) -> None:
         log(f"Push → {cfg.git_remote}/{branch}")
 
 
-def rollback(project: str) -> None:
-    """Wycofaj nieudaną iterację do ostatniego dobrego commita."""
-    git(project, "reset", "--hard", "HEAD", check=False)
+def rollback(project: str, ref: str = "HEAD") -> None:
+    """Wycofaj nieudaną pracę do wskazanego punktu (domyślnie ostatni commit)."""
+    git(project, "reset", "--hard", ref, check=False)
     git(project, "clean", "-fd", check=False)  # usuwa nowe pliki (poza .gitignore)
-    log("ROLLBACK: przywrócono stan z ostatniego commita.")
+    log(f"ROLLBACK: przywrócono stan '{ref}'.")
 
 
 # --- Bramka testów -----------------------------------------------------------
+
+def _run_shellfree(project: str, cmd: str, timeout: int) -> tuple[int | None, str]:
+    """Wspólny rdzeń wszystkich bramek: pojedyncza komenda bez shella.
+
+    Zwraca (returncode, wyjście) albo (None, diagnoza), gdy komenda w ogóle
+    nie wystartowała (składnia/pusta/OSError/timeout). Jedno miejsce prawdy
+    dla semantyki subprocess — run_tests, build_then_test i run_gate nie mogą
+    się rozjechać."""
+    try:
+        argv = shlex.split(cmd)
+    except ValueError as exc:
+        return None, f"niepoprawna składnia komendy ({exc})"
+    if not argv:
+        return None, "pusta komenda"
+    try:
+        proc = subprocess.run(argv, cwd=project, shell=False, text=True,
+                              capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "TIMEOUT"
+    except OSError as exc:
+        return None, f"nie udało się uruchomić ({exc})"
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
 
 def run_tests(project: str, test_cmd: str, timeout: int) -> bool:
     if not test_cmd:
         log("Testy: brak test_cmd → czerwone.")
         return False
     log(f"Bramka testów: {test_cmd}")
-    try:
-        argv = shlex.split(test_cmd)
-        if not argv:
-            log("Testy: pusta komenda → czerwone.")
-            return False
-        proc = subprocess.run(argv, cwd=project, shell=False, text=True,
-                              capture_output=True, timeout=timeout)
-    except ValueError as exc:
-        log(f"Testy: niepoprawna składnia komendy ({exc}) → czerwone.")
+    rc, out = _run_shellfree(project, test_cmd, timeout)
+    if rc is None:
+        log(f"Testy: {out} → czerwone.")
         return False
-    except OSError as exc:
-        log(f"Testy: nie udało się uruchomić komendy ({exc}) → czerwone.")
-        return False
-    except subprocess.TimeoutExpired:
-        log("Testy: TIMEOUT → czerwone.")
-        return False
-    green = proc.returncode == 0
-    log(f"Testy: {'ZIELONE' if green else 'CZERWONE (rc=%d)' % proc.returncode}")
+    green = rc == 0
+    log(f"Testy: {'ZIELONE' if green else 'CZERWONE (rc=%d)' % rc}")
     if not green:
-        tail = (proc.stdout or "") + (proc.stderr or "")
-        print(tail[-1200:])
+        print(out[-1200:])
     return green
 
 
@@ -230,23 +240,15 @@ def build_then_test(project: str, build_cmd: str, test_cmd: str, timeout: int) -
     przejść. Build padnie → bramka czerwona (jak nieudane testy)."""
     if build_cmd:
         log(f"Build: {build_cmd}")
-        try:
-            argv = shlex.split(build_cmd)
-        except ValueError as exc:
-            log(f"Build: niepoprawna składnia ({exc}) → czerwony.")
+        rc, out = _run_shellfree(project, build_cmd, timeout)
+        if rc is None:
+            log(f"Build: {out} → czerwony.")
             return False
-        if argv:
-            try:
-                proc = subprocess.run(argv, cwd=project, shell=False, text=True,
-                                      capture_output=True, timeout=timeout)
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                log(f"Build: nie udało się uruchomić ({exc}) → czerwony.")
-                return False
-            if proc.returncode != 0:
-                log(f"Build: CZERWONY (rc={proc.returncode})")
-                print(((proc.stdout or "") + (proc.stderr or ""))[-1200:])
-                return False
-            log("Build: OK")
+        if rc != 0:
+            log(f"Build: CZERWONY (rc={rc})")
+            print(out[-1200:])
+            return False
+        log("Build: OK")
     return run_tests(project, test_cmd, timeout)
 
 
@@ -324,12 +326,22 @@ def phase_fix(cfg: Config, project: str, notes: list[str], test_cmd: str, logf) 
     return extract_json(out) or {}
 
 
+def _append_line(path: str, line: str) -> None:
+    """Best-effort dopisanie linii (makedirs + append). Zapisy diagnostyczne
+    nigdy nie wywracają pętli — błąd IO jest połykany świadomie i wszędzie
+    tak samo (failures.md, dziennik zadania)."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
 def record_failure(project: str, cfg: Config, state: State, title: str, reason: str) -> None:
     state.failures.append(f"{title}: {reason}")
-    path = os.path.join(project, cfg.runtime_dir, "failures.md")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"- [{ts()}] {title} — {reason}\n")
+    _append_line(os.path.join(project, cfg.runtime_dir, "failures.md"),
+                 f"- [{ts()}] {title} — {reason}\n")
 
 
 # --- Pętla główna ------------------------------------------------------------
@@ -556,31 +568,31 @@ def _delete_tag(project: str, tag: str) -> None:
 
 
 def _reset_to_tag(project: str, tag: str) -> None:
-    if tag:
-        git(project, "reset", "--hard", tag, check=False)
-    git(project, "clean", "-fd", check=False)
+    rollback(project, tag or "HEAD")
 
 
-# Artefakty runtime orkiestratora — nigdy nie podlegają kontroli podziału ról
-# ani rollbackowi plikowemu (w prod są w .gitignore, ale filtrujemy też jawnie).
-_RUNTIME_ARTIFACTS = ("STATE.json", "STATE.json.tmp", "STOP")
-
-
-def _is_runtime_artifact(path: str) -> bool:
+def _is_runtime_artifact(path: str, *, runtime_dir: str = ".forge",
+                         stop_file: str = "STOP") -> bool:
+    """Artefakty runtime orkiestratora — nigdy nie podlegają kontroli podziału
+    ról ani rollbackowi plikowemu (w prod są w .gitignore, filtrujemy też jawnie)."""
     p = path.replace("\\", "/")
-    return p in _RUNTIME_ARTIFACTS or p.startswith(".forge/")
+    return (p in {"STATE.json", "STATE.json.tmp", stop_file}
+            or p.startswith(runtime_dir.rstrip("/") + "/"))
 
 
-def changed_files(project: str, ref: str = "HEAD") -> list[str]:
+def changed_files(project: str, ref: str = "HEAD", *,
+                  runtime_dir: str = ".forge", stop_file: str = "STOP") -> list[str]:
     """Pliki zmienione względem ref (śledzone) plus nowe nieśledzone.
 
-    Artefakty runtime (STATE.json, STOP, .forge/) są pomijane — nie są częścią
-    pracy agenta, więc nie mogą naruszać podziału ról ani być wycofane."""
+    Artefakty runtime (STATE.json, plik stopu, katalog runtime) są pomijane —
+    nie są częścią pracy agenta, więc nie mogą naruszać podziału ról ani być
+    wycofane. Nazwy pochodzą z konfiguracji, nie z literałów."""
     tracked = git(project, "diff", "--name-only", ref, check=False).stdout.splitlines()
     untracked = git(project, "ls-files", "--others", "--exclude-standard",
                     check=False).stdout.splitlines()
     return sorted({ln.strip() for ln in (tracked + untracked)
-                   if ln.strip() and not _is_runtime_artifact(ln.strip())})
+                   if ln.strip() and not _is_runtime_artifact(
+                       ln.strip(), runtime_dir=runtime_dir, stop_file=stop_file)})
 
 
 def revert_paths(project: str, paths: list[str]) -> None:
@@ -593,48 +605,23 @@ def revert_paths(project: str, paths: list[str]) -> None:
                 pass
 
 
-def _commit_cycle(project: str, msg: str) -> bool:
-    """Commit lokalny (BEZ push) — push całego zadania następuje dopiero po ukończeniu."""
-    git(project, "add", "-A")
-    if git(project, "diff", "--cached", "--quiet", check=False).returncode != 0:
-        git(project, "commit", "-q", "-m", msg)
-        log(f"Commit: {msg}")
-        return True
-    return False
-
-
 def run_gate(project: str, build_cmd: str, test_cmd: str, timeout: int) -> tuple[bool, str]:
-    """Bramka build+test zwracająca (zielona?, ogon wyjścia przy czerwieni)."""
+    """Bramka build+test zwracająca (zielona?, ogon wyjścia przy czerwieni).
+
+    Cicha wersja build_then_test (bez logowania) — dla pętli mikro-TDD, która
+    ogon czerwieni przekazuje agentowi zamiast na konsolę."""
     if build_cmd:
-        try:
-            argv = shlex.split(build_cmd)
-        except ValueError as exc:
-            return False, f"build: niepoprawna składnia ({exc})"
-        if argv:
-            try:
-                proc = subprocess.run(argv, cwd=project, shell=False, text=True,
-                                      capture_output=True, timeout=timeout)
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                return False, f"build: nie uruchomiono ({exc})"
-            if proc.returncode != 0:
-                return False, ((proc.stdout or "") + (proc.stderr or ""))[-1500:]
+        rc, out = _run_shellfree(project, build_cmd, timeout)
+        if rc is None:
+            return False, f"build: {out}"
+        if rc != 0:
+            return False, out[-1500:]
     if not test_cmd:
         return False, "brak test_cmd"
-    try:
-        argv = shlex.split(test_cmd)
-    except ValueError as exc:
-        return False, f"test: niepoprawna składnia ({exc})"
-    if not argv:
-        return False, "pusta komenda testowa"
-    try:
-        proc = subprocess.run(argv, cwd=project, shell=False, text=True,
-                              capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return False, "test: TIMEOUT"
-    except OSError as exc:
-        return False, f"test: nie uruchomiono ({exc})"
-    green = proc.returncode == 0
-    return green, "" if green else ((proc.stdout or "") + (proc.stderr or ""))[-1500:]
+    rc, out = _run_shellfree(project, test_cmd, timeout)
+    if rc is None:
+        return False, f"test: {out}"
+    return (rc == 0), ("" if rc == 0 else out[-1500:])
 
 
 # --- Dziennik zadania i odzyskiwanie sesji ----------------------------------
@@ -666,13 +653,7 @@ def journal_reset(project: str, cfg: Config, title: str) -> None:
 
 
 def journal_append(project: str, cfg: Config, text: str) -> None:
-    try:
-        path = _journal_path(project, cfg)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(f"- [{ts()}] {text}\n")
-    except OSError:
-        pass  # dziennik jest best-effort
+    _append_line(_journal_path(project, cfg), f"- [{ts()}] {text}\n")
 
 
 def journal_tail(project: str, cfg: Config, max_chars: int = 3000) -> str:
@@ -883,6 +864,9 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
     task_file = task.get("file", "")
     test_globs = task.get("test_globs") or []
 
+    def gate() -> tuple[bool, str]:
+        return run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+
     while True:
         if state.micro_cycle >= cfg.max_micro_cycles:
             log(f"Limit mikro-cykli ({cfg.max_micro_cycles}) — zadanie nieukończone.")
@@ -908,7 +892,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
                     state.micro_sub = "test"
                     save_checkpoint(project, state)
                     continue
-                green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+                green, _ = gate()
                 if not green:
                     log("DONE zgłoszony przy CZERWONEJ bramce — naprawa kodem.")
                     state.pending_no_test = True
@@ -933,14 +917,16 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
                 continue
 
             # action == "wrote_test"
-            changed = changed_files(project, "HEAD")
+            changed = changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
+                                    stop_file=cfg.stop_file)
             offending = tester_path_violations(changed, test_globs)
             if offending:
                 log(f"TESTER poza ścieżkami testów: {offending} — wycofuję.")
                 revert_paths(project, offending)
-                changed = changed_files(project, "HEAD")
+                changed = changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
+                                        stop_file=cfg.stop_file)
             tests_here = [p for p in changed if _is_test_path(p, test_globs)]
-            green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+            green, _ = gate()
             if red_gate_ok(green):
                 state.cycle_test_files = tests_here
                 snapshot_cycle_tests(project, cfg, tests_here)  # do przywracania po koderze
@@ -966,7 +952,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
                                     task_file, state.test_cmd, no_test, tail),
                                 logf(f"c{c:02d}-code{attempt}"))
             verdict = extract_json(out) or {}
-            green, tail = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+            green, tail = gate()
             if green:
                 break
             log(f"[cykl {c}] bramka CZERWONA (próba {attempt + 1}/{cfg.max_green_retries + 1})")
@@ -979,13 +965,14 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
 
         declared = [tc.get("file", "") for tc in (verdict.get("test_changes") or [])
                     if isinstance(tc, dict)]
-        changed = changed_files(project, "HEAD")
+        changed = changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
+                                stop_file=cfg.stop_file)
         violations = coder_test_violations(changed, test_globs,
                                            state.cycle_test_files, declared)
         if violations:
             log(f"KODER zmienił testy niezadeklarowanie: {violations} — wycofuję, ponawiam bramkę.")
             revert_paths(project, violations)
-            green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+            green, _ = gate()
             if not green:
                 log("Po wycofaniu niedozwolonych zmian testów bramka czerwona — porażka.")
                 return False
@@ -995,12 +982,12 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
             log(f"ANTY-OSŁABIANIE: zadeklarowane testy {declared} przechodzą na kodzie "
                 "sprzed cyklu — zmiana je rozwodniła. Przywracam wersje testów.")
             restore_test_changes(project, cfg, declared, state.cycle_test_files)
-            green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+            green, _ = gate()
             if not green:
                 log("Po przywróceniu testów bramka czerwona — porażka zadania.")
                 return False
 
-        _commit_cycle(project, f"tdd: {state.current_task_title} (cykl {c})")
+        commit_all(project, f"tdd: {state.current_task_title} (cykl {c})")
         state.micro_cycle = c
         state.micro_sub = "test"
         state.cycle_test_files = []
@@ -1008,12 +995,25 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
         save_checkpoint(project, state)
 
 
-def _run_review_loop(cfg: Config, project: str, state: State, logf) -> bool:
+_GATE_RED_NOTE = "Bramka testów czerwona — przywróć zieleń."
+
+
+def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
+                     gate_green: bool = False) -> bool:
     """Faza d): recenzja całości przez Codeksa-testera + poprawki kodera.
 
-    Zwraca True gdy approve, False gdy limit poprawek / trwała czerwień."""
+    ``gate_green=True`` gdy wołający ma świeży, zielony wynik bramki na
+    niezmienionym drzewie (prosto z DONE mikro-pętli) — wtedy nie odpalamy
+    jej ponownie. Zwraca True gdy approve, False gdy limit poprawek."""
     task = state.current_task
     task_file = task.get("file", "")
+    def gate() -> tuple[bool, str]:
+        return run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+
+    # None = wynik nieznany (trzeba odpalić bramkę); ustawiany, gdy drzewo się
+    # nie zmieniło od ostatniego pomiaru. Świadomie NIE trwały w STATE.json —
+    # po restarcie wynikowi sprzed restartu nie ufamy.
+    known_green: bool | None = True if (gate_green and state.phase == "review") else None
 
     while True:
         if state.phase == "fix_review":
@@ -1021,22 +1021,28 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf) -> bool:
             out = _session_call(cfg, project, state, "coder",
                                 prompts.fix_review_prompt(state.review_notes, state.test_cmd),
                                 logf(f"review-fix{state.fix_attempt + 1}"))
-            green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+            green, _ = gate()
             if green:
-                _commit_cycle(project, f"fix: {state.current_task_title} (recenzja {state.fix_attempt + 1})")
+                commit_all(project, f"fix: {state.current_task_title} (recenzja {state.fix_attempt + 1})")
             elif state.fix_attempt + 1 >= cfg.max_fix_attempts:
                 log("Poprawki recenzji nie zazieleniły bramki w limicie — porażka.")
                 return False
-            state.review_notes = []
             state.fix_attempt += 1
             state.phase = "review"
             save_checkpoint(project, state)
+            known_green = green  # drzewo bez zmian od pomiaru — nie mierz drugi raz
 
-        green, _ = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+        if known_green is None:
+            green, _ = gate()
+        else:
+            green, known_green = known_green, None
         if not green:
             if state.fix_attempt >= cfg.max_fix_attempts:
                 return False
-            state.review_notes = ["Bramka testów czerwona — przywróć zieleń."]
+            # Zachowaj merytoryczne uwagi recenzenta — czerwona bramka ich nie
+            # unieważnia; dopisz tylko wymóg przywrócenia zieleni.
+            if _GATE_RED_NOTE not in state.review_notes:
+                state.review_notes = list(state.review_notes) + [_GATE_RED_NOTE]
             state.phase = "fix_review"
             save_checkpoint(project, state)
             continue
@@ -1061,7 +1067,7 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf) -> bool:
 
 
 def _finish_task(cfg: Config, project: str, state: State, n: int) -> None:
-    _commit_cycle(project, f"feat: {state.current_task_title}")  # residuum (np. docs)
+    commit_all(project, f"feat: {state.current_task_title}")  # residuum (np. docs)
     if cfg.git_push:
         push(project, cfg)  # pojedynczy push całego, zielonego zadania
     _delete_tag(project, state.task_start_tag)
@@ -1117,13 +1123,15 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
     else:
         log(f"WZNAWIAM fazę '{state.phase}': {state.current_task_title}")
 
+    fresh_from_done = False
     if state.phase == "micro":
         if not _run_micro_loop(cfg, project, state, logf):
             _fail_task(cfg, project, state, n, f"mikro-TDD nieukończone (cykli={state.micro_cycle})")
             return True
+        fresh_from_done = True  # DONE potwierdzone zieloną bramką chwilę temu
 
     if state.phase in {"review", "fix_review"}:
-        if _run_review_loop(cfg, project, state, logf):
+        if _run_review_loop(cfg, project, state, logf, gate_green=fresh_from_done):
             _finish_task(cfg, project, state, n)
         else:
             _fail_task(cfg, project, state, n, "recenzja nie zaakceptowała / bramka czerwona")
@@ -1160,11 +1168,12 @@ def one_iteration(cfg: Config, project: str, state: State) -> bool:
         raise
 
 
-def _print_usage(project: str) -> None:
+def _print_usage(project: str, runtime_dir: str = ".forge") -> None:
     """Podsumowanie zużycia tokenów na koniec biegu (best-effort)."""
     try:
         from .report import usage_summary
-        print("\nZużycie tokenów w tym projekcie:\n" + usage_summary(project))
+        print("\nZużycie tokenów w tym projekcie:\n"
+              + usage_summary(project, runtime_dir))
     except Exception:  # raport nigdy nie psuje kodu wyjścia pętli
         pass
 
@@ -1293,7 +1302,7 @@ def main(argv: list[str] | None = None) -> int:
         log(f"LIMITY WYCZERPANE: {e}")
         log("Stan zapisany — uruchom ponownie później, by kontynuować.")
         state.save(state_path)
-        _print_usage(project)
+        _print_usage(project, cfg.runtime_dir)
         return 3
     except KeyboardInterrupt:
         log("Przerwano ręcznie. Stan zapisany.")
@@ -1306,7 +1315,7 @@ def main(argv: list[str] | None = None) -> int:
 
     state.save(state_path)
     log("Koniec pracy.")
-    _print_usage(project)
+    _print_usage(project, cfg.runtime_dir)
     return 0
 
 

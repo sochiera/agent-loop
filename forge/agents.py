@@ -298,16 +298,27 @@ def _prepare_last_msg_file(project_dir: str, cfg: Config) -> str:
     return last_msg
 
 
-def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
-              *, model: str | None = None, effort: str | None = None) -> str:
-    """Codex exec (non-interactive). Zwraca ostatnią wiadomość agenta."""
+def _codex_agent(cfg: Config, model: str | None, effort: str | None):
     a = cfg.codex()
     if model is not None:
         a.model = model
     if effort is not None:
         a.effort = effort
-    last_msg = _prepare_last_msg_file(project_dir, cfg)
-    argv = a.argv + ["exec", prompt]
+    return a
+
+
+def _codex_argv(a, cfg: Config, project_dir: str, last_msg: str, prompt: str,
+                *, json_stream: bool = False, resume_id: str | None = None) -> list[str]:
+    """JEDNO miejsce prawdy o kontrakcie CLI Codeksa (flagi, sandbox, prompt).
+
+    Rozjazd między wywołaniem legacy a sesyjnym oznaczałby różny posture
+    sandboxa dla różnych ról — dlatego różnice ograniczają się do --json
+    i podkomendy resume."""
+    argv = a.argv + ["exec"]
+    if resume_id:
+        argv += ["resume", resume_id]
+    if json_stream:
+        argv += ["--json"]
     if a.model:  # pusty → Codex użyje modelu z własnego config.toml
         argv += ["-m", a.model]
     argv += ["-c", f'model_reasoning_effort="{a.effort}"']
@@ -317,18 +328,27 @@ def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
         argv += ["--dangerously-bypass-approvals-and-sandbox"]
     else:
         argv += ["-s", cfg.codex_sandbox]
-    argv += [
-        "-C", project_dir,
-        "--skip-git-repo-check",
-        "-o", last_msg,
-        "--color", "never",
-    ]
-    _run_with_backoff(argv, project_dir, cfg, log_path)
+    argv += ["-C", project_dir, "--skip-git-repo-check", "-o", last_msg,
+             "--color", "never", prompt]  # prompt jako ostatni pozycyjny
+    return argv
+
+
+def _read_last_msg(last_msg: str) -> str:
     try:
         with open(last_msg, "r", encoding="utf-8") as f:
             return f.read()
     except OSError:
         return ""
+
+
+def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
+              *, model: str | None = None, effort: str | None = None) -> str:
+    """Codex exec (non-interactive). Zwraca ostatnią wiadomość agenta."""
+    a = _codex_agent(cfg, model, effort)
+    last_msg = _prepare_last_msg_file(project_dir, cfg)
+    argv = _codex_argv(a, cfg, project_dir, last_msg, prompt)
+    _run_with_backoff(argv, project_dir, cfg, log_path)
+    return _read_last_msg(last_msg)
 
 
 def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
@@ -339,27 +359,10 @@ def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
     Gdy ``session_id`` podany — wznawia sesję (``codex exec resume <id>``);
     inaczej startuje nową i przechwytuje jej id ze strumienia ``--json``.
     Zwraca (ostatnia wiadomość agenta, session_id). Loguje zużycie tokenów."""
-    a = cfg.codex()
-    if model is not None:
-        a.model = model
-    if effort is not None:
-        a.effort = effort
+    a = _codex_agent(cfg, model, effort)
     last_msg = _prepare_last_msg_file(project_dir, cfg)
-
-    argv = a.argv + ["exec"]
-    if session_id:
-        argv += ["resume", session_id]
-    argv += ["--json"]
-    if a.model:  # pusty → Codex użyje modelu z własnego config.toml
-        argv += ["-m", a.model]
-    argv += ["-c", f'model_reasoning_effort="{a.effort}"']
-    if cfg.codex_sandbox == "danger-full-access":
-        argv += ["--dangerously-bypass-approvals-and-sandbox"]
-    else:
-        argv += ["-s", cfg.codex_sandbox]
-    argv += ["-C", project_dir, "--skip-git-repo-check", "-o", last_msg,
-             "--color", "never", prompt]  # prompt jako ostatni pozycyjny
-
+    argv = _codex_argv(a, cfg, project_dir, last_msg, prompt,
+                       json_stream=True, resume_id=session_id)
     stream = _run_with_backoff(argv, project_dir, cfg, log_path)
     sid = session_id or extract_session_id(stream)
     usage = extract_codex_usage(stream)
@@ -367,11 +370,7 @@ def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
         log_usage(project_dir, cfg, {"agent": "codex", "phase": _phase_from_log(log_path),
                                      "model": a.model, "effort": a.effort,
                                      "resumed": bool(session_id), "usage": usage})
-    try:
-        with open(last_msg, "r", encoding="utf-8") as f:
-            return f.read(), sid
-    except OSError:
-        return "", sid
+    return _read_last_msg(last_msg), sid
 
 
 def run_planner(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:

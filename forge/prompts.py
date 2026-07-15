@@ -241,7 +241,7 @@ C) Jeśli WSZYSTKIE kryteria są już spełnione i cały pakiet zielony — zako
 
 Na końcu zwróć WYŁĄCZNIE jeden z bloków:
 ```json
-{{"action": "wrote_test", "test_files": ["<ścieżka>"], "about": "<co sprawdza>"}}
+{{"action": "wrote_test", "about": "<co sprawdza nowy test>"}}
 ```
 ```json
 {{"action": "no_test", "reason": "<dlaczego brak sensownego testu na ten krok>"}}
@@ -277,10 +277,10 @@ ZASADY twarde:
   to poniżej z uzasadnieniem (rozstrzygnie recenzja). Nie osłabiaj testu, by przeszedł.
 - NIE commituj.
 
-Na końcu zwróć WYŁĄCZNIE:
+Na końcu zwróć WYŁĄCZNIE (o zieleni i tak rozstrzyga bramka orkiestratora,
+nie Twoja deklaracja — ale zmiany w testach MUSISZ zadeklarować):
 ```json
-{{"made_green": <true|false>, "refactored": <true|false>,
-  "test_changes": [{{"file": "<ścieżka>", "reason": "<czemu zmieniony>"}}],
+{{"test_changes": [{{"file": "<ścieżka>", "reason": "<czemu zmieniony>"}}],
   "notes": "<co zrobione / co blokuje>"}}
 ```"""
 
@@ -325,5 +325,5 @@ Poprawki testów tylko jeśli recenzent tego wymaga (i zadeklaruj je). NIE commi
 
 Na końcu zwróć WYŁĄCZNIE:
 ```json
-{{"fixed": true, "test_changes": [{{"file": "<ścieżka>", "reason": "<czemu>"}}], "notes": "<co zmienione>"}}
+{{"test_changes": [{{"file": "<ścieżka>", "reason": "<czemu>"}}], "notes": "<co zmienione>"}}
 ```"""

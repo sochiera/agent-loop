@@ -335,6 +335,46 @@ class EmptyPlanQueueTest(unittest.TestCase):
         self.assertFalse(_task_iteration(Config(), "/tmp/p", self._state()))
 
 
+class ReviewLoopGateEconomyTest(unittest.TestCase):
+    def _state(self) -> State:
+        return State(phase="review", current_task={"file": "f"},
+                     current_task_title="T", test_cmd="pytest")
+
+    @patch("forge.orchestrate.run_gate")
+    @patch("forge.orchestrate._session_call",
+           return_value='```json\n{"verdict":"approve","notes":[]}\n```')
+    def test_fresh_green_from_done_skips_initial_gate(self, _call: Mock, gate: Mock) -> None:
+        from forge.orchestrate import _run_review_loop
+        with tempfile.TemporaryDirectory() as project:
+            ok = _run_review_loop(Config(), project, self._state(),
+                                  lambda ph: "/tmp/log", gate_green=True)
+        self.assertTrue(ok)
+        gate.assert_not_called()  # DONE chwilę temu potwierdził zieleń
+
+    @patch("forge.orchestrate.commit_all")
+    @patch("forge.orchestrate.run_gate", side_effect=[(False, ""), (True, "")])
+    @patch("forge.orchestrate._session_call",
+           side_effect=['```json\n{}\n```',
+                        '```json\n{"verdict":"approve","notes":[]}\n```'])
+    def test_red_gate_keeps_reviewer_notes_and_reuses_fix_gate_result(
+        self, call: Mock, gate: Mock, _commit: Mock
+    ) -> None:
+        from forge.orchestrate import _run_review_loop
+        state = self._state()
+        state.review_notes = ["Uwaga recenzenta X"]
+        with tempfile.TemporaryDirectory() as project:
+            ok = _run_review_loop(Config(), project, state,
+                                  lambda ph: "/tmp/log", gate_green=False)
+        self.assertTrue(ok)
+        # Prompt rundy poprawek zawiera i uwagę recenzenta, i wymóg zieleni.
+        fix_prompt = call.call_args_list[0].args[4]
+        self.assertIn("Uwaga recenzenta X", fix_prompt)
+        self.assertIn("Bramka testów czerwona", fix_prompt)
+        # Bramka: raz na wejściu (czerwona) + raz po poprawce (zielona) — wynik
+        # po poprawce jest reużyty, bez trzeciego przebiegu przed recenzją.
+        self.assertEqual(gate.call_count, 2)
+
+
 class CalledProcessErrorPathTest(unittest.TestCase):
     @patch("forge.orchestrate.rollback")
     @patch("forge.orchestrate._fail_task")
