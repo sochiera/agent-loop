@@ -55,16 +55,13 @@ Działają tu dwie przeciwstawne siły:
 Obecna konfiguracja płaci **~2 drogie wywołania podatku od każdego zadania, niezależnie
 jak małe ono jest**. Przy zadaniach typu „dodaj jedno pole do struktury" podatek planisty
 może kosztować więcej niż sama implementacja. Zadania są więc najprawdopodobniej
-**za drobne względem kosztu stałego** — ale nie względem ryzyka fix-loopów. Rozwiązaniem
-nie jest powiększanie zadań (to podnosi ryzyko rollbacku), tylko **obniżenie kosztu
-stałego na zadanie**:
+**za drobne względem kosztu stałego** — ale nie względem ryzyka fix-loopów.
 
-1. **Planowanie wsadowe.** Jedno wywołanie planisty produkuje kolejkę **3–5 zadań**
-   (każde jako osobny plik `.forge/task-NNN.md`). Pętla konsumuje kolejkę bez udziału
-   planisty; planista wraca dopiero, gdy kolejka pusta albo zadanie padło. To tnie liczbę
-   wywołań opus/high w fazie PLAN ~4-krotnie przy tym samym rozmiarze zadań.
-2. **Review nie musi być opus/high.** Review to porównanie diffu z kryteriami akceptacji —
-   praca dla `sonnet/medium`. Osobne pokrętła `review_model`/`review_effort` w `Config`.
+Model docelowy z sekcji 3 rozwiązuje ten dylemat **z obu stron naraz**:
+planowanie wsadowe (1 drogie wywołanie na ~5 zadań) tnie koszt stały zadania, a ciągły
+kontekst sesji w obrębie zadania tnie koszt stały *pojedynczego kroku* — dzięki czemu
+kroki mogą być bardzo małe (jeden test na cykl) bez płacenia za każde wywołanie pełnego
+zimnego startu.
 
 ### 2.3. Konkretne przecieki (uszeregowane wg szacowanego zysku)
 
@@ -101,200 +98,178 @@ stałego na zadanie**:
 | Archiwizacja BACKLOG + dyscyplina DESIGN | hamuje liniowy wzrost inputu | mały |
 | Bogatszy zapis w `failures.md` | mniej ponownego odkrywania po rollbacku | mały |
 
+Uwaga: pozycje 1–2 z tej tabeli dotyczą starej pętli; jeśli idziemy prosto w model
+docelowy (sekcja 3), review-przy-czerwonym znika razem z całą fazą REVIEW Claude'a.
+Pomiar (usage.jsonl), archiwizacja BACKLOG-u i bogatszy `failures.md` obowiązują
+w obu modelach.
+
 ---
 
-## 3. Nowy model: planista + 2 instancje Codeksa (tester ↔ koder)
+## 3. Model docelowy: mikro-TDD ping-pong z ciągłym kontekstem per zadanie
 
-### 3.1. Cel
+Podział pracy: **Claude planuje wsadowo** (5 zadań w przód), a każde zadanie realizuje
+**para instancji Codeksa** w pętli mikro-TDD — Codex-1 (tester) dyktuje po jednym
+failującym teście, Codex-2 (koder) doprowadza do zieleni i refaktoryzuje. Obie instancje
+trzymają **ciągły kontekst w obrębie zadania** i startują od zera przy następnym.
 
-Rozdzielenie autorstwa testów i kodu ma dwie zalety:
-
-- **testy przestają być pisane „pod implementację"** — tester zna tylko specyfikację
-  zadania (kryteria akceptacji), więc testuje kontrakt, nie własne bugi;
-- **testy przejmują rolę recenzenta** — skoro kod musi przejść testy napisane przez
-  niezależnego agenta, osobna faza REVIEW robi się w dużej mierze zbędna, co wprost
-  adresuje problem tokenowy z sekcji 2.
-
-Ważna obserwacja upraszczająca: ponieważ każde wywołanie agenta jest bezstanowe,
-„dwie instancje Codeksa" **nie wymagają żadnej infrastruktury** — to po prostu dwie
-role z różnymi promptami (i opcjonalnie różnym modelem/effort). Cała trudność leży
-w orkiestracji i egzekwowaniu podziału ról, nie w uruchamianiu.
-
-### 3.2. Warianty architektury
-
-**Wariant A — sekwencyjny ping-pong (rekomendowany na start):**
+### 3.1. Przebieg pętli
 
 ```
-PLAN (Claude)                        — kontrakt zadania + kolejka wsadowa
-  └→ TESTY (Codex-tester)            — pisze WYŁĄCZNIE testy do zadania
-       └→ BRAMKA CZERWONA            — orkiestrator: nowe testy MUSZĄ failować
-            └→ KOD (Codex-koder)     — pisze WYŁĄCZNIE kod, testów nie dotyka
-                 └→ BRAMKA ZIELONA   — pełny pakiet musi przejść
-                      └→ REFAKTOR (Codex-koder) — sprzątanie pod zielonymi testami
-                           └→ BRAMKA ZIELONA (ponownie)
-                                └→ commit  ↺   (albo arbitraż, opisany niżej)
+a) PLAN (Claude, opus/high, 1 wywołanie)
+   → 5 zadań w przód, każde jako .forge/task-NNN.md (kryteria akceptacji!)
+
+   dla każdego zadania po kolei (świeże sesje Codex-1 i Codex-2):
+   ┌→ b) Codex-1 (tester): czego jeszcze brakuje względem kryteriów?
+   │     → pisze JEDEN test, który ma failować
+   │     → albo deklaruje "brak sensownego testu" (dozwolone, jawne) → c) bez testu
+   │        [bramka czerwona orkiestratora: nowy test failuje, reszta zielona]
+   │  c) Codex-2 (koder): kod → pełny pakiet zielony → refaktor pod zielonymi
+   │        [bramka zielona orkiestratora; commit mikro-cyklu]
+   └─ powtarzaj, aż Codex-1 orzeknie DONE:
+      wszystkie testy zielone ORAZ żadnej funkcjonalności zadania nie brakuje
+
+d) Codex-1: review całości zadania (zwłaszcza kodu Codeksa-2)
+   → Codex-2: naprawia wszystkie uwagi → bramka zielona → commit końcowy
+e) następne zadanie z kolejki; kolejka pusta → wróć do a)
 ```
 
-Zalety: brak konfliktów (jedna kopia repo), prosta maszyna stanów, każda faza ma
-twardą, *mechaniczną* bramkę (nie opinię modelu). Wady: brak równoległości — ale
-równoległość w obrębie jednego zadania jest w TDD iluzoryczna, bo czerwone testy
-muszą istnieć zanim koder zacznie.
+Co ten układ daje względem dzisiejszej pętli:
 
-**Wariant B — pipelining między zadaniami (rozszerzenie A):**
+- **Claude znika z pętli wykonawczej.** Drogi model odpala się raz na ~5 zadań,
+  zamiast 2–5 razy na *każde* zadanie. To największa pojedyncza oszczędność.
+- **Prawdziwy rytm TDD** (red → green → refactor po jednym teście), zamiast
+  „napisz wszystkie testy, potem cały kod" — mniejsze kroki, mniejsze ryzyko
+  rozjazdu, refaktor wbudowany w każdy cykl, a nie doklejony.
+- **Naturalny podział ról**: tester nie widzi implementacji zanim napisze test,
+  koder dostaje test jako specyfikację wykonywalną.
+- **Review robi Codex-1, nie Claude** — jest inny niż autor kodu (cross-check
+  zostaje), a kontekst zadania ma już załadowany, więc review jest tanie.
 
-Prawdziwy zysk z dwóch instancji to praca na **różnych zadaniach jednocześnie**:
-tester pisze testy do zadania N+1 (w osobnym `git worktree`), podczas gdy koder
-implementuje zadanie N. Wymaga: kolejki zadań (i tak wynika z planowania wsadowego),
-`git worktree` per rola, merge testów do głównej kopii po zakończeniu N. Złożoność
-zauważalna (konflikty przy merge, wznawialność dwóch równoległych faz w STATE.json),
-zysk: ~40–50% czasu zegarowego, **zero oszczędności tokenów**. Robić dopiero, gdy A
-działa stabilnie i to czas, nie tokeny, będzie wąskim gardłem.
+### 3.2. Ciągły kontekst per zadanie — mechanika
 
-**Wariant C — równolegle na tym samym zadaniu (odradzam):** tester i koder startują
-jednocześnie, koder pisze do interfejsów „w ciemno". W praktyce koder zgaduje API,
-które tester właśnie ustala testami → niezgodności → dodatkowe rundy uzgadniania,
-czyli *więcej* tokenów. Sprzeczne z celem.
+Obecny `run_codex` jest one-shotem. Potrzebne są **sesje wznawialne**:
 
-### 3.3. Nowa maszyna stanów (wariant A)
+- Pierwsze wywołanie roli w zadaniu: `codex exec ...` z przechwyceniem **session id**
+  (z `codex exec --json` — zdarzenie startu sesji; nie polegać na `resume --last`,
+  bo w pętli żyją DWIE przeplatające się sesje). Kolejne kroki tej roli:
+  `codex exec resume <session_id> <prompt>`.
+- Session id obu ról trzymane w `STATE.json` → po restarcie orkiestratora sesje da
+  się wznowić (żyją na dysku w `~/.codex/sessions`). Jeśli wznowienie się nie uda,
+  zadanie restartuje od tagu początkowego — commit po każdym mikro-cyklu (3.5)
+  ogranicza stratę do bieżącego cyklu.
+- Claude: bez sesji — robi tylko a), każde planowanie jest świeże (i tak musi
+  przeczytać aktualny stan repo).
+- Fallback, gdyby `codex exec resume` zawodził: wspólny dziennik zadania
+  `.forge/task_journal.md` (orkiestrator dopisuje po każdej fazie jedno-dwa zdania +
+  ogon testów), doklejany do promptów zamiast sesji. Gorsze, ale działa wszędzie.
 
-Fazy w `State.phase`: `idle → plan → write_tests → implement → refactor → (arbitrate) → idle`.
+Skutki tokenowe ciągłego kontekstu:
 
-- **plan** (Claude, opus/high, wsadowo): produkuje `.forge/task-NNN.md` × 3–5. Format
-  zadania rozszerzony o sekcję **„Kontrakt API"** (sygnatury/nazwy modułów, które tester
-  i koder muszą współdzielić — to jedyny punkt uzgodnienia między nimi) oraz jawne
-  **„Ścieżki testów" / „Ścieżki kodu"** (do mechanicznej kontroli diffu).
-- **write_tests** (Codex-tester): czyta zadanie + kontrakt API; pisze wyłącznie pliki
-  z „Ścieżek testów". Po fazie orkiestrator:
-  1. sprawdza diff — zmiany poza ścieżkami testów → odrzucenie fazy (checkout tych plików) i jedno ponowienie;
-  2. **bramka czerwona**: pełny pakiet musi failować, a stare testy przechodzić
-     (uruchomienie pakietu dwa razy: nowe testy failują *z właściwego powodu*, tzn.
-     brak implementacji, nie błąd składni — rozróżnialne po kodzie/komunikacie).
-     Jeśli nowe testy od razu przechodzą → zadanie puste albo testy wydmuszki → arbitraż.
-- **implement** (Codex-koder): czyta zadanie + kontrakt + **treść testów** (to jest jego
-  specyfikacja wykonywalna); pisze głównie poza ścieżkami testów — zmiany w testach są
-  dozwolone, ale tylko **zadeklarowane** i pod bramką anty-osłabiania (polityka w 3.5).
-  Potem **bramka zielona** na pełnym pakiecie. Czerwona → do 2 rund poprawek kodera
-  z ogonem testów (bez udziału drogiego modelu).
-- **arbitrate** (Claude, może być sonnet/medium): wchodzi **tylko** gdy koder po
-  limicie rund twierdzi, że testy są błędne, albo bramka czerwona wykryła anomalię.
-  Werdykt JSON: `{"blame": "tests"|"code"|"task", ...}` → poprawa testów przez
-  testera / podział zadania przez planistę / rollback. To jedyne miejsce, gdzie
-  dawny „review" przetrwał — i odpala się wyjątkowo, nie co iterację.
+- **(+)** koniec z zimnym startem co fazę: pliki przeczytane raz zostają w kontekście,
+  kolejne kroki płacą tylko za przyrost (a cache promptu tnie koszt powtarzanego
+  prefiksu);
+- **(+)** dzięki temu kroki mogą być mikroskopijne (jeden test) bez podatku od wywołania —
+  to rozwiązuje dylemat z 2.2 od drugiej strony: zamiast powiększać zadania, taniejemy
+  na kroku;
+- **(−)** kontekst sesji rośnie z każdym cyklem — limit mikro-cykli (3.3) ogranicza
+  jednocześnie budżet i rozmiar sesji; reset po zadaniu (wymóg modelu) zapobiega
+  nieograniczonemu wzrostowi;
+- **(−)** dwie żywe sesje na tym samym repo: w tej pętli b) i c) są ściśle sekwencyjne,
+  więc nie ma konfliktów — ale NIE wolno ich zrównoleglać bez osobnych worktree.
 
-Committ i rollback bez zmian koncepcyjnych: commit po zielonej bramce (można commitować
-testy i kod osobno — czytelniejsza historia: `test:` + `feat:`), rollback przy porażce.
+### 3.3. Bramki orkiestratora (mechaniczne, zero tokenów)
 
-### 3.4. Faza REFAKTOR — brakujący trzeci krok TDD
+Podziału ról **nie pilnuje prompt, tylko orkiestrator**:
 
-Ani obecna pętla, ani goły ping-pong tester↔koder nie mają odpowiednika kroku
-*refactor* z cyklu red→green→refactor. To realny dług: prompt każe koderowi pisać
-„minimalny kod spełniający kryteria", więc bez fazy sprzątania pętla **systemowo
-akumuluje duplikację i doraźne rozwiązania**. Dziś częściowo łatał to recenzent
-(mógł zażądać uproszczeń w notes) — w nowym modelu review znika, więc refaktor musi
-dostać własne, jawne miejsce.
+- **Bramka czerwona po b):** nowy test musi failować (z powodu braku implementacji,
+  nie błędu składni), a dotychczasowy pakiet pozostać zielony. Kontrola diffu:
+  tester zmienia wyłącznie ścieżki testów z zadania.
+- **„Brak sensownego testu"** to legalne wyjście z b), ale musi być jawne w werdykcie
+  JSON z uzasadnieniem (`{"no_test": true, "reason": ...}`). Orkiestrator je liczy:
+  taki cykl jest chroniony tylko regresyjnie (stary pakiet zielony), a nadużywanie
+  (np. >⅓ cykli zadania) to smell — wcześniejsze wymuszenie review d).
+- **Bramka zielona po c):** pełny pakiet. Czerwony → ogon testów wraca do sesji
+  Codeksa-2 (tanio — kontekst już jest), do 2 dogrywek w cyklu.
+- **Polityka zmian w testach przez kodera** — nie „zakaz", tylko **anty-osłabianie
+  specyfikacji**: (1) zmiany niezadeklarowane → checkout + ponowienie; (2) adaptacyjne
+  (renamy/importy po refaktorze) zawsze wolno, pod bramką mechaniczną: zmodyfikowany
+  test na snapshocie kodu sprzed cyklu musi nadal failować; (3) merytoryczne — z
+  deklaracją w JSON; rozstrzyga review d) (w razie sporu w trakcie cyklu: tani
+  diff-audyt samych testów).
+- **Werdykt DONE Codeksa-1** nie może być gołym „skończone": JSON musi mapować
+  **każde kryterium akceptacji z task-NNN.md na test albo uzasadnienie**. Orkiestrator
+  sprawdza kompletność mapy mechanicznie (lista kryteriów pochodzi z pliku zadania).
+- **Limit mikro-cykli** (np. 10–12) → porażka zadania → wpis do `failures.md`
+  z ogonem testów i ostatnimi werdyktami → reset do tagu → planista przy następnym
+  a) dzieli zadanie. Limit chroni budżet i rozmiar sesji jednocześnie.
 
-Argument tokenowy jest nieoczywisty, ale gra **na korzyść** refaktoru: każdy agent
-jest bezstanowy i czyta kod od zera, więc rosnący, zduplikowany kod podraża *każde
-przyszłe wywołanie* (ten sam mechanizm co wzrost BACKLOG-u w 2.3 pkt 2). Jedno
-wywołanie sprzątające amortyzuje się w kolejnych iteracjach.
+### 3.4. Review d) — uwaga o kotwicy
 
-Proponuję refaktor na dwóch poziomach:
+Review w **ciągłej sesji** Codeksa-1 jest tanie (kontekst załadowany), ale recenzent
+widział, jak kod powstawał, i recenzuje m.in. własne testy — będzie zakotwiczony.
+Silniejszy wariant: review w **świeżej sesji** Codeksa-1, która dostaje tylko
+`git diff <tag-zadania>..HEAD` + plik zadania. Droższe o jeden zimny start na zadanie,
+niezależność wyraźnie większa. Decyzja otwarta (sekcja 4); proponuję zacząć od wersji
+ciągłej (prostsza, zgodna z założeniem) i porównać jakość po kilkunastu zadaniach —
+usage.jsonl da liczby, historia commitów da jakość.
 
-- **Mikro-refaktor po każdej zielonej bramce** (Codex-koder, osobne wywołanie, nie
-  doklejone do implementacji — doklejone „przy okazji zrefaktoruj" model notorycznie
-  pomija, gdy walczy o zielone testy). Zakres: tylko pliki dotknięte w zadaniu +
-  ich bezpośrednie sąsiedztwo. Bramki mechaniczne: testy nadal zielone, zmiany w
-  testach tylko adaptacyjne i zadeklarowane (polityka w 3.5), zero nowego publicznego
-  API. Jeśli refaktor psuje testy → `git checkout` zmian refaktoru
-  i commit wersji sprzed niego — refaktor jest *opcjonalnym bonusem*, nigdy nie
-  blokuje ukończenia zadania.
-- **Makro-refaktor co N iteracji** (domyślnie N=5–8) jako zwykłe zadanie z kolejki:
-  planista przy planowaniu wsadowym ma obowiązek ocenić stan kodu i w razie potrzeby
-  wstawić zadanie refaktoryzacyjne (duplikacja międzymodułowa, rozjazd z
-  ARCHITECTURE.md — rzeczy niewidoczne z perspektywy jednego zadania). Takie zadanie
-  przechodzi normalny cykl, z jedną różnicą: **bramka czerwona jest pominięta**
-  (refaktor z definicji nie zmienia zachowania, więc nie ma nowych testów), a rolę
-  specyfikacji pełni istniejący pakiet — musi być zielony przed i po.
+Po review Codex-2 naprawia wszystkie uwagi w swojej sesji; bramka zielona zamyka
+zadanie. Spory „test vs kod" rozstrzyga review — osobny arbitraż Claude'a nie jest
+potrzebny (Claude wraca do gry dopiero przy planowaniu, gdzie widzi `failures.md`).
 
-Głębszy refaktor **testów** (wspólne fixtures, helpery, przebudowa struktury) należy
-do testera, naturalnie w ramach zadania makro-refaktoru, z bramką „pakiet nadal
-zielony".
+### 3.5. Commity, rollback, refaktor duży
 
-### 3.5. Egzekwowanie podziału ról i polityka zmian w testach
-
-Kluczowe: podziału **nie pilnuje prompt, tylko orkiestrator** (prompty się „nie słuchają"
-wystarczająco niezawodnie). Ale niezmiennik, którego naprawdę bronimy, to **nie**
-„koder nie dotyka testów" — to zbyt sztywne (każda zmiana sygnatury przy refaktorze
-łamie importy w testach, a ewidentnie błędny test wymagałby wtedy pełnego arbitrażu).
-Prawdziwy niezmiennik brzmi: **specyfikacja nie może zostać osłabiona pod presją
-czerwonej bramki**. Niebezpieczna nie jest edycja testu, tylko jego *rozwadnianie*,
-żeby zły kod przeszedł.
-
-Stąd polityka trójstopniowa dla kodera:
-
-1. **Zmiany niezadeklarowane — nigdy.** `git diff --name-only` po każdej fazie;
-   niezadeklarowana zmiana w ścieżkach testów → `git checkout -- <pliki>` + jedno
-   ponowienie fazy z ostrą adnotacją; drugie naruszenie → porażka fazy.
-2. **Zmiany adaptacyjne — zawsze wolno, pod bramką mechaniczną.** Renamy, importy,
-   sygnatury wynikające z refaktoru. Weryfikacja bez udziału modelu — **bramka
-   anty-osłabiania**: zmodyfikowane testy uruchamiane na snapszocie kodu *sprzed
-   implementacji* (osobny `git worktree` na commicie bazowym) muszą **nadal failować**.
-   Jeśli po edycji przechodzą na starym kodzie, to znaczy, że przestały cokolwiek
-   specyfikować → odrzucenie.
-3. **Zmiany merytoryczne — wolno z deklaracją i tanim audytem.** Koder uważa test za
-   błędny → poprawia go i deklaruje w werdykcie JSON
-   (`"test_changes": [{"file": ..., "reason": ...}]`). Orkiestrator wysyła **sam diff
-   testów + uzasadnienie** (nie cały kontekst) do taniego arbitra (sonnet/medium).
-   Zaakceptowane → faza biegnie dalej; odrzucone → checkout zmian w testach i
-   ponowienie. To jest lekka ścieżka zamiast ciężkiego arbitrażu z 3.3 — tamten
-   zostaje na spory, których diff-audyt nie rozstrzygnął.
-
-Do tego bramka czerwona (testy muszą failować przed implementacją) — mechaniczny
-odpowiednik „czy jest TDD?" z obecnego review, nie kosztuje ani tokena.
-
-Ryzyko modelu: **słabe testy** (tester pisze wydmuszki, koder trywialnie je przechodzi).
-Mitygacje: bramka czerwona odsiewa testy-tautologie; kryteria akceptacji w zadaniu
-muszą być mierzalne (odpowiedzialność planisty); opcjonalny **audyt co N iteracji**
-(planista przegląda ostatnie N commitów jednym wywołaniem — dużo taniej niż review
-co iterację).
+- **Tag na starcie zadania** (`forge/task-NNN-start`). **Commit po każdym zielonym
+  mikro-cyklu** (test + kod + refaktor razem — każdy commit zielony) — to zachowuje
+  dzisiejszą odporność na limity: przerwanie w środku zadania traci najwyżej bieżący
+  cykl. Porażka zadania → `git reset --hard <tag>`.
+- Po d) commit końcowy; ewentualny squash cykli do jednego commita na zadanie —
+  decyzja kosmetyczna (sekcja 4).
+- **Makro-refaktor** (duplikacja międzymodułowa, niewidoczna z poziomu jednego
+  zadania): obowiązek Claude'a w a) — przy każdym batchu ocenia stan kodu i w razie
+  potrzeby wstawia zadanie refaktoryzacyjne do kolejki. Takie zadanie przechodzi
+  normalną pętlę b/c z tą różnicą, że b) zwykle deklaruje „brak nowego testu"
+  (zachowanie bez zmian), a specyfikacją jest istniejący pakiet.
 
 ### 3.6. Zmiany w plikach (mapa implementacji)
 
 | Plik | Zmiana |
 |---|---|
-| `forge/prompts.py` | nowy `plan_batch_prompt` (kolejka + kontrakt API + ścieżki), `write_tests_prompt`, `implement_against_tests_prompt`, `refactor_prompt`, `arbitrate_prompt`; usunięcie `review_prompt`/`fix_prompt` (lub zostawienie za flagą legacy) |
-| `forge/config.py` | pokrętła: `tester_model/effort`, `coder_model/effort`, `arbiter_model/effort`, `batch_size`, `legacy_mode` |
-| `forge/orchestrate.py` | nowe fazy + bramka czerwona + kontrola diffu per rola; review-tylko-przy-zielonym (jeśli legacy zostaje); logowanie usage |
-| `forge/state.py` | kolejka zadań (`task_queue: list[str]`), nowe wartości `phase`, licznik naruszeń ról |
-| `forge/agents.py` | wyciągnięcie `usage` z JSON-a Claude'a i (na ile się da) z wyjścia Codeksa → `.forge/usage.jsonl` |
-| `tests/` | testy bramki czerwonej, kontroli diffu, konsumpcji kolejki, wznawialności nowych faz |
+| `forge/agents.py` | sesje Codeksa: start + przechwycenie session id (`--json`) + `codex exec resume`; logowanie usage do `.forge/usage.jsonl` |
+| `forge/state.py` | kolejka zadań (`task_queue`), session id obu ról, licznik mikro-cykli i „no_test", nowe fazy, tag zadania |
+| `forge/prompts.py` | `plan_batch_prompt` (5 zadań + kryteria + ścieżki), `next_test_prompt`, `make_green_and_refactor_prompt`, `task_done_verdict` (mapa kryteriów), `review_task_prompt`, `fix_review_prompt`; stare prompty za flagą legacy |
+| `forge/orchestrate.py` | maszyna stanów a–e, bramka czerwona/zielona/anty-osłabiania, kontrola diffu per rola, tag+rollback per zadanie, limity cykli |
+| `forge/config.py` | `batch_size`, `max_micro_cycles`, `max_green_retries`, modele/effort per rola (tester/koder), `legacy_mode` |
+| `tests/` | bramka czerwona, mapa kryteriów DONE, konsumpcja kolejki, wznawianie sesji po restarcie, kontrola diffu, anty-osłabianie |
 
 ### 3.7. Kolejność wdrożenia
 
-1. **Etap 0 — pomiar** (niezależny od reszty): `.forge/usage.jsonl` + proste podsumowanie
-   na koniec biegu. Daje bazę do porównań przed/po.
-2. **Etap 1 — szybkie wygrane w obecnym modelu**: review tylko przy zielonej bramce,
-   tańszy model review, bogatszy `failures.md`. Małe diffy, od razu zwracają tokeny.
-3. **Etap 2 — planowanie wsadowe + kolejka zadań w STATE.json.** Potrzebne i staremu,
-   i nowemu modelowi — naturalny wspólny fundament.
-4. **Etap 3 — rozdział tester/koder (wariant A)** z bramką czerwoną, kontrolą diffu
-   i mikro-refaktorem po zielonej bramce; stary tryb za flagą `legacy_mode` na czas
-   porównania. Makro-refaktor co N iteracji dochodzi jako obowiązek planisty w
-   promptcie wsadowym (etap 2/3, bez osobnego mechanizmu).
-5. **Etap 4 (opcjonalny) — pipelining (wariant B)** przez `git worktree`, tylko jeśli
-   po etapie 3 wąskim gardłem okaże się czas zegarowy, nie tokeny.
+1. **Etap 0 — pomiar**: `.forge/usage.jsonl` + podsumowanie na koniec biegu.
+   Niezależny od reszty; daje bazę do porównania starej i nowej pętli.
+2. **Etap 1 — fundament**: sesje wznawialne w `agents.py` + kolejka zadań w
+   `STATE.json` + planowanie wsadowe. Działa jeszcze ze starą pętlą (mniej wywołań
+   PLAN od razu).
+3. **Etap 2 — pętla mikro-TDD**: fazy b/c z bramkami czerwoną/zieloną, limitem cykli
+   i werdyktem DONE; review chwilowo wyłączone. Stary tryb za `legacy_mode`.
+4. **Etap 3 — domknięcie**: review d) + naprawa uwag + pełny obieg e→a.
+5. **Etap 4 — szlif**: bramka anty-osłabiania, liczniki „no_test", makro-refaktor
+   w promptcie planisty, archiwizacja BACKLOG-u.
 
 ---
 
-## 4. Otwarte pytania (do decyzji przed etapem 3)
+## 4. Ryzyka i otwarte pytania
 
-1. **Modele dwóch Codeksów**: ten sam model dla testera i kodera, czy tester na niższym
-   effort (testy do małego zadania to zwykle prostsza praca niż implementacja)?
-2. **Kontrakt API w zadaniu**: jak szczegółowy? Za luźny → tester i koder rozjadą się na
-   nazwach; za sztywny → planista de facto projektuje implementację (drogo). Propozycja
-   startowa: tylko publiczne sygnatury modułu, którego dotyczy zadanie.
-3. **Commit testów osobno od kodu** (`test:` + `feat:`) czy razem? Osobno daje
-   czytelniejszą historię i naturalny punkt wznowienia, ale czerwone testy w historii
-   commitów łamią zasadę „każdy commit zielony" — proponuję razem, a testy trzymać
-   w indeksie/stash do czasu zielonej bramki.
-4. Czy audyt co N iteracji (3.4) ma być od początku, czy dopiero gdy jakość spadnie?
+1. **Sędzia we własnej sprawie.** Codex-1 pisze testy, orzeka DONE **i** robi review —
+   ryzyko przedwczesnego DONE i pobłażliwego review. Mitygacje już wbudowane: DONE
+   wymaga mechanicznie sprawdzanej mapy kryterium→test, a bramki są poza modelem.
+   Do decyzji: czy dodać rzadki audyt Claude'a (np. co 3–4 batche, jedno wywołanie na
+   ostatnie N commitów)?
+2. **Review: sesja ciągła czy świeża?** Ciągła = taniej, zakotwiczona; świeża = jeden
+   zimny start na zadanie, niezależna. Start: ciągła; rewizja po danych z usage.jsonl.
+3. **Squash cykli do jednego commita na zadanie?** Mikro-commity dają wznawialność
+   i czytelny przebieg TDD; squash daje czystą historię „1 commit = 1 zadanie".
+4. **Kalibracja limitów**: `max_micro_cycles` (start: 12), dogrywki zieleni w cyklu
+   (start: 2), próg smella „no_test" (start: ⅓ cykli zadania).
+5. **Modele/effort ról**: tester i koder na tym samym modelu? Tester bywa prostszą
+   pracą (jeden test) — kandydat na niższy effort; ale to on trzyma jakość specyfikacji.
+   Rozstrzygnąć pomiarem, nie z góry.
