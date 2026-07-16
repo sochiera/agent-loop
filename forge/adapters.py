@@ -18,12 +18,22 @@ Generyczny agent NIE wznawia sesji (nie znamy formatu jego wyjścia, więc nie
 przechwycimy id sesji). Ciągłość kontekstu per zadanie zapewnia mu dziennik
 zadania — orchestrate dokleja go do promptu (patrz _session_call). To ten sam
 mechanizm, którego claude/generic używają zamiast resume.
+
+KONTRAKT generycznego agenta (nie wykryjemy tego za Ciebie — CLI bywają różne):
+- przy PORAŻCE wyjdź kodem != 0 (wtedy orkiestrator zgłosi błąd/backoff);
+  agent, który zgłasza błąd „w treści" a wychodzi 0, zostanie uznany za sukces,
+- finalną odpowiedź (blok ```json wymagany przez rolę) wypisz na STDOUT albo do
+  pliku {output}; komunikaty diagnostyczne kieruj na STDERR,
+- nie znamy zużycia tokenów generyka — nie trafia do .forge/usage.jsonl.
 """
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from dataclasses import dataclass
+
+_TOKEN_RE = re.compile(r"\{(\w+)\}")
 
 # Agenci z wbudowaną, przetestowaną obsługą (flagi + parsowanie wyjścia).
 BUILTIN_AGENTS = ("claude", "codex")
@@ -42,15 +52,25 @@ class GenericSpec:
 
 
 def expand_template(template: list[str], subs: dict[str, str]) -> list[str]:
-    """Podstaw placeholdery w każdym tokenie; pomiń tokeny puste po rozwinięciu."""
+    """Rozwiń szablon argv, podstawiając placeholdery znanych kluczy.
+
+    Zasady:
+    - Jeden przebieg (regex): podstawiona wartość NIE jest ponownie skanowana, więc
+      prompt zawierający literalnie np. "{model}" nie zostaje uszkodzony.
+    - Token będący SAMYM placeholderem znanego klucza o pustej wartości (np.
+      "{model}" przy nieustawionym modelu) jest pomijany RAZEM z bezpośrednio
+      poprzedzającą go flagą opcji (token zaczynający się od "-"). Dzięki temu
+      'cli --model {model}' bez modelu daje 'cli', a nie 'cli --model <następny>'.
+    - Nieznane placeholdery zostają bez zmian."""
     out: list[str] = []
     for tok in template:
-        new = tok
-        for key, val in subs.items():
-            new = new.replace("{" + key + "}", val)
-        if new == "" and tok != "":
-            continue  # czysty placeholder rozwinięty do pusta — nie zostawiaj ""
-        out.append(new)
+        pure = _TOKEN_RE.fullmatch(tok)
+        if pure and pure.group(1) in subs and subs[pure.group(1)] == "":
+            if out and out[-1].startswith("-"):
+                out.pop()  # osierocona flaga opcji — usuń parę flaga+placeholder
+            continue
+        out.append(_TOKEN_RE.sub(
+            lambda m: subs[m.group(1)] if m.group(1) in subs else m.group(0), tok))
     return out
 
 

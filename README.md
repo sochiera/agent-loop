@@ -164,7 +164,14 @@ python3 -m forge.orchestrate --coder-agent grok --planner-agent claude
 Placeholdery szablonu: `{prompt}` `{model}` `{effort}` `{project}` `{output}`.
 Jeśli szablon zawiera `{output}`, wynik czytamy z tego pliku; inaczej ze stdout.
 Token będący samym placeholderem, który rozwinie się do pusta (np. `{model}` bez
-ustawionego modelu), jest pomijany.
+ustawionego modelu), jest pomijany **razem z poprzedzającą go flagą** — czyli
+`--model {model}` bez modelu znika w całości, a nie zostawia wiszącego `--model`.
+
+Kontrakt, którego forge nie wyegzekwuje za Ciebie (CLI bywają różne):
+- przy porażce agent musi wyjść **kodem ≠ 0** (inaczej „błąd w treści" przy kodzie
+  0 zostanie uznany za sukces),
+- finalny blok ```json wypisz na **stdout** albo do pliku `{output}`; diagnostykę na stderr,
+- zużycia tokenów generyka nie znamy — nie trafia do `.forge/usage.jsonl`.
 
 Tylko `codex` wznawia sesje (`codex exec resume`) — dający ciągły kontekst per
 zadanie. Pozostali agenci są bezsesyjni: ciągłość zapewnia im **dziennik zadania**

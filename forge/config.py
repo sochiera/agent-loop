@@ -110,7 +110,8 @@ class Config:
     def role(self, name: str) -> tuple[str, str, str]:
         """(agent, model, effort) dla roli: 'planner' | 'tester' | 'coder'."""
         if name == "planner":
-            return (self.planner_agent, self.planner_model, self.planner_effort)
+            return (self.planner_agent,
+                    *self._role_model_effort(self.planner_agent, self.planner_model, self.planner_effort))
         if name == "tester":
             return (self.tester_agent,
                     *self._role_model_effort(self.tester_agent, self.tester_model, self.tester_effort))

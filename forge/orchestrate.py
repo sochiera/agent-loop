@@ -104,23 +104,23 @@ def prompt_agent_settings(cfg: Config) -> None:
     """Pobierz modele i effort obu ról przed uruchomieniem pętli."""
     print("\nKonfiguracja agentów (Enter zachowuje wartość domyślną):")
     previous_agent = cfg.planner_agent
-    cfg.planner_agent = _ask_effort(
-        "Agent do planowania", cfg.planner_agent, PLANNER_AGENTS
-    )
+    # Wolny wybór — poza claude/codex dozwolony dowolny agent generyczny.
+    cfg.planner_agent = _ask_value("Agent do planowania (claude/codex/inny)",
+                                   cfg.planner_agent)
     if cfg.planner_agent != previous_agent:
-        if cfg.planner_agent == "claude":
-            cfg.planner_model, cfg.planner_effort = "opus", "high"
-        else:
-            cfg.planner_model, cfg.planner_effort = cfg.codex_model, cfg.codex_effort
+        cfg.planner_model = {"claude": "opus", "codex": cfg.codex_model}.get(
+            cfg.planner_agent, "")
+        cfg.planner_effort = {"claude": "high", "codex": cfg.codex_effort}.get(
+            cfg.planner_agent, "medium")
     cfg.planner_model = _ask_value(
         f"Model do planowania ({cfg.planner_agent})", cfg.planner_model,
         display_default=cfg.planner_model or "z konfiguracji CLI",
     )
-    planner_efforts = (CLAUDE_EFFORTS if cfg.planner_agent == "claude"
-                       else CODEX_EFFORTS)
-    cfg.planner_effort = _ask_effort(
-        "Effort planowania", cfg.planner_effort, planner_efforts
-    )
+    planner_efforts = {"claude": CLAUDE_EFFORTS, "codex": CODEX_EFFORTS}.get(cfg.planner_agent)
+    if planner_efforts:  # wbudowany agent → waliduj wobec znanych poziomów
+        cfg.planner_effort = _ask_effort("Effort planowania", cfg.planner_effort, planner_efforts)
+    else:               # generyczny → effort to dowolny string
+        cfg.planner_effort = _ask_value("Effort planowania", cfg.planner_effort)
     cfg.codex_model = _ask_value(
         "Model do implementacji (Codex)", cfg.codex_model,
         display_default=cfg.codex_model or "z config.toml",
@@ -681,9 +681,14 @@ def journal_append(project: str, cfg: Config, text: str) -> None:
 def journal_tail(project: str, cfg: Config, max_chars: int = 3000) -> str:
     try:
         with open(_journal_path(project, cfg), "r", encoding="utf-8") as f:
-            return f.read()[-max_chars:]
+            text = f.read()
     except OSError:
         return ""
+    if len(text) <= max_chars:
+        return text
+    tail = text[-max_chars:]
+    nl = tail.find("\n")  # utnij urwaną pierwszą linię, zacznij od pełnego wpisu
+    return tail[nl + 1:] if nl != -1 else tail
 
 
 def _with_journal(project: str, cfg: Config, prompt: str, *, lost: bool = False) -> str:
@@ -895,10 +900,13 @@ def _clear_task(state: State) -> None:
     state.tests_green = False
 
 
-def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
+def _run_micro_loop(cfg: Config, project: str, state: State, logf):
     """Pętla b/c: tester dyktuje jeden test, koder zazielenia i refaktoryzuje.
 
-    Zwraca True gdy tester orzekł DONE (faza→review), False gdy zadanie padło."""
+    Zwraca: "done" gdy tester orzekł DONE po zielonej bramce; "smell" gdy
+    recenzję wymusił nadmiar 'no_test' (bramka NIE odpalona); False gdy zadanie
+    padło. Rozróżnienie „done" vs „smell" decyduje, czy pętla recenzji może
+    zaufać świeżej zieleni, czy musi sama zgatować drzewo."""
     task = state.current_task
     task_file = task.get("file", "")
     test_globs = task.get("test_globs") or []
@@ -942,7 +950,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
                 log("TESTER: DONE — kryteria pokryte, bramka zielona.")
                 state.phase = "review"
                 save_checkpoint(project, state)
-                return True
+                return "done"
 
             if action == "no_test":
                 state.no_test_count += 1
@@ -951,11 +959,18 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
                     # Tester nie potrafi już specyfikować testami — dryf „bez
                     # specyfikacji" ograniczamy, oddając całość recenzentowi.
                     log(f"SMELL: {state.no_test_count}× 'no_test' (> {threshold}) — wymuszam recenzję.")
+                    # Deklarując 'no_test' tester nie powinien nic pisać; gdyby
+                    # zostawił zmiany, cofnij je — recenzja ma oceniać ostatni
+                    # zielony commit, nie niezweryfikowane resztki.
+                    stray = changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
+                                          stop_file=cfg.stop_file)
+                    if stray:
+                        revert_paths(project, stray)
                     journal_append(project, cfg,
                                    f"smell no_test ({state.no_test_count}) → wymuszona recenzja")
                     state.phase = "review"
                     save_checkpoint(project, state)
-                    return True
+                    return "smell"
                 log(f"[cykl {c}] TESTER: brak sensownego testu — krok bez testu.")
                 state.pending_no_test = True
                 state.cycle_test_files = []
@@ -1172,10 +1187,14 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
 
     fresh_from_done = False
     if state.phase == "micro":
-        if not _run_micro_loop(cfg, project, state, logf):
+        outcome = _run_micro_loop(cfg, project, state, logf)
+        if not outcome:
             _fail_task(cfg, project, state, n, f"mikro-TDD nieukończone (cykli={state.micro_cycle})")
             return True
-        fresh_from_done = True  # DONE potwierdzone zieloną bramką chwilę temu
+        # Świeżą, zieloną bramkę mamy TYLKO gdy tester orzekł DONE (uruchomił ją
+        # tuż przed wyjściem). Wymuszona recenzja przez smell no_test nie gatowała
+        # drzewa — niech pętla recenzji zrobi to sama.
+        fresh_from_done = (outcome == "done")
 
     if state.phase in {"review", "fix_review"}:
         if _run_review_loop(cfg, project, state, logf, gate_green=fresh_from_done):
@@ -1316,12 +1335,10 @@ def main(argv: list[str] | None = None) -> int:
         log("PREFLIGHT — problemy:")
         for p in problems:
             print("  ✗ " + p)
-        # Jedyne miękkie ostrzeżenie: brak Claude CLI (użytkownik może go nie
-        # potrzebować w danej konfiguracji ról). Reszta — twarde wyjście.
-        hard = [p for p in problems if not p.startswith("Nie znaleziono Claude CLI")]
-        if args.check or hard:
-            return 2
-        log("Kontynuuję mimo ostrzeżeń (ustaw FORGE_CLAUDE_BIN, jeśli Claude nie ruszy).")
+        # Każdy agent w agents_in_use() jest wymagany przez którąś rolę — brak
+        # jego binarki to twardy błąd (inaczej pętla padnie dopiero w środku
+        # zadania, po zmarnowaniu bootstrapu/planowania).
+        return 2
     else:
         log("PREFLIGHT OK.")
     if cfg.legacy_mode:

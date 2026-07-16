@@ -418,7 +418,9 @@ class NoTestSmellTest(unittest.TestCase):
                        return_value='```json\n{"action":"no_test","reason":"strukturalny"}\n```'):
                 reached = _run_micro_loop(cfg, project, state, lambda ph: "/tmp/log")
 
-            self.assertTrue(reached)               # wymuszona recenzja = wejście w review
+            # "smell" (nie "done") — recenzja MUSI sama zgatować drzewo, bo tu
+            # bramki nie uruchomiono.
+            self.assertEqual(reached, "smell")
             self.assertEqual(state.phase, "review")
             self.assertEqual(state.no_test_count, 3)
 

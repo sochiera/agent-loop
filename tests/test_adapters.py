@@ -25,10 +25,35 @@ class TemplateExpansionTest(unittest.TestCase):
                                         {"model": "", "prompt": "hej"})
         self.assertEqual(argv, ["cli", "hej"])
 
+    def test_empty_placeholder_drops_preceding_option_flag(self) -> None:
+        # 'grok --model {model} --exec {prompt}' bez modelu → flaga --model też znika,
+        # inaczej --exec stałby się wartością --model.
+        argv = adapters.expand_template(
+            ["grok", "--model", "{model}", "--exec", "{prompt}"],
+            {"model": "", "prompt": "zrób X"})
+        self.assertEqual(argv, ["grok", "--exec", "zrób X"])
+
+    def test_empty_placeholder_keeps_binary_when_no_flag(self) -> None:
+        # Poprzednik nie jest flagą (nie zaczyna się od '-') → nic nie usuwamy poza placeholderem.
+        argv = adapters.expand_template(["cli", "{model}", "{prompt}"],
+                                        {"model": "", "prompt": "p"})
+        self.assertEqual(argv, ["cli", "p"])
+
     def test_prompt_with_spaces_stays_single_arg(self) -> None:
         argv = adapters.expand_template(["cli", "{prompt}"],
                                         {"prompt": "wiele słów tu"})
         self.assertEqual(argv, ["cli", "wiele słów tu"])
+
+    def test_placeholder_in_prompt_value_is_not_re_expanded(self) -> None:
+        # Jeden przebieg: literalne "{model}" w treści promptu MUSI przetrwać.
+        argv = adapters.expand_template(["cli", "{prompt}"],
+                                        {"prompt": "zrób {model} rzecz", "model": "X"})
+        self.assertEqual(argv, ["cli", "zrób {model} rzecz"])
+
+    def test_unknown_placeholder_left_intact(self) -> None:
+        argv = adapters.expand_template(["cli", "{nieznany}", "{prompt}"],
+                                        {"prompt": "p"})
+        self.assertEqual(argv, ["cli", "{nieznany}", "p"])
 
 
 class GenericSpecTest(unittest.TestCase):
@@ -60,6 +85,13 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         cfg = Config(codex_model="gpt-x", codex_effort="high")
         self.assertEqual(cfg.role("tester"), ("codex", "gpt-x", "high"))
         self.assertEqual(cfg.role("coder"), ("codex", "gpt-x", "high"))
+
+    def test_codex_planner_backfills_empty_effort(self) -> None:
+        # Pusty planner_effort dla codeksa dziedziczy codex_effort — inaczej
+        # -c model_reasoning_effort="" wywala codeksa.
+        cfg = Config(planner_agent="codex", planner_model="", planner_effort="",
+                     codex_model="gpt-x", codex_effort="high")
+        self.assertEqual(cfg.role("planner"), ("codex", "gpt-x", "high"))
 
     def test_generic_role_does_not_inherit_codex_model(self) -> None:
         cfg = Config(coder_agent="grok", codex_model="gpt-x")
