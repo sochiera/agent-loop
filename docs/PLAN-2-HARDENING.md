@@ -177,6 +177,48 @@ subskrypcji są ciaśniejsze niż doba.
 
 ---
 
+## 4b. Zrobione po review (kolejna seria)
+
+Po pełnym review brancha (8 kątów) naprawiono **6 znalezisk** i wykonano serię
+czyszczącą — szczegóły w historii commitów. Dla śladu, najważniejsze:
+
+- **Bramka DONE** liczyła wpisy mapy zamiast odhaczać kryteria → duplikat/zmyślone
+  kryterium przechodziło. Teraz odhacza każde kryterium z listy (normalizacja
+  case/whitespace).
+- **`codex_last.txt`** współdzielony przez role bez czyszczenia → jedna rola mogła
+  dostać werdykt drugiej. Plik jest kasowany przed każdym wywołaniem.
+- **Pusty `test_globs`** wycofywał testy testera; **`_phase_from_log`** psuł grupy
+  raportu; **pusta kolejka bez `no_more_tasks`** cicho kończyła bieg; **git-error
+  w nowym modelu** szedł legacy-rollbackiem zostawiając osierocone commity. Wszystko
+  naprawione, z testami regresyjnymi.
+- Czyszczenie: wspólny rdzeń bramek subprocess, jeden builder argv Codeksa,
+  reużycie wyniku bramki (−1–2 przebiegi suite/zadanie), zachowanie notatek recenzenta.
+
+### Generalizacja (ta seria)
+
+- **Gra albo dowolny program.** Prompty są neutralne dziedzinowo; bootstrap
+  rozpoznaje `kind` (`game`/`app`) z briefu i zapisuje w STATE.json, a planowanie
+  dobiera słownictwo („grywalne" vs „działające" MVP). DESIGN.md dla gry opisuje
+  mechanikę, dla innego programu — funkcje i kontrakty.
+- **Dowolny agent CLI.** `forge/adapters.py`: wbudowane claude/codex + generyczny
+  agent sterowany szablonem `FORGE_AGENT_<NAME>_CMD`. Każda rola (planner/tester/
+  coder) wybiera dowolnego agenta. Agenci bez `resume` (wszyscy poza codeksem)
+  jadą na dzienniku zadania zamiast sesji — ten sam mechanizm co fallback po
+  utracie sesji. To domyka też pierwotny cel „pamięć w repo": jest uniwersalny.
+- **Egzekwowanie smellu `no_test`.** Przekroczenie progu (⅓ mikro-cykli) deklaracji
+  „brak testu" wymusza wcześniejszą recenzję, zamiast tylko logować ostrzeżenie —
+  ogranicza dryf „bez specyfikacji".
+
+### Odłożone świadomie (kandydaci na później, nie blokują)
+
+1. Dekompozycja `_run_micro_loop` na `_tester_turn`/`_coder_turn` — czytelność, ale
+   to najbardziej ryzykowny refactor stanu; osobno i ostrożnie.
+2. Celowany bieg anty-osłabiania (tylko zadeklarowane testy zamiast pełnej suite) —
+   wymaga wiedzy, jak dokleić ścieżki do dowolnego `test_cmd`.
+3. Trwały `git worktree` zamiast tworzonego per cykl — oszczędność czasu, nie tokenów.
+4. Strukturalna detekcja utraty sesji ze zdarzeń `--json` zamiast regexu po tekście —
+   naturalne dopiero po żywym smoke teście (potrzebny realny format błędów).
+
 ## 5. Ryzyka, które zostają (świadomie)
 
 1. **Jakość testów testera** to nadal najsłabsze ogniwo — bramki wymuszają

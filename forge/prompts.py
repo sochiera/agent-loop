@@ -3,7 +3,7 @@
 Filozofia (token-aware, bez utraty wiedzy):
 - Pamięć współdzielona to REPO, nie prompt. Każdy agent sam czyta potrzebne
   pliki narzędziami (Read/grep), zamiast dostawać zrzut transkryptu.
-- Prompt kieruje do konkretnych ścieżek i mówi CO zrobić, nie streszcza całej gry.
+- Prompt kieruje do konkretnych ścieżek i mówi CO zrobić, nie streszcza produktu.
 - Jedno małe zadanie na iterację. TDD. Dokumentacja aktualizowana w tym samym
   commicie co kod.
 - Agenci zwracają na końcu blok ```json z ustrukturyzowanym werdyktem, który
@@ -13,15 +13,17 @@ from __future__ import annotations
 
 
 # Doklejane do KAŻDEGO agenta (przez --append-system-prompt / preambułę).
+# Neutralne wobec dziedziny — narzędzie buduje dowolne oprogramowanie (grę albo
+# inny program); charakter produktu wynika z briefu i docs/DESIGN.md.
 SHARED_PRINCIPLES = """\
-Jesteś jednym z agentów w automatycznej pętli budującej grę. Zasady twarde:
+Jesteś jednym z agentów w automatycznej pętli budującej oprogramowanie. Zasady twarde:
 1. PAMIĘĆ JEST W REPO. Zanim cokolwiek zrobisz, przeczytaj potrzebne pliki:
-   docs/DESIGN.md (żywy projekt gry), docs/ARCHITECTURE.md (decyzje techniczne),
+   docs/DESIGN.md (żywy projekt produktu), docs/ARCHITECTURE.md (decyzje techniczne),
    BACKLOG.md (kolejka zadań), .forge/current_task.md (bieżące zadanie),
    oraz właściwy kod. Nie zgaduj — czytaj.
 2. MAŁE KROKI. Jedno zadanie na raz, najmniejszy sensowny przyrost.
 3. TDD OBOWIĄZKOWE. Najpierw test, który failuje, potem kod aż testy zielone.
-4. DOKUMENTACJA ŻYJE Z KODEM. Zmiany w mechanice/architekturze odzwierciedlaj
+4. DOKUMENTACJA ŻYJE Z KODEM. Zmiany w zachowaniu/architekturze odzwierciedlaj
    w docs/ w tym samym kroku.
 5. NIE PSUJ ZIELONYCH TESTÓW. Cały pakiet testów musi przechodzić.
 6. BEZ GADANIA. Działaj na plikach; na końcu zwróć wymagany blok ```json.
@@ -29,24 +31,33 @@ Jesteś jednym z agentów w automatycznej pętli budującej grę. Zasady twarde:
 """
 
 
+def mvp_phrase(kind: str) -> str:
+    """Słownictwo MVP zależne od rodzaju produktu rozpoznanego przy bootstrapie."""
+    return "grywalnego MVP" if kind == "game" else "działającego MVP"
+
+
 def bootstrap_prompt(brief_text: str) -> str:
     return f"""{SHARED_PRINCIPLES}
 
 ROLA: Architekt-załoga (bootstrap projektu, wykonywany RAZ).
 
-Poniżej BRIEF GRY od człowieka (jedyne źródło wizji). Przeczytaj go uważnie:
+Poniżej BRIEF PRODUKTU od człowieka (jedyne źródło wizji). Może opisywać grę albo
+dowolny inny program. Przeczytaj go uważnie:
 --- BRIEF ---
 {brief_text}
 --- KONIEC BRIEFU ---
 
 Zadania bootstrapu (wykonaj wszystkie, tworząc pliki w bieżącym katalogu):
-1. Zdecyduj o stacku technicznym adekwatnym do briefu (język, silnik, framework
-   testowy). Jeśli brief mówi o forku istniejącego silnika — uszanuj to.
-2. Utwórz docs/DESIGN.md: przepisz i doprecyzuj wizję gry (mechanika, klimat,
-   pętla rozgrywki, MVP). To jest ŻYWY dokument — pisz go tak, by kolejni agenci
-   go rozwijali.
+0. ROZPOZNAJ rodzaj produktu z briefu: "game" jeśli to gra (rozgrywka, gracz,
+   mechanika), inaczej "app" (narzędzie, usługa, biblioteka, aplikacja). Zwrócisz
+   to w polu "kind".
+1. Zdecyduj o stacku technicznym adekwatnym do briefu (język, silnik/framework,
+   framework testowy). Jeśli brief mówi o forku istniejącego silnika — uszanuj to.
+2. Utwórz docs/DESIGN.md: przepisz i doprecyzuj wizję produktu i jego MVP. Dla gry
+   opisz mechanikę, klimat i pętlę rozgrywki; dla innego programu — funkcje, przepływy
+   użytkownika i kontrakty. To ŻYWY dokument — pisz go tak, by kolejni agenci go rozwijali.
 3. Utwórz docs/ARCHITECTURE.md: wybrany stack, struktura katalogów, jak uruchamiać
-   testy i grę, konwencje.
+   testy i produkt, konwencje.
 4. Utwórz BACKLOG.md: uporządkowana lista zadań od MVP w górę. Każde zadanie =
    jeden mały, testowalny przyrost, z kryteriami akceptacji. Oznacz statusy [ ].
 5. Zescaffolduj MINIMALNY szkielet projektu + działający framework testów z JEDNYM
@@ -61,12 +72,12 @@ C++/CMake) podaj niepusty build_cmd — orkiestrator uruchomi go przed testami.
 
 Na samym końcu odpowiedzi zwróć WYŁĄCZNIE blok:
 ```json
-{{"stack": "<krótki opis>", "test_cmd": "<pojedyncza komenda>", "build_cmd": "<pojedyncza komenda lub pusty string>", "run_cmd": "<pojedyncza komenda>"}}
+{{"kind": "game|app", "stack": "<krótki opis>", "test_cmd": "<pojedyncza komenda>", "build_cmd": "<pojedyncza komenda lub pusty string>", "run_cmd": "<pojedyncza komenda>"}}
 ```
 Komendy muszą działać z katalogu projektu bez interakcji."""
 
 
-def plan_prompt() -> str:
+def plan_prompt(kind: str = "app") -> str:
     return f"""{SHARED_PRINCIPLES}
 
 ROLA: Planista. Model mocny — myśl architektonicznie, ale zleć WĄSKO.
@@ -76,7 +87,7 @@ Przeczytaj: docs/DESIGN.md, docs/ARCHITECTURE.md, BACKLOG.md, ostatnie commity
 wcześniej się wywróciły — rozbij je na mniejsze lub obejdź inaczej).
 
 Wybierz JEDNO następne zadanie — najmniejszy wartościowy przyrost w stronę
-grywalnego MVP. Zaktualizuj BACKLOG.md (statusy, ewentualne nowe pozycje) i
+{mvp_phrase(kind)}. Zaktualizuj BACKLOG.md (statusy, ewentualne nowe pozycje) i
 rozwiń docs/DESIGN.md jeśli decyzja projektowa tego wymaga.
 
 Zapisz plik .forge/current_task.md w formacie:
@@ -172,7 +183,7 @@ Na końcu zwróć WYŁĄCZNIE:
 # NOWY MODEL: mikro-TDD ping-pong (Codex-tester ↔ Codex-koder), plan wsadowy.
 # =====================================================================
 
-def plan_batch_prompt(batch_size: int, start_index: int) -> str:
+def plan_batch_prompt(batch_size: int, start_index: int, kind: str = "app") -> str:
     return f"""{SHARED_PRINCIPLES}
 
 ROLA: Planista wsadowy. Jednym wywołaniem przygotuj KOLEJKĘ najbliższych zadań —
@@ -181,7 +192,7 @@ to obniża koszt stały planowania na zadanie.
 Przeczytaj: docs/DESIGN.md, docs/ARCHITECTURE.md, BACKLOG.md, `git log --oneline -20`
 oraz .forge/failures.md jeśli istnieje (zadania, które padły — rozbij je drobniej).
 
-Zaplanuj do {batch_size} NASTĘPNYCH zadań w stronę grywalnego MVP, każde =
+Zaplanuj do {batch_size} NASTĘPNYCH zadań w stronę {mvp_phrase(kind)}, każde =
 najmniejszy wartościowy, testowalny przyrost. Oceń też stan kodu: jeśli narósł
 dług (duplikacja międzymodułowa, rozjazd z ARCHITECTURE.md), wstaw zadanie
 REFAKTORYZACYJNE (przechodzi tę samą pętlę, tylko bez nowych testów).
@@ -220,7 +231,7 @@ w pełni zaimplementowane i przetestowane, a BACKLOG nie ma sensownych kroków."
 def write_test_prompt(task_file: str, test_cmd: str) -> str:
     return f"""{SHARED_PRINCIPLES}
 
-ROLA: Codex-TESTER. Dyktujesz specyfikację przez testy. NIE piszesz kodu produkcyjnego.
+ROLA: TESTER. Dyktujesz specyfikację przez testy. NIE piszesz kodu produkcyjnego.
 
 Bieżące zadanie: {task_file} (przeczytaj: cel, KRYTERIA AKCEPTACJI, Kontrakt API,
 Ścieżki testów). Przejrzyj istniejące testy i kod, ustal CZEGO JESZCZE BRAKUJE
@@ -262,7 +273,7 @@ def code_and_refactor_prompt(task_file: str, test_cmd: str,
     tail = f"\n\nOgon ostatniej bramki testów (jeśli był czerwony):\n{test_tail}\n" if test_tail else ""
     return f"""{SHARED_PRINCIPLES}
 
-ROLA: Codex-KODER. Piszesz kod produkcyjny. {goal}
+ROLA: KODER. Piszesz kod produkcyjny. {goal}
 
 Bieżące zadanie: {task_file} (cel, Kontrakt API, Ścieżki kodu). Test(y) napisane
 przez testera są Twoją wykonywalną specyfikacją — przeczytaj je i spełnij.
@@ -288,7 +299,7 @@ nie Twoja deklaracja — ale zmiany w testach MUSISZ zadeklarować):
 def review_task_prompt(task_file: str, test_cmd: str) -> str:
     return f"""{SHARED_PRINCIPLES}
 
-ROLA: Codex-RECENZENT. Zadanie przeszło mikro-cykle TDD. Oceń CAŁOŚĆ, szczególnie
+ROLA: RECENZENT. Zadanie przeszło mikro-cykle TDD. Oceń CAŁOŚĆ, szczególnie
 kod kodera. NIE piszesz teraz kodu — oceniasz.
 
 Bieżące zadanie: {task_file}. Obejrzyj zmiany całego zadania: `git diff` względem
@@ -315,7 +326,7 @@ def fix_review_prompt(notes: list[str], test_cmd: str) -> str:
     bullet = "\n".join(f"- {n}" for n in notes) or "- (brak konkretów — utwardź testy i kod)"
     return f"""{SHARED_PRINCIPLES}
 
-ROLA: Codex-KODER (poprawki po recenzji). Zastosuj WSZYSTKIE uwagi recenzenta.
+ROLA: KODER (poprawki po recenzji). Zastosuj WSZYSTKIE uwagi recenzenta.
 
 Uwagi:
 {bullet}

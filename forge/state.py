@@ -19,8 +19,11 @@ class State:
     # Komendy ustalone podczas bootstrapu — serce stack-agnostyczności.
     test_cmd: str = ""     # np. "pytest -q" albo "npm test" albo "./run_tests.sh"
     build_cmd: str = ""    # np. "" (interpreter) albo "cmake --build build"
-    run_cmd: str = ""      # jak uruchomić grę ręcznie (do dokumentacji)
+    run_cmd: str = ""      # jak uruchomić produkt ręcznie (do dokumentacji)
     stack: str = ""        # krótki opis stacku, np. "C++/CMake fork Wesnotha"
+    # Rodzaj produktu rozpoznany przez bootstrap: "game" | "app" (steruje
+    # słownictwem promptów: grywalne vs działające MVP).
+    project_kind: str = "app"
     # Historia niepowodzeń zadań — planner czyta, by dzielić/omijać.
     failures: list[str] = field(default_factory=list)
     # Ostatnio ukończone zadanie (dla kontekstu plannera).

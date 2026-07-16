@@ -20,9 +20,10 @@ import sys
 import tempfile
 import time
 
-from . import prompts
-from .agents import (AgentError, LimitExhausted, extract_json, run_codex,
-                     run_codex_session, run_planner)
+from . import adapters, prompts
+from .agents import (AgentError, LimitExhausted, agent_supports_resume,
+                     extract_json, run_agent, run_agent_session, run_codex,
+                     run_planner)
 from .config import Config
 from .state import State
 
@@ -254,16 +255,34 @@ def build_then_test(project: str, build_cmd: str, test_cmd: str, timeout: int) -
 
 # --- Preflight ---------------------------------------------------------------
 
+def _agent_bin_problem(cfg: Config, name: str) -> str | None:
+    """Sprawdź dostępność binarki agenta CLI danej nazwy; None gdy OK."""
+    if name == "claude":
+        if shutil.which(cfg.claude_bin) is None:
+            return (f"Nie znaleziono Claude CLI ('{cfg.claude_bin}'). Zainstaluj Claude "
+                    "Code jako standalone CLI albo ustaw FORGE_CLAUDE_BIN na pełną ścieżkę.")
+        return None
+    if name == "codex":
+        if shutil.which(cfg.codex_bin) is None:
+            return f"Nie znaleziono Codex CLI ('{cfg.codex_bin}')."
+        return None
+    spec = adapters.generic_spec(name)
+    if spec is None:
+        return (f"Agent '{name}' nie jest wbudowany, a brak jego szablonu komendy — "
+                f"ustaw {adapters.env_key(name)} (patrz README).")
+    if shutil.which(adapters.generic_bin(spec)) is None:
+        return f"Nie znaleziono binarki agenta '{name}' ('{adapters.generic_bin(spec)}') na PATH."
+    return None
+
+
 def preflight(cfg: Config) -> list[str]:
     problems = []
     if shutil.which("git") is None:
         problems.append("Brak 'git' na PATH.")
-    if cfg.planner_agent == "claude" and shutil.which(cfg.claude_bin) is None:
-        problems.append(
-            f"Nie znaleziono Claude CLI ('{cfg.claude_bin}'). Zainstaluj Claude Code "
-            "jako standalone CLI albo ustaw FORGE_CLAUDE_BIN na pełną ścieżkę.")
-    if shutil.which(cfg.codex_bin) is None:
-        problems.append(f"Nie znaleziono Codex CLI ('{cfg.codex_bin}').")
+    for name in cfg.agents_in_use():
+        problem = _agent_bin_problem(cfg, name)
+        if problem:
+            problems.append(problem)
     if not os.path.exists(cfg.brief_path):
         problems.append(f"Brak pliku briefu: {cfg.brief_path}")
     return problems
@@ -291,19 +310,22 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     state.test_cmd = data.get("test_cmd", "")
     state.build_cmd = data.get("build_cmd", "")
     state.run_cmd = data.get("run_cmd", "")
+    kind = str(data.get("kind", "")).strip().lower()
+    state.project_kind = "game" if kind == "game" else "app"
     state.bootstrapped = True
-    log(f"Stack: {state.stack or '(nieokreślony)'} | test_cmd: {state.test_cmd or '(brak!)'}")
+    log(f"Rodzaj: {state.project_kind} | stack: {state.stack or '(nieokreślony)'} "
+        f"| test_cmd: {state.test_cmd or '(brak!)'}")
     commit_all(project, "chore: bootstrap projektu (design, architektura, backlog, szkielet)", cfg)
 
 
-def phase_plan(cfg: Config, project: str, logf) -> dict:
+def phase_plan(cfg: Config, project: str, state: State, logf) -> dict:
     log(f"--- PLAN ({cfg.planner_agent}) ---")
     current_task = os.path.join(project, cfg.runtime_dir, "current_task.md")
     try:
         os.remove(current_task)
     except FileNotFoundError:
         pass
-    out = run_planner(prompts.plan_prompt(), cfg, project, logf("plan"))
+    out = run_planner(prompts.plan_prompt(state.project_kind), cfg, project, logf("plan"))
     commit_all(project, "docs: aktualizacja planu i backlogu", cfg)  # plan może dotknąć docs/backlog
     return extract_json(out) or {"task_title": "(nieznane)", "no_more_tasks": False}
 
@@ -375,7 +397,7 @@ def _legacy_iteration(cfg: Config, project: str, state: State) -> bool:
             f"{state.current_task_title or '(jeszcze bez tytułu)'}")
 
     if state.phase == "plan":
-        plan = phase_plan(cfg, project, logf)
+        plan = phase_plan(cfg, project, state, logf)
         if plan.get("no_more_tasks"):
             clear_checkpoint(state)
             save_checkpoint(project, state)
@@ -664,16 +686,35 @@ def journal_tail(project: str, cfg: Config, max_chars: int = 3000) -> str:
         return ""
 
 
+def _with_journal(project: str, cfg: Config, prompt: str, *, lost: bool = False) -> str:
+    """Doklej skrót dziennika zadania jako kontekst dla agenta bez sesji."""
+    tail = journal_tail(project, cfg)
+    if not tail:
+        return prompt
+    intro = ("KONTEKST ODTWORZONY Z DZIENNIKA (Twoja poprzednia sesja przepadła; "
+             if lost else
+             "KONTEKST Z DZIENNIKA ZADANIA (Twoje wywołania są bezstanowe; ")
+    return (f"{intro}to skrót dotychczasowego przebiegu zadania):\n"
+            f"{tail}\n--- KONIEC DZIENNIKA ---\n\n{prompt}")
+
+
 def _session_call(cfg: Config, project: str, state: State, role: str,
                   prompt: str, log_path: str) -> str:
-    """Wywołaj rolę Codeksa z jej sesją; po utracie sesji — świeża + dziennik.
+    """Wywołaj rolę (tester/coder) jej agentem CLI, utrzymując ciągłość kontekstu.
 
-    role: "tester" | "coder". Aktualizuje id sesji w stanie."""
+    Agent wznawialny (codex) → sesja z resume; po utracie sesji świeża sesja
+    z dziennikiem. Agent bezsesyjny (claude/generic) → jedno wywołanie z
+    dziennikiem zadania jako kontekstem. Aktualizuje id sesji w stanie."""
     attr = "tester_session" if role == "tester" else "coder_session"
-    model, effort = cfg.tester() if role == "tester" else cfg.coder()
+    agent, model, effort = cfg.role(role)
+
+    if not agent_supports_resume(agent):
+        return run_agent(agent, _with_journal(project, cfg, prompt),
+                         cfg, project, log_path, model=model, effort=effort)
+
     sid = getattr(state, attr) or None
     try:
-        out, new_sid = run_codex_session(prompt, cfg, project, log_path,
+        out, new_sid = run_agent_session(agent, prompt, cfg, project, log_path,
                                          session_id=sid, model=model, effort=effort)
     except AgentError as exc:
         if not (sid and _looks_like_session_loss(str(exc))):
@@ -681,12 +722,9 @@ def _session_call(cfg: Config, project: str, state: State, role: str,
         log(f"Sesja roli '{role}' nieodtwarzalna — świeża sesja z dziennikiem zadania.")
         setattr(state, attr, "")
         save_checkpoint(project, state)
-        tail = journal_tail(project, cfg)
-        preamble = ("KONTEKST ODTWORZONY Z DZIENNIKA (Twoja poprzednia sesja przepadła; "
-                    "to skrót dotychczasowego przebiegu zadania):\n"
-                    f"{tail}\n--- KONIEC DZIENNIKA ---\n\n") if tail else ""
-        out, new_sid = run_codex_session(preamble + prompt, cfg, project, log_path,
-                                         session_id=None, model=model, effort=effort)
+        out, new_sid = run_agent_session(
+            agent, _with_journal(project, cfg, prompt, lost=True),
+            cfg, project, log_path, session_id=None, model=model, effort=effort)
     if new_sid:
         setattr(state, attr, new_sid)
     return out
@@ -783,7 +821,8 @@ def _next_task_index(project: str) -> int:
 def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     log(f"--- PLAN WSADOWY ({cfg.planner_agent}) ---")
     start = _next_task_index(project)
-    out = run_planner(prompts.plan_batch_prompt(cfg.batch_size, start), cfg, project, logf("plan"))
+    out = run_planner(prompts.plan_batch_prompt(cfg.batch_size, start, state.project_kind),
+                      cfg, project, logf("plan"))
     commit_all(project, "docs: plan wsadowy i backlog", cfg)  # pliki zadań, docs, backlog
     data = extract_json(out) or {}
     tasks = []
@@ -907,8 +946,16 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf) -> bool:
 
             if action == "no_test":
                 state.no_test_count += 1
-                if state.no_test_count > max(2, cfg.max_micro_cycles // 3):
-                    log(f"UWAGA: dużo 'no_test' ({state.no_test_count}) — możliwy smell testera.")
+                threshold = max(2, cfg.max_micro_cycles // 3)
+                if state.no_test_count > threshold:
+                    # Tester nie potrafi już specyfikować testami — dryf „bez
+                    # specyfikacji" ograniczamy, oddając całość recenzentowi.
+                    log(f"SMELL: {state.no_test_count}× 'no_test' (> {threshold}) — wymuszam recenzję.")
+                    journal_append(project, cfg,
+                                   f"smell no_test ({state.no_test_count}) → wymuszona recenzja")
+                    state.phase = "review"
+                    save_checkpoint(project, state)
+                    return True
                 log(f"[cykl {c}] TESTER: brak sensownego testu — krok bez testu.")
                 state.pending_no_test = True
                 state.cycle_test_files = []
@@ -1179,13 +1226,15 @@ def _print_usage(project: str, runtime_dir: str = ".forge") -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Orkiestrator agentów budujących grę.")
-    ap.add_argument("--brief", default="game.md", help="Plik z opisem gry.")
-    ap.add_argument("--project", default="game", help="Katalog projektu gry.")
+    ap = argparse.ArgumentParser(
+        description="Orkiestrator agentów CLI budujących oprogramowanie (grę lub inny program).")
+    ap.add_argument("--brief", default="game.md", help="Plik z briefem produktu.")
+    ap.add_argument("--project", default="game", help="Katalog projektu.")
     ap.add_argument("--max-iters", type=int, default=None, help="Limit iteracji (0=bez).")
     ap.add_argument("--sleep", type=parse_start_delay, default=0.0, metavar="CZAS",
                     help="Opóźnij start, np. 30, 30s, 5m albo 2h.")
-    ap.add_argument("--planner-agent", choices=PLANNER_AGENTS, default=None)
+    ap.add_argument("--planner-agent", default=None,
+                    help="Agent planisty: claude, codex lub dowolny (FORGE_AGENT_<NAME>_CMD).")
     ap.add_argument("--planner-model", "--claude-model", dest="planner_model", default=None)
     ap.add_argument("--planner-effort", "--claude-effort", dest="planner_effort", default=None)
     ap.add_argument("--codex-model", default=None)
@@ -1196,10 +1245,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="Ile zadań planista przygotowuje jednym wywołaniem (nowy model).")
     ap.add_argument("--max-micro-cycles", type=int, default=None,
                     help="Sufit mikro-cykli TDD na zadanie (nowy model).")
-    ap.add_argument("--tester-model", default=None, help="Model Codeksa-testera (nowy model).")
-    ap.add_argument("--tester-effort", default=None, choices=CODEX_EFFORTS)
-    ap.add_argument("--coder-model", default=None, help="Model Codeksa-kodera (nowy model).")
-    ap.add_argument("--coder-effort", default=None, choices=CODEX_EFFORTS)
+    ap.add_argument("--tester-agent", default=None,
+                    help="Agent testera: claude, codex lub dowolny (FORGE_AGENT_<NAME>_CMD).")
+    ap.add_argument("--tester-model", default=None, help="Model agenta-testera (nowy model).")
+    ap.add_argument("--tester-effort", default=None, help="Effort agenta-testera.")
+    ap.add_argument("--coder-agent", default=None,
+                    help="Agent kodera: claude, codex lub dowolny (FORGE_AGENT_<NAME>_CMD).")
+    ap.add_argument("--coder-model", default=None, help="Model agenta-kodera (nowy model).")
+    ap.add_argument("--coder-effort", default=None, help="Effort agenta-kodera.")
     ap.add_argument("--non-interactive", action="store_true",
                     help="Nie pytaj o modele i effort; użyj flag/env/dom wartości.")
     ap.add_argument("--check", action="store_true", help="Tylko preflight i wyjście.")
@@ -1213,9 +1266,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.planner_agent and args.planner_agent != cfg.planner_agent:
         cfg.planner_agent = args.planner_agent
         if not args.planner_model:
-            cfg.planner_model = "opus" if args.planner_agent == "claude" else cfg.codex_model
+            cfg.planner_model = {"claude": "opus", "codex": cfg.codex_model}.get(
+                args.planner_agent, "")
         if not args.planner_effort:
-            cfg.planner_effort = "high" if args.planner_agent == "claude" else cfg.codex_effort
+            cfg.planner_effort = {"claude": "high", "codex": cfg.codex_effort}.get(
+                args.planner_agent, "medium")
     if args.planner_model:
         cfg.planner_model = args.planner_model
     if args.planner_effort:
@@ -1230,18 +1285,24 @@ def main(argv: list[str] | None = None) -> int:
         cfg.batch_size = args.batch_size
     if args.max_micro_cycles is not None:
         cfg.max_micro_cycles = args.max_micro_cycles
+    if args.tester_agent:
+        cfg.tester_agent = args.tester_agent
     if args.tester_model:
         cfg.tester_model = args.tester_model
     if args.tester_effort:
         cfg.tester_effort = args.tester_effort
+    if args.coder_agent:
+        cfg.coder_agent = args.coder_agent
     if args.coder_model:
         cfg.coder_model = args.coder_model
     if args.coder_effort:
         cfg.coder_effort = args.coder_effort
 
-    allowed_planner_efforts = (CLAUDE_EFFORTS if cfg.planner_agent == "claude"
-                               else CODEX_EFFORTS)
-    if cfg.planner_effort not in allowed_planner_efforts:
+    # Effort waliduj tylko dla wbudowanych agentów o znanym zbiorze poziomów;
+    # dla generycznego CLI effort to dowolny string przekazywany przez szablon.
+    allowed_planner_efforts = {"claude": CLAUDE_EFFORTS, "codex": CODEX_EFFORTS}.get(
+        cfg.planner_agent)
+    if allowed_planner_efforts and cfg.planner_effort not in allowed_planner_efforts:
         ap.error(f"effort {cfg.planner_effort!r} nie jest obsługiwany przez {cfg.planner_agent}")
 
     if not args.check and not args.non_interactive:
@@ -1255,7 +1316,10 @@ def main(argv: list[str] | None = None) -> int:
         log("PREFLIGHT — problemy:")
         for p in problems:
             print("  ✗ " + p)
-        if args.check or any("git" in p or "Codex" in p or "briefu" in p for p in problems):
+        # Jedyne miękkie ostrzeżenie: brak Claude CLI (użytkownik może go nie
+        # potrzebować w danej konfiguracji ról). Reszta — twarde wyjście.
+        hard = [p for p in problems if not p.startswith("Nie znaleziono Claude CLI")]
+        if args.check or hard:
             return 2
         log("Kontynuuję mimo ostrzeżeń (ustaw FORGE_CLAUDE_BIN, jeśli Claude nie ruszy).")
     else:
@@ -1263,8 +1327,9 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.legacy_mode:
         log("TRYB: legacy (plan → implement → review[Claude] → fix).")
     else:
-        log(f"TRYB: mikro-TDD (plan wsadowy {cfg.batch_size} → tester↔koder → recenzja Codeksa); "
-            f"sufit mikro-cykli={cfg.max_micro_cycles}.")
+        log(f"TRYB: mikro-TDD (plan wsadowy {cfg.batch_size} → tester↔koder → recenzja); "
+            f"agenci: planista={cfg.planner_agent}, tester={cfg.tester_agent}, "
+            f"koder={cfg.coder_agent}; sufit mikro-cykli={cfg.max_micro_cycles}.")
     if args.check:
         return 0
 

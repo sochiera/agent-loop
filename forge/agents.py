@@ -15,6 +15,7 @@ import re
 import subprocess
 import time
 
+from . import adapters
 from .config import Config, RATE_LIMIT_PATTERNS
 
 _LIMIT_RE = re.compile("|".join(RATE_LIMIT_PATTERNS), re.IGNORECASE)
@@ -254,13 +255,19 @@ def _append_log(log_path: str, argv: list[str], output: str, code: int) -> None:
 
 # --- Konkretni agenci -------------------------------------------------------
 
-def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:
-    """Claude Code headless. Zwraca końcowy tekst odpowiedzi (pole .result)."""
+def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str,
+               *, model: str | None = None, effort: str | None = None) -> str:
+    """Claude Code headless. Zwraca końcowy tekst odpowiedzi (pole .result).
+
+    model/effort None → wartości planisty (zgodność wsteczna). Puste → Claude
+    użyje swojego domyślnego modelu; effort domyślnie 'medium'."""
+    model = cfg.planner_model if model is None else model
+    effort = (cfg.planner_effort if effort is None else effort) or "medium"
     argv = [cfg.claude_bin, "-p", prompt]
-    if cfg.planner_model:
-        argv += ["--model", cfg.planner_model]
+    if model:
+        argv += ["--model", model]
     argv += [
-        "--effort", cfg.planner_effort,
+        "--effort", effort,
         "--output-format", "json",
         "--dangerously-skip-permissions",  # pełna autonomia — edytuje pliki bez pytań
     ]
@@ -275,8 +282,7 @@ def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str
         if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
             log_usage(project_dir, cfg, {"agent": "claude",
                                          "phase": _phase_from_log(log_path),
-                                         "model": cfg.planner_model,
-                                         "effort": cfg.planner_effort,
+                                         "model": model, "effort": effort,
                                          "usage": obj["usage"]})
         return obj.get("result", raw) if isinstance(obj, dict) else raw
     except json.JSONDecodeError:
@@ -373,11 +379,55 @@ def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
     return _read_last_msg(last_msg), sid
 
 
+def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str,
+                 *, model: str, effort: str) -> str:
+    """Uruchom dowolny agent CLI wg szablonu (adapters.GenericSpec)."""
+    out_file = _prepare_last_msg_file(project_dir, cfg) if spec.uses_output_file else None
+    subs = {"prompt": prompt, "model": model or "", "effort": effort or "",
+            "project": project_dir, "output": out_file or ""}
+    argv = adapters.expand_template(spec.template, subs)
+    if not argv:
+        raise AgentError(f"Pusty szablon komendy dla agenta '{spec.name}'.")
+    stream = _run_with_backoff(argv, project_dir, cfg, log_path)
+    return _read_last_msg(out_file) if out_file else stream
+
+
+def run_agent(name: str, prompt: str, cfg: Config, project_dir: str, log_path: str,
+              *, model: str = "", effort: str = "") -> str:
+    """Jedno-strzałowe wywołanie dowolnego agenta CLI (any-CLI dyspozytor)."""
+    if name == "claude":
+        return run_claude(prompt, cfg, project_dir, log_path, model=model, effort=effort)
+    if name == "codex":
+        return run_codex(prompt, cfg, project_dir, log_path, model=model, effort=effort)
+    spec = adapters.generic_spec(name)
+    if spec is None:
+        raise AgentError(
+            f"Nieznany agent '{name}'. Wbudowane: claude, codex. Dla innego CLI "
+            f"ustaw {adapters.env_key(name)} z szablonem komendy.")
+    return _run_generic(spec, prompt, cfg, project_dir, log_path,
+                        model=model, effort=effort)
+
+
+def run_agent_session(name: str, prompt: str, cfg: Config, project_dir: str,
+                      log_path: str, *, session_id: str | None = None,
+                      model: str = "", effort: str = "") -> tuple[str, str | None]:
+    """Wywołanie agenta z ciągłością sesji, gdy ją wspiera.
+
+    codex → sesja z resume (zwraca id). Pozostali agenci są bezsesyjni: jedno
+    wywołanie, id=None; ciągłość zapewnia im dziennik zadania (patrz orchestrate)."""
+    if name == "codex":
+        return run_codex_session(prompt, cfg, project_dir, log_path,
+                                 session_id=session_id, model=model, effort=effort)
+    return run_agent(name, prompt, cfg, project_dir, log_path,
+                     model=model, effort=effort), None
+
+
+def agent_supports_resume(name: str) -> bool:
+    return adapters.supports_resume(name)
+
+
 def run_planner(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:
-    """Uruchom wybranego planistę z jego niezależnym modelem i effort."""
-    if cfg.planner_agent == "claude":
-        return run_claude(prompt, cfg, project_dir, log_path)
-    if cfg.planner_agent == "codex":
-        return run_codex(prompt, cfg, project_dir, log_path,
-                         model=cfg.planner_model, effort=cfg.planner_effort)
-    raise AgentError(f"Nieznany agent planujący: {cfg.planner_agent}")
+    """Uruchom planistę wybranym agentem CLI z jego modelem i effort."""
+    agent, model, effort = cfg.role("planner")
+    return run_agent(agent, prompt, cfg, project_dir, log_path,
+                     model=model, effort=effort)

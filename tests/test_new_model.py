@@ -226,7 +226,7 @@ class MicroLoopTest(unittest.TestCase):
 
             calls = {"n": 0}
 
-            def fake_codex(prompt, cfg_, proj, log, *, session_id=None, model=None, effort=None):
+            def fake_codex(name, prompt, cfg_, proj, log, *, session_id=None, model=None, effort=None):
                 calls["n"] += 1
                 if calls["n"] == 1:  # tester pisze test
                     Path(proj, "tests", "test_a.py").write_text("def test_a():\n    assert move()\n",
@@ -243,7 +243,7 @@ class MicroLoopTest(unittest.TestCase):
             # bramka: po teście czerwona, po kodzie zielona, przy DONE zielona
             gate_results = iter([(False, "brak move()"), (True, ""), (True, "")])
 
-            with patch("forge.orchestrate.run_codex_session", side_effect=fake_codex), \
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake_codex), \
                  patch("forge.orchestrate.run_gate", side_effect=lambda *a, **k: next(gate_results)):
                 reached = _run_micro_loop(cfg, project, state, lambda ph: os.path.join(project, "log"))
 
@@ -267,12 +267,12 @@ class MicroLoopTest(unittest.TestCase):
                                         "code_globs": ["src/**"]},
                           phase="micro", micro_sub="test")
 
-            def fake_codex(prompt, cfg_, proj, log, *, session_id=None, model=None, effort=None):
+            def fake_codex(name, prompt, cfg_, proj, log, *, session_id=None, model=None, effort=None):
                 Path(proj, "tests", "test_a.py").write_text("def test_a():\n    assert True\n",
                                                             encoding="utf-8")
                 return '```json\n{"action":"wrote_test","test_files":["tests/test_a.py"]}\n```', "sess-t"
 
-            with patch("forge.orchestrate.run_codex_session", side_effect=fake_codex), \
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake_codex), \
                  patch("forge.orchestrate.run_gate", return_value=(True, "")):  # test przechodzi od razu
                 reached = _run_micro_loop(cfg, project, state, lambda ph: os.path.join(project, "log"))
 
@@ -333,6 +333,94 @@ class EmptyPlanQueueTest(unittest.TestCase):
         from forge.orchestrate import _task_iteration
         plan.return_value = {"no_more_tasks": True}
         self.assertFalse(_task_iteration(Config(), "/tmp/p", self._state()))
+
+
+class ProjectKindTest(unittest.TestCase):
+    def test_bootstrap_classifies_and_prompts_adapt(self) -> None:
+        import forge.prompts as p
+        self.assertEqual(p.mvp_phrase("game"), "grywalnego MVP")
+        self.assertEqual(p.mvp_phrase("app"), "działającego MVP")
+        self.assertIn("grywalnego MVP", p.plan_batch_prompt(5, 1, "game"))
+        self.assertIn("działającego MVP", p.plan_batch_prompt(5, 1, "app"))
+        # Prompt bootstrapu jest neutralny i prosi o klasyfikację.
+        boot = p.bootstrap_prompt("dowolny brief")
+        self.assertIn("BRIEF PRODUKTU", boot)
+        self.assertIn('"kind"', boot)
+        self.assertNotIn("BRIEF GRY", boot)
+
+    @patch("forge.orchestrate.commit_all")
+    @patch("forge.orchestrate.build_then_test", return_value=True)
+    def test_bootstrap_stores_project_kind(self, _bt: Mock, _commit: Mock) -> None:
+        from forge.orchestrate import phase_bootstrap
+        with tempfile.TemporaryDirectory() as project:
+            brief = Path(project) / "brief.md"
+            brief.write_text("gra taktyczna", encoding="utf-8")
+            cfg = Config(brief_path=str(brief), agent_timeout_s=5)
+            state = State()
+            payload = ('{"kind":"game","stack":"Py","test_cmd":"pytest",'
+                       '"build_cmd":"","run_cmd":"python g.py"}')
+            with patch("forge.orchestrate.run_planner", return_value=payload):
+                phase_bootstrap(cfg, project, state, lambda ph: "/tmp/log")
+            self.assertEqual(state.project_kind, "game")
+
+    @patch("forge.orchestrate.commit_all")
+    @patch("forge.orchestrate.build_then_test", return_value=True)
+    def test_bootstrap_defaults_to_app_when_kind_missing(self, _bt: Mock, _commit: Mock) -> None:
+        from forge.orchestrate import phase_bootstrap
+        with tempfile.TemporaryDirectory() as project:
+            brief = Path(project) / "brief.md"
+            brief.write_text("narzędzie CLI", encoding="utf-8")
+            cfg = Config(brief_path=str(brief), agent_timeout_s=5)
+            state = State()
+            payload = ('{"stack":"Py","test_cmd":"pytest","build_cmd":"","run_cmd":"x"}')
+            with patch("forge.orchestrate.run_planner", return_value=payload):
+                phase_bootstrap(cfg, project, state, lambda ph: "/tmp/log")
+            self.assertEqual(state.project_kind, "app")
+
+
+class SessionlessAgentTest(unittest.TestCase):
+    def test_non_resumable_agent_gets_journal_and_no_session_id(self) -> None:
+        from forge.orchestrate import _session_call, journal_append, journal_reset
+        with tempfile.TemporaryDirectory() as project:
+            cfg = Config(coder_agent="grok")  # generyczny → bezsesyjny
+            state = State()
+            journal_reset(project, cfg, "Zadanie")
+            journal_append(project, cfg, "cykl 1, tester: wrote_test (walidacja wejścia)")
+            seen = {}
+
+            def fake_run_agent(name, prompt, cfg_, proj, log, *, model="", effort=""):
+                seen["name"] = name
+                seen["prompt"] = prompt
+                return "gotowe"
+
+            with patch("forge.orchestrate.run_agent", side_effect=fake_run_agent):
+                out = _session_call(cfg, project, state, "coder", "ZRÓB", "/tmp/log")
+
+            self.assertEqual(out, "gotowe")
+            self.assertEqual(seen["name"], "grok")
+            self.assertIn("DZIENNIKA", seen["prompt"])          # kontekst doklejony
+            self.assertIn("walidacja wejścia", seen["prompt"])
+            self.assertTrue(seen["prompt"].endswith("ZRÓB"))
+            self.assertEqual(state.coder_session, "")            # brak id sesji
+
+
+class NoTestSmellTest(unittest.TestCase):
+    def test_excessive_no_test_forces_review(self) -> None:
+        with tempfile.TemporaryDirectory() as project:
+            subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+            # próg = max(2, 6//3) = 2 → 3. deklaracja no_test wymusza recenzję
+            cfg = Config(max_micro_cycles=6, git_push=False)
+            state = State(test_cmd="pytest", current_task_title="T",
+                          current_task={"file": "f", "criteria": [], "test_globs": ["tests/**"]},
+                          phase="micro", micro_sub="test", no_test_count=2)
+
+            with patch("forge.orchestrate._session_call",
+                       return_value='```json\n{"action":"no_test","reason":"strukturalny"}\n```'):
+                reached = _run_micro_loop(cfg, project, state, lambda ph: "/tmp/log")
+
+            self.assertTrue(reached)               # wymuszona recenzja = wejście w review
+            self.assertEqual(state.phase, "review")
+            self.assertEqual(state.no_test_count, 3)
 
 
 class ReviewLoopGateEconomyTest(unittest.TestCase):
@@ -433,13 +521,13 @@ class SessionLossFallbackTest(unittest.TestCase):
 
             seen = []
 
-            def fake(prompt, cfg_, proj, log, *, session_id=None, model=None, effort=None):
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None, model=None, effort=None):
                 seen.append((prompt, session_id))
                 if session_id:  # pierwsza próba: wznowienie znikniętej sesji
                     raise AgentError("error: thread 'stary-id' not found")
                 return "wynik", "nowy-id"
 
-            with patch("forge.orchestrate.run_codex_session", side_effect=fake):
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake):
                 out = _session_call(cfg, project, state, "tester", "PROMPT", "/tmp/log")
 
             self.assertEqual(out, "wynik")
@@ -456,7 +544,7 @@ class SessionLossFallbackTest(unittest.TestCase):
         from forge.orchestrate import _session_call
         with tempfile.TemporaryDirectory() as project:
             state = State(coder_session="id")
-            with patch("forge.orchestrate.run_codex_session",
+            with patch("forge.orchestrate.run_agent_session",
                        side_effect=AgentError("agent zwrócił kod 1. Ogon:\nSyntaxError")):
                 with self.assertRaisesRegex(AgentError, "SyntaxError"):
                     _session_call(Config(), project, state, "coder", "P", "/tmp/log")
@@ -552,7 +640,7 @@ class TaskIterationEndToEndTest(unittest.TestCase):
 
             calls = {"n": 0}
 
-            def fake_codex(prompt, cfg_, proj, log, *, session_id=None, model=None, effort=None):
+            def fake_codex(name, prompt, cfg_, proj, log, *, session_id=None, model=None, effort=None):
                 calls["n"] += 1
                 if calls["n"] == 1:
                     Path(proj, "tests", "test_a.py").write_text("def test_a():\n    assert 1\n",
@@ -569,7 +657,7 @@ class TaskIterationEndToEndTest(unittest.TestCase):
             gate = iter([(False, "red"), (True, ""), (True, ""), (True, "")])
 
             with patch("forge.orchestrate.run_planner", side_effect=fake_planner), \
-                 patch("forge.orchestrate.run_codex_session", side_effect=fake_codex), \
+                 patch("forge.orchestrate.run_agent_session", side_effect=fake_codex), \
                  patch("forge.orchestrate.run_gate", side_effect=lambda *a, **k: next(gate)):
                 cont = _task_iteration(cfg, project, state)
 

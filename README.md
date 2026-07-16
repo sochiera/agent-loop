@@ -1,6 +1,10 @@
-# forge — pętla agentów budujących grę
+# forge — pętla agentów budujących oprogramowanie
 
 Orkiestrator, który w kółko odpala agentów CLI, aż skończą się limity subskrypcji.
+Buduje **grę albo dowolny inny program** — agent bootstrapu sam rozpoznaje z briefu
+rodzaj produktu (`game`/`app`) i dostosowuje słownictwo planowania. Rolę każdego
+agenta może pełnić **dowolne narzędzie CLI** (claude, codex, a przez szablon
+komendy także grok, Kiro i inne — patrz „Dowolny agent CLI").
 
 **Domyślny model (mikro-TDD ping-pong).** Claude planuje wsadowo (kilka zadań w
 przód), a każde zadanie realizuje para instancji Codeksa w rytmie red→green→refactor:
@@ -132,8 +136,10 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 | Rozmiar wsadu planowania | `5` | `--batch-size N` lub `FORGE_BATCH_SIZE` |
 | Sufit mikro-cykli/zadanie | `12` | `--max-micro-cycles N` lub `FORGE_MAX_MICRO_CYCLES` |
 | Dogrywki „zazielenienia"/cykl | `2` | `FORGE_MAX_GREEN_RETRIES` |
-| Model/effort Codeksa-testera | z `codex_model`/`effort` | `--tester-model/--tester-effort` lub `FORGE_TESTER_*` |
-| Model/effort Codeksa-kodera | z `codex_model`/`effort` | `--coder-model/--coder-effort` lub `FORGE_CODER_*` |
+| Agent testera | `codex` | `--tester-agent NAZWA` lub `FORGE_TESTER_AGENT` |
+| Agent kodera | `codex` | `--coder-agent NAZWA` lub `FORGE_CODER_AGENT` |
+| Model/effort testera | z `codex_model`/`effort` | `--tester-model/--tester-effort` lub `FORGE_TESTER_*` |
+| Model/effort kodera | z `codex_model`/`effort` | `--coder-model/--coder-effort` lub `FORGE_CODER_*` |
 | Limit iteracji | bez limitu | `--max-iters 20` |
 | Opóźnienie startu | brak | `--sleep 30s`, `--sleep 5m`, `--sleep 2h` |
 | Timeout agenta | 3600 s | `FORGE_AGENT_TIMEOUT=...` |
@@ -143,6 +149,27 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 > bardzo szybko. Gdy zacznie boleć, zejdź na `--claude-model sonnet` — pętla
 > pociągnie znacznie dłużej. Orkiestrator sam wykrywa komunikaty o limitach,
 > robi backoff (z logiem czasu wznowienia), a po wyczerpaniu — czysty stop.
+
+## Dowolny agent CLI (claude, codex, grok, Kiro, …)
+
+Każdą rolę — planistę, testera, kodera — może pełnić dowolny agent CLI. `claude`
+i `codex` mają wbudowaną obsługę. Inne narzędzie wpinasz **bez zmian w kodzie**,
+podając szablon jego komendy w zmiennej `FORGE_AGENT_<NAZWA>_CMD`:
+
+```bash
+export FORGE_AGENT_GROK_CMD='grok --model {model} --exec {prompt} --out {output}'
+python3 -m forge.orchestrate --coder-agent grok --planner-agent claude
+```
+
+Placeholdery szablonu: `{prompt}` `{model}` `{effort}` `{project}` `{output}`.
+Jeśli szablon zawiera `{output}`, wynik czytamy z tego pliku; inaczej ze stdout.
+Token będący samym placeholderem, który rozwinie się do pusta (np. `{model}` bez
+ustawionego modelu), jest pomijany.
+
+Tylko `codex` wznawia sesje (`codex exec resume`) — dający ciągły kontekst per
+zadanie. Pozostali agenci są bezsesyjni: ciągłość zapewnia im **dziennik zadania**
+(`.forge/task_journal.md`), który orkiestrator dokleja do promptu. To ta sama
+filozofia „pamięć w repo" — działa dla każdego CLI, tylko trochę drożej tokenowo.
 
 ## Co powstaje w `game/`
 
