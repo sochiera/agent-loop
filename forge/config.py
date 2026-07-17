@@ -182,6 +182,12 @@ class Config:
             return (self.verifier_agent,
                     *self._role_model_effort(self.verifier_agent,
                                              self.verifier_model, self.verifier_effort))
+        if name == "reviewer":
+            if not self.reviewer_agent:  # domyślnie agent testera, ALE świeży kontekst
+                return self.role("tester")
+            return (self.reviewer_agent,
+                    *self._role_model_effort(self.reviewer_agent,
+                                             self.reviewer_model, self.reviewer_effort))
         raise ValueError(f"nieznana rola: {name}")
 
     def tester(self) -> tuple[str, str]:
@@ -197,7 +203,8 @@ class Config:
         if self.legacy_mode:
             return list(dict.fromkeys([self.planner_agent, "codex"]))
         return list(dict.fromkeys([self.planner_agent, self.tester_agent,
-                                   self.coder_agent, self.role("verifier")[0]]))
+                                   self.coder_agent, self.role("verifier")[0],
+                                   self.role("reviewer")[0]]))
 
     # --- Komendy bazowe CLI (bez shella) ------------------------------------
     # Claude Code headless. Jeśli 'claude' nie jest na PATH, ustaw FORGE_CLAUDE_BIN.

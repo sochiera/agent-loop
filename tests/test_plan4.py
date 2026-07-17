@@ -269,5 +269,382 @@ class ValidateCriteriaMapTest(unittest.TestCase):
             self.assertEqual(self._validate([], [], tmp), [])
 
 
+# =====================================================================
+# E2.1: rola recenzenta w Config
+# =====================================================================
+
+class ReviewerRoleConfigTest(unittest.TestCase):
+    def test_default_reviewer_is_tester_role(self) -> None:
+        cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high")
+        self.assertEqual(cfg.role("reviewer"), cfg.role("tester"))
+
+    def test_explicit_reviewer_agent_wins(self) -> None:
+        cfg = Config(reviewer_agent="claude", reviewer_model="sonnet",
+                     reviewer_effort="medium")
+        self.assertEqual(cfg.role("reviewer"), ("claude", "sonnet", "medium"))
+
+    def test_agents_in_use_includes_reviewer(self) -> None:
+        cfg = Config(reviewer_agent="grok")
+        self.assertIn("grok", cfg.agents_in_use())
+
+
+# =====================================================================
+# E2.2: recenzja w świeżym kontekście (bez sesji testera, bez dziennika)
+# =====================================================================
+
+class ReviewFreshContextTest(unittest.TestCase):
+    @patch("forge.orchestrate._session_call")
+    @patch("forge.orchestrate.run_agent",
+           return_value='```json\n{"verdict":"approve","notes":[]}\n```')
+    def test_review_uses_fresh_agent_with_mechanical_context(
+        self, run_agent: Mock, session_call: Mock
+    ) -> None:
+        from forge.orchestrate import _run_review_loop
+        state = State(phase="review", current_task={"file": "f"},
+                      current_task_title="T", test_cmd="pytest",
+                      task_start_tag="forge/task-001-start",
+                      justified_criteria=[{"criterion": "k2",
+                                           "why": "nie da się zautomatyzować bo X"}])
+        with tempfile.TemporaryDirectory() as project:
+            ok = _run_review_loop(Config(), project, state,
+                                  lambda ph: "/tmp/log", gate_green=True)
+        self.assertTrue(ok)
+        session_call.assert_not_called()          # recenzent NIE dziedziczy sesji
+        prompt = run_agent.call_args.args[1]
+        self.assertIn("forge/task-001-start", prompt)   # jawny ref do diffu
+        self.assertIn("k2", prompt)                     # justified do rozstrzygnięcia
+        self.assertIn("nie da się zautomatyzować", prompt)
+
+
+# =====================================================================
+# E2.3: przewiązanie mikro-pętli (rotacja, kandydaci mechaniczni,
+#        toolchain w kroku bez testu, lock testów, dziennik)
+# =====================================================================
+
+class MicroLoopWiringBase(unittest.TestCase):
+    def _init_repo(self, project: str, extra: dict | None = None) -> None:
+        _init_repo(project)
+        Path(project, "seed.txt").write_text("seed", encoding="utf-8")
+        for rel, body in (extra or {}).items():
+            path = Path(project, rel)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        _commit_all(project, "init")
+        os.makedirs(os.path.join(project, "tests"), exist_ok=True)
+        os.makedirs(os.path.join(project, "src"), exist_ok=True)
+
+    def _state(self, **kw) -> State:
+        base = dict(test_cmd="pytest", build_cmd="", current_task_title="Ruch",
+                    current_task={"id": "task-001", "title": "Ruch",
+                                  "file": ".forge/tasks/task-001.md",
+                                  "criteria": ["c1"], "test_globs": ["tests/**"],
+                                  "code_globs": ["src/**"]},
+                    phase="micro", micro_sub="test")
+        base.update(kw)
+        return State(**base)
+
+
+class SessionRotationTest(MicroLoopWiringBase):
+    def test_sessions_rotate_after_k_cycles_and_fresh_call_gets_journal(self) -> None:
+        from forge.orchestrate import _run_micro_loop
+        with tempfile.TemporaryDirectory() as project:
+            self._init_repo(project)
+            cfg = Config(max_micro_cycles=5, max_green_retries=0,
+                         session_rotate_cycles=1, git_push=False)
+            state = self._state()
+            seen = []
+
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None,
+                     model=None, effort=None):
+                seen.append((session_id, prompt))
+                n = len(seen)
+                if n == 1:
+                    Path(proj, "tests", "test_a.py").write_text(
+                        "def test_a():\n    assert move()\n", encoding="utf-8")
+                    return '```json\n{"action":"wrote_test"}\n```', "sess-t"
+                if n == 2:
+                    Path(proj, "src", "a.py").write_text(
+                        "def move():\n    return True\n", encoding="utf-8")
+                    return '```json\n{"notes":"ok"}\n```', "sess-c"
+                return ('```json\n{"action":"done","criteria_map":['
+                        '{"criterion":"c1","test":"tests/test_a.py::test_a",'
+                        '"status":"covered"}]}\n```'), "sess-t2"
+
+            gates = iter([(False, "red"), (True, ""), (True, "")])
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake), \
+                 patch("forge.orchestrate.run_gate",
+                       side_effect=lambda *a, **k: next(gates)):
+                out = _run_micro_loop(cfg, project, state,
+                                      lambda ph: os.path.join(project, "log"))
+
+            self.assertEqual(out, "done")
+            # Po cyklu 1 rotacja wyzerowała sesje → wywołanie DONE startuje
+            # świeżą sesję (session_id None) z dziennikiem zadania.
+            self.assertIsNone(seen[2][0])
+            self.assertIn("DZIENNIKA", seen[2][1])
+
+
+class MechanicalWeakeningWiringTest(MicroLoopWiringBase):
+    PKG = '{"scripts": {"test": "uczciwy runner"}}\n'
+
+    def test_undeclared_toolchain_nerf_is_reverted(self) -> None:
+        from forge.orchestrate import _run_micro_loop
+        with tempfile.TemporaryDirectory() as project:
+            self._init_repo(project, {"package.json": self.PKG})
+            cfg = Config(max_micro_cycles=1, max_green_retries=0, git_push=False,
+                         lock_tests=False)
+            state = self._state()
+            calls = {"n": 0}
+
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None,
+                     model=None, effort=None):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    Path(proj, "tests", "test_a.py").write_text(
+                        "def test_a():\n    assert move()\n", encoding="utf-8")
+                    return '```json\n{"action":"wrote_test"}\n```', "s-t"
+                Path(proj, "src", "a.py").write_text("def move():\n    return True\n",
+                                                     encoding="utf-8")
+                Path(proj, "package.json").write_text('{"scripts": {"test": "true"}}\n',
+                                                      encoding="utf-8")  # NERF
+                return '```json\n{"notes":"zielono"}\n```', "s-c"
+
+            gates = iter([(False, "red"), (True, ""), (True, "")])
+            weakening = Mock(return_value=False)  # pomiar: osłabiono
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake), \
+                 patch("forge.orchestrate.run_gate",
+                       side_effect=lambda *a, **k: next(gates)), \
+                 patch("forge.orchestrate.anti_weakening_ok", weakening):
+                _run_micro_loop(cfg, project, state,
+                                lambda ph: os.path.join(project, "log"))
+
+            weakening.assert_called_once()
+            files = weakening.call_args.args[1]
+            self.assertIn("package.json", files)        # toolchain w pomiarze
+            self.assertIn("tests/test_a.py", files)     # testy cyklu dla sensu pomiaru
+            # Nerf wycofany do wersji z HEAD.
+            self.assertEqual(Path(project, "package.json").read_text(encoding="utf-8"),
+                             self.PKG)
+
+    def test_untouched_tests_and_toolchain_skip_measurement(self) -> None:
+        from forge.orchestrate import _run_micro_loop
+        with tempfile.TemporaryDirectory() as project:
+            self._init_repo(project)
+            cfg = Config(max_micro_cycles=1, max_green_retries=0, git_push=False,
+                         lock_tests=False)
+            state = self._state()
+            calls = {"n": 0}
+
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None,
+                     model=None, effort=None):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    Path(proj, "tests", "test_a.py").write_text(
+                        "def test_a():\n    assert move()\n", encoding="utf-8")
+                    return '```json\n{"action":"wrote_test"}\n```', "s-t"
+                Path(proj, "src", "a.py").write_text("def move():\n    return True\n",
+                                                     encoding="utf-8")
+                return '```json\n{"notes":"ok"}\n```', "s-c"
+
+            gates = iter([(False, "red"), (True, "")])
+            weakening = Mock(return_value=True)
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake), \
+                 patch("forge.orchestrate.run_gate",
+                       side_effect=lambda *a, **k: next(gates)), \
+                 patch("forge.orchestrate.anti_weakening_ok", weakening):
+                _run_micro_loop(cfg, project, state,
+                                lambda ph: os.path.join(project, "log"))
+
+            weakening.assert_not_called()  # nic podejrzanego → zero kosztu
+
+
+class NoTestToolchainRevertTest(MicroLoopWiringBase):
+    PKG = '{"scripts": {"test": "uczciwy runner"}}\n'
+
+    def test_toolchain_change_outside_code_globs_is_reverted(self) -> None:
+        from forge.orchestrate import _run_micro_loop
+        with tempfile.TemporaryDirectory() as project:
+            self._init_repo(project, {"package.json": self.PKG})
+            cfg = Config(max_micro_cycles=1, max_green_retries=0, git_push=False,
+                         lock_tests=False)
+            state = self._state()
+            calls = {"n": 0}
+
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None,
+                     model=None, effort=None):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return '```json\n{"action":"no_test","reason":"strukturalny"}\n```', "s-t"
+                Path(proj, "src", "a.py").write_text("x = 1\n", encoding="utf-8")
+                Path(proj, "package.json").write_text('{"scripts": {"test": "true"}}\n',
+                                                      encoding="utf-8")  # NERF
+                return '```json\n{"notes":"krok bez testu"}\n```', "s-c"
+
+            gates = iter([(True, ""), (True, "")])
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake), \
+                 patch("forge.orchestrate.run_gate",
+                       side_effect=lambda *a, **k: next(gates)):
+                _run_micro_loop(cfg, project, state,
+                                lambda ph: os.path.join(project, "log"))
+
+            # W kroku bez testu nie ma mechanicznego pomiaru → toolchain spoza
+            # code_globs wraca do wersji z HEAD; kod kodera zostaje.
+            self.assertEqual(Path(project, "package.json").read_text(encoding="utf-8"),
+                             self.PKG)
+            self.assertTrue(Path(project, "src", "a.py").exists())
+
+
+class LockTestsDuringCoderTest(MicroLoopWiringBase):
+    def test_cycle_tests_are_readonly_for_coder_and_restored_after(self) -> None:
+        from forge.orchestrate import _run_micro_loop
+        with tempfile.TemporaryDirectory() as project:
+            self._init_repo(project)
+            cfg = Config(max_micro_cycles=5, max_green_retries=0, git_push=False,
+                         lock_tests=True)
+            state = self._state()
+            seen = {}
+            calls = {"n": 0}
+
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None,
+                     model=None, effort=None):
+                calls["n"] += 1
+                test_path = os.path.join(proj, "tests", "test_a.py")
+                if calls["n"] == 1:
+                    Path(test_path).write_text("def test_a():\n    assert move()\n",
+                                               encoding="utf-8")
+                    return '```json\n{"action":"wrote_test"}\n```', "s-t"
+                # Bity trybu, nie os.access — root pisze mimo chmod a-w,
+                # a mechanizm ma zdejmować bity zapisu.
+                if calls["n"] == 2:
+                    seen["coder_can_write"] = bool(os.stat(test_path).st_mode & 0o222)
+                    Path(proj, "src", "a.py").write_text(
+                        "def move():\n    return True\n", encoding="utf-8")
+                    return '```json\n{"notes":"ok"}\n```', "s-c"
+                seen["after_can_write"] = bool(os.stat(test_path).st_mode & 0o200)
+                return ('```json\n{"action":"done","criteria_map":['
+                        '{"criterion":"c1","test":"tests/test_a.py::test_a",'
+                        '"status":"covered"}]}\n```'), "s-t"
+
+            gates = iter([(False, "red"), (True, ""), (True, "")])
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake), \
+                 patch("forge.orchestrate.run_gate",
+                       side_effect=lambda *a, **k: next(gates)):
+                out = _run_micro_loop(cfg, project, state,
+                                      lambda ph: os.path.join(project, "log"))
+
+            self.assertEqual(out, "done")
+            self.assertFalse(seen["coder_can_write"])   # tura kodera: read-only
+            self.assertTrue(seen["after_can_write"])    # po turze: przywrócone
+
+
+class JournalEnrichmentTest(MicroLoopWiringBase):
+    def test_cycle_commit_appends_changed_files_to_journal(self) -> None:
+        from forge.orchestrate import _journal_path, _run_micro_loop, journal_reset
+        with tempfile.TemporaryDirectory() as project:
+            self._init_repo(project)
+            cfg = Config(max_micro_cycles=1, max_green_retries=0, git_push=False,
+                         lock_tests=False)
+            state = self._state()
+            journal_reset(project, cfg, "Ruch")
+            calls = {"n": 0}
+
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None,
+                     model=None, effort=None):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    Path(proj, "tests", "test_a.py").write_text(
+                        "def test_a():\n    assert 1\n", encoding="utf-8")
+                    return '```json\n{"action":"wrote_test"}\n```', "s-t"
+                Path(proj, "src", "a.py").write_text("x = 1\n", encoding="utf-8")
+                return '```json\n{"notes":"ok"}\n```', "s-c"
+
+            gates = iter([(False, "red"), (True, "")])
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake), \
+                 patch("forge.orchestrate.run_gate",
+                       side_effect=lambda *a, **k: next(gates)):
+                _run_micro_loop(cfg, project, state,
+                                lambda ph: os.path.join(project, "log"))
+
+            journal = Path(_journal_path(project, cfg)).read_text(encoding="utf-8")
+            self.assertIn("pliki:", journal)
+            self.assertIn("src/a.py", journal)
+
+
+# =====================================================================
+# E2.4: dziennik przy świeżej sesji w toku zadania + sufit z konfiguracji
+# =====================================================================
+
+class SessionCallJournalMidTaskTest(unittest.TestCase):
+    def _call(self, state: State) -> tuple[str, object]:
+        from forge.orchestrate import _session_call, journal_append, journal_reset
+        with tempfile.TemporaryDirectory() as project:
+            cfg = Config()  # codex → agent wznawialny
+            journal_reset(project, cfg, "Ruch")
+            journal_append(project, cfg, "cykl 1, tester: wrote_test (ruch po heksach)")
+            seen = {}
+
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None,
+                     model=None, effort=None):
+                seen["prompt"], seen["sid"] = prompt, session_id
+                return "ok", "nowy-id"
+
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake):
+                _session_call(cfg, project, state, "tester", "PROMPT", "/tmp/log")
+            return seen["prompt"], seen["sid"]
+
+    def test_fresh_session_mid_task_gets_journal(self) -> None:
+        prompt, sid = self._call(State(micro_cycle=2))
+        self.assertIsNone(sid)
+        self.assertIn("DZIENNIKA", prompt)
+        self.assertIn("ruch po heksach", prompt)
+
+    def test_task_start_stays_journal_free(self) -> None:
+        prompt, _sid = self._call(State(micro_cycle=0, fix_attempt=0))
+        self.assertEqual(prompt, "PROMPT")
+
+
+class JournalTailConfigTest(unittest.TestCase):
+    def test_tail_limit_comes_from_config(self) -> None:
+        from forge.orchestrate import journal_append, journal_reset, journal_tail
+        with tempfile.TemporaryDirectory() as project:
+            cfg = Config(journal_tail_chars=120)
+            journal_reset(project, cfg, "T")
+            for i in range(30):
+                journal_append(project, cfg, f"wpis numer {i:02d} o stałej długości")
+            tail = journal_tail(project, cfg)
+            self.assertLessEqual(len(tail), 120)
+            self.assertIn("wpis numer 29", tail)   # ogon, nie początek
+            # Wyższy sufit → więcej kontekstu.
+            self.assertGreater(len(journal_tail(project, Config(journal_tail_chars=2000))),
+                               len(tail))
+
+
+# =====================================================================
+# E2.5: porażka zadania unieważnia resztę wsadu
+# =====================================================================
+
+class FailTaskReplanTest(unittest.TestCase):
+    def _fail(self, cfg: Config) -> tuple[State, str]:
+        from forge.orchestrate import _fail_task
+        with tempfile.TemporaryDirectory() as project:
+            state = State(current_task_title="T", task_start_tag="",
+                          justified_criteria=[{"criterion": "k", "why": "w" * 20}],
+                          task_queue=[{"id": "task-002", "title": "Nast", "file": "f"}])
+            _fail_task(cfg, project, state, 1, "mikro-TDD nieukończone")
+            failures = Path(project, cfg.runtime_dir, "failures.md")
+            body = failures.read_text(encoding="utf-8") if failures.exists() else ""
+            return state, body
+
+    def test_failure_drops_batch_and_records_it(self) -> None:
+        state, failures = self._fail(Config(replan_on_failure=True))
+        self.assertEqual(state.task_queue, [])
+        self.assertIn("task-002", failures)
+        self.assertEqual(state.justified_criteria, [])  # sprzątnięte z zadaniem
+
+    def test_opt_out_keeps_queue(self) -> None:
+        state, _failures = self._fail(Config(replan_on_failure=False))
+        self.assertEqual(len(state.task_queue), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

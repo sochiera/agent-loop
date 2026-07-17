@@ -836,7 +836,9 @@ def journal_append(project: str, cfg: Config, text: str) -> None:
     _append_line(_journal_path(project, cfg), f"- [{ts()}] {text}\n")
 
 
-def journal_tail(project: str, cfg: Config, max_chars: int = 3000) -> str:
+def journal_tail(project: str, cfg: Config, max_chars: int | None = None) -> str:
+    if max_chars is None:
+        max_chars = cfg.journal_tail_chars
     try:
         with open(_journal_path(project, cfg), "r", encoding="utf-8") as f:
             text = f.read()
@@ -876,8 +878,13 @@ def _session_call(cfg: Config, project: str, state: State, role: str,
                          cfg, project, log_path, model=model, effort=effort)
 
     sid = getattr(state, attr) or None
+    # Świeża sesja w TOKU zadania (rotacja, restart) → kontekst z dziennika;
+    # na starcie zadania (cykl 0, bez poprawek) świeża sesja jest naturalna.
+    first_prompt = prompt
+    if sid is None and (state.micro_cycle > 0 or state.fix_attempt > 0):
+        first_prompt = _with_journal(project, cfg, prompt)
     try:
-        out, new_sid = run_agent_session(agent, prompt, cfg, project, log_path,
+        out, new_sid = run_agent_session(agent, first_prompt, cfg, project, log_path,
                                          session_id=sid, model=model, effort=effort)
     except AgentError as exc:
         if not (sid and _looks_like_session_loss(str(exc))):
@@ -895,6 +902,30 @@ def _session_call(cfg: Config, project: str, state: State, role: str,
 
 def _cycle_snapshot_dir(project: str, cfg: Config) -> str:
     return os.path.join(project, cfg.runtime_dir, "cycle_tests")
+
+
+def _snapshot_identical(project: str, cfg: Config, rel: str) -> bool:
+    """Czy plik cyklu jest bajt w bajt zgodny ze snapshotem testera —
+    nietknięte testy cyklu nie wymagają ponownego pomiaru anty-osłabiania."""
+    snap = os.path.join(_cycle_snapshot_dir(project, cfg), rel)
+    try:
+        with open(snap, "rb") as a, open(os.path.join(project, rel), "rb") as b:
+            return a.read() == b.read()
+    except OSError:
+        return False
+
+
+def _set_writable(project: str, files: list[str], writable: bool) -> None:
+    """Best-effort chmod testów cyklu na turę kodera (PLAN-4, Z1). To
+    DETERRENT odruchowych edycji, nie bariera — agent może zdjąć atrybut;
+    właściwą bramką pozostaje kontrola diffu."""
+    for rel in files:
+        path = os.path.join(project, rel)
+        try:
+            mode = os.stat(path).st_mode
+            os.chmod(path, (mode | 0o200) if writable else (mode & ~0o222))
+        except OSError:
+            pass
 
 
 def snapshot_cycle_tests(project: str, cfg: Config, files: list[str]) -> None:
@@ -1099,6 +1130,8 @@ def _clear_task(state: State) -> None:
     state.review_notes = []
     state.fix_attempt = 0
     state.tests_green = False
+    state.done_reject_reasons = []
+    state.justified_criteria = []
 
 
 def _task_gate(cfg: Config, project: str, state: State) -> tuple[bool, str]:
@@ -1147,9 +1180,12 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
         if state.micro_sub == "test":
             log(f"[cykl {c}] TESTER pisze test / ocenia ukończenie")
             out = _session_call(cfg, project, state, "tester",
-                                prompts.write_test_prompt(task_file, state.test_cmd),
+                                prompts.write_test_prompt(
+                                    task_file, state.test_cmd,
+                                    reject_reasons=state.done_reject_reasons),
                                 logf(f"c{c:02d}-test"))
             verdict = extract_json(out) or {"action": "no_test", "reason": "brak werdyktu JSON"}
+            state.done_reject_reasons = []  # skonsumowane w prompcie powyżej
             action = verdict.get("action")
             journal_append(project, cfg,
                            f"cykl {c}, tester: {action} "
@@ -1252,16 +1288,21 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
         log(f"[cykl {c}] KODER {'(krok bez testu)' if no_test else 'zazielenia test'} + refaktor")
         green, tail = False, ""
         verdict: dict = {}
-        for attempt in range(cfg.max_green_retries + 1):
-            out = _session_call(cfg, project, state, "coder",
-                                prompts.code_and_refactor_prompt(
-                                    task_file, state.test_cmd, no_test, tail),
-                                logf(f"c{c:02d}-code{attempt}"))
-            verdict = extract_json(out) or {}
-            green, tail = _task_gate(cfg, project, state)
-            if green:
-                break
-            log(f"[cykl {c}] bramka CZERWONA (próba {attempt + 1}/{cfg.max_green_retries + 1})")
+        locked = state.cycle_test_files if cfg.lock_tests else []
+        _set_writable(project, locked, False)  # testy read-only na turę kodera
+        try:
+            for attempt in range(cfg.max_green_retries + 1):
+                out = _session_call(cfg, project, state, "coder",
+                                    prompts.code_and_refactor_prompt(
+                                        task_file, state.test_cmd, no_test, tail),
+                                    logf(f"c{c:02d}-code{attempt}"))
+                verdict = extract_json(out) or {}
+                green, tail = _task_gate(cfg, project, state)
+                if green:
+                    break
+                log(f"[cykl {c}] bramka CZERWONA (próba {attempt + 1}/{cfg.max_green_retries + 1})")
+        finally:
+            _set_writable(project, locked, True)
         journal_append(project, cfg,
                        f"cykl {c}, koder: {'zielony' if green else 'czerwony'} "
                        f"({verdict.get('notes') or ''})".rstrip())
@@ -1278,6 +1319,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
         if violations:
             log(f"KODER zmienił testy niezadeklarowanie: {violations} — wycofuję, ponawiam bramkę.")
             revert_paths(project, violations)
+            changed = [p for p in changed if p not in violations]
             green, _ = _task_gate(cfg, project, state)
             if not green:
                 log("Po wycofaniu niedozwolonych zmian testów bramka czerwona — porażka.")
@@ -1292,26 +1334,69 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                 log(f"KODER dotknął chronionych ścieżek weryfikacji: {offending} "
                     "— wycofuję (dozwolone tylko w zadaniu verify_defect).")
                 revert_paths(project, offending)
+                changed = [p for p in changed if p not in offending]
                 green, _ = _task_gate(cfg, project, state)
                 if not green:
                     log("Po wycofaniu zmian w plikach weryfikacji bramka czerwona — porażka.")
                     return False
 
-        if declared and not anti_weakening_ok(project, declared, state.build_cmd,
-                                              state.test_cmd, cfg.agent_timeout_s):
-            log(f"ANTY-OSŁABIANIE: zadeklarowane testy {declared} przechodzą na kodzie "
-                "sprzed cyklu — zmiana je rozwodniła. Przywracam wersje testów.")
-            restore_test_changes(project, cfg, declared, state.cycle_test_files)
+        tc_globs = effective_toolchain_globs(cfg, state)
+        if no_test:
+            # Krok bez testu nie ma czerwonego testu, więc pomiar anty-osłabiania
+            # nie ma czego failować — toolchain wolno ruszyć tylko, gdy planista
+            # przewidział to w "Ścieżkach kodu" zadania (decyzja widoczna w recenzji).
+            offending = [p for p in changed
+                         if is_toolchain_path(p, tc_globs)
+                         and not _match_any(p, task.get("code_globs") or [])]
+            if offending:
+                log(f"KODER dotknął toolchainu testów w kroku bez testu: {offending} "
+                    "— wycofuję (dozwolone tylko w 'Ścieżkach kodu' zadania).")
+                revert_paths(project, offending)
+                changed = [p for p in changed if p not in offending]
+                green, _ = _task_gate(cfg, project, state)
+                if not green:
+                    log("Po wycofaniu zmian toolchainu bramka czerwona — porażka.")
+                    return False
+
+        # Anty-osłabianie v2: zbiór wejściowy MECHANICZNIE z diffu (deklaracja
+        # kodera zostaje tylko kontekstem recenzji). Nietknięte testy cyklu nie
+        # wymagają pomiaru same w sobie, ale przy zmianach toolchainu wchodzą
+        # do kopii — bez nich pomiar nerfu nie miałby czego failować.
+        candidates = weakening_candidates(changed, test_globs, tc_globs)
+        tool_part = [p for p in candidates if not _is_test_path(p, test_globs)]
+        test_part = [p for p in candidates if _is_test_path(p, test_globs)]
+        if tool_part:
+            test_part = sorted(set(test_part) | set(state.cycle_test_files))
+        else:
+            test_part = [p for p in test_part
+                         if not (p in state.cycle_test_files
+                                 and _snapshot_identical(project, cfg, p))]
+        measured = sorted(set(test_part) | set(tool_part))
+        if test_part and not anti_weakening_ok(project, measured, state.build_cmd,
+                                               state.test_cmd, cfg.agent_timeout_s):
+            log(f"ANTY-OSŁABIANIE: {measured} przechodzą na kodzie sprzed cyklu "
+                "— rozwodnione testy albo znerfowany toolchain. Przywracam.")
+            restore_test_changes(project, cfg, test_part, state.cycle_test_files)
+            revert_paths(project, tool_part)
             green, _ = _task_gate(cfg, project, state)
             if not green:
-                log("Po przywróceniu testów bramka czerwona — porażka zadania.")
+                log("Po przywróceniu testów/toolchainu bramka czerwona — porażka zadania.")
                 return False
 
+        final_changed = changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
+                                      stop_file=cfg.stop_file)
+        journal_append(project, cfg,
+                       f"cykl {c}, commit; pliki: {', '.join(final_changed[:12])}")
         commit_all(project, f"tdd: {state.current_task_title} (cykl {c})")
         state.micro_cycle = c
         state.micro_sub = "test"
         state.cycle_test_files = []
         state.pending_no_test = False
+        if cfg.session_rotate_cycles and c % cfg.session_rotate_cycles == 0:
+            log(f"Rotacja sesji ról po cyklu {c} — świeży kontekst z dziennikiem "
+                "(higiena kontekstu).")
+            state.tester_session = ""
+            state.coder_session = ""
         save_checkpoint(project, state)
 
 
@@ -1378,10 +1463,24 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
             save_checkpoint(project, state)
             continue
 
-        log("--- RECENZJA CAŁOŚCI (Codex-tester) ---")
-        out = _session_call(cfg, project, state, "tester",
-                            prompts.review_task_prompt(task_file, state.test_cmd),
-                            logf(f"review-r{state.fix_attempt}"))
+        # Recenzent w ŚWIEŻYM kontekście (PLAN-4, Z2): bez sesji autorów i bez
+        # dziennika (narracja testera/kodera to wektor sugestii). Kontekst
+        # buduje mechanicznie orkiestrator: diff od taga startu, zmiany
+        # toolchainu, kryteria justified do rozstrzygnięcia.
+        log("--- RECENZJA CAŁOŚCI (świeży kontekst) ---")
+        agent, model, effort = cfg.role("reviewer")
+        changed = changed_files(project, state.task_start_tag or "HEAD",
+                                runtime_dir=cfg.runtime_dir, stop_file=cfg.stop_file)
+        toolchain_changed = [p for p in changed
+                             if is_toolchain_path(p, effective_toolchain_globs(cfg, state))]
+        out = run_agent(agent,
+                        prompts.review_task_prompt(
+                            task_file, state.test_cmd,
+                            start_tag=state.task_start_tag,
+                            changed=changed, toolchain_changes=toolchain_changed,
+                            justified=state.justified_criteria),
+                        cfg, project, logf(f"review-r{state.fix_attempt}"),
+                        model=model, effort=effort)
         review = extract_json(out) or {"verdict": "changes", "notes": ["Brak werdyktu JSON."]}
         journal_append(project, cfg,
                        f"recenzja: {review.get('verdict')} ({len(review.get('notes') or [])} uwag)")
@@ -1418,6 +1517,16 @@ def _fail_task(cfg: Config, project: str, state: State, n: int, reason: str) -> 
     record_failure(project, cfg, state, title, detail)
     _reset_to_tag(project, state.task_start_tag)  # lokalnie — nic nie było pushowane
     _delete_tag(project, state.task_start_tag)
+    if cfg.replan_on_failure and state.task_queue:
+        # Wsad był planowany przy założeniu sukcesu tego zadania — porażka
+        # falsyfikuje wejście zadań następnych (PLAN-4, Z3). Planista
+        # przeplanowuje tanio: failures.md + pliki zadań zostają na dysku.
+        dropped = [t.get("id") or t.get("title", "?") for t in state.task_queue]
+        log(f"Porzucam pozostały wsad ({len(dropped)} zadań) — planowanie od nowa.")
+        _append_line(os.path.join(project, cfg.runtime_dir, "failures.md"),
+                     f"- [{ts()}] porzucono wsad po porażce '{title}': "
+                     f"{', '.join(dropped)}\n")
+        state.task_queue = []
     state.iteration = n
     _clear_task(state)
     save_checkpoint(project, state)

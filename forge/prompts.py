@@ -266,7 +266,15 @@ Ustaw "no_more_tasks": true i pustą listę "tasks" TYLKO gdy MVP z DESIGN.md je
 w pełni zaimplementowane i przetestowane, a BACKLOG nie ma sensownych kroków."""
 
 
-def write_test_prompt(task_file: str, test_cmd: str) -> str:
+def write_test_prompt(task_file: str, test_cmd: str,
+                      reject_reasons: list[str] | None = None) -> str:
+    rejected = ""
+    if reject_reasons:
+        bullets = "\n".join(f"- {r}" for r in reject_reasons)
+        rejected = (f"\nTWOJA POPRZEDNIA MAPA KRYTERIÓW (DONE) ZOSTAŁA ODRZUCONA "
+                    f"z powodów:\n{bullets}\n"
+                    "Uzupełnij brakujące pokrycie testem albo popraw mapę — nie "
+                    "zgaduj, odnieś się do każdego powodu.\n")
     return f"""{SHARED_PRINCIPLES}
 
 ROLA: TESTER. Dyktujesz specyfikację przez testy. NIE piszesz kodu produkcyjnego.
@@ -274,6 +282,7 @@ ROLA: TESTER. Dyktujesz specyfikację przez testy. NIE piszesz kodu produkcyjneg
 Bieżące zadanie: {task_file} (przeczytaj: cel, KRYTERIA AKCEPTACJI, Kontrakt API,
 Ścieżki testów). Przejrzyj istniejące testy i kod, ustal CZEGO JESZCZE BRAKUJE
 względem kryteriów.
+{rejected}
 
 Wybierz DOKŁADNIE jedno:
 A) Napisz JEDEN nowy test na brakującą funkcjonalność. Wymogi twarde:
@@ -334,19 +343,44 @@ nie Twoja deklaracja — ale zmiany w testach MUSISZ zadeklarować):
 ```"""
 
 
-def review_task_prompt(task_file: str, test_cmd: str) -> str:
+def review_task_prompt(task_file: str, test_cmd: str, *, start_tag: str = "",
+                       changed: list[str] | None = None,
+                       toolchain_changes: list[str] | None = None,
+                       justified: list[dict] | None = None) -> str:
+    diff_hint = (f"`git diff {start_tag}`" if start_tag
+                 else "`git diff` względem punktu startu zadania")
+    files_block = ""
+    if changed:
+        files_block = ("Pliki zmienione w zadaniu (policzone przez orkiestrator):\n"
+                       + "\n".join(f"- {p}" for p in changed[:40]) + "\n")
+    toolchain_block = ""
+    if toolchain_changes:
+        toolchain_block = (
+            "UWAGA: zadanie zmieniło KONFIGURACJĘ URUCHAMIANIA TESTÓW (toolchain):\n"
+            + "\n".join(f"- {p}" for p in toolchain_changes)
+            + "\nOceń JAWNIE, czy te zmiany są uzasadnione zadaniem i nie zawężają "
+            "ani nie wyłączają suity — nieuzasadnione = werdykt 'changes'.\n")
+    justified_block = ""
+    if justified:
+        rows = "\n".join(f"- {e.get('criterion', '?')} — uzasadnienie testera: "
+                         f"{e.get('why', '')}" for e in justified)
+        justified_block = (
+            "Kryteria oznaczone przez testera jako 'justified' (bez testu) — "
+            "rozstrzygnij KAŻDE merytorycznie (nietrafne uzasadnienie = 'changes'):\n"
+            + rows + "\n")
     return f"""{SHARED_PRINCIPLES}
 
-ROLA: RECENZENT. Zadanie przeszło mikro-cykle TDD. Oceń CAŁOŚĆ, szczególnie
-kod kodera. NIE piszesz teraz kodu — oceniasz.
+ROLA: RECENZENT (świeże oko — nie brałeś udziału w implementacji). Zadanie
+przeszło mikro-cykle TDD. Oceń CAŁOŚĆ, szczególnie kod kodera. NIE piszesz
+teraz kodu — oceniasz.
 
-Bieżące zadanie: {task_file}. Obejrzyj zmiany całego zadania: `git diff` względem
-punktu startu zadania (tag na HEAD sprzed pierwszego mikro-commita) oraz nowe pliki.
-
+Bieżące zadanie: {task_file}. Obejrzyj zmiany całego zadania: {diff_hint}
+oraz nowe pliki.
+{files_block}{toolchain_block}{justified_block}
 Oceń:
 - Czy WSZYSTKIE kryteria akceptacji są realnie spełnione i pokryte testami?
 - Czy testy sprawdzają zachowanie (nie tautologie/atrapy)? Czy któryś test został
-  osłabiony, żeby kod przeszedł?
+  osłabiony, żeby kod przeszedł? Czy kod nie hardkoduje wyników pod asercje?
 - Poprawność, prostota, brak wyjścia poza zakres, aktualność docs/.
 Możesz uruchomić `{test_cmd}`.
 
