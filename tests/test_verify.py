@@ -660,5 +660,34 @@ class CiEarlyWarnTest(unittest.TestCase):
             self.assertNotIn("CZERWONE", self._plan(1, early_warn=False))
 
 
+class VerifierMcpConfigTest(unittest.TestCase):
+    def test_run_claude_appends_mcp_config_only_when_given(self) -> None:
+        from forge import agents
+        cfg = Config()
+        with mock.patch("forge.agents._run_with_backoff",
+                        return_value='{"result": "ok"}') as run:
+            agents.run_claude("p", cfg, "/proj", "/log", model="opus",
+                              effort="high", mcp_config="/mcp.json")
+            argv = run.call_args.args[0]
+            self.assertIn("--mcp-config", argv)
+            self.assertIn("/mcp.json", argv)
+
+            agents.run_claude("p", cfg, "/proj", "/log", model="opus", effort="high")
+            argv = run.call_args.args[0]
+            self.assertNotIn("--mcp-config", argv)
+
+    def test_verifier_role_passes_mcp_config_from_cfg(self) -> None:
+        cfg = Config()
+        cfg.planner_agent, cfg.planner_model, cfg.planner_effort = "claude", "opus", "high"
+        cfg.verifier_mcp_config = "/mcp.json"
+        state = State(verify_targets=["smoke"], smoke_cmd="s", verify_cycle=1)
+        evidence = {"smoke": {"rc": 0, "log": "s.log"}}
+        with mock.patch("forge.orchestrate.run_agent",
+                        return_value='{"verdict":"pass","problems":[]}') as run:
+            orchestrate._accept_verdict(cfg, "/proj", state, evidence,
+                                        "/cdir", lambda ph: "/log")
+        self.assertEqual(run.call_args.kwargs.get("mcp_config"), "/mcp.json")
+
+
 if __name__ == "__main__":
     unittest.main()

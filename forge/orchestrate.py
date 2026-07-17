@@ -1350,7 +1350,8 @@ def _accept_verdict(cfg: Config, project: str, state: State, evidence: dict,
     for attempt in range(2):
         out = run_agent(agent, prompt, cfg, project,
                         logf(f"verify-c{state.verify_cycle}-a{attempt}"),
-                        model=model, effort=effort)
+                        model=model, effort=effort,
+                        mcp_config=cfg.verifier_mcp_config)
         verdict = extract_json(out)
         problems = (verdict or {}).get("problems")
         errors = []

@@ -256,16 +256,21 @@ def _append_log(log_path: str, argv: list[str], output: str, code: int) -> None:
 # --- Konkretni agenci -------------------------------------------------------
 
 def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str,
-               *, model: str | None = None, effort: str | None = None) -> str:
+               *, model: str | None = None, effort: str | None = None,
+               mcp_config: str = "") -> str:
     """Claude Code headless. Zwraca końcowy tekst odpowiedzi (pole .result).
 
     model/effort None → wartości planisty (zgodność wsteczna). Puste → Claude
-    użyje swojego domyślnego modelu; effort domyślnie 'medium'."""
+    użyje swojego domyślnego modelu; effort domyślnie 'medium'. mcp_config
+    (ścieżka pliku konfiguracji MCP) — dziś tylko rola weryfikatora, do
+    debugowania CI narzędziami MCP."""
     model = cfg.planner_model if model is None else model
     effort = (cfg.planner_effort if effort is None else effort) or "medium"
     argv = [cfg.claude_bin, "-p", prompt]
     if model:
         argv += ["--model", model]
+    if mcp_config:
+        argv += ["--mcp-config", mcp_config]
     argv += [
         "--effort", effort,
         "--output-format", "json",
@@ -393,10 +398,14 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
 
 
 def run_agent(name: str, prompt: str, cfg: Config, project_dir: str, log_path: str,
-              *, model: str = "", effort: str = "") -> str:
-    """Jedno-strzałowe wywołanie dowolnego agenta CLI (any-CLI dyspozytor)."""
+              *, model: str = "", effort: str = "", mcp_config: str = "") -> str:
+    """Jedno-strzałowe wywołanie dowolnego agenta CLI (any-CLI dyspozytor).
+
+    mcp_config wspiera tylko claude (inni agenci konfigurują MCP po swojemu,
+    np. codex w ~/.codex/config.toml) — dla nich jest ignorowany."""
     if name == "claude":
-        return run_claude(prompt, cfg, project_dir, log_path, model=model, effort=effort)
+        return run_claude(prompt, cfg, project_dir, log_path, model=model,
+                          effort=effort, mcp_config=mcp_config)
     if name == "codex":
         return run_codex(prompt, cfg, project_dir, log_path, model=model, effort=effort)
     spec = adapters.generic_spec(name)

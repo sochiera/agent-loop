@@ -74,3 +74,10 @@ class EndToEndReportTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VerifyPhaseGroupTest(unittest.TestCase):
+    def test_verify_logs_group_under_verify(self) -> None:
+        from forge.report import normalize_phase
+        self.assertEqual(normalize_phase("verify-c2-a0"), "verify")
+        self.assertEqual(normalize_phase("verify-c11-a1"), "verify")

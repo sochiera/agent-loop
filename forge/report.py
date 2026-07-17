@@ -22,6 +22,7 @@ _PHASE_GROUPS: list[tuple[str, str]] = [
     (r"^c\d+-code", "micro-code"),
     (r"^review-fix", "review-fix"),
     (r"^review", "review"),
+    (r"^verify", "verify"),
     (r"^implement", "implement (legacy)"),
     (r"^fix", "fix (legacy)"),
 ]
