@@ -1469,6 +1469,19 @@ def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
         log(f"  dowód {target}: rc={res.get('rc')} → {res.get('log')}")
 
     problems = _accept_verdict(cfg, project, state, evidence, cdir, logf)
+
+    # Kontrola diffu weryfikatora — jedyna rola bez niej byłaby dziurą:
+    # "naprawiony przy okazji" kod poszedłby na remote niezrecenzowany, pod
+    # komunikatem docs:. Dozwolone tylko wspólne ścieżki (docs, BACKLOG);
+    # artefakty w .forge/verification są odfiltrowane jako runtime.
+    stray = [p for p in changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
+                                      stop_file=cfg.stop_file)
+             if not _match_any(p, _SHARED_WRITABLE)]
+    if stray:
+        log(f"WERYFIKATOR zmienił pliki poza docs/BACKLOG: {stray} — wycofuję "
+            "(weryfikator nie pisze kodu produkcyjnego).")
+        revert_paths(project, stray)
+
     _confirm_env_issues(cfg, project, state, problems, cdir, targets)
     dropped = _drop_green_repros(cfg, project, problems)
     active = [p for p in problems if p not in dropped]

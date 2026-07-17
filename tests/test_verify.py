@@ -345,6 +345,11 @@ class VerifyGoalPhaseTest(unittest.TestCase):
         Path(self.project, "docs", "DESIGN.md").write_text(
             "Gracz może zapisać stan gry.", encoding="utf-8")
         Path(self.project, "BACKLOG.md").write_text("# Backlog\n", encoding="utf-8")
+        import subprocess as sp
+        sp.run(["git", "init", "-q"], cwd=self.project, check=True)
+        sp.run(["git", "add", "-A"], cwd=self.project, check=True)
+        sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                "commit", "-q", "-m", "init"], cwd=self.project, check=True)
         self.cfg = Config()
         self.cfg.max_stall_cycles = 2
         self.cfg.max_verify_cycles = 8
@@ -379,6 +384,22 @@ class VerifyGoalPhaseTest(unittest.TestCase):
         self.assertFalse(cont)
         self.assertEqual(self.state.phase, "idle")
         self.assertEqual(self.state.verify_cycle, 1)
+
+    def test_stray_product_edits_of_verifier_are_reverted(self) -> None:
+        def naughty_agent(*_a, **_k):
+            os.makedirs(os.path.join(self.project, "src"), exist_ok=True)
+            Path(self.project, "src", "hack.py").write_text("x", encoding="utf-8")
+            with open(os.path.join(self.project, "BACKLOG.md"), "a",
+                      encoding="utf-8") as f:
+                f.write("- notatka weryfikatora\n")
+            return _verdict([], "pass")
+
+        cont, _ = self._run(0, naughty_agent)
+
+        self.assertFalse(cont)
+        self.assertFalse(Path(self.project, "src", "hack.py").exists())
+        backlog = Path(self.project, "BACKLOG.md").read_text(encoding="utf-8")
+        self.assertIn("notatka weryfikatora", backlog)  # docs/BACKLOG dozwolone
 
     def test_agent_pass_cannot_override_red_evidence(self) -> None:
         cont, _ = self._run(1, [_verdict([], "pass")])
