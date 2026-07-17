@@ -62,6 +62,17 @@ class State:
     # repro bywa flashowaniem). Zerowane na starcie zadania.
     repro_runs: int = 0
 
+    # --- PLAN-4: uszczelnienie bramek --------------------------------------
+    # Globy toolchainu testowego zadeklarowane przy bootstrapie (uzupełniają
+    # wbudowaną heurystykę; jak verify_test_globs — serce stack-agnostyczności).
+    test_toolchain_globs: list[str] = field(default_factory=list)
+    # Powody odrzucenia ostatniej mapy kryteriów przy DONE — wracają do
+    # testera w kolejnym prompcie (bounded-retry nie zgaduje w ciemno).
+    done_reject_reasons: list[str] = field(default_factory=list)
+    # Kryteria "justified" z przyjętej mapy — recenzent dostaje je jawnie
+    # do merytorycznego rozstrzygnięcia. Czyszczone przy zamknięciu zadania.
+    justified_criteria: list[dict] = field(default_factory=list)
+
     # --- Weryfikacja celu (PLAN-3): profil + checkpoint cyklu ---------------
     # Profil deklaruje bootstrap (jak test_cmd — serce stack-agnostyczności).
     # Puste verify_targets = weryfikacja wyłączona (zachowanie sprzed PLAN-3);

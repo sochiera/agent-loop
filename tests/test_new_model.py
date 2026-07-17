@@ -11,8 +11,8 @@ from forge.agents import extract_codex_usage, extract_session_id
 from forge.config import Config
 from forge.orchestrate import (_next_task_index, _path_matches, _run_micro_loop,
                                _task_iteration, coder_test_violations,
-                               criteria_fully_mapped, phase_plan_batch,
-                               red_gate_ok, role_paths_ok, run_gate)
+                               phase_plan_batch, red_gate_ok, role_paths_ok,
+                               run_gate)
 from forge.state import State
 
 
@@ -47,33 +47,8 @@ class PureGateTest(unittest.TestCase):
             [],
         )
 
-    def test_criteria_mapping_completeness(self) -> None:
-        criteria = ["kryt1", "kryt2"]
-        full = [{"criterion": "kryt1", "test": "t::a", "status": "covered"},
-                {"criterion": "kryt2", "status": "justified"}]
-        self.assertTrue(criteria_fully_mapped(criteria, full))
-        partial = [{"criterion": "kryt1", "test": "t::a", "status": "covered"}]
-        self.assertFalse(criteria_fully_mapped(criteria, partial))
-        self.assertTrue(criteria_fully_mapped([], []))  # brak kryteriów → trywialnie spełnione
-        # "covered" bez testu nie liczy się jako pokrycie
-        self.assertFalse(criteria_fully_mapped(["k"], [{"criterion": "k", "status": "covered"}]))
-
-    def test_criteria_mapping_rejects_duplicates_and_invented_criteria(self) -> None:
-        criteria = ["kryt1", "kryt2"]
-        # Duplikat pokrycia kryt1 nie zastępuje brakującego kryt2.
-        dup = [{"criterion": "kryt1", "test": "t::a", "status": "covered"},
-               {"criterion": "kryt1", "test": "t::b", "status": "covered"}]
-        self.assertFalse(criteria_fully_mapped(criteria, dup))
-        # Zmyślone kryterium spoza listy zadania też nie.
-        invented = [{"criterion": "kryt1", "test": "t::a", "status": "covered"},
-                    {"criterion": "WYMYŚLONE", "test": "t::x", "status": "covered"}]
-        self.assertFalse(criteria_fully_mapped(criteria, invented))
-
-    def test_criteria_matching_tolerates_case_and_whitespace(self) -> None:
-        criteria = ["Gracz może  ruszyć jednostkę"]
-        entry = [{"criterion": "gracz może ruszyć jednostkę",
-                  "test": "t::ruch", "status": "covered"}]
-        self.assertTrue(criteria_fully_mapped(criteria, entry))
+    # Testy mapy kryteriów żyją w tests/test_plan4.py (ValidateCriteriaMapTest)
+    # — od PLAN-4 mapę waliduje validate_criteria_map z powodami odrzucenia.
 
     def test_tester_may_write_tests_when_globs_missing(self) -> None:
         from forge.orchestrate import tester_path_violations
@@ -560,8 +535,14 @@ class AntiWeakeningTest(unittest.TestCase):
         subprocess.run(["git", "init", "-q"], cwd=project, check=True)
         subprocess.run(["git", "config", "user.email", "t@t"], cwd=project, check=True)
         subprocess.run(["git", "config", "user.name", "t"], cwd=project, check=True)
-        # HEAD: implementacja "sprzed cyklu" (f() == 1, test by na niej padł).
+        # HEAD: implementacja "sprzed cyklu" (f() == 1, test by na niej padł)
+        # + zielona suita (baseline v2 wymaga zieleni na HEAD, jak w realnym
+        # projekcie, gdzie commit cyklu zapada tylko przy zielonej bramce).
         Path(project, "mod.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        Path(project, "test_base.py").write_text(
+            "import unittest\nclass B(unittest.TestCase):\n"
+            "    def test_base(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=project, check=True)
         subprocess.run(["git", "commit", "-qm", "przed cyklem"], cwd=project, check=True)
         # Katalog roboczy: praca kodera (niezacommitowana) + test w bieżącej postaci.
@@ -578,7 +559,8 @@ class AntiWeakeningTest(unittest.TestCase):
                 "    def test_f(self):\n"
                 "        self.assertEqual(mod.f(), 2)\n")
             self.assertTrue(anti_weakening_ok(
-                project, ["test_mod.py"], "", "python3 -m unittest -q test_mod", 60))
+                project, ["test_mod.py"], "",
+                "python3 -m unittest discover -q", 60))
 
     def test_gutted_test_passing_on_old_code_is_flagged(self) -> None:
         from forge.orchestrate import anti_weakening_ok
@@ -590,7 +572,8 @@ class AntiWeakeningTest(unittest.TestCase):
                 "    def test_f(self):\n"
                 "        self.assertTrue(True)\n")  # rozwodniony — nic nie specyfikuje
             self.assertFalse(anti_weakening_ok(
-                project, ["test_mod.py"], "", "python3 -m unittest -q test_mod", 60))
+                project, ["test_mod.py"], "",
+                "python3 -m unittest discover -q", 60))
 
     def test_no_files_never_blocks(self) -> None:
         from forge.orchestrate import anti_weakening_ok

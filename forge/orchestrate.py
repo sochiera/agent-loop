@@ -527,8 +527,46 @@ def _match_any(path: str, globs: list[str]) -> bool:
     return any(_path_matches(path, g) for g in globs)
 
 
+# Łańcuch narzędzi testowych (PLAN-4, Z1): pliki konfigurujące, CO i JAK
+# uruchamia test_cmd. Nie są własnością testera (to nie specyfikacja), a ich
+# zmiany przez kodera przechodzą bramkę anty-osłabiania — najtańszym "sposobem
+# na zieleń" nie może być wykastrowanie runnera w package.json/Makefile.
+_TOOLCHAIN_BASENAMES = frozenset({
+    "package.json", "pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini",
+    "makefile", "cmakelists.txt", "pom.xml", "cargo.toml", "noxfile.py",
+})
+_TOOLCHAIN_PREFIXES = ("jest.config.", "vitest.config.", "karma.conf.",
+                       "build.gradle")
+
+
+def _looks_like_toolchain(path: str) -> bool:
+    """Heurystyka pliku toolchainu testowego (wbudowana, uzupełniana globami)."""
+    base = os.path.basename(path.replace("\\", "/")).lower()
+    return (base in _TOOLCHAIN_BASENAMES
+            or any(base.startswith(p) for p in _TOOLCHAIN_PREFIXES))
+
+
+def is_toolchain_path(path: str, extra_globs: list[str]) -> bool:
+    """Czy ścieżka to plik toolchainu: heurystyka LUB dodatkowe globy
+    (deklaracja bootstrapu + FORGE_TOOLCHAIN_GLOBS)."""
+    return _looks_like_toolchain(path) or _match_any(path, extra_globs)
+
+
+def effective_toolchain_globs(cfg: Config, state: State) -> list[str]:
+    """Globy toolchainu spoza heurystyki: deklaracja bootstrapu (State)
+    + CSV użytkownika (Config)."""
+    extra = [g.strip() for g in cfg.toolchain_globs_extra.split(",") if g.strip()]
+    return list(state.test_toolchain_globs) + extra
+
+
 def _looks_like_test(path: str) -> bool:
-    """Heurystyka pliku testowego, gdy zadanie nie podało test_globs."""
+    """Heurystyka pliku testowego, gdy zadanie nie podało test_globs.
+
+    Pliki toolchainu są wykluczone jawnie — "pytest.ini" zawiera "test"
+    w nazwie, ale to konfiguracja runnera, nie specyfikacja (własność
+    testera obejmuje testy i fixture'y typu conftest.py, nie toolchain)."""
+    if _looks_like_toolchain(path):
+        return False
     low = path.replace("\\", "/").lower()
     base = os.path.basename(low)
     return ("test" in base or "spec" in base or low.startswith("tests/")
@@ -570,6 +608,15 @@ def coder_test_violations(changed: list[str], test_globs: list[str],
     """Pliki testowe zmienione przez kodera niedozwolenie (nie z tego cyklu, niezadeklarowane)."""
     allowed = set(cycle_test_files) | {d for d in declared if d}
     return [p for p in changed if _is_test_path(p, test_globs) and p not in allowed]
+
+
+def weakening_candidates(changed: list[str], test_globs: list[str],
+                         toolchain_globs: list[str]) -> list[str]:
+    """Zbiór wejściowy bramki anty-osłabiania, liczony MECHANICZNIE z diffu
+    (nie z deklaracji kodera): zmienione pliki testowe ∪ zmieniony toolchain."""
+    return sorted(p for p in changed
+                  if _is_test_path(p, test_globs)
+                  or is_toolchain_path(p, toolchain_globs))
 
 
 def _norm_criterion(text: str) -> str:
@@ -626,23 +673,66 @@ def _verify_protected_globs(project: str, cfg: Config, state: State) -> list[str
             + verify.verify_script_paths(project, state))
 
 
-def criteria_fully_mapped(criteria: list[str], criteria_map: list[dict]) -> bool:
-    """DONE tylko gdy KAŻDE kryterium z listy zadania jest odhaczone w mapie
-    (pokryte testem albo jawnie uzasadnione).
+_MIN_JUSTIFIED_WHY = 20  # znaków — "bo tak" nie jest uzasadnieniem
 
-    Odhaczamy kryteria z listy, nie liczymy wpisów mapy — duplikaty i wpisy
-    o zmyślonych kryteriach nie mogą zastąpić brakującego pokrycia."""
-    remaining = {_norm_criterion(c) for c in criteria if _norm_criterion(c)}
-    if not remaining:
-        return True
+
+def validate_criteria_map(criteria: list[str], criteria_map: list[dict],
+                          project: str, test_globs: list[str]) -> list[str]:
+    """Walidacja mapy kryterium→test przy DONE (PLAN-4, Z2). Zwraca listę
+    powodów odrzucenia (pusta = mapa przyjęta) — powody wracają do testera
+    w kolejnym prompcie, żeby bounded-retry nie palił cykli na zgadywanie.
+
+    Koniec samocertyfikacji: "covered" musi wskazywać ISTNIEJĄCY plik będący
+    ścieżką testową zadania, a nazwa po "::" musi występować w jego treści;
+    "justified" wymaga merytorycznego "why" (wpisy justified nie znikają —
+    wołający przekazuje je recenzentowi do rozstrzygnięcia). Odhaczamy
+    kryteria z listy zadania, nie liczymy wpisów mapy — duplikaty i wpisy
+    o zmyślonych kryteriach nie zastępują brakującego pokrycia."""
+    errors: list[str] = []
+    satisfied: set[str] = set()
     for entry in criteria_map:
         if not isinstance(entry, dict):
             continue
-        satisfied = ((entry.get("status") == "covered" and entry.get("test"))
-                     or entry.get("status") == "justified")
-        if satisfied:
-            remaining.discard(_norm_criterion(entry.get("criterion", "")))
-    return not remaining
+        crit_norm = _norm_criterion(entry.get("criterion", ""))
+        status = entry.get("status")
+        if status == "covered":
+            ref = str(entry.get("test") or "").strip()
+            if not ref:
+                errors.append(f"kryterium {entry.get('criterion', '?')!r}: "
+                              "'covered' bez pola 'test'")
+                continue
+            path, _, name = ref.partition("::")
+            path = path.strip().replace("\\", "/")
+            full = os.path.join(project, path)
+            if not os.path.isfile(full):
+                errors.append(f"'{ref}': plik {path} nie istnieje w projekcie")
+                continue
+            if not _is_test_path(path, test_globs):
+                errors.append(f"'{ref}': {path} nie jest ścieżką testową zadania")
+                continue
+            name = name.strip()
+            if name:
+                try:
+                    with open(full, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                except OSError:
+                    content = ""
+                if name not in content:
+                    errors.append(f"'{ref}': nazwa '{name}' nie występuje w {path}")
+                    continue
+            satisfied.add(crit_norm)
+        elif status == "justified":
+            why = str(entry.get("why") or "").strip()
+            if len(why) < _MIN_JUSTIFIED_WHY:
+                errors.append(f"kryterium {entry.get('criterion', '?')!r}: "
+                              "'justified' wymaga merytorycznego 'why' "
+                              f"(≥ {_MIN_JUSTIFIED_WHY} znaków)")
+                continue
+            satisfied.add(crit_norm)
+    for c in criteria:
+        if _norm_criterion(c) and _norm_criterion(c) not in satisfied:
+            errors.append(f"kryterium bez ważnego pokrycia/uzasadnienia: {c!r}")
+    return errors
 
 
 # --- Git: tag/rollback/diff per zadanie -------------------------------------
@@ -840,18 +930,23 @@ def restore_test_changes(project: str, cfg: Config, files: list[str],
         revert_paths(project, [rel])
 
 
-def anti_weakening_ok(project: str, test_files: list[str], build_cmd: str,
+def anti_weakening_ok(project: str, files: list[str], build_cmd: str,
                       test_cmd: str, timeout: int) -> bool:
-    """Bramka anty-osłabiania: testy cyklu w bieżącej postaci MUSZĄ failować
-    na kodzie sprzed cyklu (HEAD).
+    """Bramka anty-osłabiania v2: testy cyklu (i toolchain w bieżącej postaci)
+    MUSZĄ failować na kodzie sprzed cyklu (HEAD).
 
-    Koder zadeklarował zmiany w testach — sprawdzamy mechanicznie, czy po tych
-    zmianach testy nadal cokolwiek specyfikują: kopiujemy ich bieżące wersje do
-    tymczasowego worktree na HEAD (kod bez pracy kodera) i odpalamy bramkę.
-    Zielona = testy przechodzą bez implementacji = zostały rozwodnione → False.
-    Brak plików / worktree niedostępny → True (nie blokuj — rozstrzygnie recenzja)."""
-    test_files = [p for p in test_files if p]
-    if not test_files:
+    Do tymczasowego worktree na HEAD (kod bez pracy kodera) kopiowane są
+    bieżące wersje zmienionych testów ORAZ plików toolchainu, potem rusza
+    bramka. Zielona = testy przechodzą bez implementacji = rozwodnione testy
+    albo znerfowany runner → False.
+
+    Baseline: zanim cokolwiek skopiujemy, bramka w czystym worktree musi być
+    ZIELONA — czerwień (np. brak node_modules/artefaktów builda w worktree)
+    czyni pomiar środowiskowo niemiarodajnym, więc check jest jawnie pomijany
+    (fail-open Z LOGIEM; drugą linią zostaje recenzja). Brak plików /
+    worktree niedostępny → True (nie blokuj — rozstrzygnie recenzja)."""
+    files = [p for p in files if p]
+    if not files:
         return True
     tmp = tempfile.mkdtemp(prefix="forge-antiweak-")
     wt = os.path.join(tmp, "wt")
@@ -859,8 +954,13 @@ def anti_weakening_ok(project: str, test_files: list[str], build_cmd: str,
         if git(project, "worktree", "add", "--detach", wt, "HEAD",
                check=False).returncode != 0:
             return True
+        base_green, _ = run_gate(wt, build_cmd, test_cmd, timeout)
+        if not base_green:
+            log("ANTY-OSŁABIANIE: baseline na HEAD nie jest zielony w worktree "
+                "— pomiar niemiarodajny, pomijam check (fail-open).")
+            return True
         copied = False
-        for rel in test_files:
+        for rel in files:
             src = os.path.join(project, rel)
             if not os.path.exists(src):
                 continue
@@ -1056,13 +1156,24 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                            f"({verdict.get('about') or verdict.get('reason') or ''})".rstrip())
 
             if action == "done":
-                if not criteria_fully_mapped(task.get("criteria") or [],
-                                             verdict.get("criteria_map") or []):
-                    log("DONE odrzucony: niekompletna mapa kryterium→test — kolejny cykl.")
+                map_errors = validate_criteria_map(
+                    task.get("criteria") or [], verdict.get("criteria_map") or [],
+                    project, test_globs)
+                if map_errors:
+                    log("DONE odrzucony: " + "; ".join(map_errors)[:400]
+                        + " — kolejny cykl.")
+                    state.done_reject_reasons = map_errors
                     state.micro_cycle = c  # zużyj cykl, by nie zapętlić w nieskończoność
                     state.micro_sub = "test"
                     save_checkpoint(project, state)
                     continue
+                # Kryteria "justified" przeszły walidację formy — merytorykę
+                # rozstrzygnie recenzent (dostaje je jawnie w prompcie).
+                state.justified_criteria = [
+                    {"criterion": e.get("criterion", ""), "why": e.get("why", "")}
+                    for e in (verdict.get("criteria_map") or [])
+                    if isinstance(e, dict) and e.get("status") == "justified"]
+                state.done_reject_reasons = []
                 green, _ = _task_gate(cfg, project, state)
                 if not green:
                     log("DONE zgłoszony przy CZERWONEJ bramce — naprawa kodem.")
