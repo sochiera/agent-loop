@@ -80,6 +80,12 @@ Zadania bootstrapu (wykonaj wszystkie, tworząc pliki w bieżącym katalogu):
      lokalnej suicie), np. ["tests/hil/**"] — będą chronione przed osłabianiem.
    Komendy targetów, których nie deklarujesz, zostaw pustymi stringami;
    nie zgaduj — lepszy sam "smoke" niż zmyślone komendy CI.
+8. Zadeklaruj TOOLCHAIN TESTOWY ("test_toolchain_globs"): globy plików, które
+   konfigurują, CO i JAK uruchamia komenda testowa (skrypty runnera, pliki
+   konfiguracyjne spoza standardowych nazw jak package.json/pytest.ini —
+   te forge zna sam). Np. ["scripts/test*.sh"]. Zmiany tych plików przechodzą
+   bramkę anty-osłabiania — wykastrowanie runnera nie może być "naprawą".
+   Brak takich plików = pusta lista.
 
 WAŻNE o komendach (uruchamiane bez powłoki, przez shlex): każda z nich musi być
 POJEDYNCZĄ komendą wykonywalną BEZ operatorów powłoki (`&&`, `|`, `>`, `;`, `cd`).
@@ -90,6 +96,7 @@ C++/CMake) podaj niepusty build_cmd — orkiestrator uruchomi go przed testami.
 Na samym końcu odpowiedzi zwróć WYŁĄCZNIE blok:
 ```json
 {{"kind": "game|app", "stack": "<krótki opis>", "test_cmd": "<pojedyncza komenda>", "build_cmd": "<pojedyncza komenda lub pusty string>", "run_cmd": "<pojedyncza komenda>",
+ "test_toolchain_globs": [],
  "verify": {{"targets": ["smoke"], "smoke_cmd": "<komenda>", "flash_cmd": "", "target_cmd": "", "probe_cmd": "", "ci_status_cmd": "<komenda z {{sha}} lub pusty>", "ci_logs_cmd": "<komenda z {{sha}} lub pusty>", "verify_test_globs": []}}}}
 ```
 Komendy muszą działać z katalogu projektu bez interakcji."""
@@ -333,6 +340,10 @@ ZASADY twarde:
 - Dozwolone zmiany w testach: adaptacyjne (rename/importy po refaktorze) — muszą
   nadal specyfikować to samo. Jeśli uważasz test za BŁĘDNY, popraw go i ZADEKLARUJ
   to poniżej z uzasadnieniem (rozstrzygnie recenzja). Nie osłabiaj testu, by przeszedł.
+- KONFIGURACJI URUCHAMIANIA TESTÓW (toolchain: package.json, pytest.ini,
+  Makefile, skrypty runnera itp.) nie zawężaj ani nie wyłączaj — orkiestrator
+  mierzy mechanicznie, czy po Twoich zmianach testy nadal failują na kodzie
+  sprzed cyklu, i wycofa nerf. Dodanie zależności jest OK.
 - NIE commituj.
 
 Na końcu zwróć WYŁĄCZNIE (o zieleni i tak rozstrzyga bramka orkiestratora,

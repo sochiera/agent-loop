@@ -320,10 +320,15 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     if not data["stack"].strip() or not data["test_cmd"].strip() or not data["run_cmd"].strip():
         raise AgentError("Bootstrap musi określić stack oraz niepuste komendy test i run.")
     profile = parse_verify_profile(data.get("verify"), cfg)
+    # Deklaracja toolchainu testowego (PLAN-4, Z1) — jak verify_test_globs:
+    # opcjonalna, uzupełnia wbudowaną heurystykę plików konfiguracji testów.
+    toolchain_globs = [str(g).strip() for g in (data.get("test_toolchain_globs") or [])
+                       if str(g).strip()]
     if not build_then_test(project, data["build_cmd"], data["test_cmd"], cfg.agent_timeout_s):
         raise AgentError("Build/testy szkieletu po bootstrapie nie przeszły.")
     for key, value in profile.items():
         setattr(state, key, value)
+    state.test_toolchain_globs = toolchain_globs
     state.stack = data.get("stack", "")
     state.test_cmd = data.get("test_cmd", "")
     state.build_cmd = data.get("build_cmd", "")

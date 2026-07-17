@@ -646,5 +646,80 @@ class FailTaskReplanTest(unittest.TestCase):
         self.assertEqual(len(state.task_queue), 1)
 
 
+# =====================================================================
+# E3: prompty i deklaracja toolchainu w bootstrapie
+# =====================================================================
+
+class PromptsPlan4Test(unittest.TestCase):
+    def test_bootstrap_prompt_asks_for_toolchain_globs(self) -> None:
+        import forge.prompts as p
+        boot = p.bootstrap_prompt("brief")
+        self.assertIn("test_toolchain_globs", boot)
+
+    def test_write_test_prompt_carries_done_rejection_feedback(self) -> None:
+        import forge.prompts as p
+        plain = p.write_test_prompt("f.md", "pytest")
+        self.assertNotIn("ODRZUCONA", plain)
+        with_reasons = p.write_test_prompt(
+            "f.md", "pytest",
+            reject_reasons=["kryterium bez ważnego pokrycia: 'k2'"])
+        self.assertIn("ODRZUCONA", with_reasons)
+        self.assertIn("k2", with_reasons)
+
+    def test_coder_prompt_forbids_toolchain_nerf(self) -> None:
+        import forge.prompts as p
+        prompt = p.code_and_refactor_prompt("f.md", "pytest", False)
+        self.assertIn("toolchain", prompt.lower())
+
+    def test_review_prompt_surfaces_mechanical_context(self) -> None:
+        import forge.prompts as p
+        prompt = p.review_task_prompt(
+            "f.md", "pytest", start_tag="forge/task-007-start",
+            changed=["src/a.py", "package.json"],
+            toolchain_changes=["package.json"],
+            justified=[{"criterion": "k9", "why": "wymaga ręcznej inspekcji UI"}])
+        self.assertIn("git diff forge/task-007-start", prompt)
+        self.assertIn("package.json", prompt)
+        self.assertIn("KONFIGURACJĘ URUCHAMIANIA TESTÓW", prompt)
+        self.assertIn("k9", prompt)
+        self.assertIn("wymaga ręcznej inspekcji UI", prompt)
+
+
+class BootstrapToolchainGlobsTest(unittest.TestCase):
+    @patch("forge.orchestrate.commit_all")
+    @patch("forge.orchestrate.build_then_test", return_value=True)
+    def test_bootstrap_stores_declared_toolchain_globs(self, _bt: Mock,
+                                                       _commit: Mock) -> None:
+        from forge.orchestrate import phase_bootstrap
+        with tempfile.TemporaryDirectory() as project:
+            brief = Path(project) / "brief.md"
+            brief.write_text("gra", encoding="utf-8")
+            cfg = Config(brief_path=str(brief), agent_timeout_s=5)
+            state = State()
+            payload = ('{"kind":"app","stack":"Py","test_cmd":"pytest",'
+                       '"build_cmd":"","run_cmd":"x",'
+                       '"test_toolchain_globs":["scripts/test*.sh", "  ", 42]}')
+            with patch("forge.orchestrate.run_planner", return_value=payload):
+                phase_bootstrap(cfg, project, state, lambda ph: "/tmp/log")
+            # Puste/nie-stringi odfiltrowane, deklaracja zapisana w State.
+            self.assertEqual(state.test_toolchain_globs, ["scripts/test*.sh", "42"])
+
+    @patch("forge.orchestrate.commit_all")
+    @patch("forge.orchestrate.build_then_test", return_value=True)
+    def test_missing_declaration_defaults_to_empty(self, _bt: Mock,
+                                                   _commit: Mock) -> None:
+        from forge.orchestrate import phase_bootstrap
+        with tempfile.TemporaryDirectory() as project:
+            brief = Path(project) / "brief.md"
+            brief.write_text("gra", encoding="utf-8")
+            cfg = Config(brief_path=str(brief), agent_timeout_s=5)
+            state = State()
+            payload = ('{"kind":"app","stack":"Py","test_cmd":"pytest",'
+                       '"build_cmd":"","run_cmd":"x"}')
+            with patch("forge.orchestrate.run_planner", return_value=payload):
+                phase_bootstrap(cfg, project, state, lambda ph: "/tmp/log")
+            self.assertEqual(state.test_toolchain_globs, [])
+
+
 if __name__ == "__main__":
     unittest.main()

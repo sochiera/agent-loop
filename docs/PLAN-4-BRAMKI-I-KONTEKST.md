@@ -1,6 +1,23 @@
 # Plan 4: uszczelnienie bramek i higiena kontekstu — projekt do implementacji
 
-Data: 2026-07-17. Kontynuacja PLAN-2/PLAN-3. Punkt wyjścia: przegląd repo
+Data: 2026-07-17. Kontynuacja PLAN-2/PLAN-3.
+
+> **Stan implementacji (2026-07-17):** E1–E3 ZAIMPLEMENTOWANE w TDD
+> (214 testów zielonych; nowe w `tests/test_plan4.py`). Z1: heurystyka
+> toolchainu + `test_toolchain_globs` (bootstrap/State/env), anty-osłabianie
+> v2 (zbiór mechaniczny z diffu, kopiowanie toolchainu, baseline fail-open
+> z logiem), reguła no_test (toolchain tylko w Ścieżkach kodu), testy cyklu
+> read-only na turę kodera. Z2: `validate_criteria_map` z powodami odrzucenia
+> wracającymi do testera, rola `reviewer` w świeżym kontekście z kontekstem
+> mechanicznym (tag startu, pliki, toolchain, justified). Z3: rotacja sesji
+> co K cykli ze startem na dzienniku, dziennik z plikami cyklu i sufitem
+> z konfiguracji, czyszczenie wsadu po porażce zadania. Odstępstwa od tekstu
+> planu: (1) pomiar anty-osłabiania pomijany, gdy w kopii nie ma żadnego
+> pliku testowego (sam toolchain na zielonym HEAD dawałby fałszywy alarm) —
+> nietknięte testy cyklu wchodzą do kopii przy zmianach toolchainu;
+> (2) test blokady zapisu sprawdza bity trybu, nie `os.access` (root pisze
+> mimo chmod). Do zrobienia po dostępie do żywych agentów: E4 (żywy test
+> nerfu `package.json` i kryterium `justified` w prompcie recenzenta). Punkt wyjścia: przegląd repo
 skonfrontowany z badaniami 2025–2026 o pętlach agentowych wskazał trzy słabe
 punkty do naprawy (dwa pozostałe — sandbox/bezpieczeństwo i budżety tokenów —
 świadomie odłożone, poza zakresem tego planu):

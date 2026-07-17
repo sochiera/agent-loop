@@ -144,6 +144,12 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 | Opóźnienie startu | brak | `--sleep 30s`, `--sleep 5m`, `--sleep 2h` |
 | Timeout agenta | 3600 s | `FORGE_AGENT_TIMEOUT=...` |
 | Push do remote | włączony (`origin`) | `FORGE_GIT_PUSH=0`, `FORGE_GIT_REMOTE=...` |
+| Recenzent zadania | agent testera, ŚWIEŻY kontekst | `FORGE_REVIEWER_AGENT/MODEL/EFFORT` |
+| Globy toolchainu testów (extra) | heurystyka + deklaracja bootstrapu | `FORGE_TOOLCHAIN_GLOBS` (CSV) |
+| Rotacja sesji ról co K cykli | `6` (0 = wyłączona) | `FORGE_SESSION_ROTATE_CYCLES` |
+| Sufit skrótu dziennika zadania | `8000` znaków | `FORGE_JOURNAL_TAIL_CHARS` |
+| Testy read-only na turę kodera | włączone | `FORGE_LOCK_TESTS=0` |
+| Re-plan wsadu po porażce zadania | włączony | `FORGE_REPLAN_ON_FAILURE=0` |
 
 > **Uwaga o Opusie na Pro $20:** Opus w każdej fazie wyczerpie tygodniowy limit
 > bardzo szybko. Gdy zacznie boleć, zejdź na `--claude-model sonnet` — pętla
@@ -180,6 +186,31 @@ naprawdę działa w środowisku docelowym. Szczegóły projektu:
   `FORGE_MAX_REPRO_RUNS`, `FORGE_CI_EARLY_WARN` (ostrzeżenie o czerwonym CI
   przy każdym planowaniu), `FORGE_VERIFIER_MCP_CONFIG` (plik MCP doklejany
   do Claude'a tylko w roli weryfikatora — np. serwer GitHuba do debugowania CI).
+
+## Uszczelnienie bramek i higiena kontekstu (PLAN-4)
+
+Projekt: `docs/PLAN-4-BRAMKI-I-KONTEKST.md`. W skrócie:
+
+- **Toolchain testowy pod ochroną.** Pliki konfigurujące uruchamianie testów
+  (`package.json`, `pytest.ini`, `Makefile`… + deklaracja bootstrapu
+  `test_toolchain_globs` + `FORGE_TOOLCHAIN_GLOBS`) przechodzą bramkę
+  anty-osłabiania: testy cyklu i toolchain w bieżącej postaci MUSZĄ failować
+  na kodzie sprzed cyklu (worktree na HEAD, z baseline'em odsiewającym pomiary
+  niemiarodajne środowiskowo). Wykastrowanie runnera nie może być „naprawą".
+- **Koniec samocertyfikacji DONE.** Mapa kryterium→test jest walidowana
+  mechanicznie (plik istnieje, jest ścieżką testową, nazwa testu występuje
+  w treści; `justified` wymaga merytorycznego `why`), a powody odrzucenia
+  wracają do testera w kolejnym prompcie.
+- **Recenzent ≠ autor.** Recenzja zadania idzie w świeżym kontekście (bez sesji
+  testera/kodera i bez dziennika), z kontekstem budowanym przez orkiestrator:
+  tag startu zadania, lista zmian, zmiany toolchainu, kryteria `justified` do
+  rozstrzygnięcia. Domyślnie to agent testera; **zalecana dywersyfikacja** —
+  wspólny model to wspólne ślepe punkty, np. `FORGE_REVIEWER_AGENT=claude`
+  przy koderze-Codeksie (decyzja kosztowa).
+- **Higiena kontekstu.** Sesje ról rotują co `FORGE_SESSION_ROTATE_CYCLES`
+  cykli (świeża sesja startuje z dziennika zadania, wzbogacanego mechanicznie
+  o pliki każdego cyklu); porażka zadania czyści resztę wsadu planowania —
+  plan budowany przy założeniu sukcesu jest przeplanowywany z `failures.md`.
 
 ## Dowolny agent CLI (claude, codex, grok, Kiro, …)
 
