@@ -577,6 +577,39 @@ def _norm_criterion(text: str) -> str:
     return " ".join((text or "").split()).casefold()
 
 
+def verify_protected_violations(changed: list[str], protected_globs: list[str],
+                                allowed: bool) -> list[str]:
+    """Pliki weryfikacji dotknięte bez uprawnienia (PLAN-3, sekcja 8).
+
+    ``allowed=True`` tylko dla zadania naprawiającego problem klasy
+    verify_defect — wtedy edycja chronionych ścieżek jest legalna."""
+    if allowed:
+        return []
+    return [p for p in changed if _match_any(p, protected_globs)]
+
+
+def _task_may_touch_verify(state: State, task: dict) -> bool:
+    """Odblokowanie chronionych ścieżek przez REJESTR, nie przez planistę:
+    pole 'fixes' zadania musi wskazywać problem klasy verify_defect."""
+    pid = (task or {}).get("fixes", "")
+    if not pid:
+        return False
+    return any(p.get("id") == pid and p.get("class") == "verify_defect"
+               for p in state.verify_problems)
+
+
+# Konfiguracje CI chronione niezależnie od profilu (odpowiedniki workflow).
+_CI_CONFIG_GLOBS = [".github/workflows/**", ".gitlab-ci.yml"]
+
+
+def _verify_protected_globs(project: str, cfg: Config, state: State) -> list[str]:
+    """Chronione ścieżki weryfikacji: workflow CI, testy targetowe/CI
+    (verify_test_globs) i skrypty komend profilu. Najtańszą "naprawą"
+    czerwonej weryfikacji nie może być jej wyłączenie."""
+    return (_CI_CONFIG_GLOBS + list(state.verify_test_globs)
+            + verify.verify_script_paths(project, state))
+
+
 def criteria_fully_mapped(criteria: list[str], criteria_map: list[dict]) -> bool:
     """DONE tylko gdy KAŻDE kryterium z listy zadania jest odhaczone w mapie
     (pokryte testem albo jawnie uzasadnione).
@@ -858,8 +891,21 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     feedback_path = _verify_feedback_path(project, cfg, state)
     if feedback_path:
         log(f"PLAN: przekazuję feedback weryfikacji: {feedback_path}")
+    ci_warning = ""
+    if cfg.ci_early_warn and "ci" in state.verify_targets and state.ci_status_cmd:
+        # Wczesne ostrzeganie (PLAN-3, sekcja 9): push jest per zadanie, więc
+        # CI i tak mieli — jeden tani odczyt statusu HEAD chroni przed
+        # budowaniem dziesiątek zadań na złamanym CI. rc==2 (trwa) jest OK.
+        rc, _ = _run_shellfree(project,
+                               verify.expand_sha(state.ci_status_cmd, _head_sha(project)),
+                               120)
+        if rc == 1:
+            ci_warning = ("CI dla bieżącego HEAD jest CZERWONE — rozważ zadanie "
+                          "naprawcze, zanim dobudujesz kolejne funkcje.")
+            log("PLAN: " + ci_warning)
     out = run_planner(prompts.plan_batch_prompt(cfg.batch_size, start, state.project_kind,
-                                                verify_feedback_path=feedback_path),
+                                                verify_feedback_path=feedback_path,
+                                                ci_warning=ci_warning),
                       cfg, project, logf("plan"))
     commit_all(project, "docs: plan wsadowy i backlog", cfg)  # pliki zadań, docs, backlog
     data = extract_json(out) or {}
@@ -911,6 +957,7 @@ def _start_task(cfg: Config, project: str, state: State) -> None:
     state.cycle_test_files = []
     state.pending_no_test = False
     state.no_test_count = 0
+    state.repro_runs = 0
     state.review_notes = []
     state.fix_attempt = 0
     state.phase = "micro"
@@ -930,10 +977,34 @@ def _clear_task(state: State) -> None:
     state.cycle_test_files = []
     state.pending_no_test = False
     state.no_test_count = 0
+    state.repro_runs = 0
     state.task_start_tag = ""
     state.review_notes = []
     state.fix_attempt = 0
     state.tests_green = False
+
+
+def _task_gate(cfg: Config, project: str, state: State) -> tuple[bool, str]:
+    """Bramka ZIELENI zadania: lokalna suita + (dla zadań naprawczych
+    weryfikacji) repro problemu. Zieleń zadania z repro_cmd wymaga OBU.
+
+    Sufit uruchomień repro per zadanie chroni sprzęt i czas (repro bywa
+    flashowaniem targetu); wyczerpany = czerwień, zadanie pada, planista
+    tnie inaczej. Bramka CZERWIENI testera pozostaje na samej suicie —
+    repro jest czerwone z definicji, więc mieszanie go tam zaślepiłoby
+    kontrolę "nowy test musi failować"."""
+    green, tail = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+    repro = (state.current_task or {}).get("repro_cmd", "")
+    if not (green and repro):
+        return green, tail
+    if state.repro_runs >= cfg.max_repro_runs_per_task:
+        return False, (f"limit uruchomień repro w zadaniu "
+                       f"({cfg.max_repro_runs_per_task}) wyczerpany")
+    state.repro_runs += 1
+    repro_green, repro_tail = verify.run_repro(project, repro, cfg.verify_timeout_s)
+    if not repro_green:
+        return False, "REPRO problemu nadal czerwone:\n" + repro_tail
+    return True, ""
 
 
 def _run_micro_loop(cfg: Config, project: str, state: State, logf):
@@ -975,7 +1046,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                     state.micro_sub = "test"
                     save_checkpoint(project, state)
                     continue
-                green, _ = gate()
+                green, _ = _task_gate(cfg, project, state)
                 if not green:
                     log("DONE zgłoszony przy CZERWONEJ bramce — naprawa kodem.")
                     state.pending_no_test = True
@@ -989,6 +1060,15 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                 return "done"
 
             if action == "no_test":
+                if task.get("repro_cmd"):
+                    # Zadanie naprawcze weryfikacji: specyfikacją jest repro,
+                    # więc brak lokalnego testu nie jest smellem (PLAN-3, 5.2).
+                    log(f"[cykl {c}] TESTER: brak testu (zadanie z repro — bez smellu).")
+                    state.pending_no_test = True
+                    state.cycle_test_files = []
+                    state.micro_sub = "code"
+                    save_checkpoint(project, state)
+                    continue
                 state.no_test_count += 1
                 threshold = max(2, cfg.max_micro_cycles // 3)
                 if state.no_test_count > threshold:
@@ -1050,7 +1130,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                                     task_file, state.test_cmd, no_test, tail),
                                 logf(f"c{c:02d}-code{attempt}"))
             verdict = extract_json(out) or {}
-            green, tail = gate()
+            green, tail = _task_gate(cfg, project, state)
             if green:
                 break
             log(f"[cykl {c}] bramka CZERWONA (próba {attempt + 1}/{cfg.max_green_retries + 1})")
@@ -1070,17 +1150,30 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
         if violations:
             log(f"KODER zmienił testy niezadeklarowanie: {violations} — wycofuję, ponawiam bramkę.")
             revert_paths(project, violations)
-            green, _ = gate()
+            green, _ = _task_gate(cfg, project, state)
             if not green:
                 log("Po wycofaniu niedozwolonych zmian testów bramka czerwona — porażka.")
                 return False
+
+        protected = _verify_protected_globs(project, cfg, state)
+        if protected:
+            offending = verify_protected_violations(
+                changed, protected, _task_may_touch_verify(state, task))
+            if offending:
+                log(f"KODER dotknął chronionych ścieżek weryfikacji: {offending} "
+                    "— wycofuję (dozwolone tylko w zadaniu verify_defect).")
+                revert_paths(project, offending)
+                green, _ = _task_gate(cfg, project, state)
+                if not green:
+                    log("Po wycofaniu zmian w plikach weryfikacji bramka czerwona — porażka.")
+                    return False
 
         if declared and not anti_weakening_ok(project, declared, state.build_cmd,
                                               state.test_cmd, cfg.agent_timeout_s):
             log(f"ANTY-OSŁABIANIE: zadeklarowane testy {declared} przechodzą na kodzie "
                 "sprzed cyklu — zmiana je rozwodniła. Przywracam wersje testów.")
             restore_test_changes(project, cfg, declared, state.cycle_test_files)
-            green, _ = gate()
+            green, _ = _task_gate(cfg, project, state)
             if not green:
                 log("Po przywróceniu testów bramka czerwona — porażka zadania.")
                 return False
@@ -1106,7 +1199,7 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
     task = state.current_task
     task_file = task.get("file", "")
     def gate() -> tuple[bool, str]:
-        return run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+        return _task_gate(cfg, project, state)  # suita + repro zadania naprawczego
 
     # None = wynik nieznany (trzeba odpalić bramkę); ustawiany, gdy drzewo się
     # nie zmieniło od ostatniego pomiaru. Świadomie NIE trwały w STATE.json —
@@ -1119,6 +1212,16 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
             out = _session_call(cfg, project, state, "coder",
                                 prompts.fix_review_prompt(state.review_notes, state.test_cmd),
                                 logf(f"review-fix{state.fix_attempt + 1}"))
+            protected = _verify_protected_globs(project, cfg, state)
+            if protected:
+                changed = changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
+                                        stop_file=cfg.stop_file)
+                offending = verify_protected_violations(
+                    changed, protected, _task_may_touch_verify(state, task))
+                if offending:
+                    log(f"Poprawki dotknęły chronionych ścieżek weryfikacji: {offending} "
+                        "— wycofuję.")
+                    revert_paths(project, offending)
             green, _ = gate()
             if green:
                 commit_all(project, f"fix: {state.current_task_title} (recenzja {state.fix_attempt + 1})")
@@ -1421,6 +1524,19 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
                     "(pusta kolejka bez no_more_tasks) — sprawdź log fazy plan.")
         _start_task(cfg, project, state)
         save_checkpoint(project, state)
+        repro = state.current_task.get("repro_cmd", "")
+        if repro:
+            # Zadanie naprawcze: repro MUSI być czerwone na starcie ("czerwone
+            # najpierw"). Zielone = problem już nie występuje — zadanie jest
+            # bezprzedmiotowe; potwierdzi to pełna weryfikacja następnego cyklu.
+            green, _ = verify.run_repro(project, repro, cfg.verify_timeout_s)
+            state.repro_runs = 1
+            if green:
+                log(f"Repro zadania '{state.current_task_title}' już ZIELONE na "
+                    "starcie — zamykam jako bezprzedmiotowe.")
+                journal_append(project, cfg, "repro zielone na starcie — zadanie bezprzedmiotowe")
+                _finish_task(cfg, project, state, n)
+                return True
     else:
         log(f"WZNAWIAM fazę '{state.phase}': {state.current_task_title}")
 

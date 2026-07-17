@@ -498,5 +498,167 @@ class VerifyGoalWiringTest(unittest.TestCase):
         self.assertTrue(cont)
 
 
+class TaskGateWithReproTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cfg = Config()
+        self.cfg.max_repro_runs_per_task = 3
+        self.state = State(test_cmd="t", current_task={"repro_cmd": "bash r.sh"})
+
+    def test_green_suite_but_red_repro_is_red_with_repro_tail(self) -> None:
+        with mock.patch("forge.orchestrate.run_gate", return_value=(True, "")), \
+             mock.patch("forge.orchestrate.verify.run_repro",
+                        return_value=(False, "objaw")):
+            green, tail = orchestrate._task_gate(self.cfg, "/p", self.state)
+        self.assertFalse(green)
+        self.assertIn("REPRO", tail)
+        self.assertEqual(self.state.repro_runs, 1)
+
+    def test_green_suite_and_green_repro_is_green(self) -> None:
+        with mock.patch("forge.orchestrate.run_gate", return_value=(True, "")), \
+             mock.patch("forge.orchestrate.verify.run_repro",
+                        return_value=(True, "")):
+            self.assertEqual(orchestrate._task_gate(self.cfg, "/p", self.state),
+                             (True, ""))
+
+    def test_red_suite_skips_repro(self) -> None:
+        with mock.patch("forge.orchestrate.run_gate", return_value=(False, "boom")), \
+             mock.patch("forge.orchestrate.verify.run_repro") as repro:
+            green, tail = orchestrate._task_gate(self.cfg, "/p", self.state)
+        repro.assert_not_called()
+        self.assertEqual((green, tail), (False, "boom"))
+
+    def test_repro_run_cap_fails_closed_without_touching_hardware(self) -> None:
+        self.state.repro_runs = 3
+        with mock.patch("forge.orchestrate.run_gate", return_value=(True, "")), \
+             mock.patch("forge.orchestrate.verify.run_repro") as repro:
+            green, tail = orchestrate._task_gate(self.cfg, "/p", self.state)
+        repro.assert_not_called()
+        self.assertFalse(green)
+        self.assertIn("limit", tail)
+
+    def test_task_without_repro_passes_suite_result_through(self) -> None:
+        self.state.current_task = {}
+        with mock.patch("forge.orchestrate.run_gate", return_value=(True, "")), \
+             mock.patch("forge.orchestrate.verify.run_repro") as repro:
+            self.assertEqual(orchestrate._task_gate(self.cfg, "/p", self.state),
+                             (True, ""))
+        repro.assert_not_called()
+
+
+class NoTestWithReproTest(unittest.TestCase):
+    def test_no_test_in_repro_task_does_not_count_towards_smell(self) -> None:
+        import subprocess as sp
+        with tempfile.TemporaryDirectory() as project:
+            sp.run(["git", "init", "-q"], cwd=project, check=True)
+            cfg = Config(max_micro_cycles=6, git_push=False)
+            cfg.max_green_retries = 0
+            state = State(test_cmd="pytest", current_task_title="T",
+                          current_task={"file": "f", "criteria": [],
+                                        "test_globs": ["tests/**"],
+                                        "repro_cmd": "bash r.sh"},
+                          phase="micro", micro_sub="test", no_test_count=2)
+
+            with mock.patch("forge.orchestrate._session_call",
+                            return_value='{"action":"no_test","reason":"strukturalny"}'), \
+                 mock.patch("forge.orchestrate._task_gate",
+                            return_value=(False, "czerwono")):
+                reached = orchestrate._run_micro_loop(
+                    cfg, project, state, lambda ph: os.path.join(project, "log"))
+
+            # bez smellu (licznik stoi), zadanie pada na bramce, nie na recenzji
+            self.assertEqual(state.no_test_count, 2)
+            self.assertFalse(reached)
+
+
+class ProtectedVerifyPathsTest(unittest.TestCase):
+    def test_violations_only_when_not_allowed(self) -> None:
+        changed = [".github/workflows/ci.yml", "src/a.py", "tests/hil/test_x.py"]
+        globs = [".github/workflows/**", "tests/hil/**"]
+        self.assertEqual(
+            orchestrate.verify_protected_violations(changed, globs, allowed=False),
+            [".github/workflows/ci.yml", "tests/hil/test_x.py"])
+        self.assertEqual(
+            orchestrate.verify_protected_violations(changed, globs, allowed=True), [])
+
+    def test_task_may_touch_verify_only_for_verify_defect_fix(self) -> None:
+        state = State(verify_problems=[
+            {"id": "P-001", "status": "new", "class": "verify_defect", "title": "t"},
+            {"id": "P-002", "status": "new", "class": "code_bug", "title": "t"}])
+        self.assertTrue(orchestrate._task_may_touch_verify(state, {"fixes": "P-001"}))
+        self.assertFalse(orchestrate._task_may_touch_verify(state, {"fixes": "P-002"}))
+        self.assertFalse(orchestrate._task_may_touch_verify(state, {}))
+
+    def test_protected_globs_include_declared_script_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as project:
+            os.makedirs(os.path.join(project, "scripts"))
+            Path(project, "scripts", "smoke.sh").write_text("exit 0", encoding="utf-8")
+            state = State(smoke_cmd="bash scripts/smoke.sh",
+                          verify_test_globs=["tests/hil/**"])
+            cfg = Config()
+
+            globs = orchestrate._verify_protected_globs(project, cfg, state)
+
+        self.assertIn(".github/workflows/**", globs)
+        self.assertIn("tests/hil/**", globs)
+        self.assertIn("scripts/smoke.sh", globs)
+
+
+class PointlessFixTaskTest(unittest.TestCase):
+    def test_green_repro_at_task_start_closes_task_without_micro_tdd(self) -> None:
+        import subprocess as sp
+        with tempfile.TemporaryDirectory() as project:
+            sp.run(["git", "init", "-q"], cwd=project, check=True)
+            os.makedirs(os.path.join(project, ".forge", "tasks"))
+            Path(project, ".forge", "tasks", "task-001.md").write_text(
+                "# Zadanie", encoding="utf-8")
+            cfg = Config(git_push=False)
+            state = State(bootstrapped=True, test_cmd="t",
+                          task_queue=[{"id": "task-001", "title": "Naprawa P-001",
+                                       "file": ".forge/tasks/task-001.md",
+                                       "criteria": [], "test_globs": [],
+                                       "code_globs": [], "fixes": "P-001",
+                                       "repro_cmd": "bash r.sh"}])
+
+            with mock.patch("forge.orchestrate.verify.run_repro",
+                            return_value=(True, "")), \
+                 mock.patch("forge.orchestrate._run_micro_loop") as micro, \
+                 mock.patch("forge.orchestrate.commit_all"):
+                cont = orchestrate._task_iteration(cfg, project, state)
+
+        micro.assert_not_called()
+        self.assertTrue(cont)
+        self.assertEqual(state.last_done, "Naprawa P-001")
+
+
+class CiEarlyWarnTest(unittest.TestCase):
+    def _plan(self, status_rc: int, early_warn: bool = True) -> str:
+        with tempfile.TemporaryDirectory() as project:
+            cfg = Config()
+            cfg.ci_early_warn = early_warn
+            state = State(verify_targets=["ci"],
+                          ci_status_cmd="bash ci.sh {sha}", ci_logs_cmd="bash l.sh")
+            with mock.patch("forge.orchestrate._run_shellfree",
+                            return_value=(status_rc, "")), \
+                 mock.patch("forge.orchestrate._head_sha", return_value="abc"), \
+                 mock.patch("forge.orchestrate.commit_all"), \
+                 mock.patch("forge.orchestrate.run_planner",
+                            return_value='{"no_more_tasks": false, "tasks": []}')\
+                 as planner:
+                orchestrate.phase_plan_batch(cfg, project, state,
+                                             lambda ph: os.path.join(project, "log"))
+            return planner.call_args.args[0]
+
+    def test_red_head_ci_warns_the_planner(self) -> None:
+        self.assertIn("CZERWONE", self._plan(1))
+
+    def test_green_or_running_ci_stays_silent(self) -> None:
+        self.assertNotIn("CZERWONE", self._plan(0))
+        self.assertNotIn("CZERWONE", self._plan(2))
+
+    def test_early_warn_can_be_disabled(self) -> None:
+        with mock.patch("forge.orchestrate._run_shellfree") as run:
+            self.assertNotIn("CZERWONE", self._plan(1, early_warn=False))
+
+
 if __name__ == "__main__":
     unittest.main()

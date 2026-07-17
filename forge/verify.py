@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import shlex
 import time
 
 from .config import Config
@@ -124,3 +125,21 @@ def run_repro(project: str, repro_cmd: str, timeout: int) -> tuple[bool, str]:
     rc, out = run_shellfree(project, repro_cmd, timeout)
     green = rc == 0
     return green, ("" if green else (out or "")[-1500:])
+
+
+def verify_script_paths(project: str, state: State) -> list[str]:
+    """Ścieżki skryptów użytych w komendach profilu weryfikacji (istniejące
+    pliki repo wskazane jako argumenty, np. 'scripts/smoke.sh' w
+    'bash scripts/smoke.sh'). Wchodzą do chronionych ścieżek — najtańszą
+    "naprawą" czerwonej weryfikacji nie może być edycja jej skryptu."""
+    paths: set[str] = set()
+    for cmd in (state.smoke_cmd, state.flash_cmd, state.target_cmd,
+                state.probe_cmd, state.ci_status_cmd, state.ci_logs_cmd):
+        try:
+            tokens = shlex.split(cmd or "")
+        except ValueError:
+            continue
+        for tok in tokens[1:]:
+            if os.path.isfile(os.path.join(project, tok)):
+                paths.add(tok.replace("\\", "/"))
+    return sorted(paths)

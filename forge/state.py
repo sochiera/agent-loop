@@ -58,6 +58,9 @@ class State:
     no_test_count: int = 0
     # Tag gita ustawiony na starcie zadania — punkt rollbacku przy porażce zadania.
     task_start_tag: str = ""
+    # Ile razy w bieżącym zadaniu uruchomiono repro (sufit chroni sprzęt:
+    # repro bywa flashowaniem). Zerowane na starcie zadania.
+    repro_runs: int = 0
 
     # --- Weryfikacja celu (PLAN-3): profil + checkpoint cyklu ---------------
     # Profil deklaruje bootstrap (jak test_cmd — serce stack-agnostyczności).
