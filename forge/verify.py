@@ -139,7 +139,10 @@ def verify_script_paths(project: str, state: State) -> list[str]:
             tokens = shlex.split(cmd or "")
         except ValueError:
             continue
-        for tok in tokens[1:]:
+        # tokens[0] też: skrypt bywa wywoływany bezpośrednio ("./scripts/x.sh"),
+        # nie tylko przez interpreter — prawdziwa binarka (bash, python3) i tak
+        # nie jest plikiem w repo, więc warunek isfile ją odsiewa.
+        for tok in tokens:
             if os.path.isfile(os.path.join(project, tok)):
                 paths.add(tok.replace("\\", "/"))
     return sorted(paths)

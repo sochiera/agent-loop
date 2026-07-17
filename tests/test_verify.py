@@ -602,6 +602,18 @@ class ProtectedVerifyPathsTest(unittest.TestCase):
         self.assertIn("tests/hil/**", globs)
         self.assertIn("scripts/smoke.sh", globs)
 
+    def test_directly_invoked_script_is_protected_too(self) -> None:
+        # smoke_cmd bez prefiksu 'bash' — ścieżka skryptu jest w tokens[0].
+        with tempfile.TemporaryDirectory() as project:
+            os.makedirs(os.path.join(project, "scripts"))
+            Path(project, "scripts", "smoke.sh").write_text("exit 0", encoding="utf-8")
+            state = State(smoke_cmd="./scripts/smoke.sh")
+
+            from forge.verify import verify_script_paths
+            paths = verify_script_paths(project, state)
+
+        self.assertEqual(paths, ["./scripts/smoke.sh"])
+
 
 class PointlessFixTaskTest(unittest.TestCase):
     def test_green_repro_at_task_start_closes_task_without_micro_tdd(self) -> None:
