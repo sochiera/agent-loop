@@ -1,58 +1,51 @@
-# Plan 3: faza weryfikacji celu (CI + real hardware) — projekt
+# Plan 3: faza weryfikacji celu (CI + real hardware) — projekt do implementacji
 
-Data: 2026-07-17 (rewizja 2 — zmiana koncepcji po decyzji użytkownika).
-Kontynuacja `PLAN-2-HARDENING.md`.
+Data: 2026-07-17 (rewizja 3 — domknięte trzy słabe punkty rewizji 2:
+rozjazd środowisk naprawy, brak zbieżności werdyktu, niebramkow ane
+klasyfikacje i luka anty-osłabiania).
 
-**Koncepcja:** weryfikacja NIE jest wpleciona w każde zadanie. Pracuje na sam
-koniec — gdy planista orzeknie, że cel jest osiągnięty (`no_more_tasks`),
-do gry wchodzi **nowy agent (weryfikator-QA)**, który sprawdza, czy całość
-naprawdę działa: na CI i na prawdziwym hardware. Jeśli nie — pisze **obszerny
-feedback** i oddaje go planiście, a cały cykl rusza od nowa (plan → zadania →
-mikro-TDD → ... → ponowna weryfikacja), aż weryfikacja przejdzie.
+**Koncepcja:** weryfikacja NIE jest wpleciona w każde zadanie. Gdy planista
+orzeknie `no_more_tasks`, do gry wchodzi **nowy agent (weryfikator-QA)**,
+który sprawdza całość na CI i prawdziwym hardware. Porażka = ustrukturyzowany
+raport + **rejestr problemów** → planista planuje zadania naprawcze → cały
+cykl od nowa, aż PASS albo brak postępu.
 
 ```
 pętla zadań (jak dziś) → planista: no_more_tasks
         │
         ▼
-  WERYFIKACJA CELU (nowy agent, świeży kontekst)
-   ├─ CI: obserwuje/debuguje przebieg dla HEAD (gh / MCP)
-   ├─ hardware: flash → testy na targecie → logi seriala
-   └─ werdykt:
-        PASS → koniec pracy 🎉
-        FAIL → obszerny raport → .forge/verification/feedback.md
-                 → cykl N+1: planista czyta feedback, planuje naprawy
-                 → pętla zadań → ... → ponowna weryfikacja
-        (limit cykli → czysty stop z raportem dla człowieka)
+  WERYFIKACJA CELU (cykl N)
+   ├─ orkiestrator zbiera dowody mechanicznie (CI/hardware/smoke, 0 tokenów)
+   ├─ agent QA bada dowody i produkt (gh/MCP/serial przez zadeklarowane skrypty)
+   └─ werdykt = REJESTR PROBLEMÓW (id, status, klasa, repro, dowód)
+        PASS → koniec pracy 🎉        PASS-z-notatkami → koniec + wpisy do BACKLOG
+        FAIL → feedback.md + repro-skrypty → planista → zadania naprawcze
+               (bramkowane własnym repro_cmd, nie tylko lokalną suitą)
+               → pętla zadań → weryfikacja (cykl N+1)
+        stop: brak postępu 2 cykle z rzędu | potwierdzony env_issue | sufit cykli
 ```
 
-Dlaczego to lepszy krój niż weryfikacja per zadanie (rewizja 1):
-
-- **Prostota maszyny stanów.** Jedna nowa faza na końcu cyklu zamiast czterech
-  faz wplecionych między recenzję, push i rollback każdego zadania.
-- **Koszt.** CI mieli minuty, flash+testy na targecie też — per zadanie
-  zabiłoby to przepustowość nocnej pętli. Per cykl celu płacimy raz.
-- **Naturalna rola.** Weryfikator to inżynier QA patrzący na CAŁOŚĆ świeżym
-  okiem (bez historii intencji), a nie podprogram diagnostyczny. Ocenia
-  produkt, nie diff.
-- **Feedback → planista to istniejący mechanizm.** Dokładnie tak działa dziś
-  `failures.md`: pamięć w repo, planista czyta i planuje. Zero nowych kanałów.
+Dlaczego ten krój (a nie weryfikacja per zadanie): jedna nowa faza zamiast
+czterech wplecionych w każde zadanie; koszt CI/hardware płacony per cykl celu;
+weryfikator to QA patrzący na całość świeżym okiem; feedback do planisty to
+istniejący mechanizm (jak `failures.md`). Świadoma cena: późne wykrycie —
+mitygowane wczesnym ostrzeganiem (sekcja 9) i bramkami per zadanie, które
+zostają pierwszą linią obrony.
 
 ---
 
-## 1. Zasady projektowe (niezmienne filary forge)
+## 1. Filary (niezmienne zasady forge)
 
-1. **Stack-agnostyczność przez deklarację.** Forge nie zna GitHub Actions ani
-   ESP-IDF. Sposób weryfikacji deklaruje agent bootstrapu (profil w
-   STATE.json), człowiek nadpisuje przez env/flagi.
-2. **Pamięć w repo.** Feedback weryfikacji żyje w plikach
-   (`.forge/verification/`), nie w kontekście modelu. Planista czyta plik,
-   weryfikator kolejnego cyklu czyta poprzednie raporty (co się poprawiło,
-   co nawraca).
-3. **Bramki mechaniczne tam, gdzie się da.** Werdykt PASS nie może być gołą
-   deklaracją agenta — orkiestrator żąda dowodów (patrz 4.3).
-4. **Wypchnięta historia nienaruszalna.** Weryfikacja startuje, gdy wszystko
-   jest już na remote; naprawy to nowe zadania i nowe commity. Zero rollbacków
-   w tej fazie.
+1. **Stack-agnostyczność przez deklarację** — sposób weryfikacji deklaruje
+   bootstrap w STATE.json; człowiek nadpisuje env/flagami. Forge zna tylko
+   kody wyjścia komend.
+2. **Pamięć w repo** — feedback i repro-skrypty żyją w
+   `.forge/verification/`, commitowane; kolejne cykle czytają poprzednie.
+3. **Bramki mechaniczne poza modelem** — PASS, postęp między cyklami,
+   klasyfikacje i ochrona plików weryfikacji są egzekwowane przez
+   orkiestrator na parsowalnych strukturach, nie na dobrej woli promptu.
+4. **Wypchnięta historia nienaruszalna** — weryfikacja startuje po pushu
+   wszystkiego; naprawy to nowe zadania i commity naprzód, zero rollbacków.
 
 ## 2. Profil weryfikacji w STATE.json
 
@@ -61,252 +54,357 @@ Bootstrap (rozszerzony prompt) deklaruje obok `test_cmd`/`run_cmd`:
 ```json
 "verify": {
   "targets": ["ci", "hardware", "smoke"],
-  "smoke_cmd":  "<dymny bieg produktu, rc==0 = OK — fallback, gdy brak ci/hw>",
-  "flash_cmd":  "<hardware: wgranie na target, np. bash scripts/flash.sh>",
-  "target_cmd": "<hardware: testy na targecie; rc==0 = OK, stdout = log seriala>",
+  "smoke_cmd":  "<dymny bieg produktu; rc==0 = OK>",
+  "flash_cmd":  "<hardware: wgranie na target>",
+  "target_cmd": "<hardware: testy na targecie; rc==0 = OK, stdout = log>",
   "probe_cmd":  "<hardware, opcjonalne: czy urządzenie podpięte (preflight)>",
   "ci_status_cmd": "<ci: status checków dla {sha}; rc: 0=zielono,1=czerwono,2=trwa>",
-  "ci_logs_cmd":   "<ci: log porażek dla {sha} na stdout>"
+  "ci_logs_cmd":   "<ci: log porażek dla {sha} na stdout>",
+  "verify_test_globs": ["<globy testów wykonywanych na targecie/w CI,
+                          np. tests/hil/**, .github/workflows/**>"]
 }
 ```
 
-- `targets` wybiera bootstrap z briefu i repo: `.github/workflows/` (czy inny
-  konfig CI) → `ci`; brief mówi o płytce/firmware → `hardware`; zawsze warto
-  dodać `smoke`. Człowiek nadpisuje: `FORGE_VERIFY_TARGETS=ci,hardware` /
-  `--verify-targets` (`none` = wyłącznik, zachowanie jak dziś).
-- Kontrakt komend ten sam co `test_cmd`: pojedyncza komenda bez operatorów
-  powłoki (złożone kroki → skrypt), `{sha}` rozwijany przez orkiestrator.
-  Provider CI jest wymienny — forge zna tylko kody wyjścia.
-- Pola płasko w `State` (jak `test_cmd`); walidacja w `phase_bootstrap`:
-  target zadeklarowany bez swoich komend = błąd bootstrapu. Stare STATE.json
-  migrują na `verify_targets=[]` + log z podpowiedzią.
-- Preflight: tryb `hardware` w `preflight()` odpala `probe_cmd` (jeśli jest) —
-  brak płytki wychodzi przy starcie pętli, nie w środku nocy.
+- `targets` wybiera bootstrap (konfig CI w repo → `ci`; brief o
+  płytce/firmware → `hardware`; `smoke` zawsze warto). Nadpisanie:
+  `FORGE_VERIFY_TARGETS=ci,hardware` / `--verify-targets`; `none` = wyłącznik
+  (zachowanie bit-w-bit dzisiejsze).
+- Kontrakt komend jak `test_cmd`: pojedyncza komenda bez operatorów powłoki,
+  `{sha}` rozwija orkiestrator. Provider CI wymienny.
+- **`verify_test_globs`** (nowe względem rew. 2): ścieżki testów, które
+  wykonują się w środowisku weryfikacji (na targecie, w CI), a NIE w lokalnej
+  suicie — objęte ochroną anty-osłabiania (sekcja 8). Bootstrap deklaruje,
+  planista może rozszerzać w zadaniach tworzących takie testy.
+- Pola płasko w `State`; walidacja w `phase_bootstrap` (target bez swoich
+  komend = błąd). Stare STATE.json migrują na `verify_targets=[]` + log.
+- Preflight trybu `hardware` odpala `probe_cmd` — brak płytki wychodzi przy
+  starcie pętli, nie w środku nocy.
 
 ## 3. Przebieg fazy weryfikacji
 
 ### 3.1. Wejście
 
-Dziś `no_more_tasks` kończy pętlę (`return False` w `_task_iteration`).
-Po zmianie: jeśli `verify_targets` niepuste → `state.phase = "verify_goal"`,
-`state.verify_cycle += 1` i wchodzimy w fazę weryfikacji. Pętlę kończy
-dopiero PASS albo limit cykli.
+Dziś `no_more_tasks` kończy pętlę. Po zmianie: przy niepustych
+`verify_targets` → `state.phase = "verify_goal"`, `state.verify_cycle += 1`.
+Pętlę kończy PASS albo warunki stopu (sekcja 6.3).
 
-### 3.2. Przygotowanie mechaniczne (0 tokenów)
+### 3.2. Dowody mechaniczne (0 tokenów)
 
-Zanim orkiestrator zawoła agenta, sam zbiera tani materiał dowodowy:
+Orkiestrator zbiera materiał zanim zawoła agenta:
 
 - `ci`: polling `ci_status_cmd {sha}` dla HEAD z backoffem (start 30 s, sufit
-  5 min, `FORGE_CI_TIMEOUT` domyślnie 45 min). Jeśli czerwono — ściąga
-  `ci_logs_cmd` do `.forge/verification/cycle-N/ci.log`. CI zielone i brak
-  innych targetów → można w ogóle nie budzić agenta (patrz 3.4).
-- `hardware`: `flash_cmd` (z jednym darmowym retry — USB bywa flaky), potem
-  `target_cmd` z timeoutem; pełny stdout/stderr do
-  `.forge/verification/cycle-N/hardware.log`.
-- `smoke`: `smoke_cmd`, wyjście do `.forge/verification/cycle-N/smoke.log`.
+  5 min, `FORGE_CI_TIMEOUT` domyślnie 45 min); czerwono → `ci_logs_cmd` do
+  `.forge/verification/cycle-N/ci.log`.
+- `hardware`: `flash_cmd` (retry `FORGE_FLASH_RETRIES`, start 1) →
+  `target_cmd` z timeoutem; pełne wyjście do `cycle-N/hardware.log`.
+- `smoke`: `smoke_cmd` → `cycle-N/smoke.log`.
 
-Wyniki (rc + ścieżki logów) trafiają do promptu weryfikatora. Czekanie na CI
-odbywa się więc w orkiestratorze za darmo, a nie w wiszącym wywołaniu agenta.
+Wyniki per target: `{"rc": int, "log": "<ścieżka>"}` — trafiają do promptu
+agenta i do bramki PASS. Czekanie na CI dzieje się w orkiestratorze za darmo.
 
 ### 3.3. Agent weryfikator-QA
 
-Nowa rola obok planisty/testera/kodera: `--verifier-agent/-model/-effort`,
-`FORGE_VERIFIER_*`; domyślnie agent planisty (to zadanie „mocnego modelu" —
-ocena całości, nie mechaniczne kodowanie). Zawsze **świeży kontekst** (bez
-sesji): ma oceniać produkt i dowody, nie pamiętać intencji z budowy.
+Rola konfigurowana jak pozostałe (`--verifier-agent/-model/-effort`,
+`FORGE_VERIFIER_*`; domyślnie agent planisty — to zadanie mocnego modelu).
+Zawsze **świeży kontekst**: ocenia produkt i dowody, nie intencje z budowy.
 
-Prompt (`prompts.verify_goal_prompt`) dostaje: brief/DESIGN.md (ścieżki, nie
-treść — agent sam czyta), profil weryfikacji, wyniki mechaniczne z 3.2
-(rc + ścieżki logów), ścieżki raportów z poprzednich cykli. Zadania agenta:
+Prompt (`prompts.verify_goal_prompt`) dostaje: ścieżki briefu/DESIGN.md,
+profil weryfikacji, wyniki mechaniczne (rc + ścieżki logów), ścieżkę
+rejestru problemów z poprzedniego cyklu (`cycle-(N-1)/problems.json`).
+Zadania agenta:
 
-1. Zbadać dowody: przeczytać logi, w razie potrzeby samodzielnie drążyć —
-   ponowić `target_cmd`, obejrzeć konkretny job CI (`gh` albo MCP, patrz 5),
-   uruchomić produkt (`run_cmd`) i sprawdzić realne zachowania z DESIGN.md.
-2. Przy porażce: napisać **obszerny raport** do
-   `.forge/verification/cycle-N/feedback.md` (format w sekcji 4).
-3. Zwrócić werdykt:
+1. Zbadać dowody; w razie potrzeby drążyć samodzielnie: ponowić `target_cmd`,
+   obejrzeć joby CI (`gh` albo MCP — sekcja 10), uruchomić produkt
+   (`run_cmd`) i skonfrontować zachowanie z DESIGN.md.
+2. **Zaktualizować rejestr problemów** (sekcja 4): każdy problem z cyklu N-1
+   oznaczyć `resolved`/`persisting`; nowe dodać jako `new`.
+3. Dla każdego problemu naprawialnego kodem napisać **skrypt reprodukcji**
+   `cycle-N/repro/<id>.sh` (sekcja 5.1).
+4. Przy porażce napisać obszerny `cycle-N/feedback.md` (narracja dla
+   planisty: objawy, cytaty z logów, hipotezy, proponowany podział na
+   zadania, porównanie z cyklem N-1).
+5. Zwrócić werdykt JSON (sekcja 4) — rejestr jest częścią werdyktu.
+
+## 4. Rejestr problemów — struktura werdyktu
+
+Serce rewizji 3: werdykt to nie „pass/fail + esej", tylko **parsowalny
+rejestr**, na którym orkiestrator egzekwuje postęp, klasy i ochronę plików:
 
 ```json
-{"verdict": "pass",
- "evidence": {"ci": "green", "hardware": "rc=0", "smoke": "rc=0"}}
+{"verdict": "pass | fail",
+ "problems": [
+   {"id": "P-007",
+    "status": "new | persisting | resolved",
+    "class": "code_bug | verify_defect | env_issue | flaky | design_gap",
+    "title": "<1 zdanie>",
+    "target": "ci | hardware | smoke | behavior",
+    "evidence": "<ścieżka:linie w logu / komenda z rc>",
+    "repro_cmd": "bash .forge/verification/cycle-N/repro/P-007.sh",
+    "criterion": "<dla design_gap: DOSŁOWNY cytat kryterium z DESIGN.md>"}
+ ]}
 ```
+
+Reguły (bramki orkiestratora, `verify_ledger.py` — czysta logika, testowalna
+bez agentów):
+
+- **Trwałe id.** Problem raz nazwany zachowuje id między cyklami; rejestr
+  poprzedniego cyklu jest wejściem, więc agent odhacza, a orkiestrator
+  weryfikuje kompletność: każdy problem otwarty w N-1 MUSI wystąpić w N ze
+  statusem `resolved` albo `persisting` (jak `criteria_fully_mapped` przy
+  DONE). Rejestr niekompletny → werdykt odrzucony, jedno ponowienie wywołania.
+- **Klasy o skutkach mechanicznych:**
+  - `code_bug` — trafia do planisty jako zadanie naprawcze; wymaga
+    `repro_cmd`.
+  - `verify_defect` — usterka samej weryfikacji (zły workflow, kruchy skrypt
+    flash); JEDYNA klasa odblokowująca edycję chronionych ścieżek (sekcja 8).
+  - `env_issue` — świat fizyczny/sekrety; NIGDY nie staje się zadaniem
+    kodowym; obsługa w sekcji 7.
+  - `flaky` — powtórka za darmo; nawrót w kolejnym cyklu → problem
+    pełnoprawny (stabilizacja jako zadanie).
+  - `design_gap` — zastrzeżenie behawioralne przy zielonych rc; **ważne
+    tylko z polem `criterion`, którego znormalizowany tekst występuje w
+    docs/DESIGN.md** (podciąg po normalizacji whitespace/case — mechanicznie,
+    jak `_norm_criterion`). Bez tego orkiestrator degraduje problem do
+    nieblokującej notatki. To zamyka „ruchome bramki": świeży agent nie może
+    blokować PASS ocennym widzimisię, tylko niespełnionym, zapisanym
+    kryterium.
+
+## 5. Naprawa: zadania z własną bramką reprodukcji
+
+Domknięcie rozjazdu środowisk (słaby punkt nr 1): usterka znaleziona na
+CI/targecie dostaje **wykonywalną reprodukcję**, która staje się bramką
+zadania naprawczego — lokalna suita przestaje być jedynym sędzią.
+
+### 5.1. Kontrakt repro-skryptu
+
+- `bash .forge/verification/cycle-N/repro/<id>.sh` — rc≠0 = bug obecny,
+  rc==0 = naprawiony. Pojedyncza komenda (uruchamiana przez `_run_shellfree`).
+- Skrypt może używać zadeklarowanych komend profilu (flash+target z filtrem
+  na konkretny test, `gh` dla CI, kontener imitujący runnera) — pisze go
+  weryfikator, który właśnie diagnozował problem, więc wie, co odtwarza.
+- **Walidacja przy odbiorze werdyktu:** orkiestrator uruchamia każdy nowy
+  `repro_cmd` — MUSI być czerwony (bug wszak istnieje). Zielony repro =
+  odrzucony problem (dowód nie odtwarza usterki) → notatka, nie zadanie.
+  To samo „czerwone najpierw", które pilnuje testera.
+- Repro bywa drogi (flash). Akceptowalne: walidacja przy odbiorze + bramka
+  w zadaniu naprawczym to 2 wykonania minimum; sufit
+  `FORGE_MAX_REPRO_RUNS_PER_TASK` (start 6) chroni sprzęt i czas.
+
+### 5.2. Zadania naprawcze w pętli mikro-TDD
+
+Planista, czytając feedback + rejestr, tworzy zadania z nowymi polami:
+
 ```json
-{"verdict": "fail",
- "report": ".forge/verification/cycle-N/feedback.md",
- "headline": "<1 zdanie: co jest zepsute>",
- "areas": ["ci", "hardware"]}
+{"id": "task-021", "fixes": "P-007",
+ "repro_cmd": "bash .forge/verification/cycle-3/repro/P-007.sh", ...}
 ```
 
-### 3.4. Rozstrzygnięcie orkiestratora
+Zmiany w pętli zadania, gdy `repro_cmd` obecny:
 
-- **PASS wymaga zgody dowodów z deklaracją** (bramka anty-„ogłaszaniu
-  zwycięstwa", jak przy DONE testera): orkiestrator przyjmuje `pass` tylko
-  gdy jego WŁASNE wyniki z 3.2 są zielone dla każdego targetu. Agent nie może
-  przegłosować czerwonego rc. Odwrotnie może: agent może sfailować mimo
-  zielonych komend (np. produkt startuje, ale zachowanie niezgodne z DESIGN).
-  Optymalizacja: gdy wszystkie targety zielone mechanicznie, wywołanie agenta
-  można ograniczyć do taniego przeglądu (albo pominąć przy
-  `FORGE_VERIFY_AGENT_ON_GREEN=0`) — pokrętło, decyzja po pomiarach.
-- **PASS** → `log("CEL ZWERYFIKOWANY")`, koniec pętli (dzisiejsze „MVP
-  ukończone 🎉" przenosi się tutaj).
-- **FAIL** → orkiestrator:
-  1. commituje raport (`docs`-commit, jak plan) i pushuje — feedback jest
-     częścią historii projektu;
-  2. czyści `no_more_tasks`-stan: `state.phase = "idle"`, kolejka pusta;
-  3. `verify_cycle >= FORGE_MAX_VERIFY_CYCLES` (start: 3) → **czysty stop**
-     z kodem wyjścia ≠ 0 i wskazaniem raportu — dalsze mielenie bez człowieka
-     to palenie tokenów w kółko;
-  4. inaczej → następna iteracja pętli: planista dostaje feedback (sekcja 4.2)
-     i planuje zadania naprawcze; te przechodzą normalną pętlę mikro-TDD ze
-     wszystkimi istniejącymi bramkami.
+- **Start zadania:** orkiestrator odpala repro — musi być czerwony (inaczej
+  problem już nie występuje → zadanie zamykane jako bezprzedmiotowe, wpis do
+  rejestru cyklu jako `resolved` z adnotacją).
+- **Tester:** pisze lokalny test regresji, jeśli się DA (najlepszy wynik);
+  gdy natura błędu na to nie pozwala, `no_test` w zadaniu z repro **nie
+  nalicza smellu** — specyfikacją jest repro (flaga w `_run_micro_loop`).
+- **Bramka zielona zadania:** `test_cmd` zielony **i** `repro_cmd` zielony
+  (rozszerzenie `run_gate` o drugi człon dla zadań z repro). Koder dostaje
+  ogon wyjścia repro przy czerwieni, jak dziś ogon testów.
+- **DONE testera:** mapa kryteriów jak dziś; dla zadania z repro orkiestrator
+  dodatkowo wymaga zielonego repro (mechanicznie, nie z mapy).
 
-### 3.5. Wznawialność
+Efekt: potwierdzenie naprawy przychodzi w zadaniu (minuty), nie w następnym
+pełnym cyklu (godziny). Pełna weryfikacja cyklu N+1 potwierdza integrację.
 
-`verify_cycle`, `phase="verify_goal"` i SHA badanego HEAD w STATE.json.
-Restart w tej fazie: ponowny polling/flash dla zapisanego SHA (wyniki
-mechaniczne są odtwarzalne, logi nadpisywane per cykl). Limit/Ctrl-C działa
-jak w każdej fazie — checkpoint przed wywołaniem agenta.
+## 6. PASS, postęp i warunki stopu
 
-## 4. Feedback: format i droga do planisty
+### 6.1. Bramka PASS
 
-### 4.1. Raport `feedback.md`
+Orkiestrator przyjmuje `pass` tylko gdy JEDNOCZEŚNIE:
 
-Obszerny, ale ustrukturyzowany — to kontrakt między weryfikatorem a planistą:
+- wszystkie targety z 3.2 mają rc==0 (agent nie przegłosuje czerwonego rc),
+- rejestr nie zawiera problemów blokujących (`code_bug`/`verify_defect`/
+  `design_gap`-z-kryterium o statusie ≠ `resolved`).
 
-```markdown
-# Weryfikacja celu — cykl N: FAIL
-## Co sprawdzono i jak (target → komenda/ścieżka → wynik)
-## Co działa (żeby planista tego nie ruszał)
-## Problemy (per problem):
-### P1: <tytuł>
-- Objaw: <co widać, cytat z loga + ścieżka do pełnego loga>
-- Dowód: .forge/verification/cycle-N/ci.log:123-160
-- Podejrzana przyczyna: <hipoteza + pliki>
-- Proponowany podział na zadania: <1-3 małe, testowalne kroki>
-- Klasyfikacja: code_bug | env_issue | flaky
-## Porównanie z cyklem N-1 (co naprawiono, co nawraca)
-```
+Agent może sfailować mimo zielonych rc — ale wyłącznie przez ważny
+`design_gap` (4.). Problemy zdegradowane (design_gap bez kryterium) przy
+zielonych rc → **PASS-z-notatkami**: koniec pracy, notatki dopisane do
+BACKLOG.md jako propozycje, nie porażka.
 
-- Klasyfikacja `env_issue` (brak sekretu CI, odpięta płytka, brak toolchaina
-  na runnerze) jest wyróżniona w werdykcie: to NIE wraca do planisty jako
-  zadanie kodowe, tylko zatrzymuje pętlę z komunikatem dla człowieka —
-  agent nie naprawi fizycznego świata, a cykle by się paliły.
-- `flaky`: jedna darmowa powtórka targetu przed uznaniem porażki; nawracająca
-  flakiness w kolejnych cyklach → jawny problem w raporcie (ustabilizowanie
-  testu to legalne zadanie naprawcze).
+### 6.2. Miara postępu (zamiast gołego limitu cykli)
 
-### 4.2. Planista czyta feedback
+Cykl liczy się jako **postępowy**, gdy ≥1 problem przeszedł na `resolved`
+albo liczba otwartych problemów blokujących spadła. Liczniki w stanie:
+`verify_cycle`, `verify_stall` (kolejne cykle bez postępu).
 
-Rozszerzenie `plan_batch_prompt` (ten sam mechanizm co `failures.md`):
-jeśli istnieje `.forge/verification/cycle-N/feedback.md` z ostatniego cyklu —
-przeczytaj, przełóż problemy na zadania naprawcze (sekcja „Proponowany
-podział" to sugestia, nie rozkaz — planista może pociąć inaczej), zaktualizuj
-BACKLOG. `no_more_tasks` wolno mu orzec dopiero, gdy problemy z raportu są
-zaadresowane — wtedy pętla naturalnie wraca do weryfikacji (cykl N+1).
+### 6.3. Warunki stopu (twarde, mechaniczne)
 
-### 4.3. Guardraile anty-osłabiania
+1. `verify_stall >= FORGE_MAX_STALL_CYCLES` (start: 2) — pętla kręci się bez
+   postępu → stop, kod wyjścia ≠ 0, log wskazuje rejestr i feedback.
+2. `verify_cycle >= FORGE_MAX_VERIFY_CYCLES` (start: 8 — bezpiecznik
+   absolutny, nie główny mechanizm; projekt robiący postęp w 9 problemach po
+   3 na cykl nie zostanie ubity limitem 3, jak groziło w rew. 2).
+3. Potwierdzony `env_issue` (sekcja 7).
 
-Zadania naprawcze przechodzą normalne bramki mikro-TDD, ale dochodzi ryzyko
-specyficzne dla weryfikacji: najtańszą „naprawą" CI jest wyłączenie kroku w
-workflow, a testu na targecie — skip. Mechanicznie (rozszerzenie istniejącej
-kontroli diffu): w cyklach naprawczych (verify_cycle > 1) zmiany w
-`.github/workflows/**` i w plikach skryptów zadeklarowanych w profilu
-weryfikacji są dozwolone TYLKO, gdy zadanie z planu jawnie je wymienia w
-`code_globs` — a takie zadanie planista może utworzyć wyłącznie, gdy raport
-klasyfikuje problem jako usterkę samej weryfikacji. Backstop jak zawsze:
-recenzja + człowiek rano.
+### 6.4. Wznawialność
 
-## 5. Dostęp weryfikatora do CI i hardware
+`verify_cycle`, `verify_stall`, faza, SHA badanego HEAD i ścieżka bieżącego
+rejestru w STATE.json. Restart w `verify_goal` → ponowne dowody mechaniczne
+dla zapisanego SHA (odtwarzalne; logi nadpisywane per cykl). Checkpoint przed
+wywołaniem agenta, jak we wszystkich fazach.
+
+## 7. `env_issue`: potwierdzenie zamiast zaufania
+
+Słaby punkt nr 3a: stop całego biegu nie może wisieć na słowie agenta.
+
+- Zgłoszony `env_issue` → orkiestrator robi **mechaniczne potwierdzenie**:
+  pełna powtórka dowodów dla wskazanego targetu (dla hardware wraz z
+  `probe_cmd`, dla CI świeży `ci_status_cmd`). Zielono → klasyfikacja
+  odrzucona, problem wraca jako `code_bug` do rozpatrzenia (agent się
+  pomylił, bieg trwa).
+- Czerwono → `env_issue` **potwierdzony**: target zablokowany, PASS
+  niemożliwy → grzeczny stop z DEDYKOWANYM kodem wyjścia (rozróżnialnym od
+  porażki merytorycznej) i plikiem `cycle-N/ENV-ISSUE.md` (co sprawdzić:
+  sekret, kabel, toolchain). To celowe: agent nie naprawi fizycznego świata,
+  a mielenie cykli pali tokeny.
+- `env_issue` nigdy nie trafia do planisty jako zadanie — egzekwowane
+  mechanicznie przy przekazywaniu rejestru (filtrowanie klas).
+
+## 8. Anty-osłabianie domknięte (mechanicznie)
+
+Słaby punkt nr 3b — dwie luki rewizji 2, obie zamknięte regułami na danych,
+które orkiestrator sam kontroluje:
+
+1. **Chronione ścieżki:** `.github/workflows/**` (i odpowiedniki innych CI),
+   skrypty komend profilu weryfikacji, `verify_test_globs` (testy
+   targetowe/CI — luka rew. 2: były zwykłymi plikami testowymi, więc
+   najtańszą „naprawą" hardware było ich osłabienie), oraz
+   `.forge/verification/**` (repro i rejestry — pisze je wyłącznie
+   weryfikator; koder/tester mają tam zakaz diffu).
+2. **Odblokowanie tylko przez rejestr, nie przez planistę:** zadanie może
+   deklarować chronione ścieżki w `code_globs` TYLKO gdy jego pole `fixes`
+   wskazuje problem o klasie `verify_defect` w rejestrze bieżącego cyklu.
+   Warunek sprawdza orkiestrator przy starcie zadania (lookup id→klasa) —
+   planista nie może już „sam sobie napisać code_globs" (luka rew. 2:
+   warunek był niesprawdzalny). Naruszenie w diffie → `revert_paths` +
+   ponowna bramka, jak dziś przy testach.
+3. **Osłabienie testu targetowego jest wykrywalne skutkiem:** nawet gdy
+   koder legalnie dotknie testu z `verify_test_globs` (zadanie
+   `verify_defect`), bramką zadania pozostaje repro + pełna weryfikacja
+   cyklu N+1 na prawdziwym targecie — skip/rozwodnienie testu nie zazieleni
+   czerwonego `target_cmd`, jeśli usterka jest realna. Backstop: recenzja
+   i człowiek, jak przy testach lokalnych.
+
+## 9. Wczesne ostrzeganie (mitygacja późnego wykrycia)
+
+Push jest per zadanie, więc CI i tak mieli przy każdym zadaniu — odroczone
+jest tylko patrzenie. Darmowa mitygacja: przy KAŻDYM planowaniu wsadowym
+orkiestrator odpala `ci_status_cmd HEAD` (bez czekania: rc==2 „trwa" jest OK)
+i wynik dokleja do promptu planisty jako jedną linię
+(`UWAGA: CI dla HEAD czerwone od zadania X`). Planista może wstawić zadanie
+naprawcze wcześniej, zamiast budować dziesiątki zadań na złamanym CI.
+Zero tokenów, zero nowych faz; pokrętło `FORGE_CI_EARLY_WARN=0` wyłącza.
+
+## 10. Dostęp weryfikatora do CI i hardware
 
 - **Warstwa mechaniczna** (orkiestrator): zadeklarowane komendy — polling,
   logi, flash. Deterministyczna, 0 tokenów, provider-agnostyczna.
-- **Warstwa dochodzeniowa** (agent): gdy ogon loga nie wystarcza, agent drąży
-  sam:
-  - `claude` jako weryfikator: `--mcp-config` z serwerem MCP GitHuba —
-    nowa opcja `FORGE_VERIFIER_MCP_CONFIG`, dokładana do argv w `run_claude`
-    tylko dla tej roli;
-  - `codex`: serwery MCP w `~/.codex/config.toml` (`[mcp_servers.*]`) — poza
-    forge, wystarczy udokumentować;
-  - fallback bez MCP: sandbox ma sieć (`danger-full-access`), prompt wskazuje
-    `gh run view --log-failed` itd. jako narzędzia.
-  - hardware: agent może ponawiać `flash_cmd`/`target_cmd` i czytać pełne
-    logi z `.forge/verification/` — fizyczny dostęp zawsze przez zadeklarowane
-    skrypty, nigdy przez komendy wymyślone ad hoc (skrypt przypina konkretne
-    urządzenie/port).
+- **Warstwa dochodzeniowa** (agent):
+  - `claude` jako weryfikator: `--mcp-config` z serwerem MCP GitHuba — opcja
+    `FORGE_VERIFIER_MCP_CONFIG` dokładana do argv w `run_claude` tylko dla
+    tej roli;
+  - `codex`: serwery MCP w `~/.codex/config.toml` — poza forge, wystarczy
+    udokumentować;
+  - fallback bez MCP: sandbox ma sieć, prompt wskazuje `gh run view
+    --log-failed` itd.;
+  - hardware zawsze przez zadeklarowane skrypty (przypięte do konkretnego
+    urządzenia/portu), nigdy przez komendy wymyślone ad hoc.
 
-  MCP jest opcjonalnym wzmocnieniem, nie rdzeniem — nocny bieg nie może
-  zależeć od konfiguracji MCP.
+  MCP to opcjonalne wzmocnienie diagnozy — nocny bieg nie może zależeć od
+  jego konfiguracji.
 
-## 6. Zmiany w kodzie (per plik)
+## 11. Zmiany w kodzie (per plik)
 
 | Plik | Zmiana |
 |---|---|
-| `config.py` | `verifier_agent/model/effort`, `verify_targets` (nadpisanie), `max_verify_cycles`, `ci_timeout_s`, `ci_poll_start_s/max_s`, `verify_timeout_s`, `flash_retries`, `verifier_mcp_config`; `agents_in_use()` + weryfikator gdy targets ≠ puste |
-| `state.py` | profil (`verify_targets`, `smoke_cmd`, `flash_cmd`, `target_cmd`, `probe_cmd`, `ci_status_cmd`, `ci_logs_cmd`), checkpoint (`verify_cycle`, `verify_sha`); migracja starych STATE.json |
-| `prompts.py` | `bootstrap_prompt` + profil weryfikacji; nowy `verify_goal_prompt`; `plan_batch_prompt` + akapit o feedbacku (analogiczny do failures.md) |
-| `orchestrate.py` | czyste funkcje: `collect_verify_evidence()` (smoke/flash+target/polling CI, zapis logów, zwraca wyniki per target), `verdict_allowed()` (bramka PASS-wymaga-zielonych-rc), `verify_config_violations()` (4.3); faza `verify_goal` wpięta w miejsce dzisiejszego `return False` po `no_more_tasks`; limit cykli |
-| `agents.py` | `run_claude`: opcjonalny `--mcp-config` per rola; reszta bez zmian (weryfikator = zwykłe `run_agent`) |
-| `report.py` | grupa faz `verify`; podsumowanie cykli weryfikacji |
+| `config.py` | `verifier_agent/model/effort`, `verify_targets` (nadpisanie), `max_verify_cycles`, `max_stall_cycles`, `ci_timeout_s`, `ci_poll_start_s/max_s`, `verify_timeout_s`, `flash_retries`, `max_repro_runs_per_task`, `ci_early_warn`, `verifier_mcp_config`; `agents_in_use()` + weryfikator |
+| `state.py` | profil (`verify_targets`, komendy, `verify_test_globs`), checkpoint (`verify_cycle`, `verify_stall`, `verify_sha`, `verify_ledger_path`); migracja starych STATE.json |
+| **`verify_ledger.py`** (nowy) | czysta logika rejestru: walidacja kompletności (odhaczanie id z N-1), klasy i ich skutki, degradacja `design_gap` bez kryterium (podciąg w DESIGN.md), miara postępu, filtrowanie do planisty. Bez subprocessów — w pełni testowalne |
+| **`verify.py`** (nowy) | dowody mechaniczne: `collect_evidence()` (smoke/flash+target/polling CI, zapis logów), `confirm_env_issue()`, `run_repro()`; wszystko na `_run_shellfree` (wydzielić do wspólnego modułu, by uniknąć importu z orchestrate) |
+| `prompts.py` | `bootstrap_prompt` + profil; nowe `verify_goal_prompt` (z kontraktem rejestru i repro); `plan_batch_prompt` + akapit o feedbacku/rejestrze i polach `fixes`/`repro_cmd`; `write_test_prompt`/`code_and_refactor_prompt` + wariant zadania z repro |
+| `orchestrate.py` | faza `verify_goal` w miejscu dzisiejszego `return False`; bramka PASS (6.1); stop-warunki (6.3); zadania z repro: czerwony-na-starcie, `run_gate`+repro, `no_test` bez smellu; egzekwowanie chronionych ścieżek (8.2) w kontroli diffu; early-warn przy planowaniu (9) |
+| `agents.py` | `run_claude`: opcjonalny `--mcp-config` per rola; reszta bez zmian |
+| `report.py` | grupa faz `verify`; podsumowanie cykli (problemy otwarte/rozwiązane per cykl) |
 | `smoke.py` | `--dry`: walidacja profilu (parsowalność komend, `probe_cmd` dla hardware) |
-| `README.md` | sekcja „Weryfikacja celu" + pokrętła + referencyjne skrypty `gh` |
+| `README.md` | sekcja „Weryfikacja celu" + pokrętła + referencyjne skrypty `gh` + kontrakt repro |
 
-Wszystkie nowe bramki na wzór `run_gate`/`_run_shellfree`: bez shella,
-z timeoutem, testowalne bez agentów (komendy mockowane skryptami — jak testy
-bramki anty-osłabiania).
+## 12. Etapy wdrożenia
 
-## 7. Etapy wdrożenia
+**E-V0 — rejestr + szkielet cyklu na trybie `smoke`.**
+`verify_ledger.py` w całości (to rdzeń — czysta logika, pełne testy
+jednostkowe), profil w bootstrapie, faza `verify_goal`, PASS/stall/limity,
+feedback → planista, wznawialność. Repro w wersji minimalnej (repro dla
+smoke = zwykły skrypt). Kryterium wyjścia: wszystkie testy + tryb `none`
+regresyjnie bit-w-bit.
 
-**E-V0 — szkielet cyklu na trybie `smoke`.** Profil w bootstrapie, faza
-`verify_goal`, raport → feedback → planista → cykl N+1, limit cykli,
-wznawialność. Najprostszy target przewierca CAŁĄ nową pętlę zewnętrzną.
-Testy jednostkowe: bramka PASS/rc, limit cykli, migracja STATE, przepływ
-feedbacku (planista dostaje ścieżkę raportu).
+**E-V1 — target `ci` + zadania z repro w mikro-TDD.**
+Polling, logi, early-warn (9), dochodzenie agenta (gh/MCP), pełny obieg
+repro (5.2: czerwony-na-starcie, bramka złożona, `no_test` bez smellu),
+potwierdzanie `env_issue`. Żywy test na repo z minimalnym workflow
+(`python3 -m unittest` jako królik doświadczalny).
 
-**E-V1 — target `ci`.** Polling + logi + dochodzenie agenta (gh/MCP),
-klasyfikacja `env_issue`/`flaky`, referencyjne skrypty. Żywy test na repo
-z minimalnym workflow (`python3 -m unittest` jako królik doświadczalny).
+**E-V2 — target `hardware`.**
+Flash/target/probe, retry, `verify_test_globs` w ochronie ścieżek, pełne
+logi seriala. Do czasu fizycznego targetu — mock płytki jako skrypt
+echo/exit (dokładnie jak testy `run_gate`).
 
-**E-V2 — target `hardware`.** Flash/target/probe, retry, pełne logi seriala,
-preflight. Do czasu dostępu do fizycznego targetu — bramki na
-skryptach-atrapach (mock płytki = skrypt echo/exit).
+**E-V3 — kalibracja po danych.**
+Limity (`FORGE_MAX_STALL_CYCLES`, timeouty, sufit repro), pomiar: ile usterek
+łapie weryfikacja, których nie złapały bramki zadań; ile problemów
+degradowanych (design_gap bez kryterium) — dużo = DESIGN.md za chudy, sygnał
+dla bootstrapu/planisty, by pisali kryteria weryfikowalne.
 
-**E-V3 — hartowanie po danych.** Kalibracja limitów i pokręteł
-(`FORGE_MAX_VERIFY_CYCLES`, timeouty, `FORGE_VERIFY_AGENT_ON_GREEN`), pomiar:
-ile realnych usterek łapie weryfikacja, których nie złapały bramki zadań —
-to uzasadnia jej koszt. Decyzja o 4.3 w wersji twardszej/miększej.
+## 13. Ryzyka (świadomie przyjęte, po rewizji 3)
 
-## 8. Ryzyka (świadomie przyjęte)
-
-1. **Pętla cykli bez postępu** — planista może kręcić się wokół tego samego
-   problemu. Mitygacje: limit cykli (twardy stop z raportem), sekcja
-   „porównanie z cyklem N-1" w raporcie (nawracający problem jest jawny),
-   człowiek rano.
-2. **Późne wykrycie** — cena tego kroju: usterka fundamentu wychodzi dopiero
-   na końcu, naprawa bywa droższa niż per zadanie. Akceptowane świadomie
-   (koszt CI/hw per zadanie byłby gorszy); istniejące bramki per zadanie
-   (testy, recenzja) zostają pierwszą linią obrony.
-3. **`env_issue` w środku nocy** — brak sekretu/płytki zatrzymuje pętlę.
-   Celowo: to sprawa człowieka; preflight (`probe_cmd`, smoke `--dry`)
-   minimalizuje ryzyko przed startem.
-4. **Werdykt „pass" na słowo** — pokryte bramką 3.4 (dowody rc muszą się
-   zgadzać); subiektywna część oceny („zachowanie zgodne z DESIGN") pozostaje
-   na odpowiedzialności agenta — backstop: człowiek.
+1. **Jakość repro-skryptów** — repro może odtwarzać objaw, nie przyczynę
+   (zielony repro ≠ naprawiony bug). Backstopy: walidacja czerwony-na-starcie,
+   pełna weryfikacja cyklu N+1 na realnym środowisku, recenzja.
+2. **Koszt sprzętu przy repro** (flash per bieg bramki) — sufit
+   `FORGE_MAX_REPRO_RUNS_PER_TASK`; zachęta w promptach: repro możliwie
+   tani (filtr na jeden test).
+3. **`design_gap` ograniczony do literalnych kryteriów** — cena zamknięcia
+   ruchomych bramek: realny problem behawioralny nieopisany w DESIGN.md
+   zostanie tylko notatką. Akceptowane: DESIGN.md jest żywy, notatki PASS
+   trafiają do BACKLOG — człowiek/planista może je awansować.
+4. **Późne wykrycie** — cecha kroju; mitygacje: early-warn (9) + bramki per
+   zadanie jako pierwsza linia.
 5. **Sekrety CI** — `gh`/MCP wymagają tokenu na maszynie pętli; forge tylko
-   dokumentuje wymóg (jak dziś `codex login`).
-6. **Flaky hardware/CI** — darmowe powtórki + klasyfikacja `flaky`; nawroty
-   eskalowane w raporcie zamiast zamiatane.
+   dokumentuje wymóg (jak `codex login`).
+6. **Dwa wykonania drogiego repro w cyklu życia problemu** (walidacja +
+   bramka) — świadomy koszt pewności „czerwone najpierw".
 
-## 9. Kryteria akceptacji (E-V0/E-V1)
+## 14. Kryteria akceptacji (definicja ukończenia E-V0/E-V1)
 
-- [ ] `no_more_tasks` przy niepustych `verify_targets` NIE kończy pętli —
-      wchodzi weryfikacja; przy `targets=[]`/`none` zachowanie bit-w-bit
-      dzisiejsze (regresyjne testy pętli przechodzą bez zmian).
-- [ ] FAIL: raport `feedback.md` zacommitowany i wypchnięty; następna
-      iteracja planowania dostaje go w prompcie; pętla zadań rusza od nowa.
-- [ ] PASS niemożliwy przy czerwonym rc któregokolwiek targetu (test bramki).
-- [ ] Limit cykli: po `FORGE_MAX_VERIFY_CYCLES` porażkach czysty stop,
-      kod wyjścia ≠ 0, log wskazuje raport.
-- [ ] Restart w fazie `verify_goal` wznawia weryfikację tego samego SHA.
-- [ ] Zmiany workflow/skryptów weryfikacji w cyklach naprawczych możliwe
-      tylko przez jawnie zaplanowane zadanie (test kontroli diffu).
+- [ ] `no_more_tasks` przy niepustych `verify_targets` NIE kończy pętli;
+      przy `targets=[]`/`none` zachowanie bit-w-bit dzisiejsze (regresja).
+- [ ] PASS niemożliwy przy czerwonym rc któregokolwiek targetu ani przy
+      otwartym problemie blokującym (testy bramki 6.1).
+- [ ] Rejestr niekompletny (nieodhaczony problem z N-1) → werdykt odrzucony.
+- [ ] `design_gap` bez kryterium obecnego w DESIGN.md nie blokuje PASS
+      (degradacja do notatki; test normalizacji podciągu).
+- [ ] Nowy `repro_cmd` zielony przy odbiorze → problem odrzucony; zadanie
+      z repro czerwonym na starcie przechodzi bramkę tylko przy zielonym
+      repro na końcu (testy na mock-skryptach).
+- [ ] `no_test` w zadaniu z repro nie nalicza smellu.
+- [ ] Zgłoszony `env_issue` z zielonym potwierdzeniem mechanicznym wraca do
+      obiegu; z czerwonym → stop z dedykowanym kodem wyjścia i ENV-ISSUE.md.
+- [ ] Stop po `FORGE_MAX_STALL_CYCLES` cyklach bez postępu; cykle z postępem
+      nie zużywają stall-licznika (testy miary postępu).
+- [ ] Chronione ścieżki: diff dotykający workflow/skryptów
+      weryfikacji/`verify_test_globs`/`.forge/verification/**` wycofywany,
+      chyba że zadanie ma `fixes` → problem klasy `verify_defect` (testy
+      lookupu i revertu).
+- [ ] FAIL: feedback + rejestr zacommitowane i wypchnięte; prompt planisty
+      zawiera ścieżki; następna iteracja rusza od planowania.
+- [ ] Restart w `verify_goal` wznawia dowody dla zapisanego SHA.
 - [ ] Wszystkie nowe bramki mają testy jednostkowe bez agentów.
