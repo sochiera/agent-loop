@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import os
+import stat
+import tempfile
 import unittest
+from pathlib import Path
 
 from forge.config import Config
+from forge.state import State
+from forge.verify import (collect_evidence, confirm_env_issue, expand_sha,
+                          run_repro)
 
 
 class VerifierConfigTest(unittest.TestCase):
@@ -58,6 +65,165 @@ class VerifierConfigTest(unittest.TestCase):
         self.assertGreaterEqual(cfg.flash_retries, 1)
         self.assertGreater(cfg.max_repro_runs_per_task, 1)
         self.assertTrue(cfg.ci_early_warn)
+
+
+
+
+def _script(tmp: Path, name: str, body: str) -> str:
+    """Zapisz wykonywalny skrypt i zwróć komendę uruchamiającą go."""
+    path = tmp / name
+    path.write_text("#!/usr/bin/env bash\n" + body + "\n", encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return f"bash {path}"
+
+
+class ExpandShaTest(unittest.TestCase):
+    def test_placeholder_is_replaced_everywhere(self) -> None:
+        self.assertEqual(expand_sha("ci.sh {sha} --ref {sha}", "abc"),
+                         "ci.sh abc --ref abc")
+        self.assertEqual(expand_sha("ci.sh", "abc"), "ci.sh")
+
+
+class EvidenceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.project = self.tmp / "proj"
+        self.project.mkdir()
+        self.cycle_dir = str(self.tmp / "cycle-1")
+        self.cfg = Config()
+        self.cfg.verify_timeout_s = 30
+        self.cfg.flash_retries = 1
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_smoke_evidence_records_rc_and_full_log(self) -> None:
+        state = State(verify_targets=["smoke"],
+                      smoke_cmd=_script(self.tmp, "smoke.sh",
+                                        "echo dziala; echo blad >&2; exit 3"))
+
+        results = collect_evidence(str(self.project), state, self.cfg,
+                                   self.cycle_dir, sha="", sleep=lambda s: None)
+
+        self.assertEqual(results["smoke"]["rc"], 3)
+        log = Path(results["smoke"]["log"]).read_text(encoding="utf-8")
+        self.assertIn("dziala", log)
+        self.assertIn("blad", log)
+
+    def test_hardware_flash_gets_free_retry_then_runs_target(self) -> None:
+        marker = self.tmp / "flash_count"
+        flash = _script(self.tmp, "flash.sh",
+                        f'n=$(cat {marker} 2>/dev/null || echo 0); '
+                        f'echo $((n+1)) > {marker}; '
+                        f'[ "$n" -ge 1 ] && exit 0 || exit 1')
+        target = _script(self.tmp, "target.sh", "echo SERIAL-OK; exit 0")
+        state = State(verify_targets=["hardware"], flash_cmd=flash, target_cmd=target)
+
+        results = collect_evidence(str(self.project), state, self.cfg,
+                                   self.cycle_dir, sha="", sleep=lambda s: None)
+
+        self.assertEqual(results["hardware"]["rc"], 0)
+        self.assertEqual(marker.read_text().strip(), "2")  # 1 porażka + 1 retry
+        self.assertIn("SERIAL-OK",
+                      Path(results["hardware"]["log"]).read_text(encoding="utf-8"))
+
+    def test_hardware_flash_exhausted_skips_target(self) -> None:
+        flash = _script(self.tmp, "flash.sh", "exit 1")
+        sentinel = self.tmp / "target_ran"
+        target = _script(self.tmp, "target.sh", f"touch {sentinel}; exit 0")
+        state = State(verify_targets=["hardware"], flash_cmd=flash, target_cmd=target)
+
+        results = collect_evidence(str(self.project), state, self.cfg,
+                                   self.cycle_dir, sha="", sleep=lambda s: None)
+
+        self.assertEqual(results["hardware"]["rc"], 1)
+        self.assertFalse(sentinel.exists())
+
+    def test_ci_polls_until_verdict_and_fetches_failure_logs(self) -> None:
+        marker = self.tmp / "polls"
+        status = _script(self.tmp, "status.sh",
+                         f'n=$(cat {marker} 2>/dev/null || echo 0); '
+                         f'echo $((n+1)) > {marker}; '
+                         f'[ "$1" = "abc123" ] || exit 9; '
+                         f'[ "$n" -ge 2 ] && exit 1 || exit 2')
+        logs = _script(self.tmp, "logs.sh", "echo CI-FAILURE-LOG")
+        state = State(verify_targets=["ci"],
+                      ci_status_cmd=status + " {sha}", ci_logs_cmd=logs + " {sha}")
+        delays: list[float] = []
+
+        results = collect_evidence(str(self.project), state, self.cfg,
+                                   self.cycle_dir, sha="abc123",
+                                   sleep=delays.append)
+
+        self.assertEqual(results["ci"]["rc"], 1)
+        self.assertEqual(marker.read_text().strip(), "3")  # 2× "trwa" + werdykt
+        self.assertEqual(len(delays), 2)
+        self.assertLessEqual(delays[0], delays[1])  # backoff nie maleje
+        self.assertIn("CI-FAILURE-LOG",
+                      Path(results["ci"]["log"]).read_text(encoding="utf-8"))
+
+    def test_ci_timeout_returns_none_not_green(self) -> None:
+        status = _script(self.tmp, "status.sh", "exit 2")  # wiecznie "trwa"
+        state = State(verify_targets=["ci"], ci_status_cmd=status + " {sha}",
+                      ci_logs_cmd="")
+        self.cfg.ci_timeout_s = 0  # natychmiastowy deadline
+
+        results = collect_evidence(str(self.project), state, self.cfg,
+                                   self.cycle_dir, sha="abc", sleep=lambda s: None)
+
+        self.assertIsNone(results["ci"]["rc"])
+
+
+class ReproAndEnvConfirmTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.project = str(self.tmp / "proj")
+        os.makedirs(self.project)
+        self.cfg = Config()
+        self.cfg.verify_timeout_s = 30
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_repro_red_and_green_with_tail(self) -> None:
+        red = _script(self.tmp, "red.sh", "echo objaw-bledu; exit 1")
+        green, tail = run_repro(self.project, red, 30)
+        self.assertFalse(green)
+        self.assertIn("objaw-bledu", tail)
+
+        ok = _script(self.tmp, "ok.sh", "exit 0")
+        green, tail = run_repro(self.project, ok, 30)
+        self.assertTrue(green)
+        self.assertEqual(tail, "")
+
+    def test_env_issue_confirmed_only_when_reproducibly_red(self) -> None:
+        state = State(verify_targets=["smoke"],
+                      smoke_cmd=_script(self.tmp, "bad.sh", "exit 1"))
+        self.assertTrue(confirm_env_issue(self.project, state, self.cfg,
+                                          "smoke", str(self.tmp / "confirm"),
+                                          sha="", sleep=lambda s: None))
+
+        state.smoke_cmd = _script(self.tmp, "good.sh", "exit 0")
+        self.assertFalse(confirm_env_issue(self.project, state, self.cfg,
+                                           "smoke", str(self.tmp / "confirm2"),
+                                           sha="", sleep=lambda s: None))
+
+    def test_hardware_env_confirmation_uses_probe_when_declared(self) -> None:
+        # Odpięta płytka: probe czerwony → potwierdzone bez flashowania.
+        sentinel = self.tmp / "flashed"
+        state = State(verify_targets=["hardware"],
+                      probe_cmd=_script(self.tmp, "probe.sh", "exit 1"),
+                      flash_cmd=_script(self.tmp, "flash.sh", f"touch {sentinel}; exit 0"),
+                      target_cmd=_script(self.tmp, "t.sh", "exit 0"))
+
+        confirmed = confirm_env_issue(self.project, state, self.cfg, "hardware",
+                                      str(self.tmp / "confirm"), sha="",
+                                      sleep=lambda s: None)
+
+        self.assertTrue(confirmed)
+        self.assertFalse(sentinel.exists())
 
 
 if __name__ == "__main__":
