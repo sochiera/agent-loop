@@ -320,10 +320,15 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     if not data["stack"].strip() or not data["test_cmd"].strip() or not data["run_cmd"].strip():
         raise AgentError("Bootstrap musi określić stack oraz niepuste komendy test i run.")
     profile = parse_verify_profile(data.get("verify"), cfg)
+    # Deklaracja toolchainu testowego (PLAN-4, Z1) — jak verify_test_globs:
+    # opcjonalna, uzupełnia wbudowaną heurystykę plików konfiguracji testów.
+    toolchain_globs = [str(g).strip() for g in (data.get("test_toolchain_globs") or [])
+                       if str(g).strip()]
     if not build_then_test(project, data["build_cmd"], data["test_cmd"], cfg.agent_timeout_s):
         raise AgentError("Build/testy szkieletu po bootstrapie nie przeszły.")
     for key, value in profile.items():
         setattr(state, key, value)
+    state.test_toolchain_globs = toolchain_globs
     state.stack = data.get("stack", "")
     state.test_cmd = data.get("test_cmd", "")
     state.build_cmd = data.get("build_cmd", "")
@@ -527,8 +532,46 @@ def _match_any(path: str, globs: list[str]) -> bool:
     return any(_path_matches(path, g) for g in globs)
 
 
+# Łańcuch narzędzi testowych (PLAN-4, Z1): pliki konfigurujące, CO i JAK
+# uruchamia test_cmd. Nie są własnością testera (to nie specyfikacja), a ich
+# zmiany przez kodera przechodzą bramkę anty-osłabiania — najtańszym "sposobem
+# na zieleń" nie może być wykastrowanie runnera w package.json/Makefile.
+_TOOLCHAIN_BASENAMES = frozenset({
+    "package.json", "pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini",
+    "makefile", "cmakelists.txt", "pom.xml", "cargo.toml", "noxfile.py",
+})
+_TOOLCHAIN_PREFIXES = ("jest.config.", "vitest.config.", "karma.conf.",
+                       "build.gradle")
+
+
+def _looks_like_toolchain(path: str) -> bool:
+    """Heurystyka pliku toolchainu testowego (wbudowana, uzupełniana globami)."""
+    base = os.path.basename(path.replace("\\", "/")).lower()
+    return (base in _TOOLCHAIN_BASENAMES
+            or any(base.startswith(p) for p in _TOOLCHAIN_PREFIXES))
+
+
+def is_toolchain_path(path: str, extra_globs: list[str]) -> bool:
+    """Czy ścieżka to plik toolchainu: heurystyka LUB dodatkowe globy
+    (deklaracja bootstrapu + FORGE_TOOLCHAIN_GLOBS)."""
+    return _looks_like_toolchain(path) or _match_any(path, extra_globs)
+
+
+def effective_toolchain_globs(cfg: Config, state: State) -> list[str]:
+    """Globy toolchainu spoza heurystyki: deklaracja bootstrapu (State)
+    + CSV użytkownika (Config)."""
+    extra = [g.strip() for g in cfg.toolchain_globs_extra.split(",") if g.strip()]
+    return list(state.test_toolchain_globs) + extra
+
+
 def _looks_like_test(path: str) -> bool:
-    """Heurystyka pliku testowego, gdy zadanie nie podało test_globs."""
+    """Heurystyka pliku testowego, gdy zadanie nie podało test_globs.
+
+    Pliki toolchainu są wykluczone jawnie — "pytest.ini" zawiera "test"
+    w nazwie, ale to konfiguracja runnera, nie specyfikacja (własność
+    testera obejmuje testy i fixture'y typu conftest.py, nie toolchain)."""
+    if _looks_like_toolchain(path):
+        return False
     low = path.replace("\\", "/").lower()
     base = os.path.basename(low)
     return ("test" in base or "spec" in base or low.startswith("tests/")
@@ -570,6 +613,15 @@ def coder_test_violations(changed: list[str], test_globs: list[str],
     """Pliki testowe zmienione przez kodera niedozwolenie (nie z tego cyklu, niezadeklarowane)."""
     allowed = set(cycle_test_files) | {d for d in declared if d}
     return [p for p in changed if _is_test_path(p, test_globs) and p not in allowed]
+
+
+def weakening_candidates(changed: list[str], test_globs: list[str],
+                         toolchain_globs: list[str]) -> list[str]:
+    """Zbiór wejściowy bramki anty-osłabiania, liczony MECHANICZNIE z diffu
+    (nie z deklaracji kodera): zmienione pliki testowe ∪ zmieniony toolchain."""
+    return sorted(p for p in changed
+                  if _is_test_path(p, test_globs)
+                  or is_toolchain_path(p, toolchain_globs))
 
 
 def _norm_criterion(text: str) -> str:
@@ -626,23 +678,66 @@ def _verify_protected_globs(project: str, cfg: Config, state: State) -> list[str
             + verify.verify_script_paths(project, state))
 
 
-def criteria_fully_mapped(criteria: list[str], criteria_map: list[dict]) -> bool:
-    """DONE tylko gdy KAŻDE kryterium z listy zadania jest odhaczone w mapie
-    (pokryte testem albo jawnie uzasadnione).
+_MIN_JUSTIFIED_WHY = 20  # znaków — "bo tak" nie jest uzasadnieniem
 
-    Odhaczamy kryteria z listy, nie liczymy wpisów mapy — duplikaty i wpisy
-    o zmyślonych kryteriach nie mogą zastąpić brakującego pokrycia."""
-    remaining = {_norm_criterion(c) for c in criteria if _norm_criterion(c)}
-    if not remaining:
-        return True
+
+def validate_criteria_map(criteria: list[str], criteria_map: list[dict],
+                          project: str, test_globs: list[str]) -> list[str]:
+    """Walidacja mapy kryterium→test przy DONE (PLAN-4, Z2). Zwraca listę
+    powodów odrzucenia (pusta = mapa przyjęta) — powody wracają do testera
+    w kolejnym prompcie, żeby bounded-retry nie palił cykli na zgadywanie.
+
+    Koniec samocertyfikacji: "covered" musi wskazywać ISTNIEJĄCY plik będący
+    ścieżką testową zadania, a nazwa po "::" musi występować w jego treści;
+    "justified" wymaga merytorycznego "why" (wpisy justified nie znikają —
+    wołający przekazuje je recenzentowi do rozstrzygnięcia). Odhaczamy
+    kryteria z listy zadania, nie liczymy wpisów mapy — duplikaty i wpisy
+    o zmyślonych kryteriach nie zastępują brakującego pokrycia."""
+    errors: list[str] = []
+    satisfied: set[str] = set()
     for entry in criteria_map:
         if not isinstance(entry, dict):
             continue
-        satisfied = ((entry.get("status") == "covered" and entry.get("test"))
-                     or entry.get("status") == "justified")
-        if satisfied:
-            remaining.discard(_norm_criterion(entry.get("criterion", "")))
-    return not remaining
+        crit_norm = _norm_criterion(entry.get("criterion", ""))
+        status = entry.get("status")
+        if status == "covered":
+            ref = str(entry.get("test") or "").strip()
+            if not ref:
+                errors.append(f"kryterium {entry.get('criterion', '?')!r}: "
+                              "'covered' bez pola 'test'")
+                continue
+            path, _, name = ref.partition("::")
+            path = path.strip().replace("\\", "/")
+            full = os.path.join(project, path)
+            if not os.path.isfile(full):
+                errors.append(f"'{ref}': plik {path} nie istnieje w projekcie")
+                continue
+            if not _is_test_path(path, test_globs):
+                errors.append(f"'{ref}': {path} nie jest ścieżką testową zadania")
+                continue
+            name = name.strip()
+            if name:
+                try:
+                    with open(full, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                except OSError:
+                    content = ""
+                if name not in content:
+                    errors.append(f"'{ref}': nazwa '{name}' nie występuje w {path}")
+                    continue
+            satisfied.add(crit_norm)
+        elif status == "justified":
+            why = str(entry.get("why") or "").strip()
+            if len(why) < _MIN_JUSTIFIED_WHY:
+                errors.append(f"kryterium {entry.get('criterion', '?')!r}: "
+                              "'justified' wymaga merytorycznego 'why' "
+                              f"(≥ {_MIN_JUSTIFIED_WHY} znaków)")
+                continue
+            satisfied.add(crit_norm)
+    for c in criteria:
+        if _norm_criterion(c) and _norm_criterion(c) not in satisfied:
+            errors.append(f"kryterium bez ważnego pokrycia/uzasadnienia: {c!r}")
+    return errors
 
 
 # --- Git: tag/rollback/diff per zadanie -------------------------------------
@@ -746,7 +841,9 @@ def journal_append(project: str, cfg: Config, text: str) -> None:
     _append_line(_journal_path(project, cfg), f"- [{ts()}] {text}\n")
 
 
-def journal_tail(project: str, cfg: Config, max_chars: int = 3000) -> str:
+def journal_tail(project: str, cfg: Config, max_chars: int | None = None) -> str:
+    if max_chars is None:
+        max_chars = cfg.journal_tail_chars
     try:
         with open(_journal_path(project, cfg), "r", encoding="utf-8") as f:
             text = f.read()
@@ -786,8 +883,13 @@ def _session_call(cfg: Config, project: str, state: State, role: str,
                          cfg, project, log_path, model=model, effort=effort)
 
     sid = getattr(state, attr) or None
+    # Świeża sesja w TOKU zadania (rotacja, restart) → kontekst z dziennika;
+    # na starcie zadania (cykl 0, bez poprawek) świeża sesja jest naturalna.
+    first_prompt = prompt
+    if sid is None and (state.micro_cycle > 0 or state.fix_attempt > 0):
+        first_prompt = _with_journal(project, cfg, prompt)
     try:
-        out, new_sid = run_agent_session(agent, prompt, cfg, project, log_path,
+        out, new_sid = run_agent_session(agent, first_prompt, cfg, project, log_path,
                                          session_id=sid, model=model, effort=effort)
     except AgentError as exc:
         if not (sid and _looks_like_session_loss(str(exc))):
@@ -805,6 +907,30 @@ def _session_call(cfg: Config, project: str, state: State, role: str,
 
 def _cycle_snapshot_dir(project: str, cfg: Config) -> str:
     return os.path.join(project, cfg.runtime_dir, "cycle_tests")
+
+
+def _snapshot_identical(project: str, cfg: Config, rel: str) -> bool:
+    """Czy plik cyklu jest bajt w bajt zgodny ze snapshotem testera —
+    nietknięte testy cyklu nie wymagają ponownego pomiaru anty-osłabiania."""
+    snap = os.path.join(_cycle_snapshot_dir(project, cfg), rel)
+    try:
+        with open(snap, "rb") as a, open(os.path.join(project, rel), "rb") as b:
+            return a.read() == b.read()
+    except OSError:
+        return False
+
+
+def _set_writable(project: str, files: list[str], writable: bool) -> None:
+    """Best-effort chmod testów cyklu na turę kodera (PLAN-4, Z1). To
+    DETERRENT odruchowych edycji, nie bariera — agent może zdjąć atrybut;
+    właściwą bramką pozostaje kontrola diffu."""
+    for rel in files:
+        path = os.path.join(project, rel)
+        try:
+            mode = os.stat(path).st_mode
+            os.chmod(path, (mode | 0o200) if writable else (mode & ~0o222))
+        except OSError:
+            pass
 
 
 def snapshot_cycle_tests(project: str, cfg: Config, files: list[str]) -> None:
@@ -840,18 +966,23 @@ def restore_test_changes(project: str, cfg: Config, files: list[str],
         revert_paths(project, [rel])
 
 
-def anti_weakening_ok(project: str, test_files: list[str], build_cmd: str,
+def anti_weakening_ok(project: str, files: list[str], build_cmd: str,
                       test_cmd: str, timeout: int) -> bool:
-    """Bramka anty-osłabiania: testy cyklu w bieżącej postaci MUSZĄ failować
-    na kodzie sprzed cyklu (HEAD).
+    """Bramka anty-osłabiania v2: testy cyklu (i toolchain w bieżącej postaci)
+    MUSZĄ failować na kodzie sprzed cyklu (HEAD).
 
-    Koder zadeklarował zmiany w testach — sprawdzamy mechanicznie, czy po tych
-    zmianach testy nadal cokolwiek specyfikują: kopiujemy ich bieżące wersje do
-    tymczasowego worktree na HEAD (kod bez pracy kodera) i odpalamy bramkę.
-    Zielona = testy przechodzą bez implementacji = zostały rozwodnione → False.
-    Brak plików / worktree niedostępny → True (nie blokuj — rozstrzygnie recenzja)."""
-    test_files = [p for p in test_files if p]
-    if not test_files:
+    Do tymczasowego worktree na HEAD (kod bez pracy kodera) kopiowane są
+    bieżące wersje zmienionych testów ORAZ plików toolchainu, potem rusza
+    bramka. Zielona = testy przechodzą bez implementacji = rozwodnione testy
+    albo znerfowany runner → False.
+
+    Baseline: zanim cokolwiek skopiujemy, bramka w czystym worktree musi być
+    ZIELONA — czerwień (np. brak node_modules/artefaktów builda w worktree)
+    czyni pomiar środowiskowo niemiarodajnym, więc check jest jawnie pomijany
+    (fail-open Z LOGIEM; drugą linią zostaje recenzja). Brak plików /
+    worktree niedostępny → True (nie blokuj — rozstrzygnie recenzja)."""
+    files = [p for p in files if p]
+    if not files:
         return True
     tmp = tempfile.mkdtemp(prefix="forge-antiweak-")
     wt = os.path.join(tmp, "wt")
@@ -859,8 +990,13 @@ def anti_weakening_ok(project: str, test_files: list[str], build_cmd: str,
         if git(project, "worktree", "add", "--detach", wt, "HEAD",
                check=False).returncode != 0:
             return True
+        base_green, _ = run_gate(wt, build_cmd, test_cmd, timeout)
+        if not base_green:
+            log("ANTY-OSŁABIANIE: baseline na HEAD nie jest zielony w worktree "
+                "— pomiar niemiarodajny, pomijam check (fail-open).")
+            return True
         copied = False
-        for rel in test_files:
+        for rel in files:
             src = os.path.join(project, rel)
             if not os.path.exists(src):
                 continue
@@ -999,6 +1135,8 @@ def _clear_task(state: State) -> None:
     state.review_notes = []
     state.fix_attempt = 0
     state.tests_green = False
+    state.done_reject_reasons = []
+    state.justified_criteria = []
 
 
 def _task_gate(cfg: Config, project: str, state: State) -> tuple[bool, str]:
@@ -1047,22 +1185,36 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
         if state.micro_sub == "test":
             log(f"[cykl {c}] TESTER pisze test / ocenia ukończenie")
             out = _session_call(cfg, project, state, "tester",
-                                prompts.write_test_prompt(task_file, state.test_cmd),
+                                prompts.write_test_prompt(
+                                    task_file, state.test_cmd,
+                                    reject_reasons=state.done_reject_reasons),
                                 logf(f"c{c:02d}-test"))
             verdict = extract_json(out) or {"action": "no_test", "reason": "brak werdyktu JSON"}
+            state.done_reject_reasons = []  # skonsumowane w prompcie powyżej
             action = verdict.get("action")
             journal_append(project, cfg,
                            f"cykl {c}, tester: {action} "
                            f"({verdict.get('about') or verdict.get('reason') or ''})".rstrip())
 
             if action == "done":
-                if not criteria_fully_mapped(task.get("criteria") or [],
-                                             verdict.get("criteria_map") or []):
-                    log("DONE odrzucony: niekompletna mapa kryterium→test — kolejny cykl.")
+                map_errors = validate_criteria_map(
+                    task.get("criteria") or [], verdict.get("criteria_map") or [],
+                    project, test_globs)
+                if map_errors:
+                    log("DONE odrzucony: " + "; ".join(map_errors)[:400]
+                        + " — kolejny cykl.")
+                    state.done_reject_reasons = map_errors
                     state.micro_cycle = c  # zużyj cykl, by nie zapętlić w nieskończoność
                     state.micro_sub = "test"
                     save_checkpoint(project, state)
                     continue
+                # Kryteria "justified" przeszły walidację formy — merytorykę
+                # rozstrzygnie recenzent (dostaje je jawnie w prompcie).
+                state.justified_criteria = [
+                    {"criterion": e.get("criterion", ""), "why": e.get("why", "")}
+                    for e in (verdict.get("criteria_map") or [])
+                    if isinstance(e, dict) and e.get("status") == "justified"]
+                state.done_reject_reasons = []
                 green, _ = _task_gate(cfg, project, state)
                 if not green:
                     log("DONE zgłoszony przy CZERWONEJ bramce — naprawa kodem.")
@@ -1141,16 +1293,21 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
         log(f"[cykl {c}] KODER {'(krok bez testu)' if no_test else 'zazielenia test'} + refaktor")
         green, tail = False, ""
         verdict: dict = {}
-        for attempt in range(cfg.max_green_retries + 1):
-            out = _session_call(cfg, project, state, "coder",
-                                prompts.code_and_refactor_prompt(
-                                    task_file, state.test_cmd, no_test, tail),
-                                logf(f"c{c:02d}-code{attempt}"))
-            verdict = extract_json(out) or {}
-            green, tail = _task_gate(cfg, project, state)
-            if green:
-                break
-            log(f"[cykl {c}] bramka CZERWONA (próba {attempt + 1}/{cfg.max_green_retries + 1})")
+        locked = state.cycle_test_files if cfg.lock_tests else []
+        _set_writable(project, locked, False)  # testy read-only na turę kodera
+        try:
+            for attempt in range(cfg.max_green_retries + 1):
+                out = _session_call(cfg, project, state, "coder",
+                                    prompts.code_and_refactor_prompt(
+                                        task_file, state.test_cmd, no_test, tail),
+                                    logf(f"c{c:02d}-code{attempt}"))
+                verdict = extract_json(out) or {}
+                green, tail = _task_gate(cfg, project, state)
+                if green:
+                    break
+                log(f"[cykl {c}] bramka CZERWONA (próba {attempt + 1}/{cfg.max_green_retries + 1})")
+        finally:
+            _set_writable(project, locked, True)
         journal_append(project, cfg,
                        f"cykl {c}, koder: {'zielony' if green else 'czerwony'} "
                        f"({verdict.get('notes') or ''})".rstrip())
@@ -1167,6 +1324,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
         if violations:
             log(f"KODER zmienił testy niezadeklarowanie: {violations} — wycofuję, ponawiam bramkę.")
             revert_paths(project, violations)
+            changed = [p for p in changed if p not in violations]
             green, _ = _task_gate(cfg, project, state)
             if not green:
                 log("Po wycofaniu niedozwolonych zmian testów bramka czerwona — porażka.")
@@ -1181,26 +1339,69 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                 log(f"KODER dotknął chronionych ścieżek weryfikacji: {offending} "
                     "— wycofuję (dozwolone tylko w zadaniu verify_defect).")
                 revert_paths(project, offending)
+                changed = [p for p in changed if p not in offending]
                 green, _ = _task_gate(cfg, project, state)
                 if not green:
                     log("Po wycofaniu zmian w plikach weryfikacji bramka czerwona — porażka.")
                     return False
 
-        if declared and not anti_weakening_ok(project, declared, state.build_cmd,
-                                              state.test_cmd, cfg.agent_timeout_s):
-            log(f"ANTY-OSŁABIANIE: zadeklarowane testy {declared} przechodzą na kodzie "
-                "sprzed cyklu — zmiana je rozwodniła. Przywracam wersje testów.")
-            restore_test_changes(project, cfg, declared, state.cycle_test_files)
+        tc_globs = effective_toolchain_globs(cfg, state)
+        if no_test:
+            # Krok bez testu nie ma czerwonego testu, więc pomiar anty-osłabiania
+            # nie ma czego failować — toolchain wolno ruszyć tylko, gdy planista
+            # przewidział to w "Ścieżkach kodu" zadania (decyzja widoczna w recenzji).
+            offending = [p for p in changed
+                         if is_toolchain_path(p, tc_globs)
+                         and not _match_any(p, task.get("code_globs") or [])]
+            if offending:
+                log(f"KODER dotknął toolchainu testów w kroku bez testu: {offending} "
+                    "— wycofuję (dozwolone tylko w 'Ścieżkach kodu' zadania).")
+                revert_paths(project, offending)
+                changed = [p for p in changed if p not in offending]
+                green, _ = _task_gate(cfg, project, state)
+                if not green:
+                    log("Po wycofaniu zmian toolchainu bramka czerwona — porażka.")
+                    return False
+
+        # Anty-osłabianie v2: zbiór wejściowy MECHANICZNIE z diffu (deklaracja
+        # kodera zostaje tylko kontekstem recenzji). Nietknięte testy cyklu nie
+        # wymagają pomiaru same w sobie, ale przy zmianach toolchainu wchodzą
+        # do kopii — bez nich pomiar nerfu nie miałby czego failować.
+        candidates = weakening_candidates(changed, test_globs, tc_globs)
+        tool_part = [p for p in candidates if not _is_test_path(p, test_globs)]
+        test_part = [p for p in candidates if _is_test_path(p, test_globs)]
+        if tool_part:
+            test_part = sorted(set(test_part) | set(state.cycle_test_files))
+        else:
+            test_part = [p for p in test_part
+                         if not (p in state.cycle_test_files
+                                 and _snapshot_identical(project, cfg, p))]
+        measured = sorted(set(test_part) | set(tool_part))
+        if test_part and not anti_weakening_ok(project, measured, state.build_cmd,
+                                               state.test_cmd, cfg.agent_timeout_s):
+            log(f"ANTY-OSŁABIANIE: {measured} przechodzą na kodzie sprzed cyklu "
+                "— rozwodnione testy albo znerfowany toolchain. Przywracam.")
+            restore_test_changes(project, cfg, test_part, state.cycle_test_files)
+            revert_paths(project, tool_part)
             green, _ = _task_gate(cfg, project, state)
             if not green:
-                log("Po przywróceniu testów bramka czerwona — porażka zadania.")
+                log("Po przywróceniu testów/toolchainu bramka czerwona — porażka zadania.")
                 return False
 
+        final_changed = changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
+                                      stop_file=cfg.stop_file)
+        journal_append(project, cfg,
+                       f"cykl {c}, commit; pliki: {', '.join(final_changed[:12])}")
         commit_all(project, f"tdd: {state.current_task_title} (cykl {c})")
         state.micro_cycle = c
         state.micro_sub = "test"
         state.cycle_test_files = []
         state.pending_no_test = False
+        if cfg.session_rotate_cycles and c % cfg.session_rotate_cycles == 0:
+            log(f"Rotacja sesji ról po cyklu {c} — świeży kontekst z dziennikiem "
+                "(higiena kontekstu).")
+            state.tester_session = ""
+            state.coder_session = ""
         save_checkpoint(project, state)
 
 
@@ -1267,10 +1468,24 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
             save_checkpoint(project, state)
             continue
 
-        log("--- RECENZJA CAŁOŚCI (Codex-tester) ---")
-        out = _session_call(cfg, project, state, "tester",
-                            prompts.review_task_prompt(task_file, state.test_cmd),
-                            logf(f"review-r{state.fix_attempt}"))
+        # Recenzent w ŚWIEŻYM kontekście (PLAN-4, Z2): bez sesji autorów i bez
+        # dziennika (narracja testera/kodera to wektor sugestii). Kontekst
+        # buduje mechanicznie orkiestrator: diff od taga startu, zmiany
+        # toolchainu, kryteria justified do rozstrzygnięcia.
+        log("--- RECENZJA CAŁOŚCI (świeży kontekst) ---")
+        agent, model, effort = cfg.role("reviewer")
+        changed = changed_files(project, state.task_start_tag or "HEAD",
+                                runtime_dir=cfg.runtime_dir, stop_file=cfg.stop_file)
+        toolchain_changed = [p for p in changed
+                             if is_toolchain_path(p, effective_toolchain_globs(cfg, state))]
+        out = run_agent(agent,
+                        prompts.review_task_prompt(
+                            task_file, state.test_cmd,
+                            start_tag=state.task_start_tag,
+                            changed=changed, toolchain_changes=toolchain_changed,
+                            justified=state.justified_criteria),
+                        cfg, project, logf(f"review-r{state.fix_attempt}"),
+                        model=model, effort=effort)
         review = extract_json(out) or {"verdict": "changes", "notes": ["Brak werdyktu JSON."]}
         journal_append(project, cfg,
                        f"recenzja: {review.get('verdict')} ({len(review.get('notes') or [])} uwag)")
@@ -1307,6 +1522,16 @@ def _fail_task(cfg: Config, project: str, state: State, n: int, reason: str) -> 
     record_failure(project, cfg, state, title, detail)
     _reset_to_tag(project, state.task_start_tag)  # lokalnie — nic nie było pushowane
     _delete_tag(project, state.task_start_tag)
+    if cfg.replan_on_failure and state.task_queue:
+        # Wsad był planowany przy założeniu sukcesu tego zadania — porażka
+        # falsyfikuje wejście zadań następnych (PLAN-4, Z3). Planista
+        # przeplanowuje tanio: failures.md + pliki zadań zostają na dysku.
+        dropped = [t.get("id") or t.get("title", "?") for t in state.task_queue]
+        log(f"Porzucam pozostały wsad ({len(dropped)} zadań) — planowanie od nowa.")
+        _append_line(os.path.join(project, cfg.runtime_dir, "failures.md"),
+                     f"- [{ts()}] porzucono wsad po porażce '{title}': "
+                     f"{', '.join(dropped)}\n")
+        state.task_queue = []
     state.iteration = n
     _clear_task(state)
     save_checkpoint(project, state)

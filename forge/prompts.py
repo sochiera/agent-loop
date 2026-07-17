@@ -80,6 +80,12 @@ Zadania bootstrapu (wykonaj wszystkie, tworząc pliki w bieżącym katalogu):
      lokalnej suicie), np. ["tests/hil/**"] — będą chronione przed osłabianiem.
    Komendy targetów, których nie deklarujesz, zostaw pustymi stringami;
    nie zgaduj — lepszy sam "smoke" niż zmyślone komendy CI.
+8. Zadeklaruj TOOLCHAIN TESTOWY ("test_toolchain_globs"): globy plików, które
+   konfigurują, CO i JAK uruchamia komenda testowa (skrypty runnera, pliki
+   konfiguracyjne spoza standardowych nazw jak package.json/pytest.ini —
+   te forge zna sam). Np. ["scripts/test*.sh"]. Zmiany tych plików przechodzą
+   bramkę anty-osłabiania — wykastrowanie runnera nie może być "naprawą".
+   Brak takich plików = pusta lista.
 
 WAŻNE o komendach (uruchamiane bez powłoki, przez shlex): każda z nich musi być
 POJEDYNCZĄ komendą wykonywalną BEZ operatorów powłoki (`&&`, `|`, `>`, `;`, `cd`).
@@ -90,6 +96,7 @@ C++/CMake) podaj niepusty build_cmd — orkiestrator uruchomi go przed testami.
 Na samym końcu odpowiedzi zwróć WYŁĄCZNIE blok:
 ```json
 {{"kind": "game|app", "stack": "<krótki opis>", "test_cmd": "<pojedyncza komenda>", "build_cmd": "<pojedyncza komenda lub pusty string>", "run_cmd": "<pojedyncza komenda>",
+ "test_toolchain_globs": [],
  "verify": {{"targets": ["smoke"], "smoke_cmd": "<komenda>", "flash_cmd": "", "target_cmd": "", "probe_cmd": "", "ci_status_cmd": "<komenda z {{sha}} lub pusty>", "ci_logs_cmd": "<komenda z {{sha}} lub pusty>", "verify_test_globs": []}}}}
 ```
 Komendy muszą działać z katalogu projektu bez interakcji."""
@@ -266,7 +273,15 @@ Ustaw "no_more_tasks": true i pustą listę "tasks" TYLKO gdy MVP z DESIGN.md je
 w pełni zaimplementowane i przetestowane, a BACKLOG nie ma sensownych kroków."""
 
 
-def write_test_prompt(task_file: str, test_cmd: str) -> str:
+def write_test_prompt(task_file: str, test_cmd: str,
+                      reject_reasons: list[str] | None = None) -> str:
+    rejected = ""
+    if reject_reasons:
+        bullets = "\n".join(f"- {r}" for r in reject_reasons)
+        rejected = (f"\nTWOJA POPRZEDNIA MAPA KRYTERIÓW (DONE) ZOSTAŁA ODRZUCONA "
+                    f"z powodów:\n{bullets}\n"
+                    "Uzupełnij brakujące pokrycie testem albo popraw mapę — nie "
+                    "zgaduj, odnieś się do każdego powodu.\n")
     return f"""{SHARED_PRINCIPLES}
 
 ROLA: TESTER. Dyktujesz specyfikację przez testy. NIE piszesz kodu produkcyjnego.
@@ -274,6 +289,7 @@ ROLA: TESTER. Dyktujesz specyfikację przez testy. NIE piszesz kodu produkcyjneg
 Bieżące zadanie: {task_file} (przeczytaj: cel, KRYTERIA AKCEPTACJI, Kontrakt API,
 Ścieżki testów). Przejrzyj istniejące testy i kod, ustal CZEGO JESZCZE BRAKUJE
 względem kryteriów.
+{rejected}
 
 Wybierz DOKŁADNIE jedno:
 A) Napisz JEDEN nowy test na brakującą funkcjonalność. Wymogi twarde:
@@ -324,6 +340,10 @@ ZASADY twarde:
 - Dozwolone zmiany w testach: adaptacyjne (rename/importy po refaktorze) — muszą
   nadal specyfikować to samo. Jeśli uważasz test za BŁĘDNY, popraw go i ZADEKLARUJ
   to poniżej z uzasadnieniem (rozstrzygnie recenzja). Nie osłabiaj testu, by przeszedł.
+- KONFIGURACJI URUCHAMIANIA TESTÓW (toolchain: package.json, pytest.ini,
+  Makefile, skrypty runnera itp.) nie zawężaj ani nie wyłączaj — orkiestrator
+  mierzy mechanicznie, czy po Twoich zmianach testy nadal failują na kodzie
+  sprzed cyklu, i wycofa nerf. Dodanie zależności jest OK.
 - NIE commituj.
 
 Na końcu zwróć WYŁĄCZNIE (o zieleni i tak rozstrzyga bramka orkiestratora,
@@ -334,19 +354,44 @@ nie Twoja deklaracja — ale zmiany w testach MUSISZ zadeklarować):
 ```"""
 
 
-def review_task_prompt(task_file: str, test_cmd: str) -> str:
+def review_task_prompt(task_file: str, test_cmd: str, *, start_tag: str = "",
+                       changed: list[str] | None = None,
+                       toolchain_changes: list[str] | None = None,
+                       justified: list[dict] | None = None) -> str:
+    diff_hint = (f"`git diff {start_tag}`" if start_tag
+                 else "`git diff` względem punktu startu zadania")
+    files_block = ""
+    if changed:
+        files_block = ("Pliki zmienione w zadaniu (policzone przez orkiestrator):\n"
+                       + "\n".join(f"- {p}" for p in changed[:40]) + "\n")
+    toolchain_block = ""
+    if toolchain_changes:
+        toolchain_block = (
+            "UWAGA: zadanie zmieniło KONFIGURACJĘ URUCHAMIANIA TESTÓW (toolchain):\n"
+            + "\n".join(f"- {p}" for p in toolchain_changes)
+            + "\nOceń JAWNIE, czy te zmiany są uzasadnione zadaniem i nie zawężają "
+            "ani nie wyłączają suity — nieuzasadnione = werdykt 'changes'.\n")
+    justified_block = ""
+    if justified:
+        rows = "\n".join(f"- {e.get('criterion', '?')} — uzasadnienie testera: "
+                         f"{e.get('why', '')}" for e in justified)
+        justified_block = (
+            "Kryteria oznaczone przez testera jako 'justified' (bez testu) — "
+            "rozstrzygnij KAŻDE merytorycznie (nietrafne uzasadnienie = 'changes'):\n"
+            + rows + "\n")
     return f"""{SHARED_PRINCIPLES}
 
-ROLA: RECENZENT. Zadanie przeszło mikro-cykle TDD. Oceń CAŁOŚĆ, szczególnie
-kod kodera. NIE piszesz teraz kodu — oceniasz.
+ROLA: RECENZENT (świeże oko — nie brałeś udziału w implementacji). Zadanie
+przeszło mikro-cykle TDD. Oceń CAŁOŚĆ, szczególnie kod kodera. NIE piszesz
+teraz kodu — oceniasz.
 
-Bieżące zadanie: {task_file}. Obejrzyj zmiany całego zadania: `git diff` względem
-punktu startu zadania (tag na HEAD sprzed pierwszego mikro-commita) oraz nowe pliki.
-
+Bieżące zadanie: {task_file}. Obejrzyj zmiany całego zadania: {diff_hint}
+oraz nowe pliki.
+{files_block}{toolchain_block}{justified_block}
 Oceń:
 - Czy WSZYSTKIE kryteria akceptacji są realnie spełnione i pokryte testami?
 - Czy testy sprawdzają zachowanie (nie tautologie/atrapy)? Czy któryś test został
-  osłabiony, żeby kod przeszedł?
+  osłabiony, żeby kod przeszedł? Czy kod nie hardkoduje wyników pod asercje?
 - Poprawność, prostota, brak wyjścia poza zakres, aktualność docs/.
 Możesz uruchomić `{test_cmd}`.
 

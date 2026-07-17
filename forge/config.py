@@ -128,6 +128,27 @@ class Config:
     # Plik konfiguracji MCP doklejany do claude TYLKO w roli weryfikatora.
     verifier_mcp_config: str = os.environ.get("FORGE_VERIFIER_MCP_CONFIG", "")
 
+    # --- PLAN-4: uszczelnienie bramek i higiena kontekstu --------------------
+    # Dodatkowe globy toolchainu testowego (CSV), doklejane do heurystyki
+    # wbudowanej i deklaracji bootstrapu (State.test_toolchain_globs).
+    toolchain_globs_extra: str = os.environ.get("FORGE_TOOLCHAIN_GLOBS", "")
+    # Recenzent zadania: pusty agent = agent testera, ale ZAWSZE świeży
+    # kontekst (bez sesji i dziennika) — autor nie recenzuje własnej pracy.
+    reviewer_agent: str = os.environ.get("FORGE_REVIEWER_AGENT", "")
+    reviewer_model: str = os.environ.get("FORGE_REVIEWER_MODEL", "")
+    reviewer_effort: str = os.environ.get("FORGE_REVIEWER_EFFORT", "")
+    # Rotacja sesji ról co K ukończonych mikro-cykli (0 = wyłączona) —
+    # higiena kontekstu: świeża sesja z dziennikiem zamiast spuchniętej.
+    session_rotate_cycles: int = int(os.environ.get("FORGE_SESSION_ROTATE_CYCLES", "6"))
+    # Sufit skrótu dziennika doklejanego do promptu (pełny dziennik na dysku).
+    journal_tail_chars: int = int(os.environ.get("FORGE_JOURNAL_TAIL_CHARS", "8000"))
+    # Blokada zapisu (chmod a-w) testów cyklu na czas tury kodera — tani
+    # deterrent, NIE bariera; właściwą bramką pozostaje kontrola diffu.
+    lock_tests: bool = os.environ.get("FORGE_LOCK_TESTS", "1") != "0"
+    # Porażka zadania czyści resztę kolejki wsadu (plan był budowany przy
+    # założeniu sukcesu) — planista przeplanowuje z failures.md.
+    replan_on_failure: bool = os.environ.get("FORGE_REPLAN_ON_FAILURE", "1") != "0"
+
     def effective_verify_targets(self, declared: list[str]) -> list[str]:
         """Targety po nadpisaniu użytkownika ("" = deklaracja bootstrapu)."""
         override = self.verify_targets_override.strip().lower()
@@ -161,6 +182,12 @@ class Config:
             return (self.verifier_agent,
                     *self._role_model_effort(self.verifier_agent,
                                              self.verifier_model, self.verifier_effort))
+        if name == "reviewer":
+            if not self.reviewer_agent:  # domyślnie agent testera, ALE świeży kontekst
+                return self.role("tester")
+            return (self.reviewer_agent,
+                    *self._role_model_effort(self.reviewer_agent,
+                                             self.reviewer_model, self.reviewer_effort))
         raise ValueError(f"nieznana rola: {name}")
 
     def tester(self) -> tuple[str, str]:
@@ -176,7 +203,8 @@ class Config:
         if self.legacy_mode:
             return list(dict.fromkeys([self.planner_agent, "codex"]))
         return list(dict.fromkeys([self.planner_agent, self.tester_agent,
-                                   self.coder_agent, self.role("verifier")[0]]))
+                                   self.coder_agent, self.role("verifier")[0],
+                                   self.role("reviewer")[0]]))
 
     # --- Komendy bazowe CLI (bez shella) ------------------------------------
     # Claude Code headless. Jeśli 'claude' nie jest na PATH, ustaw FORGE_CLAUDE_BIN.

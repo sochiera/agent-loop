@@ -11,8 +11,8 @@ from forge.agents import extract_codex_usage, extract_session_id
 from forge.config import Config
 from forge.orchestrate import (_next_task_index, _path_matches, _run_micro_loop,
                                _task_iteration, coder_test_violations,
-                               criteria_fully_mapped, phase_plan_batch,
-                               red_gate_ok, role_paths_ok, run_gate)
+                               phase_plan_batch, red_gate_ok, role_paths_ok,
+                               run_gate)
 from forge.state import State
 
 
@@ -47,33 +47,8 @@ class PureGateTest(unittest.TestCase):
             [],
         )
 
-    def test_criteria_mapping_completeness(self) -> None:
-        criteria = ["kryt1", "kryt2"]
-        full = [{"criterion": "kryt1", "test": "t::a", "status": "covered"},
-                {"criterion": "kryt2", "status": "justified"}]
-        self.assertTrue(criteria_fully_mapped(criteria, full))
-        partial = [{"criterion": "kryt1", "test": "t::a", "status": "covered"}]
-        self.assertFalse(criteria_fully_mapped(criteria, partial))
-        self.assertTrue(criteria_fully_mapped([], []))  # brak kryteriów → trywialnie spełnione
-        # "covered" bez testu nie liczy się jako pokrycie
-        self.assertFalse(criteria_fully_mapped(["k"], [{"criterion": "k", "status": "covered"}]))
-
-    def test_criteria_mapping_rejects_duplicates_and_invented_criteria(self) -> None:
-        criteria = ["kryt1", "kryt2"]
-        # Duplikat pokrycia kryt1 nie zastępuje brakującego kryt2.
-        dup = [{"criterion": "kryt1", "test": "t::a", "status": "covered"},
-               {"criterion": "kryt1", "test": "t::b", "status": "covered"}]
-        self.assertFalse(criteria_fully_mapped(criteria, dup))
-        # Zmyślone kryterium spoza listy zadania też nie.
-        invented = [{"criterion": "kryt1", "test": "t::a", "status": "covered"},
-                    {"criterion": "WYMYŚLONE", "test": "t::x", "status": "covered"}]
-        self.assertFalse(criteria_fully_mapped(criteria, invented))
-
-    def test_criteria_matching_tolerates_case_and_whitespace(self) -> None:
-        criteria = ["Gracz może  ruszyć jednostkę"]
-        entry = [{"criterion": "gracz może ruszyć jednostkę",
-                  "test": "t::ruch", "status": "covered"}]
-        self.assertTrue(criteria_fully_mapped(criteria, entry))
+    # Testy mapy kryteriów żyją w tests/test_plan4.py (ValidateCriteriaMapTest)
+    # — od PLAN-4 mapę waliduje validate_criteria_map z powodami odrzucenia.
 
     def test_tester_may_write_tests_when_globs_missing(self) -> None:
         from forge.orchestrate import tester_path_violations
@@ -431,9 +406,9 @@ class ReviewLoopGateEconomyTest(unittest.TestCase):
                      current_task_title="T", test_cmd="pytest")
 
     @patch("forge.orchestrate.run_gate")
-    @patch("forge.orchestrate._session_call",
+    @patch("forge.orchestrate.run_agent",
            return_value='```json\n{"verdict":"approve","notes":[]}\n```')
-    def test_fresh_green_from_done_skips_initial_gate(self, _call: Mock, gate: Mock) -> None:
+    def test_fresh_green_from_done_skips_initial_gate(self, _review: Mock, gate: Mock) -> None:
         from forge.orchestrate import _run_review_loop
         with tempfile.TemporaryDirectory() as project:
             ok = _run_review_loop(Config(), project, self._state(),
@@ -443,11 +418,11 @@ class ReviewLoopGateEconomyTest(unittest.TestCase):
 
     @patch("forge.orchestrate.commit_all")
     @patch("forge.orchestrate.run_gate", side_effect=[(False, ""), (True, "")])
-    @patch("forge.orchestrate._session_call",
-           side_effect=['```json\n{}\n```',
-                        '```json\n{"verdict":"approve","notes":[]}\n```'])
+    @patch("forge.orchestrate.run_agent",
+           return_value='```json\n{"verdict":"approve","notes":[]}\n```')
+    @patch("forge.orchestrate._session_call", side_effect=['```json\n{}\n```'])
     def test_red_gate_keeps_reviewer_notes_and_reuses_fix_gate_result(
-        self, call: Mock, gate: Mock, _commit: Mock
+        self, call: Mock, _review: Mock, gate: Mock, _commit: Mock
     ) -> None:
         from forge.orchestrate import _run_review_loop
         state = self._state()
@@ -560,8 +535,14 @@ class AntiWeakeningTest(unittest.TestCase):
         subprocess.run(["git", "init", "-q"], cwd=project, check=True)
         subprocess.run(["git", "config", "user.email", "t@t"], cwd=project, check=True)
         subprocess.run(["git", "config", "user.name", "t"], cwd=project, check=True)
-        # HEAD: implementacja "sprzed cyklu" (f() == 1, test by na niej padł).
+        # HEAD: implementacja "sprzed cyklu" (f() == 1, test by na niej padł)
+        # + zielona suita (baseline v2 wymaga zieleni na HEAD, jak w realnym
+        # projekcie, gdzie commit cyklu zapada tylko przy zielonej bramce).
         Path(project, "mod.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        Path(project, "test_base.py").write_text(
+            "import unittest\nclass B(unittest.TestCase):\n"
+            "    def test_base(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=project, check=True)
         subprocess.run(["git", "commit", "-qm", "przed cyklem"], cwd=project, check=True)
         # Katalog roboczy: praca kodera (niezacommitowana) + test w bieżącej postaci.
@@ -578,7 +559,8 @@ class AntiWeakeningTest(unittest.TestCase):
                 "    def test_f(self):\n"
                 "        self.assertEqual(mod.f(), 2)\n")
             self.assertTrue(anti_weakening_ok(
-                project, ["test_mod.py"], "", "python3 -m unittest -q test_mod", 60))
+                project, ["test_mod.py"], "",
+                "python3 -m unittest discover -q", 60))
 
     def test_gutted_test_passing_on_old_code_is_flagged(self) -> None:
         from forge.orchestrate import anti_weakening_ok
@@ -590,7 +572,8 @@ class AntiWeakeningTest(unittest.TestCase):
                 "    def test_f(self):\n"
                 "        self.assertTrue(True)\n")  # rozwodniony — nic nie specyfikuje
             self.assertFalse(anti_weakening_ok(
-                project, ["test_mod.py"], "", "python3 -m unittest -q test_mod", 60))
+                project, ["test_mod.py"], "",
+                "python3 -m unittest discover -q", 60))
 
     def test_no_files_never_blocks(self) -> None:
         from forge.orchestrate import anti_weakening_ok
@@ -651,15 +634,16 @@ class TaskIterationEndToEndTest(unittest.TestCase):
                 if calls["n"] == 2:
                     Path(proj, "src", "a.py").write_text("x = 1\n", encoding="utf-8")
                     return '```json\n{"made_green":true}\n```', "s-c"
-                if calls["n"] == 3:
-                    return ('```json\n{"action":"done","criteria_map":['
-                            '{"criterion":"c1","test":"tests/test_a.py::test_a","status":"covered"}]}\n```'), "s-t"
-                return '```json\n{"verdict":"approve","notes":[]}\n```', "s-t"
+                # n == 3: tester orzeka DONE (recenzja idzie już przez run_agent)
+                return ('```json\n{"action":"done","criteria_map":['
+                        '{"criterion":"c1","test":"tests/test_a.py::test_a","status":"covered"}]}\n```'), "s-t"
 
             gate = iter([(False, "red"), (True, ""), (True, ""), (True, "")])
 
             with patch("forge.orchestrate.run_planner", side_effect=fake_planner), \
                  patch("forge.orchestrate.run_agent_session", side_effect=fake_codex), \
+                 patch("forge.orchestrate.run_agent",
+                       return_value='```json\n{"verdict":"approve","notes":[]}\n```'), \
                  patch("forge.orchestrate.run_gate", side_effect=lambda *a, **k: next(gate)):
                 cont = _task_iteration(cfg, project, state)
 
