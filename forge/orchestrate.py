@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import os
 import re
 import shutil
@@ -19,7 +20,7 @@ import sys
 import tempfile
 import time
 
-from . import adapters, prompts
+from . import adapters, prompts, verify, verify_ledger
 from .agents import (AgentError, LimitExhausted, agent_supports_resume,
                      extract_json, run_agent, run_agent_session, run_codex,
                      run_planner)
@@ -841,10 +842,24 @@ def _next_task_index(project: str) -> int:
     return top + 1
 
 
+def _verify_feedback_path(project: str, cfg: Config, state: State) -> str:
+    """Ścieżka raportu ostatniej nieudanej weryfikacji — jeśli są otwarte
+    problemy do naprawy i raport fizycznie istnieje (pamięć w repo)."""
+    if not verify_ledger.for_planner(state.verify_problems):
+        return ""
+    path = os.path.join(project, cfg.runtime_dir, "verification",
+                        f"cycle-{state.verify_cycle}", "feedback.md")
+    return path if os.path.exists(path) else ""
+
+
 def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     log(f"--- PLAN WSADOWY ({cfg.planner_agent}) ---")
     start = _next_task_index(project)
-    out = run_planner(prompts.plan_batch_prompt(cfg.batch_size, start, state.project_kind),
+    feedback_path = _verify_feedback_path(project, cfg, state)
+    if feedback_path:
+        log(f"PLAN: przekazuję feedback weryfikacji: {feedback_path}")
+    out = run_planner(prompts.plan_batch_prompt(cfg.batch_size, start, state.project_kind,
+                                                verify_feedback_path=feedback_path),
                       cfg, project, logf("plan"))
     commit_all(project, "docs: plan wsadowy i backlog", cfg)  # pliki zadań, docs, backlog
     data = extract_json(out) or {}
@@ -858,6 +873,9 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
                 "criteria": t.get("criteria") or [],
                 "test_globs": t.get("test_globs") or [],
                 "code_globs": t.get("code_globs") or [],
+                # Zadania naprawcze weryfikacji (PLAN-3): id problemu + bramka repro.
+                "fixes": str(t.get("fixes") or ""),
+                "repro_cmd": str(t.get("repro_cmd") or ""),
             })
         else:
             log(f"PLAN: pomijam zadanie bez pliku na dysku: {t.get('id') or rel!r}")
@@ -1172,6 +1190,202 @@ def _fail_task(cfg: Config, project: str, state: State, n: int, reason: str) -> 
     save_checkpoint(project, state)
 
 
+# --- Weryfikacja celu (PLAN-3): cykl po wyczerpaniu backlogu -----------------
+
+class VerificationStop(RuntimeError):
+    """Twardy, mechaniczny stop pętli przez weryfikację celu: potwierdzony
+    env_issue (kod 4) albo brak postępu / sufit cykli (kod 5). Odróżnialny
+    w main() od porażek merytorycznych."""
+
+    def __init__(self, message: str, exit_code: int = 4):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def _head_sha(project: str) -> str:
+    return git(project, "rev-parse", "HEAD", check=False).stdout.strip()
+
+
+def _cycle_dir(project: str, cfg: Config, cycle: int) -> str:
+    return os.path.join(project, cfg.runtime_dir, "verification", f"cycle-{cycle}")
+
+
+def _read_design(project: str) -> str:
+    try:
+        with open(os.path.join(project, "docs", "DESIGN.md"), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _note_problems(project: str, notes: list[dict], cycle: int) -> None:
+    """Nieblokujące znaleziska weryfikacji → propozycje w BACKLOG.md.
+
+    To ujście zdegradowanych design_gapów i odrzuconych repro: nie blokują
+    PASS, ale nie giną — człowiek/planista może je awansować."""
+    for p in notes:
+        _append_line(os.path.join(project, "BACKLOG.md"),
+                     f"- [ ] (weryfikacja c{cycle}, {p.get('id')}, nieblokujące) "
+                     f"{p.get('title', '')}\n")
+
+
+def _accept_verdict(cfg: Config, project: str, state: State, evidence: dict,
+                    cycle_dir: str, logf) -> list[dict]:
+    """Wywołaj weryfikatora (świeży kontekst) i wyegzekwuj poprawny rejestr.
+
+    Odrzucenie (zły JSON, nieodhaczone problemy z N-1, nowy code_bug bez
+    repro_cmd) daje JEDNO ponowienie z listą powodów; potem AgentError —
+    checkpoint zostaje, człowiek widzi log."""
+    agent, model, effort = cfg.role("verifier")
+    prev_path = (os.path.join(project, cfg.runtime_dir, "verification",
+                              f"cycle-{state.verify_cycle - 1}", "problems.json")
+                 if state.verify_problems else "")
+    base_prompt = prompts.verify_goal_prompt(
+        cycle=state.verify_cycle, evidence=evidence, cycle_dir=cycle_dir,
+        prev_problems_path=prev_path, run_cmd=state.run_cmd)
+    prompt, errors = base_prompt, ["(nie wywołano)"]
+    for attempt in range(2):
+        out = run_agent(agent, prompt, cfg, project,
+                        logf(f"verify-c{state.verify_cycle}-a{attempt}"),
+                        model=model, effort=effort)
+        verdict = extract_json(out)
+        problems = (verdict or {}).get("problems")
+        errors = []
+        if not isinstance(problems, list):
+            problems, errors = [], ["brak werdyktu JSON z listą 'problems'"]
+        else:
+            errors += verify_ledger.validate_problems(problems)
+            ok, missing = verify_ledger.ledger_complete(state.verify_problems, problems)
+            if not ok:
+                errors.append("nieodhaczone problemy z poprzedniego cyklu: "
+                              + ", ".join(missing))
+            need = verify_ledger.missing_repro(problems)
+            if need:
+                errors.append("brak repro_cmd dla nowych code_bug: " + ", ".join(need))
+        if not errors:
+            return problems
+        log(f"Werdykt weryfikatora odrzucony: {'; '.join(errors)}")
+        prompt = (base_prompt + "\n\nPOPRZEDNI WERDYKT ODRZUCONY z powodów: "
+                  + "; ".join(errors) + "\nPopraw rejestr i zwróć werdykt ponownie.")
+    raise AgentError("Weryfikator nie dostarczył poprawnego rejestru problemów: "
+                     + "; ".join(errors))
+
+
+def _confirm_env_issues(cfg: Config, project: str, state: State,
+                        problems: list[dict], cycle_dir: str) -> None:
+    """env_issue na słowo agenta nie zatrzymuje biegu — najpierw mechaniczna
+    powtórka dowodów targetu. Potwierdzony → ENV-ISSUE.md + VerificationStop
+    (sprawa człowieka). Niepotwierdzony → reklasyfikacja na code_bug."""
+    for p in problems:
+        if p.get("class") != "env_issue" or p.get("status") == "resolved":
+            continue
+        target = p.get("target", "")
+        if target in state.verify_targets and verify.confirm_env_issue(
+                project, state, cfg, target, cycle_dir, sha=state.verify_sha):
+            path = os.path.join(cycle_dir, "ENV-ISSUE.md")
+            _append_line(path,
+                         f"# Problem środowiska: {p.get('id')} — {p.get('title', '')}\n\n"
+                         f"Target: {target}\nDowód: {p.get('evidence', '')}\n\n"
+                         "Potwierdzone mechanicznie (powtórka dowodów nadal czerwona).\n"
+                         "Sprawdź sekrety CI / podłączenie sprzętu / toolchain "
+                         "i uruchom pętlę ponownie.\n")
+            save_checkpoint(project, state)
+            raise VerificationStop(
+                f"env_issue potwierdzony ({p.get('id')}: {p.get('title', '')}) "
+                f"— raport: {path}", exit_code=4)
+        log(f"env_issue {p.get('id')} NIEPOTWIERDZONY mechanicznie — "
+            "reklasyfikacja na code_bug.")
+        p["class"] = "code_bug"
+        p["reclassified"] = "env_issue"
+
+
+def _drop_green_repros(cfg: Config, project: str, problems: list[dict]) -> list[dict]:
+    """Repro nowego code_buga MUSI być czerwony przy odbiorze ("czerwone
+    najpierw", jak test testera). Zielony = dowód nie odtwarza usterki →
+    problem zdegradowany do notatki. Zwraca odrzucone wpisy."""
+    dropped = []
+    for p in problems:
+        if (p.get("class") == "code_bug" and p.get("status") == "new"
+                and p.get("repro_cmd") and not p.get("reclassified")):
+            green, _ = verify.run_repro(project, p["repro_cmd"], cfg.verify_timeout_s)
+            if green:
+                log(f"Repro {p.get('id')} ZIELONY przy odbiorze — problem odrzucony.")
+                p["degraded"] = "repro zielony przy odbiorze"
+                dropped.append(p)
+    return dropped
+
+
+def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
+    """Weryfikacja celu (backlog wyczerpany). Zwraca False = koniec pętli
+    (PASS), True = cykl naprawczy (planista dostanie feedback). Twarde stopy
+    (env_issue, stall, sufit) lecą jako VerificationStop."""
+    if state.phase != "verify_goal":
+        state.phase = "verify_goal"
+        state.verify_cycle += 1
+        state.verify_sha = _head_sha(project)
+        save_checkpoint(project, state)
+    else:
+        log(f"WZNAWIAM weryfikację celu (cykl {state.verify_cycle}).")
+    n = state.verify_cycle
+    cdir = _cycle_dir(project, cfg, n)
+    log(f"=== WERYFIKACJA CELU (cykl {n}; targety: {', '.join(state.verify_targets)}) ===")
+
+    evidence = verify.collect_evidence(project, state, cfg, cdir, sha=state.verify_sha)
+    for target, res in sorted(evidence.items()):
+        log(f"  dowód {target}: rc={res.get('rc')} → {res.get('log')}")
+
+    problems = _accept_verdict(cfg, project, state, evidence, cdir, logf)
+    _confirm_env_issues(cfg, project, state, problems, cdir)
+    dropped = _drop_green_repros(cfg, project, problems)
+    active = [p for p in problems if p not in dropped]
+    kept, degraded = verify_ledger.degrade_design_gaps(active, _read_design(project))
+    blockers = verify_ledger.pass_blockers(evidence, kept)
+    notes = degraded + dropped
+
+    if not blockers:
+        _note_problems(project, notes, n)
+        commit_all(project, f"docs: weryfikacja celu — cykl {n}: PASS", cfg)
+        state.verify_problems = problems
+        state.verify_stall = 0
+        state.phase = "idle"
+        save_checkpoint(project, state)
+        log("CEL ZWERYFIKOWANY" + (" (nieblokujące notatki w BACKLOG)" if notes else "")
+            + " 🎉")
+        return False
+
+    # FAIL: utrwal rejestr i raport (pamięć w repo), zmierz postęp, wróć do planisty.
+    os.makedirs(cdir, exist_ok=True)
+    with open(os.path.join(cdir, "problems.json"), "w", encoding="utf-8") as f:
+        json.dump(problems, f, indent=2, ensure_ascii=False)
+    feedback = os.path.join(cdir, "feedback.md")
+    if not os.path.exists(feedback):  # fallback — agent nie zapisał raportu
+        _append_line(feedback,
+                     f"# Weryfikacja celu — cykl {n}: FAIL\n\n## Blokery\n"
+                     + "".join(f"- {b}\n" for b in blockers)
+                     + "\n## Problemy\n"
+                     + "".join(f"- {p.get('id')} [{p.get('class')}] {p.get('title', '')}"
+                               f" (dowód: {p.get('evidence', '')})\n" for p in kept))
+    _note_problems(project, notes, n)
+    commit_all(project, f"docs: weryfikacja celu — cykl {n} nieudany (feedback)", cfg)
+
+    progressed = verify_ledger.progress_made(state.verify_problems, problems)
+    state.verify_stall = 0 if progressed else state.verify_stall + 1
+    state.verify_problems = problems
+    state.phase = "idle"
+    save_checkpoint(project, state)
+    log(f"WERYFIKACJA: FAIL (blokery: {len(blockers)}, "
+        f"postęp: {'tak' if progressed else 'NIE'}) — feedback: {feedback}")
+    if state.verify_stall >= cfg.max_stall_cycles:
+        raise VerificationStop(
+            f"{state.verify_stall} cykle weryfikacji bez postępu — stop. "
+            f"Raport: {feedback}", exit_code=5)
+    if state.verify_cycle >= cfg.max_verify_cycles:
+        raise VerificationStop(
+            f"osiągnięto sufit {cfg.max_verify_cycles} cykli weryfikacji — stop. "
+            f"Raport: {feedback}", exit_code=5)
+    return True
+
+
 def _task_iteration(cfg: Config, project: str, state: State) -> bool:
     """Jedno zadanie nowego modelu (plan wsadowy → mikro-TDD → recenzja). Wznawialne."""
     n = state.iteration + 1
@@ -1179,6 +1393,9 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
 
     def logf(phase: str) -> str:
         return os.path.join(project, cfg.runtime_dir, "logs", f"task-{n:04d}-{phase}.log")
+
+    if state.phase == "verify_goal":
+        return phase_verify_goal(cfg, project, state, logf)  # wznowienie po restarcie
 
     if state.phase != "idle" and not state.current_task:
         log("Faza zaawansowana bez bieżącego zadania — reset do planowania.")
@@ -1190,6 +1407,10 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
             save_checkpoint(project, state)
             if not state.task_queue:
                 if plan.get("no_more_tasks"):
+                    if state.verify_targets:
+                        # Backlog pusty ≠ koniec: cel musi przejść weryfikację
+                        # w środowisku docelowym (PLAN-3).
+                        return phase_verify_goal(cfg, project, state, logf)
                     log("PLAN: brak dalszych zadań — MVP ukończone. 🎉")
                     return False
                 # Pusta kolejka BEZ deklaracji końca = usterka planisty (zły JSON,
@@ -1404,6 +1625,12 @@ def main(argv: list[str] | None = None) -> int:
         state.save(state_path)
         _print_usage(project, cfg.runtime_dir)
         return 3
+    except VerificationStop as e:
+        log(f"WERYFIKACJA ZATRZYMAŁA BIEG: {e}")
+        log("Stan zapisany — po naprawie środowiska/przeglądzie raportu uruchom ponownie.")
+        state.save(state_path)
+        _print_usage(project, cfg.runtime_dir)
+        return e.exit_code
     except KeyboardInterrupt:
         log("Przerwano ręcznie. Stan zapisany.")
         state.save(state_path)

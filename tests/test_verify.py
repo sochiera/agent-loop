@@ -328,5 +328,175 @@ class BootstrapVerifyProfileTest(unittest.TestCase):
             self._bootstrap('{"targets":["produkcja"],"smoke_cmd":"x"}')
 
 
+def _verdict(problems: list | None = None, verdict: str = "fail") -> str:
+    import json
+    return json.dumps({"verdict": verdict, "problems": problems or []})
+
+
+class VerifyGoalPhaseTest(unittest.TestCase):
+    """phase_verify_goal na mockach dowodów/agenta — testuje wyłącznie logikę
+    orkiestracji (bramka PASS, odbiór rejestru, stall, env, wznowienie)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.project = self._tmp.name
+        os.makedirs(os.path.join(self.project, "docs"))
+        Path(self.project, "docs", "DESIGN.md").write_text(
+            "Gracz może zapisać stan gry.", encoding="utf-8")
+        Path(self.project, "BACKLOG.md").write_text("# Backlog\n", encoding="utf-8")
+        self.cfg = Config()
+        self.cfg.max_stall_cycles = 2
+        self.cfg.max_verify_cycles = 8
+        self.state = State(bootstrapped=True, verify_targets=["smoke"],
+                           smoke_cmd="bash s.sh", test_cmd="t")
+        self.logf = lambda ph: os.path.join(self.project, ".forge", "logs", f"{ph}.log")
+
+    def _run(self, evidence_rc: int, agent_outputs: list[str],
+             repro_green: bool = False, env_confirmed: bool = False):
+        evidence = {"smoke": {"rc": evidence_rc,
+                              "log": os.path.join(self.project, "s.log")}}
+        patches = [
+            mock.patch("forge.orchestrate.verify.collect_evidence",
+                       return_value=evidence),
+            mock.patch("forge.orchestrate.verify.run_repro",
+                       return_value=(repro_green, "" if repro_green else "ogon")),
+            mock.patch("forge.orchestrate.verify.confirm_env_issue",
+                       return_value=env_confirmed),
+            mock.patch("forge.orchestrate.run_agent", side_effect=agent_outputs),
+            mock.patch("forge.orchestrate.commit_all"),
+            mock.patch("forge.orchestrate._head_sha", return_value="sha123"),
+        ]
+        mocks = [p.start() for p in patches]
+        for p in patches:
+            self.addCleanup(p.stop)
+        result = orchestrate.phase_verify_goal(self.cfg, self.project,
+                                               self.state, self.logf)
+        return result, mocks
+
+    def test_green_evidence_and_clean_ledger_end_the_loop(self) -> None:
+        cont, _ = self._run(0, [_verdict([], "pass")])
+        self.assertFalse(cont)
+        self.assertEqual(self.state.phase, "idle")
+        self.assertEqual(self.state.verify_cycle, 1)
+
+    def test_agent_pass_cannot_override_red_evidence(self) -> None:
+        cont, _ = self._run(1, [_verdict([], "pass")])
+        self.assertTrue(cont)  # porażka → wracamy do planowania
+
+    def test_fail_with_red_repro_stores_ledger_and_returns_to_planning(self) -> None:
+        problem = {"id": "P-001", "status": "new", "class": "code_bug",
+                   "title": "pad", "target": "smoke", "repro_cmd": "bash r.sh"}
+        cont, _ = self._run(1, [_verdict([problem])])
+        self.assertTrue(cont)
+        self.assertEqual(self.state.phase, "idle")
+        self.assertEqual(self.state.verify_problems[0]["id"], "P-001")
+        problems_json = Path(self.project, ".forge", "verification",
+                             "cycle-1", "problems.json")
+        self.assertTrue(problems_json.exists())
+        feedback = Path(self.project, ".forge", "verification",
+                        "cycle-1", "feedback.md")
+        self.assertTrue(feedback.exists())  # fallback, gdy agent nie napisał
+
+    def test_green_repro_drops_problem_and_allows_pass_with_notes(self) -> None:
+        problem = {"id": "P-001", "status": "new", "class": "code_bug",
+                   "title": "nie odtwarza się", "target": "smoke",
+                   "repro_cmd": "bash r.sh"}
+        cont, _ = self._run(0, [_verdict([problem])], repro_green=True)
+        self.assertFalse(cont)  # zieleń + brak ważnych blokerów = PASS-z-notatkami
+        backlog = Path(self.project, "BACKLOG.md").read_text(encoding="utf-8")
+        self.assertIn("P-001", backlog)
+
+    def test_design_gap_with_real_criterion_blocks_pass(self) -> None:
+        gap = {"id": "P-002", "status": "new", "class": "design_gap",
+               "title": "zapis nie działa", "target": "behavior",
+               "criterion": "gracz może zapisać stan gry"}
+        cont, _ = self._run(0, [_verdict([gap])])
+        self.assertTrue(cont)
+
+    def test_design_gap_without_criterion_degrades_to_note(self) -> None:
+        gap = {"id": "P-002", "status": "new", "class": "design_gap",
+               "title": "nie podoba mi się", "target": "behavior",
+               "criterion": "zmyślone kryterium"}
+        cont, _ = self._run(0, [_verdict([gap])])
+        self.assertFalse(cont)
+        self.assertIn("P-002", Path(self.project, "BACKLOG.md").read_text("utf-8"))
+
+    def test_incomplete_ledger_gets_one_retry_then_agent_error(self) -> None:
+        self.state.verify_problems = [{"id": "P-009", "status": "new",
+                                       "class": "code_bug", "title": "stary"}]
+        with self.assertRaisesRegex(AgentError, "P-009"):
+            self._run(1, [_verdict([]), _verdict([])])
+
+    def test_confirmed_env_issue_stops_the_run(self) -> None:
+        env = {"id": "P-003", "status": "new", "class": "env_issue",
+               "title": "brak płytki", "target": "smoke"}
+        with self.assertRaises(orchestrate.VerificationStop):
+            self._run(1, [_verdict([env])], env_confirmed=True)
+        self.assertTrue(Path(self.project, ".forge", "verification",
+                             "cycle-1", "ENV-ISSUE.md").exists())
+
+    def test_unconfirmed_env_issue_is_reclassified_and_run_continues(self) -> None:
+        env = {"id": "P-003", "status": "new", "class": "env_issue",
+               "title": "rzekomo brak płytki", "target": "smoke"}
+        cont, _ = self._run(1, [_verdict([env])], env_confirmed=False)
+        self.assertTrue(cont)
+        stored = self.state.verify_problems[0]
+        self.assertEqual(stored["class"], "code_bug")
+
+    def test_two_cycles_without_progress_stop_the_run(self) -> None:
+        problem = {"id": "P-001", "status": "persisting", "class": "code_bug",
+                   "title": "pad", "target": "smoke", "repro_cmd": "bash r.sh"}
+        self.state.verify_problems = [dict(problem, status="new")]
+        self.state.verify_cycle = 1
+        cont, _ = self._run(1, [_verdict([problem])])
+        self.assertTrue(cont)  # stall=1 — jeszcze wolno
+        self.assertEqual(self.state.verify_stall, 1)
+
+        self.state.phase = "idle"
+        with self.assertRaises(orchestrate.VerificationStop):
+            self._run(1, [_verdict([problem])])  # stall=2 → stop
+
+
+class VerifyGoalWiringTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.project = self._tmp.name
+        self.cfg = Config()
+
+    def test_no_more_tasks_with_targets_enters_verification(self) -> None:
+        state = State(bootstrapped=True, verify_targets=["smoke"],
+                      smoke_cmd="bash s.sh", test_cmd="t")
+        with mock.patch("forge.orchestrate.phase_plan_batch",
+                        return_value={"no_more_tasks": True}), \
+             mock.patch("forge.orchestrate.phase_verify_goal",
+                        return_value=False) as verify_phase:
+            cont = orchestrate._task_iteration(self.cfg, self.project, state)
+        verify_phase.assert_called_once()
+        self.assertFalse(cont)
+
+    def test_no_more_tasks_without_targets_ends_loop_as_before(self) -> None:
+        state = State(bootstrapped=True, test_cmd="t")
+        with mock.patch("forge.orchestrate.phase_plan_batch",
+                        return_value={"no_more_tasks": True}), \
+             mock.patch("forge.orchestrate.phase_verify_goal") as verify_phase:
+            cont = orchestrate._task_iteration(self.cfg, self.project, state)
+        verify_phase.assert_not_called()
+        self.assertFalse(cont)
+
+    def test_restart_in_verify_goal_resumes_verification_not_planning(self) -> None:
+        state = State(bootstrapped=True, verify_targets=["smoke"],
+                      smoke_cmd="bash s.sh", test_cmd="t",
+                      phase="verify_goal", verify_cycle=2, verify_sha="abc")
+        with mock.patch("forge.orchestrate.phase_plan_batch") as plan, \
+             mock.patch("forge.orchestrate.phase_verify_goal",
+                        return_value=True) as verify_phase:
+            cont = orchestrate._task_iteration(self.cfg, self.project, state)
+        plan.assert_not_called()
+        verify_phase.assert_called_once()
+        self.assertTrue(cont)
+
+
 if __name__ == "__main__":
     unittest.main()
