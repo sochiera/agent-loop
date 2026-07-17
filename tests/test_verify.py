@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from forge import prompts
 from forge.config import Config
 from forge.state import State
 from forge.verify import (collect_evidence, confirm_env_issue, expand_sha,
@@ -224,6 +225,55 @@ class ReproAndEnvConfirmTest(unittest.TestCase):
 
         self.assertTrue(confirmed)
         self.assertFalse(sentinel.exists())
+
+
+class VerifyPromptsTest(unittest.TestCase):
+    def test_bootstrap_prompt_demands_verification_profile(self) -> None:
+        prompt = prompts.bootstrap_prompt("brief")
+        self.assertIn('"verify"', prompt)
+        self.assertIn('"targets"', prompt)
+        self.assertIn("ci_status_cmd", prompt)
+        self.assertIn("{sha}", prompt)  # placeholder komend CI, rozwijany przez expand_sha
+        self.assertIn("verify_test_globs", prompt)
+
+    def test_verify_goal_prompt_carries_evidence_and_ledger_contract(self) -> None:
+        evidence = {"ci": {"rc": 1, "log": ".forge/verification/cycle-2/ci.log"},
+                    "smoke": {"rc": 0, "log": ".forge/verification/cycle-2/smoke.log"}}
+        prompt = prompts.verify_goal_prompt(
+            cycle=2, evidence=evidence,
+            cycle_dir=".forge/verification/cycle-2",
+            prev_problems_path=".forge/verification/cycle-1/problems.json",
+            run_cmd="python game.py")
+
+        self.assertIn("cycle-2/ci.log", prompt)
+        self.assertIn("rc=1", prompt)
+        self.assertIn("rc=0", prompt)
+        self.assertIn("cycle-1/problems.json", prompt)   # rejestr do odhaczenia
+        self.assertIn("feedback.md", prompt)
+        for token in ("resolved", "persisting", "new", "code_bug",
+                      "verify_defect", "env_issue", "flaky", "design_gap",
+                      "repro", "criterion"):
+            self.assertIn(token, prompt)
+
+    def test_verify_goal_prompt_first_cycle_has_no_previous_ledger(self) -> None:
+        prompt = prompts.verify_goal_prompt(
+            cycle=1, evidence={"smoke": {"rc": 0, "log": "s.log"}},
+            cycle_dir=".forge/verification/cycle-1",
+            prev_problems_path="", run_cmd="")
+        self.assertNotIn("poprzedniego cyklu: ", prompt)
+
+    def test_plan_batch_prompt_relays_verification_feedback_and_ci_warning(self) -> None:
+        plain = prompts.plan_batch_prompt(5, 1, "app")
+        self.assertNotIn('"fixes"', plain)
+
+        with_feedback = prompts.plan_batch_prompt(
+            5, 8, "app",
+            verify_feedback_path=".forge/verification/cycle-3/feedback.md",
+            ci_warning="CI dla HEAD czerwone")
+        self.assertIn("cycle-3/feedback.md", with_feedback)
+        self.assertIn('"fixes"', with_feedback)
+        self.assertIn('"repro_cmd"', with_feedback)
+        self.assertIn("CI dla HEAD czerwone", with_feedback)
 
 
 if __name__ == "__main__":
