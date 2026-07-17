@@ -15,6 +15,7 @@ import re
 import subprocess
 import time
 
+from . import adapters
 from .config import Config, RATE_LIMIT_PATTERNS
 
 _LIMIT_RE = re.compile("|".join(RATE_LIMIT_PATTERNS), re.IGNORECASE)
@@ -60,6 +61,117 @@ def _balanced_objects(text: str) -> list[str]:
             if depth == 0:
                 out.append(text[start:i + 1])
     return out
+
+
+# Format strumienia `codex exec --json` (potwierdzony w dokumentacji, 2026-07):
+#   {"type":"thread.started","thread_id":"<uuid>"}
+#   {"type":"turn.completed","usage":{"input_tokens":N,"cached_input_tokens":N,"output_tokens":N}}
+#   {"type":"turn.failed","error":{"message":"..."}} / {"type":"error","message":"..."}
+# Wznowienie: `codex exec resume <THREAD_ID> "<prompt>"`.
+# Starsze wersje CLI emitowały session_id — parser rozumie oba warianty.
+_SESSION_ID_RE = re.compile(r'"(?:session[_-]?id|thread[_-]?id)"\s*:\s*"([^"]+)"')
+
+
+def _find_session_id(obj) -> str | None:
+    """Zejdź rekurencyjnie po sparsowanym evencie i znajdź pierwsze id wątku/sesji."""
+    if isinstance(obj, dict):
+        for key in ("thread_id", "threadId", "session_id", "sessionId"):
+            val = obj.get(key)
+            if isinstance(val, str) and val:
+                return val
+        for parent in ("thread", "session"):
+            sub = obj.get(parent)
+            if isinstance(sub, dict):
+                val = sub.get("id")
+                if isinstance(val, str) and val:
+                    return val
+        for val in obj.values():
+            found = _find_session_id(val)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for val in obj:
+            found = _find_session_id(val)
+            if found:
+                return found
+    return None
+
+
+def extract_session_id(stream: str) -> str | None:
+    """Wyłuskaj id wątku/sesji Codeksa ze strumienia zdarzeń `codex exec --json`.
+
+    Preferuje zdarzenie `thread.started` (thread_id); rozumie też starszy wariant
+    session_id. Awaryjnie skanuje regexem — odporne na drobne zmiany formatu."""
+    for line in (stream or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        found = _find_session_id(obj)
+        if found:
+            return found
+    match = _SESSION_ID_RE.search(stream or "")
+    return match.group(1) if match else None
+
+
+def extract_codex_usage(stream: str) -> dict:
+    """Zużycie tokenów z JSONL Codeksa.
+
+    Ścieżka główna: sumuj pola `usage` ze zdarzeń `turn.completed` (jedno
+    wywołanie exec może mieć wiele tur). Fallback dla starszych formatów:
+    generyczny skan znanych kluczy (ostatnia wartość wygrywa)."""
+    turn_totals: dict = {}
+    fallback: dict = {}
+    for line in (stream or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") == "turn.completed" and isinstance(obj.get("usage"), dict):
+            for key, val in obj["usage"].items():
+                if isinstance(val, (int, float)):
+                    turn_totals[key] = turn_totals.get(key, 0) + val
+            continue
+        for key in ("input_tokens", "output_tokens", "cached_input_tokens",
+                    "total_tokens", "reasoning_output_tokens"):
+            val = _find_number(obj, key)
+            if val is not None:
+                fallback[key] = val  # ostatnia (skumulowana) wartość zdarzenia
+    return turn_totals or fallback
+
+
+def _find_number(obj, key: str):
+    if isinstance(obj, dict):
+        if isinstance(obj.get(key), (int, float)):
+            return obj[key]
+        for val in obj.values():
+            found = _find_number(val, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for val in obj:
+            found = _find_number(val, key)
+            if found is not None:
+                return found
+    return None
+
+
+def log_usage(project_dir: str, cfg: Config, record: dict) -> None:
+    """Dopisz jeden wiersz pomiaru zużycia do .forge/usage.jsonl (best-effort)."""
+    try:
+        path = os.path.join(project_dir, cfg.runtime_dir, "usage.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        record = {"ts": _dt.datetime.now().isoformat(timespec="seconds"), **record}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass  # pomiar nigdy nie wywraca pętli
 
 
 def extract_json(text: str) -> dict | None:
@@ -122,6 +234,18 @@ def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
     raise LimitExhausted(f"Wyczerpano ponowienia. Ostatnie:\n{last_output[-800:]}")
 
 
+def _phase_from_log(log_path: str) -> str:
+    """Wyłuskaj nazwę fazy ze ścieżki logu, zdejmując tylko prefiks iteracji:
+    'iter-0001-plan.log' → 'plan', 'task-0003-c01-test.log' → 'c01-test'.
+
+    Pełna nazwa fazy musi przetrwać, bo report.normalize_phase grupuje po
+    wzorcach typu '^c\\d+-test' i '^review-fix'."""
+    base = os.path.basename(log_path or "")
+    stem = base[:-4] if base.endswith(".log") else base
+    stem = re.sub(r"^(?:iter|task)-\d+-", "", stem)
+    return stem or "unknown"
+
+
 def _append_log(log_path: str, argv: list[str], output: str, code: int) -> None:
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
@@ -131,13 +255,19 @@ def _append_log(log_path: str, argv: list[str], output: str, code: int) -> None:
 
 # --- Konkretni agenci -------------------------------------------------------
 
-def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:
-    """Claude Code headless. Zwraca końcowy tekst odpowiedzi (pole .result)."""
+def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str,
+               *, model: str | None = None, effort: str | None = None) -> str:
+    """Claude Code headless. Zwraca końcowy tekst odpowiedzi (pole .result).
+
+    model/effort None → wartości planisty (zgodność wsteczna). Puste → Claude
+    użyje swojego domyślnego modelu; effort domyślnie 'medium'."""
+    model = cfg.planner_model if model is None else model
+    effort = (cfg.planner_effort if effort is None else effort) or "medium"
     argv = [cfg.claude_bin, "-p", prompt]
-    if cfg.planner_model:
-        argv += ["--model", cfg.planner_model]
+    if model:
+        argv += ["--model", model]
     argv += [
-        "--effort", cfg.planner_effort,
+        "--effort", effort,
         "--output-format", "json",
         "--dangerously-skip-permissions",  # pełna autonomia — edytuje pliki bez pytań
     ]
@@ -149,22 +279,52 @@ def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str
             if _looks_like_limit(json.dumps(obj)):
                 raise LimitExhausted("Claude zgłosił błąd limitu w JSON.")
             raise AgentError(f"Claude is_error: {obj.get('result') or obj}")
+        if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
+            log_usage(project_dir, cfg, {"agent": "claude",
+                                         "phase": _phase_from_log(log_path),
+                                         "model": model, "effort": effort,
+                                         "usage": obj["usage"]})
         return obj.get("result", raw) if isinstance(obj, dict) else raw
     except json.JSONDecodeError:
         return raw  # awaryjnie surowy tekst
 
 
-def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
-              *, model: str | None = None, effort: str | None = None) -> str:
-    """Codex exec (non-interactive). Zwraca ostatnią wiadomość agenta."""
+def _prepare_last_msg_file(project_dir: str, cfg: Config) -> str:
+    """Ścieżka pliku -o na ostatnią wiadomość agenta, wyczyszczona przed startem.
+
+    Plik jest współdzielony między wywołaniami (i rolami), więc stara zawartość
+    MUSI zniknąć przed uruchomieniem — inaczej run, który nic nie zapisze,
+    podsunąłby werdykt poprzedniego agenta jako swój."""
+    last_msg = os.path.join(project_dir, cfg.runtime_dir, "codex_last.txt")
+    os.makedirs(os.path.dirname(last_msg), exist_ok=True)
+    try:
+        os.remove(last_msg)
+    except OSError:
+        pass
+    return last_msg
+
+
+def _codex_agent(cfg: Config, model: str | None, effort: str | None):
     a = cfg.codex()
     if model is not None:
         a.model = model
     if effort is not None:
         a.effort = effort
-    last_msg = os.path.join(project_dir, cfg.runtime_dir, "codex_last.txt")
-    os.makedirs(os.path.dirname(last_msg), exist_ok=True)
-    argv = a.argv + ["exec", prompt]
+    return a
+
+
+def _codex_argv(a, cfg: Config, project_dir: str, last_msg: str, prompt: str,
+                *, json_stream: bool = False, resume_id: str | None = None) -> list[str]:
+    """JEDNO miejsce prawdy o kontrakcie CLI Codeksa (flagi, sandbox, prompt).
+
+    Rozjazd między wywołaniem legacy a sesyjnym oznaczałby różny posture
+    sandboxa dla różnych ról — dlatego różnice ograniczają się do --json
+    i podkomendy resume."""
+    argv = a.argv + ["exec"]
+    if resume_id:
+        argv += ["resume", resume_id]
+    if json_stream:
+        argv += ["--json"]
     if a.model:  # pusty → Codex użyje modelu z własnego config.toml
         argv += ["-m", a.model]
     argv += ["-c", f'model_reasoning_effort="{a.effort}"']
@@ -174,13 +334,12 @@ def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
         argv += ["--dangerously-bypass-approvals-and-sandbox"]
     else:
         argv += ["-s", cfg.codex_sandbox]
-    argv += [
-        "-C", project_dir,
-        "--skip-git-repo-check",
-        "-o", last_msg,
-        "--color", "never",
-    ]
-    _run_with_backoff(argv, project_dir, cfg, log_path)
+    argv += ["-C", project_dir, "--skip-git-repo-check", "-o", last_msg,
+             "--color", "never", prompt]  # prompt jako ostatni pozycyjny
+    return argv
+
+
+def _read_last_msg(last_msg: str) -> str:
     try:
         with open(last_msg, "r", encoding="utf-8") as f:
             return f.read()
@@ -188,11 +347,87 @@ def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
         return ""
 
 
+def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
+              *, model: str | None = None, effort: str | None = None) -> str:
+    """Codex exec (non-interactive). Zwraca ostatnią wiadomość agenta."""
+    a = _codex_agent(cfg, model, effort)
+    last_msg = _prepare_last_msg_file(project_dir, cfg)
+    argv = _codex_argv(a, cfg, project_dir, last_msg, prompt)
+    _run_with_backoff(argv, project_dir, cfg, log_path)
+    return _read_last_msg(last_msg)
+
+
+def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
+                      *, session_id: str | None = None, model: str | None = None,
+                      effort: str | None = None) -> tuple[str, str | None]:
+    """Codex exec w trybie sesyjnym (ciągły kontekst per zadanie).
+
+    Gdy ``session_id`` podany — wznawia sesję (``codex exec resume <id>``);
+    inaczej startuje nową i przechwytuje jej id ze strumienia ``--json``.
+    Zwraca (ostatnia wiadomość agenta, session_id). Loguje zużycie tokenów."""
+    a = _codex_agent(cfg, model, effort)
+    last_msg = _prepare_last_msg_file(project_dir, cfg)
+    argv = _codex_argv(a, cfg, project_dir, last_msg, prompt,
+                       json_stream=True, resume_id=session_id)
+    stream = _run_with_backoff(argv, project_dir, cfg, log_path)
+    sid = session_id or extract_session_id(stream)
+    usage = extract_codex_usage(stream)
+    if usage:
+        log_usage(project_dir, cfg, {"agent": "codex", "phase": _phase_from_log(log_path),
+                                     "model": a.model, "effort": a.effort,
+                                     "resumed": bool(session_id), "usage": usage})
+    return _read_last_msg(last_msg), sid
+
+
+def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str,
+                 *, model: str, effort: str) -> str:
+    """Uruchom dowolny agent CLI wg szablonu (adapters.GenericSpec)."""
+    out_file = _prepare_last_msg_file(project_dir, cfg) if spec.uses_output_file else None
+    subs = {"prompt": prompt, "model": model or "", "effort": effort or "",
+            "project": project_dir, "output": out_file or ""}
+    argv = adapters.expand_template(spec.template, subs)
+    if not argv:
+        raise AgentError(f"Pusty szablon komendy dla agenta '{spec.name}'.")
+    stream = _run_with_backoff(argv, project_dir, cfg, log_path)
+    return _read_last_msg(out_file) if out_file else stream
+
+
+def run_agent(name: str, prompt: str, cfg: Config, project_dir: str, log_path: str,
+              *, model: str = "", effort: str = "") -> str:
+    """Jedno-strzałowe wywołanie dowolnego agenta CLI (any-CLI dyspozytor)."""
+    if name == "claude":
+        return run_claude(prompt, cfg, project_dir, log_path, model=model, effort=effort)
+    if name == "codex":
+        return run_codex(prompt, cfg, project_dir, log_path, model=model, effort=effort)
+    spec = adapters.generic_spec(name)
+    if spec is None:
+        raise AgentError(
+            f"Nieznany agent '{name}'. Wbudowane: claude, codex. Dla innego CLI "
+            f"ustaw {adapters.env_key(name)} z szablonem komendy.")
+    return _run_generic(spec, prompt, cfg, project_dir, log_path,
+                        model=model, effort=effort)
+
+
+def run_agent_session(name: str, prompt: str, cfg: Config, project_dir: str,
+                      log_path: str, *, session_id: str | None = None,
+                      model: str = "", effort: str = "") -> tuple[str, str | None]:
+    """Wywołanie agenta z ciągłością sesji, gdy ją wspiera.
+
+    codex → sesja z resume (zwraca id). Pozostali agenci są bezsesyjni: jedno
+    wywołanie, id=None; ciągłość zapewnia im dziennik zadania (patrz orchestrate)."""
+    if name == "codex":
+        return run_codex_session(prompt, cfg, project_dir, log_path,
+                                 session_id=session_id, model=model, effort=effort)
+    return run_agent(name, prompt, cfg, project_dir, log_path,
+                     model=model, effort=effort), None
+
+
+def agent_supports_resume(name: str) -> bool:
+    return adapters.supports_resume(name)
+
+
 def run_planner(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:
-    """Uruchom wybranego planistę z jego niezależnym modelem i effort."""
-    if cfg.planner_agent == "claude":
-        return run_claude(prompt, cfg, project_dir, log_path)
-    if cfg.planner_agent == "codex":
-        return run_codex(prompt, cfg, project_dir, log_path,
-                         model=cfg.planner_model, effort=cfg.planner_effort)
-    raise AgentError(f"Nieznany agent planujący: {cfg.planner_agent}")
+    """Uruchom planistę wybranym agentem CLI z jego modelem i effort."""
+    agent, model, effort = cfg.role("planner")
+    return run_agent(agent, prompt, cfg, project_dir, log_path,
+                     model=model, effort=effort)

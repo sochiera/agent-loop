@@ -1,1 +1,1 @@
-"""forge — orkiestrator agentów CLI budujących grę w pętli TDD."""
+"""forge — orkiestrator agentów CLI budujących oprogramowanie w pętli TDD."""

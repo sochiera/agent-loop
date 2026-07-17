@@ -78,6 +78,62 @@ class Config:
     codex_model: str = os.environ.get("FORGE_CODEX_MODEL", "")
     codex_effort: str = os.environ.get("FORGE_CODEX_EFFORT", "medium")
 
+    # --- Nowy model: mikro-TDD ping-pong (Codex-tester ↔ Codex-koder) -------
+    # legacy_mode=False → pętla docelowa (plan wsadowy → mikro-TDD → review Codeksa).
+    # legacy_mode=True  → stary przebieg plan→implement→review(Claude)→fix.
+    legacy_mode: bool = os.environ.get("FORGE_LEGACY_MODE", "0") == "1"
+    # Ile zadań planista produkuje jednym wywołaniem (koszt stały planisty ÷ batch).
+    batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "5"))
+    # Twardy sufit mikro-cykli (test→kod→refaktor) na jedno zadanie: chroni budżet
+    # i rozmiar rosnącej sesji. Po przekroczeniu — porażka zadania i podział przez planistę.
+    max_micro_cycles: int = int(os.environ.get("FORGE_MAX_MICRO_CYCLES", "12"))
+    # Ile dogrywek „zazielenienia" w obrębie jednego mikro-cyklu, zanim zadanie padnie.
+    max_green_retries: int = int(os.environ.get("FORGE_MAX_GREEN_RETRIES", "2"))
+    # Agent CLI każdej roli nowego modelu. "claude"/"codex" mają wbudowaną
+    # obsługę; dowolna inna nazwa → agent generyczny z FORGE_AGENT_<NAME>_CMD
+    # (patrz adapters.py). Domyślnie tester i koder to codex.
+    tester_agent: str = os.environ.get("FORGE_TESTER_AGENT", "codex")
+    coder_agent: str = os.environ.get("FORGE_CODER_AGENT", "codex")
+    # Model/effort ról. Puste → agent użyje swojego domyślnego (codex: config.toml).
+    tester_model: str = os.environ.get("FORGE_TESTER_MODEL", "")
+    tester_effort: str = os.environ.get("FORGE_TESTER_EFFORT", "")
+    coder_model: str = os.environ.get("FORGE_CODER_MODEL", "")
+    coder_effort: str = os.environ.get("FORGE_CODER_EFFORT", "")
+
+    def _role_model_effort(self, agent: str, model: str, effort: str) -> tuple[str, str]:
+        # Dla codeksa puste pola dziedziczą globalne codex_model/effort (jego
+        # naturalny default); dla innych agentów puste = niech agent sam wybierze.
+        if agent == "codex":
+            return (model or self.codex_model, effort or self.codex_effort)
+        return (model, effort)
+
+    def role(self, name: str) -> tuple[str, str, str]:
+        """(agent, model, effort) dla roli: 'planner' | 'tester' | 'coder'."""
+        if name == "planner":
+            return (self.planner_agent,
+                    *self._role_model_effort(self.planner_agent, self.planner_model, self.planner_effort))
+        if name == "tester":
+            return (self.tester_agent,
+                    *self._role_model_effort(self.tester_agent, self.tester_model, self.tester_effort))
+        if name == "coder":
+            return (self.coder_agent,
+                    *self._role_model_effort(self.coder_agent, self.coder_model, self.coder_effort))
+        raise ValueError(f"nieznana rola: {name}")
+
+    def tester(self) -> tuple[str, str]:
+        """(model, effort) testera — zgodność wsteczna; patrz role('tester')."""
+        return self.role("tester")[1:]
+
+    def coder(self) -> tuple[str, str]:
+        """(model, effort) kodera — zgodność wsteczna; patrz role('coder')."""
+        return self.role("coder")[1:]
+
+    def agents_in_use(self) -> list[str]:
+        """Agenci CLI faktycznie używani w bieżącym trybie (do preflightu)."""
+        if self.legacy_mode:
+            return list(dict.fromkeys([self.planner_agent, "codex"]))
+        return list(dict.fromkeys([self.planner_agent, self.tester_agent, self.coder_agent]))
+
     # --- Komendy bazowe CLI (bez shella) ------------------------------------
     # Claude Code headless. Jeśli 'claude' nie jest na PATH, ustaw FORGE_CLAUDE_BIN.
     claude_bin: str = os.environ.get("FORGE_CLAUDE_BIN", "claude")
