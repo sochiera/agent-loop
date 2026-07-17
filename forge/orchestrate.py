@@ -578,14 +578,30 @@ def _norm_criterion(text: str) -> str:
 
 
 def verify_protected_violations(changed: list[str], protected_globs: list[str],
-                                allowed: bool) -> list[str]:
+                                allowed: bool, exempt: set[str] | frozenset = frozenset(),
+                                ) -> list[str]:
     """Pliki weryfikacji dotknięte bez uprawnienia (PLAN-3, sekcja 8).
 
     ``allowed=True`` tylko dla zadania naprawiającego problem klasy
-    verify_defect — wtedy edycja chronionych ścieżek jest legalna."""
+    verify_defect — wtedy edycja chronionych ścieżek jest legalna.
+    ``exempt`` to pliki wyjęte spod ochrony (testy bieżącego cyklu i nowe
+    testy targetowe) — ochrona blokuje OSŁABIANIE istniejącej weryfikacji,
+    nie tworzenie specyfikacji."""
     if allowed:
         return []
-    return [p for p in changed if _match_any(p, protected_globs)]
+    return [p for p in changed if p not in exempt and _match_any(p, protected_globs)]
+
+
+def _protected_exempt(project: str, state: State) -> set[str]:
+    """Wyjątki od ochrony ścieżek weryfikacji: pliki testowe bieżącego
+    mikro-cyklu oraz NOWE (nieśledzone) pliki pasujące do verify_test_globs —
+    tak się tworzy testy targetowe w zwykłych zadaniach. Konfiguracja CI
+    i skrypty profilu chronione są także jako nowe pliki."""
+    untracked = git(project, "ls-files", "--others", "--exclude-standard",
+                    check=False).stdout.splitlines()
+    exempt = {p.strip() for p in untracked
+              if p.strip() and _match_any(p.strip(), state.verify_test_globs)}
+    return exempt | set(state.cycle_test_files)
 
 
 def _task_may_touch_verify(state: State, task: dict) -> bool:
@@ -1159,7 +1175,8 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
         protected = _verify_protected_globs(project, cfg, state)
         if protected:
             offending = verify_protected_violations(
-                changed, protected, _task_may_touch_verify(state, task))
+                changed, protected, _task_may_touch_verify(state, task),
+                _protected_exempt(project, state))
             if offending:
                 log(f"KODER dotknął chronionych ścieżek weryfikacji: {offending} "
                     "— wycofuję (dozwolone tylko w zadaniu verify_defect).")
@@ -1218,7 +1235,8 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
                 changed = changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
                                         stop_file=cfg.stop_file)
                 offending = verify_protected_violations(
-                    changed, protected, _task_may_touch_verify(state, task))
+                    changed, protected, _task_may_touch_verify(state, task),
+                    _protected_exempt(project, state))
                 if offending:
                     log(f"Poprawki dotknęły chronionych ścieżek weryfikacji: {offending} "
                         "— wycofuję.")

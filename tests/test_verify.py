@@ -617,6 +617,39 @@ class ProtectedVerifyPathsTest(unittest.TestCase):
         self.assertEqual(
             orchestrate.verify_protected_violations(changed, globs, allowed=True), [])
 
+    def test_exempt_files_are_not_violations(self) -> None:
+        changed = ["tests/hil/test_new.py", "tests/hil/test_old.py"]
+        globs = ["tests/hil/**"]
+        self.assertEqual(
+            orchestrate.verify_protected_violations(
+                changed, globs, allowed=False, exempt={"tests/hil/test_new.py"}),
+            ["tests/hil/test_old.py"])
+
+    def test_protected_exempt_covers_new_target_tests_and_cycle_files(self) -> None:
+        import subprocess as sp
+        with tempfile.TemporaryDirectory() as project:
+            sp.run(["git", "init", "-q"], cwd=project, check=True)
+            os.makedirs(os.path.join(project, "tests", "hil"))
+            os.makedirs(os.path.join(project, ".github", "workflows"))
+            # śledzony, istniejący test targetowy (jego edycja = osłabianie)
+            Path(project, "tests", "hil", "test_old.py").write_text("x", encoding="utf-8")
+            sp.run(["git", "add", "-A"], cwd=project, check=True)
+            sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "init"], cwd=project, check=True)
+            # NOWY test targetowy (tworzenie specyfikacji — legalne)
+            Path(project, "tests", "hil", "test_new.py").write_text("y", encoding="utf-8")
+            # NOWY workflow — konfiguracja CI zostaje chroniona także jako nowa
+            Path(project, ".github", "workflows", "new.yml").write_text("z", encoding="utf-8")
+            state = State(verify_test_globs=["tests/hil/**"],
+                          cycle_test_files=["tests/cycle_test.py"])
+
+            exempt = orchestrate._protected_exempt(project, state)
+
+        self.assertIn("tests/hil/test_new.py", exempt)
+        self.assertIn("tests/cycle_test.py", exempt)
+        self.assertNotIn("tests/hil/test_old.py", exempt)
+        self.assertNotIn(".github/workflows/new.yml", exempt)
+
     def test_task_may_touch_verify_only_for_verify_defect_fix(self) -> None:
         state = State(verify_problems=[
             {"id": "P-001", "status": "new", "class": "verify_defect", "title": "t"},
