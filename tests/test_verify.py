@@ -485,6 +485,43 @@ class VerifyGoalWiringTest(unittest.TestCase):
         verify_phase.assert_not_called()
         self.assertFalse(cont)
 
+    def test_override_none_disables_verification_on_existing_project(self) -> None:
+        # Projekt już zbootstrapowany z targetami — użytkownik wyłącza
+        # weryfikację env-em bez edycji STATE.json.
+        self.cfg.verify_targets_override = "none"
+        state = State(bootstrapped=True, verify_targets=["smoke"],
+                      smoke_cmd="bash s.sh", test_cmd="t")
+        with mock.patch("forge.orchestrate.phase_plan_batch",
+                        return_value={"no_more_tasks": True}), \
+             mock.patch("forge.orchestrate.phase_verify_goal") as verify_phase:
+            cont = orchestrate._task_iteration(self.cfg, self.project, state)
+        verify_phase.assert_not_called()
+        self.assertFalse(cont)
+
+    def test_override_none_abandons_resumed_verify_goal_phase(self) -> None:
+        self.cfg.verify_targets_override = "none"
+        state = State(bootstrapped=True, verify_targets=["smoke"],
+                      smoke_cmd="bash s.sh", test_cmd="t", phase="verify_goal")
+        with mock.patch("forge.orchestrate.phase_plan_batch",
+                        return_value={"no_more_tasks": True}), \
+             mock.patch("forge.orchestrate.phase_verify_goal") as verify_phase:
+            cont = orchestrate._task_iteration(self.cfg, self.project, state)
+        verify_phase.assert_not_called()
+        self.assertFalse(cont)
+        self.assertEqual(state.phase, "idle")
+
+    def test_override_narrows_targets_used_for_evidence(self) -> None:
+        # collect_evidence honoruje jawną listę targetów (nadpisanie CSV).
+        with tempfile.TemporaryDirectory() as tmp:
+            state = State(verify_targets=["smoke", "ci"], smoke_cmd="true",
+                          ci_status_cmd="false", ci_logs_cmd="false")
+            cfg = Config()
+            cfg.verify_timeout_s = 10
+            results = collect_evidence(tmp, state, cfg,
+                                       os.path.join(tmp, "c"), sha="",
+                                       sleep=lambda s: None, targets=["smoke"])
+        self.assertEqual(sorted(results), ["smoke"])
+
     def test_restart_in_verify_goal_resumes_verification_not_planning(self) -> None:
         state = State(bootstrapped=True, verify_targets=["smoke"],
                       smoke_cmd="bash s.sh", test_cmd="t",

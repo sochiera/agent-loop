@@ -86,14 +86,16 @@ def _one_target(project: str, state: State, cfg: Config, target: str,
 
 
 def collect_evidence(project: str, state: State, cfg: Config, cycle_dir: str,
-                     *, sha: str, sleep=time.sleep) -> dict:
-    """Zbierz dowody dla wszystkich targetów profilu.
+                     *, sha: str, sleep=time.sleep,
+                     targets: list[str] | None = None) -> dict:
+    """Zbierz dowody dla targetów profilu (domyślnie wszystkich z State;
+    ``targets`` pozwala wołającemu zastosować nadpisanie użytkownika).
 
     Zwraca {target: {"rc": int|None, "log": ścieżka}}; rc==0 to jedyna zieleń
     (None = nie wystartowało/timeout). Logi per target nadpisywane per zbiórkę
     — stare dowody nie mogą udawać świeżych."""
     results: dict = {}
-    for target in state.verify_targets:
+    for target in (state.verify_targets if targets is None else targets):
         log_path = os.path.join(cycle_dir, f"{target}.log")
         try:
             os.remove(log_path)

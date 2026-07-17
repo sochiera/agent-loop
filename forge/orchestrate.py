@@ -892,7 +892,8 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     if feedback_path:
         log(f"PLAN: przekazuję feedback weryfikacji: {feedback_path}")
     ci_warning = ""
-    if cfg.ci_early_warn and "ci" in state.verify_targets and state.ci_status_cmd:
+    if (cfg.ci_early_warn and state.ci_status_cmd
+            and "ci" in _active_verify_targets(cfg, state)):
         # Wczesne ostrzeganie (PLAN-3, sekcja 9): push jest per zadanie, więc
         # CI i tak mieli — jeden tani odczyt statusu HEAD chroni przed
         # budowaniem dziesiątek zadań na złamanym CI. rc==2 (trwa) jest OK.
@@ -1295,6 +1296,14 @@ def _fail_task(cfg: Config, project: str, state: State, n: int, reason: str) -> 
 
 # --- Weryfikacja celu (PLAN-3): cykl po wyczerpaniu backlogu -----------------
 
+def _active_verify_targets(cfg: Config, state: State) -> list[str]:
+    """Targety weryfikacji PO nadpisaniu użytkownika. Profil w STATE.json to
+    deklaracja bootstrapu; FORGE_VERIFY_TARGETS musi działać także na już
+    zbootstrapowanym projekcie (np. 'none', gdy płytka odpięta), więc
+    nadpisanie stosujemy w miejscu użycia, nie tylko przy deklaracji."""
+    return cfg.effective_verify_targets(state.verify_targets)
+
+
 class VerificationStop(RuntimeError):
     """Twardy, mechaniczny stop pętli przez weryfikację celu: potwierdzony
     env_issue (kod 4) albo brak postępu / sufit cykli (kod 5). Odróżnialny
@@ -1376,7 +1385,8 @@ def _accept_verdict(cfg: Config, project: str, state: State, evidence: dict,
 
 
 def _confirm_env_issues(cfg: Config, project: str, state: State,
-                        problems: list[dict], cycle_dir: str) -> None:
+                        problems: list[dict], cycle_dir: str,
+                        targets: list[str]) -> None:
     """env_issue na słowo agenta nie zatrzymuje biegu — najpierw mechaniczna
     powtórka dowodów targetu. Potwierdzony → ENV-ISSUE.md + VerificationStop
     (sprawa człowieka). Niepotwierdzony → reklasyfikacja na code_bug."""
@@ -1384,7 +1394,7 @@ def _confirm_env_issues(cfg: Config, project: str, state: State,
         if p.get("class") != "env_issue" or p.get("status") == "resolved":
             continue
         target = p.get("target", "")
-        if target in state.verify_targets and verify.confirm_env_issue(
+        if target in targets and verify.confirm_env_issue(
                 project, state, cfg, target, cycle_dir, sha=state.verify_sha):
             path = os.path.join(cycle_dir, "ENV-ISSUE.md")
             _append_line(path,
@@ -1432,14 +1442,16 @@ def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
         log(f"WZNAWIAM weryfikację celu (cykl {state.verify_cycle}).")
     n = state.verify_cycle
     cdir = _cycle_dir(project, cfg, n)
-    log(f"=== WERYFIKACJA CELU (cykl {n}; targety: {', '.join(state.verify_targets)}) ===")
+    targets = _active_verify_targets(cfg, state)
+    log(f"=== WERYFIKACJA CELU (cykl {n}; targety: {', '.join(targets)}) ===")
 
-    evidence = verify.collect_evidence(project, state, cfg, cdir, sha=state.verify_sha)
+    evidence = verify.collect_evidence(project, state, cfg, cdir,
+                                       sha=state.verify_sha, targets=targets)
     for target, res in sorted(evidence.items()):
         log(f"  dowód {target}: rc={res.get('rc')} → {res.get('log')}")
 
     problems = _accept_verdict(cfg, project, state, evidence, cdir, logf)
-    _confirm_env_issues(cfg, project, state, problems, cdir)
+    _confirm_env_issues(cfg, project, state, problems, cdir, targets)
     dropped = _drop_green_repros(cfg, project, problems)
     active = [p for p in problems if p not in dropped]
     kept, degraded = verify_ledger.degrade_design_gaps(active, _read_design(project))
@@ -1499,7 +1511,11 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
         return os.path.join(project, cfg.runtime_dir, "logs", f"task-{n:04d}-{phase}.log")
 
     if state.phase == "verify_goal":
-        return phase_verify_goal(cfg, project, state, logf)  # wznowienie po restarcie
+        if _active_verify_targets(cfg, state):
+            return phase_verify_goal(cfg, project, state, logf)  # wznowienie po restarcie
+        log("Weryfikacja wyłączona nadpisaniem użytkownika — porzucam fazę verify_goal.")
+        _clear_task(state)
+        save_checkpoint(project, state)
 
     if state.phase != "idle" and not state.current_task:
         log("Faza zaawansowana bez bieżącego zadania — reset do planowania.")
@@ -1511,7 +1527,7 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
             save_checkpoint(project, state)
             if not state.task_queue:
                 if plan.get("no_more_tasks"):
-                    if state.verify_targets:
+                    if _active_verify_targets(cfg, state):
                         # Backlog pusty ≠ koniec: cel musi przejść weryfikację
                         # w środowisku docelowym (PLAN-3).
                         return phase_verify_goal(cfg, project, state, logf)
