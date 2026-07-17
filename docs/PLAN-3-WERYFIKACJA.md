@@ -16,6 +16,17 @@ klasyfikacje i luka anty-osłabiania).
 > (2) walidacja profilu w `smoke --dry` — odłożona (preflight i bootstrap
 > walidują twardo). Do zrobienia po dostępie do żywych agentów: E-V1 żywy
 > test na repo z workflow, E-V2 na fizycznym targecie, kalibracja E-V3.
+>
+> **Po review (5 znalezisk, naprawione w TDD):** ochrona ścieżek nie wycofuje
+> już tworzenia testów targetowych (wyjątki: pliki cyklu + nowe pliki
+> `verify_test_globs`); `FORGE_VERIFY_TARGETS` działa też po bootstrapie
+> (nadpisanie w miejscu użycia, w tym porzucenie wznowionej fazy);
+> chroniony jest także skrypt wywoływany bezpośrednio (tokens[0]);
+> weryfikator dostał kontrolę diffu (zmiany poza docs/BACKLOG wycofywane);
+> zdegradowane/odrzucone problemy są terminalne w rejestrze, a postęp
+> liczony na surowych statusach agenta (degradacja ≠ naprawa). Znane,
+> świadomie odłożone: --legacy ze STATE w fazie verify_goal robi zwykły
+> rollback (mieszanie trybów), mylący log przy DONE z wyczerpanym sufitem repro.
 
 **Koncepcja:** weryfikacja NIE jest wpleciona w każde zadanie. Gdy planista
 orzeknie `no_more_tasks`, do gry wchodzi **nowy agent (weryfikator-QA)**,
