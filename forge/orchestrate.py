@@ -11,20 +11,21 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 
-from . import adapters, prompts
+from . import adapters, prompts, verify, verify_ledger
 from .agents import (AgentError, LimitExhausted, agent_supports_resume,
                      extract_json, run_agent, run_agent_session, run_codex,
                      run_planner)
 from .config import Config
+from .shellrun import run_shellfree as _run_shellfree
 from .state import State
 
 
@@ -195,29 +196,6 @@ def rollback(project: str, ref: str = "HEAD") -> None:
 
 # --- Bramka testów -----------------------------------------------------------
 
-def _run_shellfree(project: str, cmd: str, timeout: int) -> tuple[int | None, str]:
-    """Wspólny rdzeń wszystkich bramek: pojedyncza komenda bez shella.
-
-    Zwraca (returncode, wyjście) albo (None, diagnoza), gdy komenda w ogóle
-    nie wystartowała (składnia/pusta/OSError/timeout). Jedno miejsce prawdy
-    dla semantyki subprocess — run_tests, build_then_test i run_gate nie mogą
-    się rozjechać."""
-    try:
-        argv = shlex.split(cmd)
-    except ValueError as exc:
-        return None, f"niepoprawna składnia komendy ({exc})"
-    if not argv:
-        return None, "pusta komenda"
-    try:
-        proc = subprocess.run(argv, cwd=project, shell=False, text=True,
-                              capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return None, "TIMEOUT"
-    except OSError as exc:
-        return None, f"nie udało się uruchomić ({exc})"
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
-
-
 def run_tests(project: str, test_cmd: str, timeout: int) -> bool:
     if not test_cmd:
         log("Testy: brak test_cmd → czerwone.")
@@ -290,6 +268,43 @@ def preflight(cfg: Config) -> list[str]:
 
 # --- Fazy --------------------------------------------------------------------
 
+# Wymagane komendy per target weryfikacji (PLAN-3, sekcja 2). Target
+# zadeklarowany bez swoich komend to usterka bootstrapu, nie "jakoś to będzie".
+_VERIFY_TARGET_CMDS = {
+    "smoke": ("smoke_cmd",),
+    "hardware": ("flash_cmd", "target_cmd"),
+    "ci": ("ci_status_cmd", "ci_logs_cmd"),
+}
+_VERIFY_CMD_FIELDS = ("smoke_cmd", "flash_cmd", "target_cmd", "probe_cmd",
+                      "ci_status_cmd", "ci_logs_cmd")
+
+
+def parse_verify_profile(verify, cfg: Config) -> dict:
+    """Zwaliduj obiekt "verify" z bootstrapu → pola profilu dla State.
+
+    Brak obiektu = weryfikacja wyłączona (kompatybilność ze starszymi
+    promptami/STATE). Nadpisanie użytkownika (FORGE_VERIFY_TARGETS) wygrywa
+    z deklaracją bootstrapu."""
+    verify = verify if isinstance(verify, dict) else {}
+    declared = [str(t).strip() for t in (verify.get("targets") or [])
+                if str(t).strip()]
+    targets = cfg.effective_verify_targets(declared)
+    unknown = [t for t in dict.fromkeys(declared + targets)
+               if t not in _VERIFY_TARGET_CMDS]
+    if unknown:
+        raise AgentError(
+            f"Nieznane targety weryfikacji: {', '.join(unknown)} "
+            f"(dozwolone: {', '.join(_VERIFY_TARGET_CMDS)}).")
+    fields = {key: str(verify.get(key) or "").strip() for key in _VERIFY_CMD_FIELDS}
+    missing = [f"{target}: brak {cmd}" for target in targets
+               for cmd in _VERIFY_TARGET_CMDS[target] if not fields[cmd]]
+    if missing:
+        raise AgentError("Profil weryfikacji niekompletny — " + "; ".join(missing) + ".")
+    globs = [str(g).strip() for g in (verify.get("verify_test_globs") or [])
+             if str(g).strip()]
+    return {"verify_targets": targets, "verify_test_globs": globs, **fields}
+
+
 def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     log("=== BOOTSTRAP ===")
     with open(cfg.brief_path, "r", encoding="utf-8") as f:
@@ -304,8 +319,11 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
         raise AgentError(f"Bootstrap zwrócił niepoprawne pola: {', '.join(invalid)}.")
     if not data["stack"].strip() or not data["test_cmd"].strip() or not data["run_cmd"].strip():
         raise AgentError("Bootstrap musi określić stack oraz niepuste komendy test i run.")
+    profile = parse_verify_profile(data.get("verify"), cfg)
     if not build_then_test(project, data["build_cmd"], data["test_cmd"], cfg.agent_timeout_s):
         raise AgentError("Build/testy szkieletu po bootstrapie nie przeszły.")
+    for key, value in profile.items():
+        setattr(state, key, value)
     state.stack = data.get("stack", "")
     state.test_cmd = data.get("test_cmd", "")
     state.build_cmd = data.get("build_cmd", "")
@@ -314,7 +332,8 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     state.project_kind = "game" if kind == "game" else "app"
     state.bootstrapped = True
     log(f"Rodzaj: {state.project_kind} | stack: {state.stack or '(nieokreślony)'} "
-        f"| test_cmd: {state.test_cmd or '(brak!)'}")
+        f"| test_cmd: {state.test_cmd or '(brak!)'} "
+        f"| weryfikacja: {', '.join(state.verify_targets) or '(wyłączona)'}")
     commit_all(project, "chore: bootstrap projektu (design, architektura, backlog, szkielet)", cfg)
 
 
@@ -556,6 +575,55 @@ def coder_test_violations(changed: list[str], test_globs: list[str],
 def _norm_criterion(text: str) -> str:
     """Normalizacja do porównań: LLM-y przekręcają wielkość liter i whitespace."""
     return " ".join((text or "").split()).casefold()
+
+
+def verify_protected_violations(changed: list[str], protected_globs: list[str],
+                                allowed: bool, exempt: set[str] | frozenset = frozenset(),
+                                ) -> list[str]:
+    """Pliki weryfikacji dotknięte bez uprawnienia (PLAN-3, sekcja 8).
+
+    ``allowed=True`` tylko dla zadania naprawiającego problem klasy
+    verify_defect — wtedy edycja chronionych ścieżek jest legalna.
+    ``exempt`` to pliki wyjęte spod ochrony (testy bieżącego cyklu i nowe
+    testy targetowe) — ochrona blokuje OSŁABIANIE istniejącej weryfikacji,
+    nie tworzenie specyfikacji."""
+    if allowed:
+        return []
+    return [p for p in changed if p not in exempt and _match_any(p, protected_globs)]
+
+
+def _protected_exempt(project: str, state: State) -> set[str]:
+    """Wyjątki od ochrony ścieżek weryfikacji: pliki testowe bieżącego
+    mikro-cyklu oraz NOWE (nieśledzone) pliki pasujące do verify_test_globs —
+    tak się tworzy testy targetowe w zwykłych zadaniach. Konfiguracja CI
+    i skrypty profilu chronione są także jako nowe pliki."""
+    untracked = git(project, "ls-files", "--others", "--exclude-standard",
+                    check=False).stdout.splitlines()
+    exempt = {p.strip() for p in untracked
+              if p.strip() and _match_any(p.strip(), state.verify_test_globs)}
+    return exempt | set(state.cycle_test_files)
+
+
+def _task_may_touch_verify(state: State, task: dict) -> bool:
+    """Odblokowanie chronionych ścieżek przez REJESTR, nie przez planistę:
+    pole 'fixes' zadania musi wskazywać problem klasy verify_defect."""
+    pid = (task or {}).get("fixes", "")
+    if not pid:
+        return False
+    return any(p.get("id") == pid and p.get("class") == "verify_defect"
+               for p in state.verify_problems)
+
+
+# Konfiguracje CI chronione niezależnie od profilu (odpowiedniki workflow).
+_CI_CONFIG_GLOBS = [".github/workflows/**", ".gitlab-ci.yml"]
+
+
+def _verify_protected_globs(project: str, cfg: Config, state: State) -> list[str]:
+    """Chronione ścieżki weryfikacji: workflow CI, testy targetowe/CI
+    (verify_test_globs) i skrypty komend profilu. Najtańszą "naprawą"
+    czerwonej weryfikacji nie może być jej wyłączenie."""
+    return (_CI_CONFIG_GLOBS + list(state.verify_test_globs)
+            + verify.verify_script_paths(project, state))
 
 
 def criteria_fully_mapped(criteria: list[str], criteria_map: list[dict]) -> bool:
@@ -823,10 +891,38 @@ def _next_task_index(project: str) -> int:
     return top + 1
 
 
+def _verify_feedback_path(project: str, cfg: Config, state: State) -> str:
+    """Ścieżka raportu ostatniej nieudanej weryfikacji — jeśli są otwarte
+    problemy do naprawy i raport fizycznie istnieje (pamięć w repo)."""
+    if not verify_ledger.for_planner(state.verify_problems):
+        return ""
+    path = os.path.join(project, cfg.runtime_dir, "verification",
+                        f"cycle-{state.verify_cycle}", "feedback.md")
+    return path if os.path.exists(path) else ""
+
+
 def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     log(f"--- PLAN WSADOWY ({cfg.planner_agent}) ---")
     start = _next_task_index(project)
-    out = run_planner(prompts.plan_batch_prompt(cfg.batch_size, start, state.project_kind),
+    feedback_path = _verify_feedback_path(project, cfg, state)
+    if feedback_path:
+        log(f"PLAN: przekazuję feedback weryfikacji: {feedback_path}")
+    ci_warning = ""
+    if (cfg.ci_early_warn and state.ci_status_cmd
+            and "ci" in _active_verify_targets(cfg, state)):
+        # Wczesne ostrzeganie (PLAN-3, sekcja 9): push jest per zadanie, więc
+        # CI i tak mieli — jeden tani odczyt statusu HEAD chroni przed
+        # budowaniem dziesiątek zadań na złamanym CI. rc==2 (trwa) jest OK.
+        rc, _ = _run_shellfree(project,
+                               verify.expand_sha(state.ci_status_cmd, _head_sha(project)),
+                               120)
+        if rc == 1:
+            ci_warning = ("CI dla bieżącego HEAD jest CZERWONE — rozważ zadanie "
+                          "naprawcze, zanim dobudujesz kolejne funkcje.")
+            log("PLAN: " + ci_warning)
+    out = run_planner(prompts.plan_batch_prompt(cfg.batch_size, start, state.project_kind,
+                                                verify_feedback_path=feedback_path,
+                                                ci_warning=ci_warning),
                       cfg, project, logf("plan"))
     commit_all(project, "docs: plan wsadowy i backlog", cfg)  # pliki zadań, docs, backlog
     data = extract_json(out) or {}
@@ -840,6 +936,9 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
                 "criteria": t.get("criteria") or [],
                 "test_globs": t.get("test_globs") or [],
                 "code_globs": t.get("code_globs") or [],
+                # Zadania naprawcze weryfikacji (PLAN-3): id problemu + bramka repro.
+                "fixes": str(t.get("fixes") or ""),
+                "repro_cmd": str(t.get("repro_cmd") or ""),
             })
         else:
             log(f"PLAN: pomijam zadanie bez pliku na dysku: {t.get('id') or rel!r}")
@@ -875,6 +974,7 @@ def _start_task(cfg: Config, project: str, state: State) -> None:
     state.cycle_test_files = []
     state.pending_no_test = False
     state.no_test_count = 0
+    state.repro_runs = 0
     state.review_notes = []
     state.fix_attempt = 0
     state.phase = "micro"
@@ -894,10 +994,34 @@ def _clear_task(state: State) -> None:
     state.cycle_test_files = []
     state.pending_no_test = False
     state.no_test_count = 0
+    state.repro_runs = 0
     state.task_start_tag = ""
     state.review_notes = []
     state.fix_attempt = 0
     state.tests_green = False
+
+
+def _task_gate(cfg: Config, project: str, state: State) -> tuple[bool, str]:
+    """Bramka ZIELENI zadania: lokalna suita + (dla zadań naprawczych
+    weryfikacji) repro problemu. Zieleń zadania z repro_cmd wymaga OBU.
+
+    Sufit uruchomień repro per zadanie chroni sprzęt i czas (repro bywa
+    flashowaniem targetu); wyczerpany = czerwień, zadanie pada, planista
+    tnie inaczej. Bramka CZERWIENI testera pozostaje na samej suicie —
+    repro jest czerwone z definicji, więc mieszanie go tam zaślepiłoby
+    kontrolę "nowy test musi failować"."""
+    green, tail = run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+    repro = (state.current_task or {}).get("repro_cmd", "")
+    if not (green and repro):
+        return green, tail
+    if state.repro_runs >= cfg.max_repro_runs_per_task:
+        return False, (f"limit uruchomień repro w zadaniu "
+                       f"({cfg.max_repro_runs_per_task}) wyczerpany")
+    state.repro_runs += 1
+    repro_green, repro_tail = verify.run_repro(project, repro, cfg.verify_timeout_s)
+    if not repro_green:
+        return False, "REPRO problemu nadal czerwone:\n" + repro_tail
+    return True, ""
 
 
 def _run_micro_loop(cfg: Config, project: str, state: State, logf):
@@ -939,7 +1063,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                     state.micro_sub = "test"
                     save_checkpoint(project, state)
                     continue
-                green, _ = gate()
+                green, _ = _task_gate(cfg, project, state)
                 if not green:
                     log("DONE zgłoszony przy CZERWONEJ bramce — naprawa kodem.")
                     state.pending_no_test = True
@@ -953,6 +1077,15 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                 return "done"
 
             if action == "no_test":
+                if task.get("repro_cmd"):
+                    # Zadanie naprawcze weryfikacji: specyfikacją jest repro,
+                    # więc brak lokalnego testu nie jest smellem (PLAN-3, 5.2).
+                    log(f"[cykl {c}] TESTER: brak testu (zadanie z repro — bez smellu).")
+                    state.pending_no_test = True
+                    state.cycle_test_files = []
+                    state.micro_sub = "code"
+                    save_checkpoint(project, state)
+                    continue
                 state.no_test_count += 1
                 threshold = max(2, cfg.max_micro_cycles // 3)
                 if state.no_test_count > threshold:
@@ -1014,7 +1147,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                                     task_file, state.test_cmd, no_test, tail),
                                 logf(f"c{c:02d}-code{attempt}"))
             verdict = extract_json(out) or {}
-            green, tail = gate()
+            green, tail = _task_gate(cfg, project, state)
             if green:
                 break
             log(f"[cykl {c}] bramka CZERWONA (próba {attempt + 1}/{cfg.max_green_retries + 1})")
@@ -1034,17 +1167,31 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
         if violations:
             log(f"KODER zmienił testy niezadeklarowanie: {violations} — wycofuję, ponawiam bramkę.")
             revert_paths(project, violations)
-            green, _ = gate()
+            green, _ = _task_gate(cfg, project, state)
             if not green:
                 log("Po wycofaniu niedozwolonych zmian testów bramka czerwona — porażka.")
                 return False
+
+        protected = _verify_protected_globs(project, cfg, state)
+        if protected:
+            offending = verify_protected_violations(
+                changed, protected, _task_may_touch_verify(state, task),
+                _protected_exempt(project, state))
+            if offending:
+                log(f"KODER dotknął chronionych ścieżek weryfikacji: {offending} "
+                    "— wycofuję (dozwolone tylko w zadaniu verify_defect).")
+                revert_paths(project, offending)
+                green, _ = _task_gate(cfg, project, state)
+                if not green:
+                    log("Po wycofaniu zmian w plikach weryfikacji bramka czerwona — porażka.")
+                    return False
 
         if declared and not anti_weakening_ok(project, declared, state.build_cmd,
                                               state.test_cmd, cfg.agent_timeout_s):
             log(f"ANTY-OSŁABIANIE: zadeklarowane testy {declared} przechodzą na kodzie "
                 "sprzed cyklu — zmiana je rozwodniła. Przywracam wersje testów.")
             restore_test_changes(project, cfg, declared, state.cycle_test_files)
-            green, _ = gate()
+            green, _ = _task_gate(cfg, project, state)
             if not green:
                 log("Po przywróceniu testów bramka czerwona — porażka zadania.")
                 return False
@@ -1070,7 +1217,7 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
     task = state.current_task
     task_file = task.get("file", "")
     def gate() -> tuple[bool, str]:
-        return run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+        return _task_gate(cfg, project, state)  # suita + repro zadania naprawczego
 
     # None = wynik nieznany (trzeba odpalić bramkę); ustawiany, gdy drzewo się
     # nie zmieniło od ostatniego pomiaru. Świadomie NIE trwały w STATE.json —
@@ -1083,6 +1230,17 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
             out = _session_call(cfg, project, state, "coder",
                                 prompts.fix_review_prompt(state.review_notes, state.test_cmd),
                                 logf(f"review-fix{state.fix_attempt + 1}"))
+            protected = _verify_protected_globs(project, cfg, state)
+            if protected:
+                changed = changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
+                                        stop_file=cfg.stop_file)
+                offending = verify_protected_violations(
+                    changed, protected, _task_may_touch_verify(state, task),
+                    _protected_exempt(project, state))
+                if offending:
+                    log(f"Poprawki dotknęły chronionych ścieżek weryfikacji: {offending} "
+                        "— wycofuję.")
+                    revert_paths(project, offending)
             green, _ = gate()
             if green:
                 commit_all(project, f"fix: {state.current_task_title} (recenzja {state.fix_attempt + 1})")
@@ -1154,6 +1312,239 @@ def _fail_task(cfg: Config, project: str, state: State, n: int, reason: str) -> 
     save_checkpoint(project, state)
 
 
+# --- Weryfikacja celu (PLAN-3): cykl po wyczerpaniu backlogu -----------------
+
+def _active_verify_targets(cfg: Config, state: State) -> list[str]:
+    """Targety weryfikacji PO nadpisaniu użytkownika. Profil w STATE.json to
+    deklaracja bootstrapu; FORGE_VERIFY_TARGETS musi działać także na już
+    zbootstrapowanym projekcie (np. 'none', gdy płytka odpięta), więc
+    nadpisanie stosujemy w miejscu użycia, nie tylko przy deklaracji."""
+    return cfg.effective_verify_targets(state.verify_targets)
+
+
+class VerificationStop(RuntimeError):
+    """Twardy, mechaniczny stop pętli przez weryfikację celu: potwierdzony
+    env_issue (kod 4) albo brak postępu / sufit cykli (kod 5). Odróżnialny
+    w main() od porażek merytorycznych."""
+
+    def __init__(self, message: str, exit_code: int = 4):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def _head_sha(project: str) -> str:
+    return git(project, "rev-parse", "HEAD", check=False).stdout.strip()
+
+
+def _cycle_dir(project: str, cfg: Config, cycle: int) -> str:
+    return os.path.join(project, cfg.runtime_dir, "verification", f"cycle-{cycle}")
+
+
+def _read_design(project: str) -> str:
+    try:
+        with open(os.path.join(project, "docs", "DESIGN.md"), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _note_problems(project: str, notes: list[dict], cycle: int) -> None:
+    """Nieblokujące znaleziska weryfikacji → propozycje w BACKLOG.md.
+
+    To ujście zdegradowanych design_gapów i odrzuconych repro: nie blokują
+    PASS, ale nie giną — człowiek/planista może je awansować."""
+    for p in notes:
+        _append_line(os.path.join(project, "BACKLOG.md"),
+                     f"- [ ] (weryfikacja c{cycle}, {p.get('id')}, nieblokujące) "
+                     f"{p.get('title', '')}\n")
+
+
+def _accept_verdict(cfg: Config, project: str, state: State, evidence: dict,
+                    cycle_dir: str, logf) -> list[dict]:
+    """Wywołaj weryfikatora (świeży kontekst) i wyegzekwuj poprawny rejestr.
+
+    Odrzucenie (zły JSON, nieodhaczone problemy z N-1, nowy code_bug bez
+    repro_cmd) daje JEDNO ponowienie z listą powodów; potem AgentError —
+    checkpoint zostaje, człowiek widzi log."""
+    agent, model, effort = cfg.role("verifier")
+    prev_path = (os.path.join(project, cfg.runtime_dir, "verification",
+                              f"cycle-{state.verify_cycle - 1}", "problems.json")
+                 if state.verify_problems else "")
+    base_prompt = prompts.verify_goal_prompt(
+        cycle=state.verify_cycle, evidence=evidence, cycle_dir=cycle_dir,
+        prev_problems_path=prev_path, run_cmd=state.run_cmd)
+    prompt, errors = base_prompt, ["(nie wywołano)"]
+    for attempt in range(2):
+        out = run_agent(agent, prompt, cfg, project,
+                        logf(f"verify-c{state.verify_cycle}-a{attempt}"),
+                        model=model, effort=effort,
+                        mcp_config=cfg.verifier_mcp_config)
+        verdict = extract_json(out)
+        problems = (verdict or {}).get("problems")
+        errors = []
+        if not isinstance(problems, list):
+            problems, errors = [], ["brak werdyktu JSON z listą 'problems'"]
+        else:
+            errors += verify_ledger.validate_problems(problems)
+            ok, missing = verify_ledger.ledger_complete(state.verify_problems, problems)
+            if not ok:
+                errors.append("nieodhaczone problemy z poprzedniego cyklu: "
+                              + ", ".join(missing))
+            need = verify_ledger.missing_repro(problems)
+            if need:
+                errors.append("brak repro_cmd dla nowych code_bug: " + ", ".join(need))
+        if not errors:
+            return problems
+        log(f"Werdykt weryfikatora odrzucony: {'; '.join(errors)}")
+        prompt = (base_prompt + "\n\nPOPRZEDNI WERDYKT ODRZUCONY z powodów: "
+                  + "; ".join(errors) + "\nPopraw rejestr i zwróć werdykt ponownie.")
+    raise AgentError("Weryfikator nie dostarczył poprawnego rejestru problemów: "
+                     + "; ".join(errors))
+
+
+def _confirm_env_issues(cfg: Config, project: str, state: State,
+                        problems: list[dict], cycle_dir: str,
+                        targets: list[str]) -> None:
+    """env_issue na słowo agenta nie zatrzymuje biegu — najpierw mechaniczna
+    powtórka dowodów targetu. Potwierdzony → ENV-ISSUE.md + VerificationStop
+    (sprawa człowieka). Niepotwierdzony → reklasyfikacja na code_bug."""
+    for p in problems:
+        if p.get("class") != "env_issue" or p.get("status") == "resolved":
+            continue
+        target = p.get("target", "")
+        if target in targets and verify.confirm_env_issue(
+                project, state, cfg, target, cycle_dir, sha=state.verify_sha):
+            path = os.path.join(cycle_dir, "ENV-ISSUE.md")
+            _append_line(path,
+                         f"# Problem środowiska: {p.get('id')} — {p.get('title', '')}\n\n"
+                         f"Target: {target}\nDowód: {p.get('evidence', '')}\n\n"
+                         "Potwierdzone mechanicznie (powtórka dowodów nadal czerwona).\n"
+                         "Sprawdź sekrety CI / podłączenie sprzętu / toolchain "
+                         "i uruchom pętlę ponownie.\n")
+            save_checkpoint(project, state)
+            raise VerificationStop(
+                f"env_issue potwierdzony ({p.get('id')}: {p.get('title', '')}) "
+                f"— raport: {path}", exit_code=4)
+        log(f"env_issue {p.get('id')} NIEPOTWIERDZONY mechanicznie — "
+            "reklasyfikacja na code_bug.")
+        p["class"] = "code_bug"
+        p["reclassified"] = "env_issue"
+
+
+def _drop_green_repros(cfg: Config, project: str, problems: list[dict]) -> list[dict]:
+    """Repro nowego code_buga MUSI być czerwony przy odbiorze ("czerwone
+    najpierw", jak test testera). Zielony = dowód nie odtwarza usterki →
+    problem zdegradowany do notatki. Zwraca odrzucone wpisy."""
+    dropped = []
+    for p in problems:
+        if (p.get("class") == "code_bug" and p.get("status") == "new"
+                and p.get("repro_cmd") and not p.get("reclassified")):
+            green, _ = verify.run_repro(project, p["repro_cmd"], cfg.verify_timeout_s)
+            if green:
+                log(f"Repro {p.get('id')} ZIELONY przy odbiorze — problem odrzucony.")
+                p["degraded"] = "repro zielony przy odbiorze"
+                dropped.append(p)
+    return dropped
+
+
+def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
+    """Weryfikacja celu (backlog wyczerpany). Zwraca False = koniec pętli
+    (PASS), True = cykl naprawczy (planista dostanie feedback). Twarde stopy
+    (env_issue, stall, sufit) lecą jako VerificationStop."""
+    if state.phase != "verify_goal":
+        state.phase = "verify_goal"
+        state.verify_cycle += 1
+        state.verify_sha = _head_sha(project)
+        save_checkpoint(project, state)
+    else:
+        log(f"WZNAWIAM weryfikację celu (cykl {state.verify_cycle}).")
+    n = state.verify_cycle
+    cdir = _cycle_dir(project, cfg, n)
+    targets = _active_verify_targets(cfg, state)
+    log(f"=== WERYFIKACJA CELU (cykl {n}; targety: {', '.join(targets)}) ===")
+
+    evidence = verify.collect_evidence(project, state, cfg, cdir,
+                                       sha=state.verify_sha, targets=targets)
+    for target, res in sorted(evidence.items()):
+        log(f"  dowód {target}: rc={res.get('rc')} → {res.get('log')}")
+
+    problems = _accept_verdict(cfg, project, state, evidence, cdir, logf)
+
+    # Kontrola diffu weryfikatora — jedyna rola bez niej byłaby dziurą:
+    # "naprawiony przy okazji" kod poszedłby na remote niezrecenzowany, pod
+    # komunikatem docs:. Dozwolone tylko wspólne ścieżki (docs, BACKLOG);
+    # artefakty w .forge/verification są odfiltrowane jako runtime.
+    stray = [p for p in changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
+                                      stop_file=cfg.stop_file)
+             if not _match_any(p, _SHARED_WRITABLE)]
+    if stray:
+        log(f"WERYFIKATOR zmienił pliki poza docs/BACKLOG: {stray} — wycofuję "
+            "(weryfikator nie pisze kodu produkcyjnego).")
+        revert_paths(project, stray)
+
+    _confirm_env_issues(cfg, project, state, problems, cdir, targets)
+    dropped = _drop_green_repros(cfg, project, problems)
+    active = [p for p in problems if p not in dropped]
+    kept, degraded = verify_ledger.degrade_design_gaps(active, _read_design(project))
+    blockers = verify_ledger.pass_blockers(evidence, kept)
+    notes = degraded + dropped
+
+    # Postęp mierzymy na SUROWYCH statusach agenta — ZANIM degradacje staną
+    # się terminalne, żeby "resolved" dopisane przez orkiestrator nie udawało
+    # naprawy (fałszywy postęp maskowałby stagnację przed stall-licznikiem).
+    progressed = verify_ledger.progress_made(state.verify_problems, problems)
+    for p in notes:
+        # Terminalnie: zdegradowany wpis nie może zostać otwartym problemem —
+        # wymuszałby odhaczanie nie-problemu w cyklu N+1, liczył się jako
+        # bloker w porównaniach postępu i dublował notatki w BACKLOG.
+        p["status"] = "resolved"
+        p.setdefault("resolution",
+                     p.get("degraded") or "design_gap bez kryterium z DESIGN.md "
+                     "— zdegradowany do notatki")
+
+    if not blockers:
+        _note_problems(project, notes, n)
+        commit_all(project, f"docs: weryfikacja celu — cykl {n}: PASS", cfg)
+        state.verify_problems = problems
+        state.verify_stall = 0
+        state.phase = "idle"
+        save_checkpoint(project, state)
+        log("CEL ZWERYFIKOWANY" + (" (nieblokujące notatki w BACKLOG)" if notes else "")
+            + " 🎉")
+        return False
+
+    # FAIL: utrwal rejestr i raport (pamięć w repo), zmierz postęp, wróć do planisty.
+    os.makedirs(cdir, exist_ok=True)
+    with open(os.path.join(cdir, "problems.json"), "w", encoding="utf-8") as f:
+        json.dump(problems, f, indent=2, ensure_ascii=False)
+    feedback = os.path.join(cdir, "feedback.md")
+    if not os.path.exists(feedback):  # fallback — agent nie zapisał raportu
+        _append_line(feedback,
+                     f"# Weryfikacja celu — cykl {n}: FAIL\n\n## Blokery\n"
+                     + "".join(f"- {b}\n" for b in blockers)
+                     + "\n## Problemy\n"
+                     + "".join(f"- {p.get('id')} [{p.get('class')}] {p.get('title', '')}"
+                               f" (dowód: {p.get('evidence', '')})\n" for p in kept))
+    _note_problems(project, notes, n)
+    commit_all(project, f"docs: weryfikacja celu — cykl {n} nieudany (feedback)", cfg)
+
+    state.verify_stall = 0 if progressed else state.verify_stall + 1
+    state.verify_problems = problems
+    state.phase = "idle"
+    save_checkpoint(project, state)
+    log(f"WERYFIKACJA: FAIL (blokery: {len(blockers)}, "
+        f"postęp: {'tak' if progressed else 'NIE'}) — feedback: {feedback}")
+    if state.verify_stall >= cfg.max_stall_cycles:
+        raise VerificationStop(
+            f"{state.verify_stall} cykle weryfikacji bez postępu — stop. "
+            f"Raport: {feedback}", exit_code=5)
+    if state.verify_cycle >= cfg.max_verify_cycles:
+        raise VerificationStop(
+            f"osiągnięto sufit {cfg.max_verify_cycles} cykli weryfikacji — stop. "
+            f"Raport: {feedback}", exit_code=5)
+    return True
+
+
 def _task_iteration(cfg: Config, project: str, state: State) -> bool:
     """Jedno zadanie nowego modelu (plan wsadowy → mikro-TDD → recenzja). Wznawialne."""
     n = state.iteration + 1
@@ -1161,6 +1552,13 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
 
     def logf(phase: str) -> str:
         return os.path.join(project, cfg.runtime_dir, "logs", f"task-{n:04d}-{phase}.log")
+
+    if state.phase == "verify_goal":
+        if _active_verify_targets(cfg, state):
+            return phase_verify_goal(cfg, project, state, logf)  # wznowienie po restarcie
+        log("Weryfikacja wyłączona nadpisaniem użytkownika — porzucam fazę verify_goal.")
+        _clear_task(state)
+        save_checkpoint(project, state)
 
     if state.phase != "idle" and not state.current_task:
         log("Faza zaawansowana bez bieżącego zadania — reset do planowania.")
@@ -1172,6 +1570,10 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
             save_checkpoint(project, state)
             if not state.task_queue:
                 if plan.get("no_more_tasks"):
+                    if _active_verify_targets(cfg, state):
+                        # Backlog pusty ≠ koniec: cel musi przejść weryfikację
+                        # w środowisku docelowym (PLAN-3).
+                        return phase_verify_goal(cfg, project, state, logf)
                     log("PLAN: brak dalszych zadań — MVP ukończone. 🎉")
                     return False
                 # Pusta kolejka BEZ deklaracji końca = usterka planisty (zły JSON,
@@ -1182,6 +1584,19 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
                     "(pusta kolejka bez no_more_tasks) — sprawdź log fazy plan.")
         _start_task(cfg, project, state)
         save_checkpoint(project, state)
+        repro = state.current_task.get("repro_cmd", "")
+        if repro:
+            # Zadanie naprawcze: repro MUSI być czerwone na starcie ("czerwone
+            # najpierw"). Zielone = problem już nie występuje — zadanie jest
+            # bezprzedmiotowe; potwierdzi to pełna weryfikacja następnego cyklu.
+            green, _ = verify.run_repro(project, repro, cfg.verify_timeout_s)
+            state.repro_runs = 1
+            if green:
+                log(f"Repro zadania '{state.current_task_title}' już ZIELONE na "
+                    "starcie — zamykam jako bezprzedmiotowe.")
+                journal_append(project, cfg, "repro zielone na starcie — zadanie bezprzedmiotowe")
+                _finish_task(cfg, project, state, n)
+                return True
     else:
         log(f"WZNAWIAM fazę '{state.phase}': {state.current_task_title}")
 
@@ -1386,6 +1801,12 @@ def main(argv: list[str] | None = None) -> int:
         state.save(state_path)
         _print_usage(project, cfg.runtime_dir)
         return 3
+    except VerificationStop as e:
+        log(f"WERYFIKACJA ZATRZYMAŁA BIEG: {e}")
+        log("Stan zapisany — po naprawie środowiska/przeglądzie raportu uruchom ponownie.")
+        state.save(state_path)
+        _print_usage(project, cfg.runtime_dir)
+        return e.exit_code
     except KeyboardInterrupt:
         log("Przerwano ręcznie. Stan zapisany.")
         state.save(state_path)

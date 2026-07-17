@@ -58,6 +58,31 @@ class State:
     no_test_count: int = 0
     # Tag gita ustawiony na starcie zadania — punkt rollbacku przy porażce zadania.
     task_start_tag: str = ""
+    # Ile razy w bieżącym zadaniu uruchomiono repro (sufit chroni sprzęt:
+    # repro bywa flashowaniem). Zerowane na starcie zadania.
+    repro_runs: int = 0
+
+    # --- Weryfikacja celu (PLAN-3): profil + checkpoint cyklu ---------------
+    # Profil deklaruje bootstrap (jak test_cmd — serce stack-agnostyczności).
+    # Puste verify_targets = weryfikacja wyłączona (zachowanie sprzed PLAN-3);
+    # stare STATE.json migrują na to naturalnie przez wartości domyślne.
+    verify_targets: list[str] = field(default_factory=list)  # np. ["ci","hardware","smoke"]
+    smoke_cmd: str = ""       # dymny bieg produktu; rc==0 = OK
+    flash_cmd: str = ""       # hardware: wgranie na target
+    target_cmd: str = ""      # hardware: testy na targecie; stdout = log seriala
+    probe_cmd: str = ""       # hardware, opcjonalne: preflight obecności urządzenia
+    ci_status_cmd: str = ""   # ci: status checków dla {sha}; rc 0/1/2=zielone/czerwone/trwa
+    ci_logs_cmd: str = ""     # ci: log porażek dla {sha} na stdout
+    # Testy wykonywane w środowisku weryfikacji (target/CI), nie w lokalnej
+    # suicie — chronione przed osłabianiem jak workflow (PLAN-3, sekcja 8).
+    verify_test_globs: list[str] = field(default_factory=list)
+    # Checkpoint fazy verify_goal: numer cyklu, kolejne cykle bez postępu,
+    # SHA badanego HEAD i rejestr problemów z ostatniego werdyktu (wejście
+    # odhaczania w cyklu następnym).
+    verify_cycle: int = 0
+    verify_stall: int = 0
+    verify_sha: str = ""
+    verify_problems: list[dict] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: str) -> "State":

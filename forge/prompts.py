@@ -63,6 +63,23 @@ Zadania bootstrapu (wykonaj wszystkie, tworząc pliki w bieżącym katalogu):
 5. Zescaffolduj MINIMALNY szkielet projektu + działający framework testów z JEDNYM
    trywialnym przechodzącym testem (żeby komenda testowa działała od zera).
 6. Ustal DOKŁADNE komendy powłoki: test, build (może być pusta), run.
+7. Zadeklaruj PROFIL WERYFIKACJI CELU — jak sprawdzić, że GOTOWY produkt
+   naprawdę działa w środowisku docelowym (uruchamiane, gdy backlog się
+   wyczerpie):
+   - "targets": podzbiór ["smoke", "ci", "hardware"] — "ci" jeśli repo ma
+     konfigurację CI (np. .github/workflows/); "hardware" jeśli brief mówi
+     o płytce/firmware/urządzeniu; "smoke" niemal zawsze warto.
+   - smoke_cmd: dymny bieg produktu (rc==0 = działa), np. "bash scripts/smoke.sh".
+   - hardware: flash_cmd (wgranie na target), target_cmd (testy na targecie;
+     rc==0 = OK, stdout = log seriala), opcjonalnie probe_cmd (czy urządzenie
+     podpięte). Skrypty przypinaj do KONKRETNEGO urządzenia/portu.
+   - ci: ci_status_cmd (status checków dla commita {{sha}}; wyjdź kodem
+     0=zielono, 1=czerwono, 2=jeszcze trwa) oraz ci_logs_cmd (log porażek dla
+     {{sha}} na stdout) — np. skrypty na `gh run list/view`.
+   - verify_test_globs: globy testów wykonywanych na targecie/w CI (nie w
+     lokalnej suicie), np. ["tests/hil/**"] — będą chronione przed osłabianiem.
+   Komendy targetów, których nie deklarujesz, zostaw pustymi stringami;
+   nie zgaduj — lepszy sam "smoke" niż zmyślone komendy CI.
 
 WAŻNE o komendach (uruchamiane bez powłoki, przez shlex): każda z nich musi być
 POJEDYNCZĄ komendą wykonywalną BEZ operatorów powłoki (`&&`, `|`, `>`, `;`, `cd`).
@@ -72,7 +89,8 @@ C++/CMake) podaj niepusty build_cmd — orkiestrator uruchomi go przed testami.
 
 Na samym końcu odpowiedzi zwróć WYŁĄCZNIE blok:
 ```json
-{{"kind": "game|app", "stack": "<krótki opis>", "test_cmd": "<pojedyncza komenda>", "build_cmd": "<pojedyncza komenda lub pusty string>", "run_cmd": "<pojedyncza komenda>"}}
+{{"kind": "game|app", "stack": "<krótki opis>", "test_cmd": "<pojedyncza komenda>", "build_cmd": "<pojedyncza komenda lub pusty string>", "run_cmd": "<pojedyncza komenda>",
+ "verify": {{"targets": ["smoke"], "smoke_cmd": "<komenda>", "flash_cmd": "", "target_cmd": "", "probe_cmd": "", "ci_status_cmd": "<komenda z {{sha}} lub pusty>", "ci_logs_cmd": "<komenda z {{sha}} lub pusty>", "verify_test_globs": []}}}}
 ```
 Komendy muszą działać z katalogu projektu bez interakcji."""
 
@@ -183,7 +201,26 @@ Na końcu zwróć WYŁĄCZNIE:
 # NOWY MODEL: mikro-TDD ping-pong (Codex-tester ↔ Codex-koder), plan wsadowy.
 # =====================================================================
 
-def plan_batch_prompt(batch_size: int, start_index: int, kind: str = "app") -> str:
+def plan_batch_prompt(batch_size: int, start_index: int, kind: str = "app",
+                      verify_feedback_path: str = "", ci_warning: str = "") -> str:
+    feedback = ""
+    if verify_feedback_path:
+        feedback = f"""
+WERYFIKACJA CELU ZAKOŃCZYŁA SIĘ PORAŻKĄ. Przeczytaj raport weryfikatora:
+{verify_feedback_path} (problemy z dowodami, hipotezami i proponowanym
+podziałem — podział to sugestia, możesz pociąć inaczej). PRIORYTET tego
+planu: zadania naprawcze dla otwartych problemów. Każde zadanie naprawcze
+MUSI w JSON-ie mieć pola "fixes" (id problemu, np. "P-003") i "repro_cmd"
+(komenda reprodukcji z raportu) — repro jest bramką zadania: czerwony na
+starcie, zielony na koniec. Plików workflow CI i skryptów weryfikacji wolno
+dotykać wyłącznie w zadaniu naprawiającym problem klasy verify_defect.
+"""
+    warning = f"\nUWAGA: {ci_warning}\n" if ci_warning else ""
+    fix_note = ('; pola "fixes" i "repro_cmd" TYLKO dla zadań naprawczych'
+                if verify_feedback_path else "")
+    fix_fields = (',\n   "fixes": "<id problemu lub pomiń>", '
+                  '"repro_cmd": "<komenda repro lub pomiń>"'
+                  if verify_feedback_path else "")
     return f"""{SHARED_PRINCIPLES}
 
 ROLA: Planista wsadowy. Jednym wywołaniem przygotuj KOLEJKĘ najbliższych zadań —
@@ -191,6 +228,7 @@ to obniża koszt stały planowania na zadanie.
 
 Przeczytaj: docs/DESIGN.md, docs/ARCHITECTURE.md, BACKLOG.md, `git log --oneline -20`
 oraz .forge/failures.md jeśli istnieje (zadania, które padły — rozbij je drobniej).
+{feedback}{warning}
 
 Zaplanuj do {batch_size} NASTĘPNYCH zadań w stronę {mvp_phrase(kind)}, każde =
 najmniejszy wartościowy, testowalny przyrost. Oceń też stan kodu: jeśli narósł
@@ -216,12 +254,12 @@ Numeruj zadania od {start_index:03d}. Dla KAŻDEGO zadania zapisz plik
 Zaktualizuj BACKLOG.md (statusy) i rozwiń docs/DESIGN.md, jeśli decyzja projektowa
 tego wymaga. Ukończone pozycje przenoś do BACKLOG-ARCHIVE.md, by BACKLOG nie puchł.
 
-Na końcu zwróć WYŁĄCZNIE (globy MUSZĄ zgadzać się z plikami zadań):
+Na końcu zwróć WYŁĄCZNIE (globy MUSZĄ zgadzać się z plikami zadań{fix_note}):
 ```json
 {{"no_more_tasks": false, "tasks": [
   {{"id": "task-{start_index:03d}", "title": "<tytuł>", "file": ".forge/tasks/task-{start_index:03d}.md",
    "criteria": ["<kryterium 1>", "<kryterium 2>"],
-   "test_globs": ["tests/..."], "code_globs": ["src/..."]}}
+   "test_globs": ["tests/..."], "code_globs": ["src/..."]{fix_fields}}}
 ]}}
 ```
 Ustaw "no_more_tasks": true i pustą listę "tasks" TYLKO gdy MVP z DESIGN.md jest
@@ -338,3 +376,73 @@ Na końcu zwróć WYŁĄCZNIE:
 ```json
 {{"test_changes": [{{"file": "<ścieżka>", "reason": "<czemu>"}}], "notes": "<co zmienione>"}}
 ```"""
+
+
+# =====================================================================
+# WERYFIKACJA CELU (PLAN-3): weryfikator-QA po wyczerpaniu backlogu.
+# =====================================================================
+
+def verify_goal_prompt(cycle: int, evidence: dict, cycle_dir: str,
+                       prev_problems_path: str, run_cmd: str) -> str:
+    ev_lines = "\n".join(
+        f"- {target}: rc={res.get('rc')} (0=zielono; None=nie wystartowało/timeout), "
+        f"pełny log: {res.get('log')}"
+        for target, res in sorted(evidence.items()))
+    prev = (f"Rejestr problemów z poprzedniego cyklu: {prev_problems_path} — "
+            "KAŻDY otwarty problem z niego MUSISZ odhaczyć statusem "
+            '"resolved" albo "persisting" (trwałe id!); rejestr niekompletny '
+            "zostanie odrzucony.\n" if prev_problems_path else
+            "To pierwszy cykl weryfikacji — rejestr zaczynasz od zera.\n")
+    run_hint = f"Produkt uruchomisz przez: `{run_cmd}`.\n" if run_cmd else ""
+    return f"""{SHARED_PRINCIPLES}
+
+ROLA: WERYFIKATOR-QA (cykl {cycle}). Backlog wyczerpany — planista uważa cel za
+osiągnięty. Twoim zadaniem jest sprawdzić świeżym okiem, czy produkt NAPRAWDĘ
+działa w środowisku docelowym. Nie piszesz kodu produkcyjnego.
+
+Orkiestrator zebrał już dowody mechaniczne (kody wyjścia + pełne logi):
+{ev_lines}
+
+{prev}{run_hint}
+Procedura:
+1. Przeczytaj dowody (logi wyżej) oraz docs/DESIGN.md i brief — skonfrontuj
+   realne zachowanie produktu z obiecanym. Możesz drążyć samodzielnie:
+   ponawiać komendy weryfikacji, oglądać joby CI (np. `gh run view --log-failed`
+   albo narzędzia MCP, jeśli je masz), uruchomić produkt.
+2. Zaktualizuj REJESTR PROBLEMÓW. Klasy i ich znaczenie:
+   - "code_bug": usterka kodu naprawialna zadaniem; dla NOWEGO code_bug MUSISZ
+     napisać skrypt reprodukcji {cycle_dir}/repro/<id>.sh (pojedyncza komenda
+     `bash ...`; rc!=0 = bug obecny, rc==0 = naprawiony; możliwie tani — filtruj
+     do jednego testu/objawu) i podać go w "repro_cmd". Orkiestrator uruchomi
+     go przy odbiorze — MUSI być czerwony, inaczej problem zostanie odrzucony.
+   - "verify_defect": zepsuta jest sama weryfikacja (workflow CI, skrypt
+     flash/smoke) — jedyna klasa pozwalająca planiście dotykać tych plików.
+   - "env_issue": świat zewnętrzny (brak sekretu CI, odpięta płytka, brak
+     toolchaina) — orkiestrator potwierdzi mechanicznie i zatrzyma bieg dla
+     człowieka. NIE nadużywaj: pomyłka wraca jako code_bug.
+   - "flaky": niedeterministyczna porażka — dostanie darmową powtórkę; nawrót
+     w kolejnym cyklu traktuj jako pełnoprawny problem (stabilizacja testu).
+   - "design_gap": rc zielone, ale zachowanie niezgodne z DESIGN.md. Ważny
+     TYLKO z polem "criterion" będącym DOSŁOWNYM cytatem kryterium/zdania
+     z docs/DESIGN.md — inaczej zostanie zdegradowany do notatki.
+3. Przy porażce napisz OBSZERNY raport {cycle_dir}/feedback.md dla planisty:
+   co sprawdzono i jak; co DZIAŁA (żeby tego nie ruszał); per problem: objaw
+   z cytatem loga i ścieżką, dowód, hipoteza przyczyny, proponowany podział na
+   1-3 małe zadania; porównanie z cyklem poprzednim (co naprawiono, co nawraca).
+4. Zapisz pełny rejestr także do {cycle_dir}/problems.json (ten sam JSON co
+   w werdykcie — pamięć dla następnego cyklu).
+
+Na końcu zwróć WYŁĄCZNIE:
+```json
+{{"verdict": "pass|fail",
+  "problems": [
+    {{"id": "P-001", "status": "new|persisting|resolved",
+      "class": "code_bug|verify_defect|env_issue|flaky|design_gap",
+      "title": "<1 zdanie>", "target": "ci|hardware|smoke|behavior",
+      "evidence": "<ścieżka loga:linie / komenda z rc>",
+      "repro_cmd": "<bash {cycle_dir}/repro/P-001.sh — dla code_bug>",
+      "criterion": "<dosłowny cytat z DESIGN.md — dla design_gap>"}}
+  ]}}
+```
+"pass" wolno Ci orzec tylko przy zielonych rc wszystkich targetów i bez
+otwartych problemów — orkiestrator to zweryfikuje niezależnie."""

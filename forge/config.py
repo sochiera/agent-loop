@@ -100,6 +100,43 @@ class Config:
     coder_model: str = os.environ.get("FORGE_CODER_MODEL", "")
     coder_effort: str = os.environ.get("FORGE_CODER_EFFORT", "")
 
+    # --- Weryfikacja celu (PLAN-3) -------------------------------------------
+    # Weryfikator-QA: pusty agent = rola planisty (ocena całości to zadanie
+    # mocnego modelu). Jawny agent konfiguruje się jak tester/koder.
+    verifier_agent: str = os.environ.get("FORGE_VERIFIER_AGENT", "")
+    verifier_model: str = os.environ.get("FORGE_VERIFIER_MODEL", "")
+    verifier_effort: str = os.environ.get("FORGE_VERIFIER_EFFORT", "")
+    # Nadpisanie targetów z bootstrapu: "" = decyduje bootstrap, "none" =
+    # weryfikacja wyłączona, "ci,hardware" = dokładnie te targety.
+    verify_targets_override: str = os.environ.get("FORGE_VERIFY_TARGETS", "")
+    # Bezpiecznik absolutny cykli; głównym mechanizmem stopu jest stall
+    # (kolejne cykle bez postępu wg verify_ledger.progress_made).
+    max_verify_cycles: int = int(os.environ.get("FORGE_MAX_VERIFY_CYCLES", "8"))
+    max_stall_cycles: int = int(os.environ.get("FORGE_MAX_STALL_CYCLES", "2"))
+    # Polling CI: backoff start→sufit; timeout całego oczekiwania na werdykt CI.
+    ci_timeout_s: int = int(os.environ.get("FORGE_CI_TIMEOUT", "2700"))
+    ci_poll_start_s: int = int(os.environ.get("FORGE_CI_POLL_START", "30"))
+    ci_poll_max_s: int = int(os.environ.get("FORGE_CI_POLL_MAX", "300"))
+    # Timeout pojedynczej komendy weryfikacji (smoke/flash/target/repro).
+    verify_timeout_s: int = int(os.environ.get("FORGE_VERIFY_TIMEOUT", "1800"))
+    # Flash bywa flaky z natury (USB) — darmowe ponowienia przed diagnozą.
+    flash_retries: int = int(os.environ.get("FORGE_FLASH_RETRIES", "1"))
+    # Sufit uruchomień repro w jednym zadaniu naprawczym (chroni sprzęt i czas).
+    max_repro_runs_per_task: int = int(os.environ.get("FORGE_MAX_REPRO_RUNS", "6"))
+    # Tani ci_status_cmd HEAD przy każdym planowaniu (ostrzeżenie w prompcie).
+    ci_early_warn: bool = os.environ.get("FORGE_CI_EARLY_WARN", "1") != "0"
+    # Plik konfiguracji MCP doklejany do claude TYLKO w roli weryfikatora.
+    verifier_mcp_config: str = os.environ.get("FORGE_VERIFIER_MCP_CONFIG", "")
+
+    def effective_verify_targets(self, declared: list[str]) -> list[str]:
+        """Targety po nadpisaniu użytkownika ("" = deklaracja bootstrapu)."""
+        override = self.verify_targets_override.strip().lower()
+        if override == "none":
+            return []
+        if override:
+            return [t.strip() for t in override.split(",") if t.strip()]
+        return declared
+
     def _role_model_effort(self, agent: str, model: str, effort: str) -> tuple[str, str]:
         # Dla codeksa puste pola dziedziczą globalne codex_model/effort (jego
         # naturalny default); dla innych agentów puste = niech agent sam wybierze.
@@ -118,6 +155,12 @@ class Config:
         if name == "coder":
             return (self.coder_agent,
                     *self._role_model_effort(self.coder_agent, self.coder_model, self.coder_effort))
+        if name == "verifier":
+            if not self.verifier_agent:  # domyślnie rola planisty w całości
+                return self.role("planner")
+            return (self.verifier_agent,
+                    *self._role_model_effort(self.verifier_agent,
+                                             self.verifier_model, self.verifier_effort))
         raise ValueError(f"nieznana rola: {name}")
 
     def tester(self) -> tuple[str, str]:
@@ -132,7 +175,8 @@ class Config:
         """Agenci CLI faktycznie używani w bieżącym trybie (do preflightu)."""
         if self.legacy_mode:
             return list(dict.fromkeys([self.planner_agent, "codex"]))
-        return list(dict.fromkeys([self.planner_agent, self.tester_agent, self.coder_agent]))
+        return list(dict.fromkeys([self.planner_agent, self.tester_agent,
+                                   self.coder_agent, self.role("verifier")[0]]))
 
     # --- Komendy bazowe CLI (bez shella) ------------------------------------
     # Claude Code headless. Jeśli 'claude' nie jest na PATH, ustaw FORGE_CLAUDE_BIN.

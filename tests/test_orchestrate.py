@@ -16,12 +16,12 @@ from forge.state import State
 
 
 class RunTestsTest(unittest.TestCase):
-    @patch("forge.orchestrate.subprocess.run")
+    @patch("forge.shellrun.subprocess.run")
     def test_missing_command_fails_closed(self, run: Mock) -> None:
         self.assertFalse(run_tests("/tmp/project", "", 10))
         run.assert_not_called()
 
-    @patch("forge.orchestrate.subprocess.run")
+    @patch("forge.shellrun.subprocess.run")
     def test_command_is_not_passed_through_a_shell(self, run: Mock) -> None:
         run.return_value = subprocess.CompletedProcess([], 0, "", "")
 
@@ -36,7 +36,7 @@ class RunTestsTest(unittest.TestCase):
             timeout=10,
         )
 
-    @patch("forge.orchestrate.subprocess.run")
+    @patch("forge.shellrun.subprocess.run")
     def test_malformed_command_fails_closed(self, run: Mock) -> None:
         self.assertFalse(run_tests("/tmp/project", "python 'unterminated", 10))
         run.assert_not_called()
@@ -90,14 +90,14 @@ class AgentSettingsTest(unittest.TestCase):
 
 class BuildGateTest(unittest.TestCase):
     @patch("forge.orchestrate.run_tests")
-    @patch("forge.orchestrate.subprocess.run")
+    @patch("forge.shellrun.subprocess.run")
     def test_failed_build_is_red_and_skips_tests(self, run: Mock, tests: Mock) -> None:
         run.return_value = subprocess.CompletedProcess([], 1, "", "boom")
         self.assertFalse(build_then_test("/tmp/p", "make", "pytest", 10))
         tests.assert_not_called()  # nie testujemy, gdy build padł
 
     @patch("forge.orchestrate.run_tests", return_value=True)
-    @patch("forge.orchestrate.subprocess.run")
+    @patch("forge.shellrun.subprocess.run")
     def test_successful_build_then_runs_tests(self, run: Mock, tests: Mock) -> None:
         run.return_value = subprocess.CompletedProcess([], 0, "", "")
         self.assertTrue(build_then_test("/tmp/p", "make", "pytest", 10))
@@ -106,7 +106,7 @@ class BuildGateTest(unittest.TestCase):
         tests.assert_called_once_with("/tmp/p", "pytest", 10)
 
     @patch("forge.orchestrate.run_tests", return_value=True)
-    @patch("forge.orchestrate.subprocess.run")
+    @patch("forge.shellrun.subprocess.run")
     def test_empty_build_cmd_goes_straight_to_tests(self, run: Mock, tests: Mock) -> None:
         self.assertTrue(build_then_test("/tmp/p", "", "pytest", 10))
         run.assert_not_called()

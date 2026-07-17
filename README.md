@@ -150,6 +150,37 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 > pociągnie znacznie dłużej. Orkiestrator sam wykrywa komunikaty o limitach,
 > robi backoff (z logiem czasu wznowienia), a po wyczerpaniu — czysty stop.
 
+## Weryfikacja celu (CI + real hardware)
+
+Gdy planista orzeknie `no_more_tasks`, pętla NIE kończy pracy: startuje
+**weryfikacja celu** — świeży agent (weryfikator-QA) sprawdza, czy całość
+naprawdę działa w środowisku docelowym. Szczegóły projektu:
+`docs/PLAN-3-WERYFIKACJA.md`.
+
+- **Profil deklaruje bootstrap** w `STATE.json` (jak `test_cmd`): targety
+  (`smoke`/`ci`/`hardware`) i komendy — `smoke_cmd`, `flash_cmd`+`target_cmd`
+  (+opcjonalny `probe_cmd`), `ci_status_cmd`/`ci_logs_cmd` z placeholderem
+  `{sha}` (kontrakt: rc 0=zielono, 1=czerwono, 2=trwa). Nadpisanie:
+  `FORGE_VERIFY_TARGETS=ci,hardware` albo `FORGE_VERIFY_TARGETS=none` (wyłącz).
+- **Dowody zbiera orkiestrator za darmo** (polling CI z backoffem, flash z
+  retry, pełne logi w `.forge/verification/cycle-N/`), agent dostaje kody
+  wyjścia i ścieżki. PASS wymaga zielonych rc WSZYSTKICH targetów i pustego
+  rejestru blokerów — agent nie przegłosuje czerwieni.
+- **Porażka = rejestr problemów + obszerny `feedback.md`** → planista planuje
+  zadania naprawcze (`fixes` + `repro_cmd`) i cykl rusza od nowa. Repro jest
+  bramką zadania: czerwone na starcie, zielone na koniec (razem z suitą).
+- **Twarde stopy:** potwierdzony `env_issue` (kod wyjścia 4 — sprawa
+  człowieka), brak postępu `FORGE_MAX_STALL_CYCLES` cykli z rzędu albo sufit
+  `FORGE_MAX_VERIFY_CYCLES` (kod 5).
+- **Ochrona przed osłabianiem:** workflow CI, skrypty weryfikacji i testy
+  targetowe (`verify_test_globs`) są wycofywane z diffu, chyba że zadanie
+  naprawia problem klasy `verify_defect` z rejestru.
+- Pokrętła: `FORGE_VERIFIER_AGENT/MODEL/EFFORT` (domyślnie planista),
+  `FORGE_CI_TIMEOUT` (45 min), `FORGE_VERIFY_TIMEOUT`, `FORGE_FLASH_RETRIES`,
+  `FORGE_MAX_REPRO_RUNS`, `FORGE_CI_EARLY_WARN` (ostrzeżenie o czerwonym CI
+  przy każdym planowaniu), `FORGE_VERIFIER_MCP_CONFIG` (plik MCP doklejany
+  do Claude'a tylko w roli weryfikatora — np. serwer GitHuba do debugowania CI).
+
 ## Dowolny agent CLI (claude, codex, grok, Kiro, …)
 
 Każdą rolę — planistę, testera, kodera — może pełnić dowolny agent CLI. `claude`
