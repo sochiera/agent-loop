@@ -13,7 +13,6 @@ import argparse
 import datetime as _dt
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -25,6 +24,7 @@ from .agents import (AgentError, LimitExhausted, agent_supports_resume,
                      extract_json, run_agent, run_agent_session, run_codex,
                      run_planner)
 from .config import Config
+from .shellrun import run_shellfree as _run_shellfree
 from .state import State
 
 
@@ -194,29 +194,6 @@ def rollback(project: str, ref: str = "HEAD") -> None:
 
 
 # --- Bramka testów -----------------------------------------------------------
-
-def _run_shellfree(project: str, cmd: str, timeout: int) -> tuple[int | None, str]:
-    """Wspólny rdzeń wszystkich bramek: pojedyncza komenda bez shella.
-
-    Zwraca (returncode, wyjście) albo (None, diagnoza), gdy komenda w ogóle
-    nie wystartowała (składnia/pusta/OSError/timeout). Jedno miejsce prawdy
-    dla semantyki subprocess — run_tests, build_then_test i run_gate nie mogą
-    się rozjechać."""
-    try:
-        argv = shlex.split(cmd)
-    except ValueError as exc:
-        return None, f"niepoprawna składnia komendy ({exc})"
-    if not argv:
-        return None, "pusta komenda"
-    try:
-        proc = subprocess.run(argv, cwd=project, shell=False, text=True,
-                              capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return None, "TIMEOUT"
-    except OSError as exc:
-        return None, f"nie udało się uruchomić ({exc})"
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
-
 
 def run_tests(project: str, test_cmd: str, timeout: int) -> bool:
     if not test_cmd:
