@@ -1489,6 +1489,19 @@ def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
     blockers = verify_ledger.pass_blockers(evidence, kept)
     notes = degraded + dropped
 
+    # Postęp mierzymy na SUROWYCH statusach agenta — ZANIM degradacje staną
+    # się terminalne, żeby "resolved" dopisane przez orkiestrator nie udawało
+    # naprawy (fałszywy postęp maskowałby stagnację przed stall-licznikiem).
+    progressed = verify_ledger.progress_made(state.verify_problems, problems)
+    for p in notes:
+        # Terminalnie: zdegradowany wpis nie może zostać otwartym problemem —
+        # wymuszałby odhaczanie nie-problemu w cyklu N+1, liczył się jako
+        # bloker w porównaniach postępu i dublował notatki w BACKLOG.
+        p["status"] = "resolved"
+        p.setdefault("resolution",
+                     p.get("degraded") or "design_gap bez kryterium z DESIGN.md "
+                     "— zdegradowany do notatki")
+
     if not blockers:
         _note_problems(project, notes, n)
         commit_all(project, f"docs: weryfikacja celu — cykl {n}: PASS", cfg)
@@ -1515,7 +1528,6 @@ def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
     _note_problems(project, notes, n)
     commit_all(project, f"docs: weryfikacja celu — cykl {n} nieudany (feedback)", cfg)
 
-    progressed = verify_ledger.progress_made(state.verify_problems, problems)
     state.verify_stall = 0 if progressed else state.verify_stall + 1
     state.verify_problems = problems
     state.phase = "idle"

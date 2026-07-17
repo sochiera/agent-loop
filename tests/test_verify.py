@@ -427,6 +427,11 @@ class VerifyGoalPhaseTest(unittest.TestCase):
         self.assertFalse(cont)  # zieleń + brak ważnych blokerów = PASS-z-notatkami
         backlog = Path(self.project, "BACKLOG.md").read_text(encoding="utf-8")
         self.assertIn("P-001", backlog)
+        # odrzucony problem NIE zostaje otwartym wpisem rejestru (nie wymusza
+        # odhaczania w następnym cyklu, nie liczy się jako otwarty bloker)
+        stored = self.state.verify_problems[0]
+        self.assertEqual(stored["status"], "resolved")
+        self.assertTrue(stored.get("resolution"))
 
     def test_design_gap_with_real_criterion_blocks_pass(self) -> None:
         gap = {"id": "P-002", "status": "new", "class": "design_gap",
@@ -442,6 +447,29 @@ class VerifyGoalPhaseTest(unittest.TestCase):
         cont, _ = self._run(0, [_verdict([gap])])
         self.assertFalse(cont)
         self.assertIn("P-002", Path(self.project, "BACKLOG.md").read_text("utf-8"))
+
+    def test_degraded_gap_is_terminal_and_does_not_fake_progress(self) -> None:
+        self.state.verify_problems = [{"id": "P-001", "status": "new",
+                                       "class": "code_bug", "title": "pad",
+                                       "repro_cmd": "bash r.sh"}]
+        self.state.verify_cycle = 1
+        verdict = _verdict([
+            {"id": "P-001", "status": "persisting", "class": "code_bug",
+             "title": "pad", "target": "smoke", "repro_cmd": "bash r.sh"},
+            {"id": "P-002", "status": "new", "class": "design_gap",
+             "title": "widzimisię", "target": "behavior",
+             "criterion": "zmyślone kryterium"},
+        ])
+
+        cont, _ = self._run(1, [verdict])
+
+        self.assertTrue(cont)
+        # degradacja nie jest postępem: nic realnie nie rozwiązano → stall
+        self.assertEqual(self.state.verify_stall, 1)
+        by_id = {p["id"]: p for p in self.state.verify_problems}
+        self.assertEqual(by_id["P-002"]["status"], "resolved")  # terminalny
+        self.assertTrue(by_id["P-002"].get("resolution"))
+        self.assertEqual(by_id["P-001"]["status"], "persisting")
 
     def test_incomplete_ledger_gets_one_retry_then_agent_error(self) -> None:
         self.state.verify_problems = [{"id": "P-009", "status": "new",
