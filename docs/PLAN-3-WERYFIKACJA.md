@@ -4,6 +4,19 @@ Data: 2026-07-17 (rewizja 3 — domknięte trzy słabe punkty rewizji 2:
 rozjazd środowisk naprawy, brak zbieżności werdyktu, niebramkow ane
 klasyfikacje i luka anty-osłabiania).
 
+> **Stan implementacji (2026-07-17):** E-V0 + mechanika E-V1/E-V2
+> ZAIMPLEMENTOWANE w TDD (167 testów zielonych): `verify_ledger.py`,
+> `verify.py`, `shellrun.py`, profil w bootstrapie, faza `verify_goal`
+> (PASS/stall/env/limity, wznawialność), zadania z bramką repro, chronione
+> ścieżki, early-warn CI, `--mcp-config` weryfikatora, raport, README.
+> Odstępstwa od tekstu planu: (1) artefakty weryfikacji żyją w
+> `.forge/verification/` — katalog `.forge/` jest w `.gitignore` projektu
+> (konwencja „repo czyste od metadanych narzędzia"), więc commit feedbacku
+> jest best-effort; pamięć między cyklami działa z dysku + STATE.json;
+> (2) walidacja profilu w `smoke --dry` — odłożona (preflight i bootstrap
+> walidują twardo). Do zrobienia po dostępie do żywych agentów: E-V1 żywy
+> test na repo z workflow, E-V2 na fizycznym targecie, kalibracja E-V3.
+
 **Koncepcja:** weryfikacja NIE jest wpleciona w każde zadanie. Gdy planista
 orzeknie `no_more_tasks`, do gry wchodzi **nowy agent (weryfikator-QA)**,
 który sprawdza całość na CI i prawdziwym hardware. Porażka = ustrukturyzowany
