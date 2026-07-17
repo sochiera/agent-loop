@@ -267,6 +267,43 @@ def preflight(cfg: Config) -> list[str]:
 
 # --- Fazy --------------------------------------------------------------------
 
+# Wymagane komendy per target weryfikacji (PLAN-3, sekcja 2). Target
+# zadeklarowany bez swoich komend to usterka bootstrapu, nie "jakoś to będzie".
+_VERIFY_TARGET_CMDS = {
+    "smoke": ("smoke_cmd",),
+    "hardware": ("flash_cmd", "target_cmd"),
+    "ci": ("ci_status_cmd", "ci_logs_cmd"),
+}
+_VERIFY_CMD_FIELDS = ("smoke_cmd", "flash_cmd", "target_cmd", "probe_cmd",
+                      "ci_status_cmd", "ci_logs_cmd")
+
+
+def parse_verify_profile(verify, cfg: Config) -> dict:
+    """Zwaliduj obiekt "verify" z bootstrapu → pola profilu dla State.
+
+    Brak obiektu = weryfikacja wyłączona (kompatybilność ze starszymi
+    promptami/STATE). Nadpisanie użytkownika (FORGE_VERIFY_TARGETS) wygrywa
+    z deklaracją bootstrapu."""
+    verify = verify if isinstance(verify, dict) else {}
+    declared = [str(t).strip() for t in (verify.get("targets") or [])
+                if str(t).strip()]
+    targets = cfg.effective_verify_targets(declared)
+    unknown = [t for t in dict.fromkeys(declared + targets)
+               if t not in _VERIFY_TARGET_CMDS]
+    if unknown:
+        raise AgentError(
+            f"Nieznane targety weryfikacji: {', '.join(unknown)} "
+            f"(dozwolone: {', '.join(_VERIFY_TARGET_CMDS)}).")
+    fields = {key: str(verify.get(key) or "").strip() for key in _VERIFY_CMD_FIELDS}
+    missing = [f"{target}: brak {cmd}" for target in targets
+               for cmd in _VERIFY_TARGET_CMDS[target] if not fields[cmd]]
+    if missing:
+        raise AgentError("Profil weryfikacji niekompletny — " + "; ".join(missing) + ".")
+    globs = [str(g).strip() for g in (verify.get("verify_test_globs") or [])
+             if str(g).strip()]
+    return {"verify_targets": targets, "verify_test_globs": globs, **fields}
+
+
 def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     log("=== BOOTSTRAP ===")
     with open(cfg.brief_path, "r", encoding="utf-8") as f:
@@ -281,8 +318,11 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
         raise AgentError(f"Bootstrap zwrócił niepoprawne pola: {', '.join(invalid)}.")
     if not data["stack"].strip() or not data["test_cmd"].strip() or not data["run_cmd"].strip():
         raise AgentError("Bootstrap musi określić stack oraz niepuste komendy test i run.")
+    profile = parse_verify_profile(data.get("verify"), cfg)
     if not build_then_test(project, data["build_cmd"], data["test_cmd"], cfg.agent_timeout_s):
         raise AgentError("Build/testy szkieletu po bootstrapie nie przeszły.")
+    for key, value in profile.items():
+        setattr(state, key, value)
     state.stack = data.get("stack", "")
     state.test_cmd = data.get("test_cmd", "")
     state.build_cmd = data.get("build_cmd", "")
@@ -291,7 +331,8 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     state.project_kind = "game" if kind == "game" else "app"
     state.bootstrapped = True
     log(f"Rodzaj: {state.project_kind} | stack: {state.stack or '(nieokreślony)'} "
-        f"| test_cmd: {state.test_cmd or '(brak!)'}")
+        f"| test_cmd: {state.test_cmd or '(brak!)'} "
+        f"| weryfikacja: {', '.join(state.verify_targets) or '(wyłączona)'}")
     commit_all(project, "chore: bootstrap projektu (design, architektura, backlog, szkielet)", cfg)
 
 

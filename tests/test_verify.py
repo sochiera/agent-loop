@@ -6,7 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from forge import prompts
+from unittest import mock
+
+from forge import orchestrate, prompts
+from forge.agents import AgentError
 from forge.config import Config
 from forge.state import State
 from forge.verify import (collect_evidence, confirm_env_issue, expand_sha,
@@ -274,6 +277,55 @@ class VerifyPromptsTest(unittest.TestCase):
         self.assertIn('"fixes"', with_feedback)
         self.assertIn('"repro_cmd"', with_feedback)
         self.assertIn("CI dla HEAD czerwone", with_feedback)
+
+
+class BootstrapVerifyProfileTest(unittest.TestCase):
+    BASE = ('{"kind":"app","stack":"Python","test_cmd":"python -m unittest",'
+            '"build_cmd":"","run_cmd":"python app.py"')
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.brief = Path(self._tmp.name) / "brief.md"
+        self.brief.write_text("brief", encoding="utf-8")
+        self.cfg = Config(brief_path=str(self.brief), agent_timeout_s=10)
+        self.state = State()
+
+    def _bootstrap(self, verify_json: str) -> None:
+        payload = self.BASE + (f',"verify":{verify_json}' if verify_json else "") + "}"
+        with mock.patch("forge.orchestrate.run_planner", return_value=payload), \
+             mock.patch("forge.orchestrate.build_then_test", return_value=True), \
+             mock.patch("forge.orchestrate.commit_all"):
+            orchestrate.phase_bootstrap(self.cfg, self._tmp.name, self.state,
+                                        lambda _: "agent.log")
+
+    def test_declared_profile_lands_in_state(self) -> None:
+        self._bootstrap('{"targets":["smoke","ci"],"smoke_cmd":"bash s.sh",'
+                        '"ci_status_cmd":"bash c.sh {sha}","ci_logs_cmd":"bash l.sh {sha}",'
+                        '"verify_test_globs":["tests/hil/**"]}')
+        self.assertEqual(self.state.verify_targets, ["smoke", "ci"])
+        self.assertEqual(self.state.smoke_cmd, "bash s.sh")
+        self.assertEqual(self.state.ci_status_cmd, "bash c.sh {sha}")
+        self.assertEqual(self.state.verify_test_globs, ["tests/hil/**"])
+
+    def test_target_without_its_commands_is_a_bootstrap_error(self) -> None:
+        with self.assertRaisesRegex(AgentError, "hardware"):
+            self._bootstrap('{"targets":["hardware"],"flash_cmd":"bash f.sh"}')
+        self.assertFalse(self.state.bootstrapped)
+
+    def test_missing_verify_object_disables_verification(self) -> None:
+        self._bootstrap("")
+        self.assertEqual(self.state.verify_targets, [])
+        self.assertTrue(self.state.bootstrapped)
+
+    def test_user_override_none_wins_over_declaration(self) -> None:
+        self.cfg.verify_targets_override = "none"
+        self._bootstrap('{"targets":["smoke"],"smoke_cmd":"bash s.sh"}')
+        self.assertEqual(self.state.verify_targets, [])
+
+    def test_unknown_target_is_a_bootstrap_error(self) -> None:
+        with self.assertRaisesRegex(AgentError, "produkcja"):
+            self._bootstrap('{"targets":["produkcja"],"smoke_cmd":"x"}')
 
 
 if __name__ == "__main__":
