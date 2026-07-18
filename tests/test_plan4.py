@@ -234,6 +234,43 @@ class ValidateCriteriaMapTest(unittest.TestCase):
                 project)
             self.assertTrue(any("test_wymyslony" in e for e in errors))
 
+    def test_covered_accepts_class_qualified_pytest_node_id(self) -> None:
+        # Standardowy node id pytest/unittest dla testu w klasie:
+        # "plik.py::Klasa::metoda" — cały string po "::" nie występuje NIGDY
+        # dosłownie w pliku (plik ma "class Klasa" i "def metoda" osobno).
+        # Walidator musi sprawdzać segmenty, nie cały ogon jako jeden literał.
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(tmp)
+            Path(project, "tests", "test_cls.py").write_text(
+                "import unittest\n"
+                "class TestBar(unittest.TestCase):\n"
+                "    def test_baz(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8")
+            errors = self._validate(
+                ["k1"],
+                [{"criterion": "k1", "test": "tests/test_cls.py::TestBar::test_baz",
+                  "status": "covered"}],
+                project)
+            self.assertEqual(errors, [])
+
+    def test_covered_class_qualified_still_requires_each_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(tmp)
+            Path(project, "tests", "test_cls.py").write_text(
+                "import unittest\n"
+                "class TestBar(unittest.TestCase):\n"
+                "    def test_baz(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8")
+            errors = self._validate(
+                ["k1"],
+                [{"criterion": "k1",
+                  "test": "tests/test_cls.py::TestBar::test_wymyslona",
+                  "status": "covered"}],
+                project)
+            self.assertTrue(any("test_wymyslona" in e for e in errors))
+
     def test_justified_requires_substantive_why(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = self._project(tmp)
@@ -287,6 +324,20 @@ class ReviewerRoleConfigTest(unittest.TestCase):
         cfg = Config(reviewer_agent="grok")
         self.assertIn("grok", cfg.agents_in_use())
 
+    def test_reviewer_model_override_applies_without_explicit_reviewer_agent(self) -> None:
+        # Dokumentowane w README pokrętło FORGE_REVIEWER_MODEL musi działać
+        # także gdy FORGE_REVIEWER_AGENT nie jest ustawiony (default = agent
+        # testera) — dziś jest po cichu ignorowane, bo role('reviewer') zwraca
+        # role('tester') w całości zamiast pozwolić na częściowe nadpisanie.
+        cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high",
+                     reviewer_model="o3")
+        self.assertEqual(cfg.role("reviewer"), ("codex", "o3", "high"))
+
+    def test_reviewer_effort_override_applies_without_explicit_reviewer_agent(self) -> None:
+        cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high",
+                     reviewer_effort="low")
+        self.assertEqual(cfg.role("reviewer"), ("codex", "m1", "low"))
+
 
 # =====================================================================
 # E2.2: recenzja w świeżym kontekście (bez sesji testera, bez dziennika)
@@ -294,10 +345,10 @@ class ReviewerRoleConfigTest(unittest.TestCase):
 
 class ReviewFreshContextTest(unittest.TestCase):
     @patch("forge.orchestrate._session_call")
-    @patch("forge.orchestrate.run_agent",
-           return_value='```json\n{"verdict":"approve","notes":[]}\n```')
+    @patch("forge.orchestrate.run_agent_session",
+           return_value=('```json\n{"verdict":"approve","notes":[]}\n```', "discarded-sid"))
     def test_review_uses_fresh_agent_with_mechanical_context(
-        self, run_agent: Mock, session_call: Mock
+        self, run_agent_session: Mock, session_call: Mock
     ) -> None:
         from forge.orchestrate import _run_review_loop
         state = State(phase="review", current_task={"file": "f"},
@@ -310,10 +361,19 @@ class ReviewFreshContextTest(unittest.TestCase):
                                   lambda ph: "/tmp/log", gate_green=True)
         self.assertTrue(ok)
         session_call.assert_not_called()          # recenzent NIE dziedziczy sesji
-        prompt = run_agent.call_args.args[1]
+        run_agent_session.assert_called_once()
+        # session_id=None → recenzent zawsze startuje bez pamięci poprzednich
+        # rund; a run_agent_session (nie gołe run_agent) jest tym, co dla
+        # codeksa zachowuje log_usage (run_codex_session go woła, run_codex nie).
+        self.assertIsNone(run_agent_session.call_args.kwargs.get("session_id"))
+        prompt = run_agent_session.call_args.args[1]
         self.assertIn("forge/task-001-start", prompt)   # jawny ref do diffu
         self.assertIn("k2", prompt)                     # justified do rozstrzygnięcia
         self.assertIn("nie da się zautomatyzować", prompt)
+        # Zwrócone id sesji recenzenta NIE jest utrwalane — świeży kontekst
+        # w KAŻDEJ rundzie, nawet gdy agentem recenzenta jest codex.
+        self.assertEqual(state.tester_session, "")
+        self.assertEqual(state.coder_session, "")
 
 
 # =====================================================================
@@ -492,6 +552,42 @@ class NoTestToolchainRevertTest(MicroLoopWiringBase):
             self.assertEqual(Path(project, "package.json").read_text(encoding="utf-8"),
                              self.PKG)
             self.assertTrue(Path(project, "src", "a.py").exists())
+
+    def test_empty_code_globs_means_nothing_enforced_not_everything_forbidden(self) -> None:
+        # Konwencja całej reszty bramek (np. role_paths_ok): PUSTE globy = brak
+        # deklaracji = nic do wyegzekwowania — nie "zakaż wszystkiego". Zadanie
+        # bez zadeklarowanych code_globs (planista pominął pole) musi wciąż
+        # pozwalać koderowi dodać zależność w kroku bez testu — prompt kodera
+        # jawnie to dopuszcza ("Dodanie zależności jest OK").
+        from forge.orchestrate import _run_micro_loop
+        with tempfile.TemporaryDirectory() as project:
+            self._init_repo(project, {"package.json": self.PKG})
+            cfg = Config(max_micro_cycles=1, max_green_retries=0, git_push=False,
+                         lock_tests=False)
+            task = dict(self._state().current_task)
+            task["code_globs"] = []  # planista nie zadeklarował — nie "zakaż"
+            state = self._state(current_task=task)
+            calls = {"n": 0}
+            NEW_PKG = '{"scripts": {"test": "uczciwy runner"}, "dependencies": {"x": "1.0"}}\n'
+
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None,
+                     model=None, effort=None):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return '```json\n{"action":"no_test","reason":"strukturalny"}\n```', "s-t"
+                Path(proj, "src", "a.py").write_text("x = 1\n", encoding="utf-8")
+                Path(proj, "package.json").write_text(NEW_PKG, encoding="utf-8")  # legalna zależność
+                return '```json\n{"notes":"dependency add"}\n```', "s-c"
+
+            gates = iter([(True, ""), (True, "")])
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake), \
+                 patch("forge.orchestrate.run_gate",
+                       side_effect=lambda *a, **k: next(gates)):
+                _run_micro_loop(cfg, project, state,
+                                lambda ph: os.path.join(project, "log"))
+
+            self.assertEqual(Path(project, "package.json").read_text(encoding="utf-8"),
+                             NEW_PKG)  # NIE wycofane
 
 
 class LockTestsDuringCoderTest(MicroLoopWiringBase):

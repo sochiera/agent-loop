@@ -183,11 +183,14 @@ class Config:
                     *self._role_model_effort(self.verifier_agent,
                                              self.verifier_model, self.verifier_effort))
         if name == "reviewer":
-            if not self.reviewer_agent:  # domyślnie agent testera, ALE świeży kontekst
-                return self.role("tester")
-            return (self.reviewer_agent,
-                    *self._role_model_effort(self.reviewer_agent,
-                                             self.reviewer_model, self.reviewer_effort))
+            # Domyślnie agent testera, ALE świeży kontekst. reviewer_model/effort
+            # muszą działać nawet bez jawnego reviewer_agent — inaczej
+            # FORGE_REVIEWER_MODEL/EFFORT z README są po cichu ignorowane.
+            agent = self.reviewer_agent or self.tester_agent
+            t_agent, t_model, t_effort = self.role("tester")
+            model = self.reviewer_model or (t_model if agent == t_agent else "")
+            effort = self.reviewer_effort or (t_effort if agent == t_agent else "")
+            return (agent, *self._role_model_effort(agent, model, effort))
         raise ValueError(f"nieznana rola: {name}")
 
     def tester(self) -> tuple[str, str]:

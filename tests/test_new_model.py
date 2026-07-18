@@ -406,8 +406,8 @@ class ReviewLoopGateEconomyTest(unittest.TestCase):
                      current_task_title="T", test_cmd="pytest")
 
     @patch("forge.orchestrate.run_gate")
-    @patch("forge.orchestrate.run_agent",
-           return_value='```json\n{"verdict":"approve","notes":[]}\n```')
+    @patch("forge.orchestrate.run_agent_session",
+           return_value=('```json\n{"verdict":"approve","notes":[]}\n```', None))
     def test_fresh_green_from_done_skips_initial_gate(self, _review: Mock, gate: Mock) -> None:
         from forge.orchestrate import _run_review_loop
         with tempfile.TemporaryDirectory() as project:
@@ -418,8 +418,8 @@ class ReviewLoopGateEconomyTest(unittest.TestCase):
 
     @patch("forge.orchestrate.commit_all")
     @patch("forge.orchestrate.run_gate", side_effect=[(False, ""), (True, "")])
-    @patch("forge.orchestrate.run_agent",
-           return_value='```json\n{"verdict":"approve","notes":[]}\n```')
+    @patch("forge.orchestrate.run_agent_session",
+           return_value=('```json\n{"verdict":"approve","notes":[]}\n```', None))
     @patch("forge.orchestrate._session_call", side_effect=['```json\n{}\n```'])
     def test_red_gate_keeps_reviewer_notes_and_reuses_fix_gate_result(
         self, call: Mock, _review: Mock, gate: Mock, _commit: Mock
@@ -634,16 +634,19 @@ class TaskIterationEndToEndTest(unittest.TestCase):
                 if calls["n"] == 2:
                     Path(proj, "src", "a.py").write_text("x = 1\n", encoding="utf-8")
                     return '```json\n{"made_green":true}\n```', "s-c"
-                # n == 3: tester orzeka DONE (recenzja idzie już przez run_agent)
-                return ('```json\n{"action":"done","criteria_map":['
-                        '{"criterion":"c1","test":"tests/test_a.py::test_a","status":"covered"}]}\n```'), "s-t"
+                if calls["n"] == 3:
+                    # tester orzeka DONE
+                    return ('```json\n{"action":"done","criteria_map":['
+                            '{"criterion":"c1","test":"tests/test_a.py::test_a",'
+                            '"status":"covered"}]}\n```'), "s-t"
+                # n == 4: recenzja — idzie przez run_agent_session (session_id=None,
+                # świeży kontekst, ale log_usage codeksa zachowany).
+                return '```json\n{"verdict":"approve","notes":[]}\n```', None
 
             gate = iter([(False, "red"), (True, ""), (True, ""), (True, "")])
 
             with patch("forge.orchestrate.run_planner", side_effect=fake_planner), \
                  patch("forge.orchestrate.run_agent_session", side_effect=fake_codex), \
-                 patch("forge.orchestrate.run_agent",
-                       return_value='```json\n{"verdict":"approve","notes":[]}\n```'), \
                  patch("forge.orchestrate.run_gate", side_effect=lambda *a, **k: next(gate)):
                 cont = _task_iteration(cfg, project, state)
 
