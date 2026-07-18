@@ -688,7 +688,10 @@ def validate_criteria_map(criteria: list[str], criteria_map: list[dict],
     w kolejnym prompcie, żeby bounded-retry nie palił cykli na zgadywanie.
 
     Koniec samocertyfikacji: "covered" musi wskazywać ISTNIEJĄCY plik będący
-    ścieżką testową zadania, a nazwa po "::" musi występować w jego treści;
+    ścieżką testową zadania, a segmenty nazwy po "::" muszą występować w jego
+    treści (node id pytest/unittest bywa dwuczłonowy: "Klasa::metoda" — cały
+    ogon nigdy nie występuje jako jeden literał, bo plik ma "class Klasa" i
+    "def metoda" osobno; sprawdzamy więc każdy człon z osobna);
     "justified" wymaga merytorycznego "why" (wpisy justified nie znikają —
     wołający przekazuje je recenzentowi do rozstrzygnięcia). Odhaczamy
     kryteria z listy zadania, nie liczymy wpisów mapy — duplikaty i wpisy
@@ -722,7 +725,10 @@ def validate_criteria_map(criteria: list[str], criteria_map: list[dict],
                         content = f.read()
                 except OSError:
                     content = ""
-                if name not in content:
+                # Każdy segment osobno ("Klasa::metoda" → "Klasa" i "metoda"),
+                # nie cały ogon jako jeden literał — patrz komentarz funkcji.
+                missing = [seg for seg in name.split("::") if seg and seg not in content]
+                if missing:
                     errors.append(f"'{ref}': nazwa '{name}' nie występuje w {path}")
                     continue
             satisfied.add(crit_norm)
@@ -1346,13 +1352,17 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                     return False
 
         tc_globs = effective_toolchain_globs(cfg, state)
-        if no_test:
+        code_globs = task.get("code_globs") or []
+        if no_test and code_globs:
             # Krok bez testu nie ma czerwonego testu, więc pomiar anty-osłabiania
             # nie ma czego failować — toolchain wolno ruszyć tylko, gdy planista
             # przewidział to w "Ścieżkach kodu" zadania (decyzja widoczna w recenzji).
+            # Puste code_globs = planista nic nie zadeklarował = nic do
+            # wyegzekwowania (konwencja jak w role_paths_ok) — NIE "zakaż
+            # wszystkiego", bo to blokowałoby nawet legalne dodanie zależności.
             offending = [p for p in changed
                          if is_toolchain_path(p, tc_globs)
-                         and not _match_any(p, task.get("code_globs") or [])]
+                         and not _match_any(p, code_globs)]
             if offending:
                 log(f"KODER dotknął toolchainu testów w kroku bez testu: {offending} "
                     "— wycofuję (dozwolone tylko w 'Ścieżkach kodu' zadania).")
@@ -1478,14 +1488,20 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
                                 runtime_dir=cfg.runtime_dir, stop_file=cfg.stop_file)
         toolchain_changed = [p for p in changed
                              if is_toolchain_path(p, effective_toolchain_globs(cfg, state))]
-        out = run_agent(agent,
-                        prompts.review_task_prompt(
-                            task_file, state.test_cmd,
-                            start_tag=state.task_start_tag,
-                            changed=changed, toolchain_changes=toolchain_changed,
-                            justified=state.justified_criteria),
-                        cfg, project, logf(f"review-r{state.fix_attempt}"),
-                        model=model, effort=effort)
+        # run_agent_session (nie gołe run_agent): dla codeksa to jedyna droga,
+        # która woła log_usage (run_codex_session), więc tokeny recenzji nie
+        # znikają z .forge/usage.jsonl. session_id=None za każdym razem i
+        # zwrócone id ŚWIADOMIE odrzucane — recenzent nigdy nie dziedziczy
+        # pamięci poprzedniej rundy (fresh-context, PLAN-4 Z2).
+        out, _reviewer_sid = run_agent_session(
+            agent,
+            prompts.review_task_prompt(
+                task_file, state.test_cmd,
+                start_tag=state.task_start_tag,
+                changed=changed, toolchain_changes=toolchain_changed,
+                justified=state.justified_criteria),
+            cfg, project, logf(f"review-r{state.fix_attempt}"),
+            session_id=None, model=model, effort=effort)
         review = extract_json(out) or {"verdict": "changes", "notes": ["Brak werdyktu JSON."]}
         journal_append(project, cfg,
                        f"recenzja: {review.get('verdict')} ({len(review.get('notes') or [])} uwag)")
