@@ -325,22 +325,35 @@ def _codex_argv(a, cfg: Config, project_dir: str, last_msg: str, prompt: str,
     Rozjazd między wywołaniem legacy a sesyjnym oznaczałby różny posture
     sandboxa dla różnych ról — dlatego różnice ograniczają się do --json
     i podkomendy resume."""
-    argv = a.argv + ["exec"]
-    if resume_id:
-        argv += ["resume", resume_id]
-    if json_stream:
-        argv += ["--json"]
+    # `codex exec resume` ma węższy zestaw opcji niż zwykłe `codex exec`.
+    # W szczególności Codex CLI 0.144 nie przyjmuje po `resume` flag globalnych
+    # takich jak -C/-s ani flagi `exec` --color. Dla wznowienia ustawiamy więc
+    # opcje wspólne przed `exec`, a opcje obsługiwane przez resume przed id sesji.
+    argv = list(a.argv)
+    common: list[str] = []
     if a.model:  # pusty → Codex użyje modelu z własnego config.toml
-        argv += ["-m", a.model]
-    argv += ["-c", f'model_reasoning_effort="{a.effort}"']
+        common += ["-m", a.model]
+    common += ["-c", f'model_reasoning_effort="{a.effort}"']
     if cfg.codex_sandbox == "danger-full-access":
         # Pełny dostęp: pomiń zatwierdzanie i sandbox (dedykowany przełącznik
         # automatyzacji — pewniejszy w headless niż samo -s).
-        argv += ["--dangerously-bypass-approvals-and-sandbox"]
+        common += ["--dangerously-bypass-approvals-and-sandbox"]
     else:
-        argv += ["-s", cfg.codex_sandbox]
-    argv += ["-C", project_dir, "--skip-git-repo-check", "-o", last_msg,
-             "--color", "never", prompt]  # prompt jako ostatni pozycyjny
+        common += ["-s", cfg.codex_sandbox]
+
+    if resume_id:
+        argv += common + ["-C", project_dir, "exec", "resume"]
+    else:
+        argv += ["exec"]
+    if json_stream:
+        argv += ["--json"]
+    if not resume_id:
+        argv += common + ["-C", project_dir]
+    argv += ["--skip-git-repo-check", "-o", last_msg]
+    if resume_id:
+        argv += [resume_id, prompt]
+    else:
+        argv += ["--color", "never", prompt]
     return argv
 
 

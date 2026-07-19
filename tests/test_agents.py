@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from forge.agents import run_claude, run_codex, run_planner
+from forge.agents import run_claude, run_codex, run_codex_session, run_planner
 from forge.config import Config
 
 
@@ -40,6 +40,22 @@ class AgentArgumentsTest(unittest.TestCase):
         argv = run.call_args.args[0]
         self.assertEqual(argv[argv.index("-m") + 1], "gpt-test")
         self.assertIn('model_reasoning_effort="high"', argv)
+
+    @patch("forge.agents._run_with_backoff", return_value="")
+    def test_codex_resume_puts_global_options_before_exec(self, run: Mock) -> None:
+        with tempfile.TemporaryDirectory() as project:
+            cfg = Config(codex_model="gpt-test", codex_effort="high")
+            run_codex_session("continue", cfg, project, "/tmp/log",
+                              session_id="session-123")
+
+        argv = run.call_args.args[0]
+        exec_index = argv.index("exec")
+        resume_index = argv.index("resume")
+        self.assertLess(argv.index("-C"), exec_index)
+        self.assertEqual(argv[exec_index:resume_index + 1], ["exec", "resume"])
+        self.assertNotIn("--color", argv)
+        self.assertLess(argv.index("--json"), argv.index("session-123"))
+        self.assertEqual(argv[-2:], ["session-123", "continue"])
 
 
 if __name__ == "__main__":
