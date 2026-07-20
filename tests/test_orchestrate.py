@@ -8,10 +8,10 @@ from unittest.mock import ANY, Mock, patch
 
 from forge.agents import AgentError, LimitExhausted
 from forge.config import Config
-from forge.orchestrate import (build_then_test, commit_all, one_iteration,
-                                parse_start_delay, phase_bootstrap,
-                                prompt_agent_settings, run_tests,
-                                wait_before_start)
+from forge.orchestrate import (_ask_model, build_then_test, commit_all,
+                                one_iteration, parse_start_delay,
+                                phase_bootstrap, prompt_agent_settings,
+                                run_tests, wait_before_start)
 from forge.state import State
 
 
@@ -63,9 +63,37 @@ class DelayedStartTest(unittest.TestCase):
         sleep.assert_called_once_with(60)
         self.assertIn("actual elapsed: 1m05s", log.call_args_list[-1].args[0])
 
+class AskModelTest(unittest.TestCase):
+    @patch("builtins.input", return_value="4")
+    def test_digit_picks_suggestion_by_position(self, _input: Mock) -> None:
+        self.assertEqual(_ask_model("Model", "", "claude"), "fable")
+
+    @patch("builtins.input", return_value="grok-3-mini")
+    def test_free_text_passes_through_unvalidated(self, _input: Mock) -> None:
+        self.assertEqual(_ask_model("Model", "", "grok"), "grok-3-mini")
+
+    @patch("builtins.input", return_value="")
+    def test_blank_keeps_default(self, _input: Mock) -> None:
+        self.assertEqual(_ask_model("Model", "sonnet", "claude"), "sonnet")
+
+    @patch("builtins.input", return_value="99")
+    def test_out_of_range_digit_passes_through_as_literal(self, _input: Mock) -> None:
+        self.assertEqual(_ask_model("Model", "", "claude"), "99")
+
+    @patch("builtins.input", return_value="whatever")
+    def test_unknown_agent_has_no_menu(self, _input: Mock) -> None:
+        self.assertEqual(_ask_model("Model", "", "kiro"), "whatever")
+
+
 class AgentSettingsTest(unittest.TestCase):
-    @patch("builtins.input", side_effect=["claude", "opus", "high", "gpt-test", "xhigh"])
-    def test_prompts_for_planner_then_implementer(self, _input: Mock) -> None:
+    @patch("builtins.input", side_effect=[
+        "claude", "opus", "high",             # planista
+        "grok", "grok-4.5", "high",           # tester
+        "grok", "grok-4.5", "medium",         # koder
+        "", "", "",                           # recenzent (dziedziczy testera → grok)
+        "", "", "",                           # weryfikator (dziedziczy planistę → claude)
+    ])
+    def test_prompts_for_every_role_and_skips_codex_when_unused(self, _input: Mock) -> None:
         cfg = Config()
 
         prompt_agent_settings(cfg)
@@ -73,13 +101,40 @@ class AgentSettingsTest(unittest.TestCase):
         self.assertEqual(cfg.planner_agent, "claude")
         self.assertEqual(cfg.planner_model, "opus")
         self.assertEqual(cfg.planner_effort, "high")
+        self.assertEqual(cfg.tester_agent, "grok")
+        self.assertEqual(cfg.tester_model, "grok-4.5")
+        self.assertEqual(cfg.tester_effort, "high")
+        self.assertEqual(cfg.coder_agent, "grok")
+        self.assertEqual(cfg.coder_model, "grok-4.5")
+        self.assertEqual(cfg.coder_effort, "medium")
+        self.assertEqual(cfg.reviewer_agent, "")
+        self.assertEqual(cfg.verifier_agent, "")
+        # Żadna rola nie używa Codeksa → pytanie o niego nie powinno paść
+        # (gdyby padło, side_effect wyczerpałby się i input rzuciłby StopIteration).
+        self.assertEqual(_input.call_count, 15)
+
+    @patch("builtins.input", side_effect=[
+        "claude", "opus", "high",             # planista
+        "", "", "",                           # tester → domyślnie codex
+        "", "", "",                           # koder → domyślnie codex
+        "", "", "",                           # recenzent
+        "", "", "",                           # weryfikator
+        "gpt-test", "xhigh",                  # Codeks w użyciu → pytanie pada
+    ])
+    def test_asks_for_codex_defaults_when_a_role_uses_it(self, _input: Mock) -> None:
+        cfg = Config()
+
+        prompt_agent_settings(cfg)
+
+        self.assertEqual(cfg.tester_agent, "codex")
+        self.assertEqual(cfg.coder_agent, "codex")
         self.assertEqual(cfg.codex_model, "gpt-test")
         self.assertEqual(cfg.codex_effort, "xhigh")
 
     @patch("builtins.input", side_effect=["", "", "wrong", "medium", "", "high"])
     def test_enter_uses_defaults_and_invalid_effort_is_retried(self, _input: Mock) -> None:
         cfg = Config(planner_agent="claude", planner_model="sonnet", planner_effort="high",
-                     codex_model="", codex_effort="medium")
+                     codex_model="", codex_effort="medium", legacy_mode=True)
 
         prompt_agent_settings(cfg)
 
@@ -87,6 +142,14 @@ class AgentSettingsTest(unittest.TestCase):
         self.assertEqual(cfg.planner_effort, "medium")
         self.assertEqual(cfg.codex_model, "")
         self.assertEqual(cfg.codex_effort, "high")
+
+    @patch("builtins.input", side_effect=["", "", "", "", ""])
+    def test_legacy_mode_skips_role_prompts(self, _input: Mock) -> None:
+        cfg = Config(legacy_mode=True)
+
+        prompt_agent_settings(cfg)
+
+        self.assertEqual(_input.call_count, 5)  # planista (3) + Codex (2), bez ról
 
 class BuildGateTest(unittest.TestCase):
     @patch("forge.orchestrate.run_tests")

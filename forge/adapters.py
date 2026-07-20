@@ -60,9 +60,10 @@ def canonical_agent(name: str) -> str:
 # gwarancja zgodności z Twoją zainstalowaną wersją CLI. Nadpisz swoim
 # szablonem, jeśli flagi się zmieniły albo używasz forka/innej wersji.
 KNOWN_TEMPLATES: dict[str, str] = {
-    # xAI Grok Build CLI: `grok -p "<prompt>" -m <model>` (docs.x.ai/build/cli).
-    # --always-approve — pełna autonomia, spójnie z pozostałymi agentami forge.
-    "grok": "grok -p {prompt} -m {model} --always-approve",
+    # xAI Grok Build CLI: `grok -p "<prompt>" -m <model> --effort low|medium|high`
+    # (docs.x.ai/build/cli/reference). --always-approve — pełna autonomia,
+    # spójnie z pozostałymi agentami forge.
+    "grok": "grok -p {prompt} -m {model} --effort {effort} --always-approve",
     # Kiro CLI (AWS): headless mode nie ma dziś flagi wyboru modelu — model
     # ustawiasz w ~/.kiro/settings/cli.json (kiro.dev/docs/cli/headless).
     "kiro": "kiro-cli chat --no-interactive --trust-all-tools {prompt}",
