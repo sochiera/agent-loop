@@ -42,6 +42,32 @@ RESUMABLE_AGENTS = ("codex",)
 
 _PLACEHOLDERS = ("prompt", "model", "effort", "project", "output")
 
+# Aliasy nazw agentów — "gpt"/"chatgpt" to po prostu Codex CLI (agent OpenAI
+# napędzany modelami GPT); zamiast osobnej, mniej przetestowanej integracji
+# korzystamy z gotowej obsługi Codeksa (sesje, usage, backoff) pod przyjazną
+# nazwą roli. Rozwiązywane wszędzie tam, gdzie nazwa agenta wpada do dyspozytora.
+AGENT_ALIASES = {"gpt": "codex", "chatgpt": "codex"}
+
+
+def canonical_agent(name: str) -> str:
+    """Rozwiąż alias (np. 'gpt' → 'codex') do kanonicznej nazwy agenta."""
+    return AGENT_ALIASES.get(name, name)
+
+
+# Domyślne szablony komend dla znanych, ale nie-wbudowanych agentów CLI.
+# Używane TYLKO gdy FORGE_AGENT_<NAZWA>_CMD nie jest ustawione — wygodny
+# punkt startowy zgodny z oficjalną dokumentacją (stan: 2026-07), nie
+# gwarancja zgodności z Twoją zainstalowaną wersją CLI. Nadpisz swoim
+# szablonem, jeśli flagi się zmieniły albo używasz forka/innej wersji.
+KNOWN_TEMPLATES: dict[str, str] = {
+    # xAI Grok Build CLI: `grok -p "<prompt>" -m <model>` (docs.x.ai/build/cli).
+    # --always-approve — pełna autonomia, spójnie z pozostałymi agentami forge.
+    "grok": "grok -p {prompt} -m {model} --always-approve",
+    # Kiro CLI (AWS): headless mode nie ma dziś flagi wyboru modelu — model
+    # ustawiasz w ~/.kiro/settings/cli.json (kiro.dev/docs/cli/headless).
+    "kiro": "kiro-cli chat --no-interactive --trust-all-tools {prompt}",
+}
+
 
 @dataclass
 class GenericSpec:
@@ -79,9 +105,10 @@ def env_key(name: str) -> str:
 
 
 def generic_spec(name: str, environ: dict | None = None) -> GenericSpec | None:
-    """Zbuduj GenericSpec z FORGE_AGENT_<NAME>_CMD; None gdy brak szablonu."""
+    """Zbuduj GenericSpec z FORGE_AGENT_<NAME>_CMD; brak → domyślny szablon
+    znanego CLI (KNOWN_TEMPLATES), jeśli istnieje; inaczej None."""
     environ = os.environ if environ is None else environ
-    template = environ.get(env_key(name), "").strip()
+    template = environ.get(env_key(name), "").strip() or KNOWN_TEMPLATES.get(name, "")
     if not template:
         return None
     try:
@@ -101,8 +128,8 @@ def generic_bin(spec: GenericSpec) -> str:
 
 
 def is_builtin(name: str) -> bool:
-    return name in BUILTIN_AGENTS
+    return canonical_agent(name) in BUILTIN_AGENTS
 
 
 def supports_resume(name: str) -> bool:
-    return name in RESUMABLE_AGENTS
+    return canonical_agent(name) in RESUMABLE_AGENTS

@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from . import adapters
+
 
 _DEFAULT_PLANNER_AGENT = os.environ.get("FORGE_PLANNER_AGENT", "claude")
 _DEFAULT_PLANNER_MODEL = os.environ.get(
@@ -159,9 +161,10 @@ class Config:
         return declared
 
     def _role_model_effort(self, agent: str, model: str, effort: str) -> tuple[str, str]:
-        # Dla codeksa puste pola dziedziczą globalne codex_model/effort (jego
-        # naturalny default); dla innych agentów puste = niech agent sam wybierze.
-        if agent == "codex":
+        # Dla codeksa (i aliasu "gpt") puste pola dziedziczą globalne
+        # codex_model/effort (jego naturalny default); dla innych agentów
+        # puste = niech agent sam wybierze.
+        if adapters.canonical_agent(agent) == "codex":
             return (model or self.codex_model, effort or self.codex_effort)
         return (model, effort)
 

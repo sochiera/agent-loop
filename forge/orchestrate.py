@@ -106,18 +106,17 @@ def prompt_agent_settings(cfg: Config) -> None:
     print("\nKonfiguracja agentów (Enter zachowuje wartość domyślną):")
     previous_agent = cfg.planner_agent
     # Wolny wybór — poza claude/codex dozwolony dowolny agent generyczny.
-    cfg.planner_agent = _ask_value("Agent do planowania (claude/codex/inny)",
+    cfg.planner_agent = _ask_value("Agent do planowania (claude/codex/gpt/grok/kiro/inny)",
                                    cfg.planner_agent)
+    canon = adapters.canonical_agent(cfg.planner_agent)
     if cfg.planner_agent != previous_agent:
-        cfg.planner_model = {"claude": "opus", "codex": cfg.codex_model}.get(
-            cfg.planner_agent, "")
-        cfg.planner_effort = {"claude": "high", "codex": cfg.codex_effort}.get(
-            cfg.planner_agent, "medium")
+        cfg.planner_model = {"claude": "opus", "codex": cfg.codex_model}.get(canon, "")
+        cfg.planner_effort = {"claude": "high", "codex": cfg.codex_effort}.get(canon, "medium")
     cfg.planner_model = _ask_value(
         f"Model do planowania ({cfg.planner_agent})", cfg.planner_model,
         display_default=cfg.planner_model or "z konfiguracji CLI",
     )
-    planner_efforts = {"claude": CLAUDE_EFFORTS, "codex": CODEX_EFFORTS}.get(cfg.planner_agent)
+    planner_efforts = {"claude": CLAUDE_EFFORTS, "codex": CODEX_EFFORTS}.get(canon)
     if planner_efforts:  # wbudowany agent → waliduj wobec znanych poziomów
         cfg.planner_effort = _ask_effort("Effort planowania", cfg.planner_effort, planner_efforts)
     else:               # generyczny → effort to dowolny string
@@ -235,6 +234,7 @@ def build_then_test(project: str, build_cmd: str, test_cmd: str, timeout: int) -
 
 def _agent_bin_problem(cfg: Config, name: str) -> str | None:
     """Sprawdź dostępność binarki agenta CLI danej nazwy; None gdy OK."""
+    name = adapters.canonical_agent(name)
     if name == "claude":
         if shutil.which(cfg.claude_bin) is None:
             return (f"Nie znaleziono Claude CLI ('{cfg.claude_bin}'). Zainstaluj Claude "
@@ -1928,6 +1928,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="Agent kodera: claude, codex lub dowolny (FORGE_AGENT_<NAME>_CMD).")
     ap.add_argument("--coder-model", default=None, help="Model agenta-kodera (nowy model).")
     ap.add_argument("--coder-effort", default=None, help="Effort agenta-kodera.")
+    ap.add_argument("--reviewer-agent", default=None,
+                    help="Agent recenzenta zadania: claude, codex/gpt, grok, kiro lub "
+                         "dowolny (FORGE_AGENT_<NAME>_CMD). Domyślnie agent testera.")
+    ap.add_argument("--reviewer-model", default=None, help="Model agenta-recenzenta.")
+    ap.add_argument("--reviewer-effort", default=None, help="Effort agenta-recenzenta.")
+    ap.add_argument("--verifier-agent", default=None,
+                    help="Agent weryfikatora celu: claude, codex/gpt, grok, kiro lub "
+                         "dowolny (FORGE_AGENT_<NAME>_CMD). Domyślnie agent planisty.")
+    ap.add_argument("--verifier-model", default=None, help="Model agenta-weryfikatora.")
+    ap.add_argument("--verifier-effort", default=None, help="Effort agenta-weryfikatora.")
     ap.add_argument("--non-interactive", action="store_true",
                     help="Nie pytaj o modele i effort; użyj flag/env/dom wartości.")
     ap.add_argument("--check", action="store_true", help="Tylko preflight i wyjście.")
@@ -1940,12 +1950,13 @@ def main(argv: list[str] | None = None) -> int:
         cfg.max_iterations = args.max_iters
     if args.planner_agent and args.planner_agent != cfg.planner_agent:
         cfg.planner_agent = args.planner_agent
+        canon = adapters.canonical_agent(args.planner_agent)
         if not args.planner_model:
             cfg.planner_model = {"claude": "opus", "codex": cfg.codex_model}.get(
-                args.planner_agent, "")
+                canon, "")
         if not args.planner_effort:
             cfg.planner_effort = {"claude": "high", "codex": cfg.codex_effort}.get(
-                args.planner_agent, "medium")
+                canon, "medium")
     if args.planner_model:
         cfg.planner_model = args.planner_model
     if args.planner_effort:
@@ -1972,11 +1983,23 @@ def main(argv: list[str] | None = None) -> int:
         cfg.coder_model = args.coder_model
     if args.coder_effort:
         cfg.coder_effort = args.coder_effort
+    if args.reviewer_agent:
+        cfg.reviewer_agent = args.reviewer_agent
+    if args.reviewer_model:
+        cfg.reviewer_model = args.reviewer_model
+    if args.reviewer_effort:
+        cfg.reviewer_effort = args.reviewer_effort
+    if args.verifier_agent:
+        cfg.verifier_agent = args.verifier_agent
+    if args.verifier_model:
+        cfg.verifier_model = args.verifier_model
+    if args.verifier_effort:
+        cfg.verifier_effort = args.verifier_effort
 
     # Effort waliduj tylko dla wbudowanych agentów o znanym zbiorze poziomów;
     # dla generycznego CLI effort to dowolny string przekazywany przez szablon.
     allowed_planner_efforts = {"claude": CLAUDE_EFFORTS, "codex": CODEX_EFFORTS}.get(
-        cfg.planner_agent)
+        adapters.canonical_agent(cfg.planner_agent))
     if allowed_planner_efforts and cfg.planner_effort not in allowed_planner_efforts:
         ap.error(f"effort {cfg.planner_effort!r} nie jest obsługiwany przez {cfg.planner_agent}")
 
