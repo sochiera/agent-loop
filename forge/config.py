@@ -191,8 +191,12 @@ class Config:
             # FORGE_REVIEWER_MODEL/EFFORT z README są po cichu ignorowane.
             agent = self.reviewer_agent or self.tester_agent
             t_agent, t_model, t_effort = self.role("tester")
-            model = self.reviewer_model or (t_model if agent == t_agent else "")
-            effort = self.reviewer_effort or (t_effort if agent == t_agent else "")
+            # Dziedziczenie ma sens, gdy to TO SAMO narzędzie — porównaj po
+            # nazwie kanonicznej, żeby recenzent-"gpt" dziedziczył po testerze-
+            # "codex" (alias), zamiast spadać na globalny codex_model/effort.
+            same_tool = adapters.canonical_agent(agent) == adapters.canonical_agent(t_agent)
+            model = self.reviewer_model or (t_model if same_tool else "")
+            effort = self.reviewer_effort or (t_effort if same_tool else "")
             return (agent, *self._role_model_effort(agent, model, effort))
         raise ValueError(f"nieznana rola: {name}")
 
@@ -205,12 +209,20 @@ class Config:
         return self.role("coder")[1:]
 
     def agents_in_use(self) -> list[str]:
-        """Agenci CLI faktycznie używani w bieżącym trybie (do preflightu)."""
+        """Agenci CLI faktycznie używani w bieżącym trybie (do preflightu).
+
+        Deduplikacja po nazwie KANONICZNEJ — 'gpt' i 'codex' to ta sama binarka,
+        więc preflight nie sprawdza jej dwa razy (i nie dubluje komunikatu o
+        braku). Zachowujemy pierwszą napotkaną nazwę wyświetlaną (dla logów)."""
         if self.legacy_mode:
-            return list(dict.fromkeys([self.planner_agent, "codex"]))
-        return list(dict.fromkeys([self.planner_agent, self.tester_agent,
-                                   self.coder_agent, self.role("verifier")[0],
-                                   self.role("reviewer")[0]]))
+            names = [self.planner_agent, "codex"]
+        else:
+            names = [self.planner_agent, self.tester_agent, self.coder_agent,
+                     self.role("verifier")[0], self.role("reviewer")[0]]
+        seen: dict[str, str] = {}
+        for name in names:
+            seen.setdefault(adapters.canonical_agent(name), name)
+        return list(seen.values())
 
     # --- Komendy bazowe CLI (bez shella) ------------------------------------
     # Claude Code headless. Jeśli 'claude' nie jest na PATH, ustaw FORGE_CLAUDE_BIN.

@@ -247,6 +247,12 @@ zmiennej środowiskowej — bo mają wbudowany domyślny szablon komendy (zgodny
 oficjalną dokumentacją, stan 2026-07). Jeśli Twoja wersja CLI ma inne flagi,
 nadpisz go tak samo jak dla zupełnie nowego narzędzia (patrz niżej).
 
+> **Effort dla grok/kiro.** Domyślne szablony **nie** przekazują `effort`
+> (Grok/Kiro nie mają dziś odpowiednika flagi „reasoning effort" w headless).
+> Ustawienie `--coder-effort`/`FORGE_CODER_EFFORT` dla tych agentów jest więc
+> **po cichu ignorowane** — jeśli Twoja wersja CLI to obsługuje, dodaj
+> `{effort}` do własnego `FORGE_AGENT_<NAZWA>_CMD`.
+
 ### Zupełnie inny/nieznany CLI
 
 Dowolne inne narzędzie (aider, własny skrypt, inna wersja grok/kiro, …) wpinasz
