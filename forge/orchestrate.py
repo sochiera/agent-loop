@@ -1290,12 +1290,57 @@ def _verify_feedback_path(project: str, cfg: Config, state: State) -> str:
     return path if os.path.exists(path) else ""
 
 
+def _design_compact_notice(cfg: Config, project: str, state: State) -> str:
+    """Notatka kompaktowania DESIGN.md dla planu wsadowego, gdy plik przerósł
+    Config.design_compact_bytes (0 = wyłączone). Kryteria otwartych design_gap
+    (jeszcze nie 'resolved') są przekazane jako chronione — patrz
+    prompts.design_compact_notice."""
+    if cfg.design_compact_bytes <= 0:
+        return ""
+    try:
+        size = os.path.getsize(os.path.join(project, "docs", "DESIGN.md"))
+    except OSError:
+        return ""
+    if size <= cfg.design_compact_bytes:
+        return ""
+    protected = sorted({
+        str(p.get("criterion") or "").strip()
+        for p in state.verify_problems
+        if p.get("class") == "design_gap" and p.get("status") != "resolved"
+        and str(p.get("criterion") or "").strip()
+    })
+    log(f"PLAN: docs/DESIGN.md {size} B > próg {cfg.design_compact_bytes} B — "
+        "proszę o zadanie kompaktujące.")
+    return prompts.design_compact_notice(protected, stalls=state.design_compact_stalls)
+
+
+def _update_design_compact_stalls(state: State, design_compact: str, tasks: list[dict]) -> None:
+    """Śledź, czy planista zastosował się do notatki o kompaktowaniu DESIGN.md.
+
+    Bez tego licznika nagabywanie byłoby bezzębne: planista mógłby ignorować
+    prośbę w nieskończoność, a pętla by tego nie zauważyła (znalezisko z
+    review). ``design_compact`` puste = notatki nie było w tym wsadzie —
+    nic do śledzenia."""
+    if not design_compact:
+        return
+    if any(t.get("kind") == "refactor" for t in tasks):
+        if state.design_compact_stalls:
+            log("PLAN: zadanie kompaktujące DESIGN.md w końcu wstawione — "
+                "reset licznika ignorowań.")
+        state.design_compact_stalls = 0
+    else:
+        state.design_compact_stalls += 1
+        log(f"PLAN: planista ZIGNOROWAŁ prośbę o kompaktowanie DESIGN.md "
+            f"({state.design_compact_stalls}. raz z rzędu).")
+
+
 def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     log(f"--- PLAN WSADOWY ({cfg.planner_agent}) ---")
     start = _next_task_index(project)
     feedback_path = _verify_feedback_path(project, cfg, state)
     if feedback_path:
         log(f"PLAN: przekazuję feedback weryfikacji: {feedback_path}")
+    design_compact = _design_compact_notice(cfg, project, state)
     ci_warning = ""
     if (cfg.ci_early_warn and state.ci_status_cmd
             and "ci" in _active_verify_targets(cfg, state)):
@@ -1311,7 +1356,8 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
             log("PLAN: " + ci_warning)
     out = run_planner(prompts.plan_batch_prompt(cfg.batch_size, start, state.project_kind,
                                                 verify_feedback_path=feedback_path,
-                                                ci_warning=ci_warning),
+                                                ci_warning=ci_warning,
+                                                design_compact=design_compact),
                       cfg, project, logf("plan"))
     commit_all(project, "docs: plan wsadowy i backlog", cfg)  # pliki zadań, docs, backlog
     data = extract_json(out) or {}
@@ -1324,6 +1370,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
             log(f"PLAN: pomijam zadanie bez pliku na dysku: {t.get('id') or rel!r}")
     state.task_queue = tasks
     log(f"PLAN: kolejka {len(tasks)} zadań.")
+    _update_design_compact_stalls(state, design_compact, tasks)
     return {"no_more_tasks": bool(data.get("no_more_tasks")) and not tasks}
 
 

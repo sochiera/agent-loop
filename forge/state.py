@@ -109,6 +109,12 @@ class State:
     verify_sha: str = ""
     verify_problems: list[dict] = field(default_factory=list)
 
+    # Ile kolejnych wsadów planista ZIGNOROWAŁ notatkę o kompaktowaniu DESIGN.md
+    # (Config.design_compact_bytes) — bez tego licznika nagabywanie byłoby
+    # bezzębne: LLM mógłby pomijać prośbę bez końca. Reset przy wstawieniu
+    # zadania "kind": "refactor" w odpowiedzi na notatkę (patrz orchestrate).
+    design_compact_stalls: int = 0
+
     @classmethod
     def load(cls, path: str) -> "State":
         if os.path.exists(path):

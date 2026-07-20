@@ -24,7 +24,10 @@ Jesteś jednym z agentów w automatycznej pętli budującej oprogramowanie. Zasa
 2. MAŁE KROKI. Jedno zadanie na raz, najmniejszy sensowny przyrost.
 3. TDD OBOWIĄZKOWE. Najpierw test, który failuje, potem kod aż testy zielone.
 4. DOKUMENTACJA ŻYJE Z KODEM. Zmiany w zachowaniu/architekturze odzwierciedlaj
-   w docs/ w tym samym kroku.
+   w docs/ w tym samym kroku. docs/DESIGN.md opisuje WYŁĄCZNIE aktualny stan
+   reguł (nie historię pracy) — nowe rozstrzygnięcia projektowe zapisuj
+   JEDNOLINIOWO w docs/DECISIONS.md (id, tytuł, jedno zdanie); pełna historia
+   i tak żyje w gicie i plikach zadań.
 5. NIE PSUJ ZIELONYCH TESTÓW. Cały pakiet testów musi przechodzić.
 6. BEZ GADANIA. Działaj na plikach; na końcu zwróć wymagany blok ```json.
 7. Commity zostawiasz orkiestratorowi — TY nie commitujesz (chyba że polecono).
@@ -55,15 +58,19 @@ Zadania bootstrapu (wykonaj wszystkie, tworząc pliki w bieżącym katalogu):
    framework testowy). Jeśli brief mówi o forku istniejącego silnika — uszanuj to.
 2. Utwórz docs/DESIGN.md: przepisz i doprecyzuj wizję produktu i jego MVP. Dla gry
    opisz mechanikę, klimat i pętlę rozgrywki; dla innego programu — funkcje, przepływy
-   użytkownika i kontrakty. To ŻYWY dokument — pisz go tak, by kolejni agenci go rozwijali.
-3. Utwórz docs/ARCHITECTURE.md: wybrany stack, struktura katalogów, jak uruchamiać
+   użytkownika i kontrakty. To ŻYWY dokument opisujący STAN OBECNY — pisz go tak,
+   by kolejni agenci go rozwijali, nie dopisywali doń historii pracy.
+3. Utwórz docs/DECISIONS.md: pusty rejestr jednoliniowych rozstrzygnięć projektowych
+   (nagłówek + jedno zdanie instrukcji formatu: "- ID — tytuł: jednozdaniowe
+   rozstrzygnięcie"). Kolejne iteracje dopisują tu decyzje zamiast rozdymać DESIGN.md.
+4. Utwórz docs/ARCHITECTURE.md: wybrany stack, struktura katalogów, jak uruchamiać
    testy i produkt, konwencje.
-4. Utwórz BACKLOG.md: uporządkowana lista zadań od MVP w górę. Każde zadanie =
+5. Utwórz BACKLOG.md: uporządkowana lista zadań od MVP w górę. Każde zadanie =
    jeden mały, testowalny przyrost, z kryteriami akceptacji. Oznacz statusy [ ].
-5. Zescaffolduj MINIMALNY szkielet projektu + działający framework testów z JEDNYM
+6. Zescaffolduj MINIMALNY szkielet projektu + działający framework testów z JEDNYM
    trywialnym przechodzącym testem (żeby komenda testowa działała od zera).
-6. Ustal DOKŁADNE komendy powłoki: test, build (może być pusta), run.
-7. Zadeklaruj PROFIL WERYFIKACJI CELU — jak sprawdzić, że GOTOWY produkt
+7. Ustal DOKŁADNE komendy powłoki: test, build (może być pusta), run.
+8. Zadeklaruj PROFIL WERYFIKACJI CELU — jak sprawdzić, że GOTOWY produkt
    naprawdę działa w środowisku docelowym (uruchamiane, gdy backlog się
    wyczerpie):
    - "targets": podzbiór ["smoke", "ci", "hardware"] — "ci" jeśli repo ma
@@ -80,7 +87,7 @@ Zadania bootstrapu (wykonaj wszystkie, tworząc pliki w bieżącym katalogu):
      lokalnej suicie), np. ["tests/hil/**"] — będą chronione przed osłabianiem.
    Komendy targetów, których nie deklarujesz, zostaw pustymi stringami;
    nie zgaduj — lepszy sam "smoke" niż zmyślone komendy CI.
-8. Zadeklaruj TOOLCHAIN TESTOWY ("test_toolchain_globs"): globy plików, które
+9. Zadeklaruj TOOLCHAIN TESTOWY ("test_toolchain_globs"): globy plików, które
    konfigurują, CO i JAK uruchamia komenda testowa (skrypty runnera, pliki
    konfiguracyjne spoza standardowych nazw jak package.json/pytest.ini —
    te forge zna sam). Np. ["scripts/test*.sh"]. Zmiany tych plików przechodzą
@@ -208,8 +215,61 @@ Na końcu zwróć WYŁĄCZNIE:
 # NOWY MODEL: mikro-TDD ping-pong (Codex-tester ↔ Codex-koder), plan wsadowy.
 # =====================================================================
 
+# Sufit cytowanych kryteriów w notatce — bez niego lista rośnie bez końca
+# z każdym nawracającym design_gap i sama staje się źródłem bloatu promptu,
+# czyli dokładnie tym, co ta notatka ma zwalczać (znalezisko z review).
+_MAX_PROTECTED_CRITERIA_IN_NOTICE = 20
+
+
+def design_compact_notice(protected_criteria: list[str] | None = None, *,
+                          stalls: int = 0) -> str:
+    """Notatka doklejana do planu wsadowego, gdy docs/DESIGN.md przerósł próg
+    (Config.design_compact_bytes). Wymusza zadanie kompaktujące: historia
+    („ROZSTRZYGNIĘTE …") wędruje do docs/DECISIONS.md, DESIGN.md zostaje opisem
+    stanu obecnego. Kryteria cytowane przez otwarte design_gap (verify_ledger)
+    są jawnie wyłączone spod skracania — kompaktowanie nie może być cichym
+    sposobem na rozbrojenie bramki weryfikacji.
+
+    ``stalls`` (orchestrate._update_design_compact_stalls) to liczba WCZEŚNIEJ
+    zignorowanych próśb — eskaluje ton zamiast nagabywać identycznym tekstem
+    w nieskończoność."""
+    protected = ""
+    if protected_criteria:
+        shown = protected_criteria[:_MAX_PROTECTED_CRITERIA_IN_NOTICE]
+        overflow = len(protected_criteria) - len(shown)
+        rows = "\n".join(f"- {c}" for c in shown)
+        overflow_note = (
+            f"\n… i jeszcze {overflow} — obcięcie listy NIE zwalnia z ich ochrony "
+            "(pełny rejestr: verify_problems w STATE.json).\n" if overflow > 0 else ""
+        )
+        protected = (
+            "\nZDANIA, KTÓRYCH NIE WOLNO USUNĄĆ ANI PRZEFORMUŁOWAĆ (cytowane dosłownie\n"
+            "przez otwarte problemy design_gap weryfikacji celu):\n"
+            + rows + overflow_note + "\n"
+        )
+    escalation = ""
+    if stalls > 0:
+        escalation = (
+            f"\nTO JUŻ KOLEJNA PROŚBA — poprzednie {stalls} wsad(y) ZIGNOROWANO mimo "
+            "tej samej notatki. TYM RAZEM zadanie kompaktujące MUSI się znaleźć w "
+            "tym wsadzie, inaczej DESIGN.md będzie rosnąć bez końca.\n"
+        )
+    return f"""
+UWAGA: docs/DESIGN.md urósł ponad rozsądny rozmiar. Wstaw do TEGO wsadu jedno
+DODATKOWE zadanie `"kind": "refactor"` kompaktujące DESIGN.md do stanu obecnego:
+- Wpisy „ROZSTRZYGNIĘTE (ID, …)" przenieś jako jednoliniowe wpisy do
+  docs/DECISIONS.md (id, tytuł, jedno zdanie) — pełna historia i tak żyje
+  w gicie i w treści plików .forge/tasks/.
+- DESIGN.md ma opisywać WYŁĄCZNIE aktualny stan reguł gry/produktu — usuń
+  odniesienia w stylu „dochodzi w X", „zastępuje Y", „pozostaje domeną Z".
+- Usuń duplikaty (ta sama reguła opisana dwa razy w różnych sekcjach).
+- NIE WOLNO usunąć ani osłabić żadnej aktualnie obowiązującej reguły/kryterium.
+{escalation}{protected}"""
+
+
 def plan_batch_prompt(batch_size: int, start_index: int, kind: str = "app",
-                      verify_feedback_path: str = "", ci_warning: str = "") -> str:
+                      verify_feedback_path: str = "", ci_warning: str = "",
+                      design_compact: str = "") -> str:
     feedback = ""
     if verify_feedback_path:
         feedback = f"""
@@ -235,7 +295,7 @@ to obniża koszt stały planowania na zadanie.
 
 Przeczytaj: docs/DESIGN.md, docs/ARCHITECTURE.md, BACKLOG.md, `git log --oneline -20`
 oraz .forge/failures.md jeśli istnieje (zadania, które padły — rozbij je drobniej).
-{feedback}{warning}
+{feedback}{warning}{design_compact}
 
 Zaplanuj do {batch_size} NASTĘPNYCH zadań w stronę {mvp_phrase(kind)}, każde =
 najmniejszy wartościowy, testowalny przyrost. Oceń też stan kodu: jeśli narósł
@@ -264,9 +324,13 @@ Zasady planowania (twarde):
 - Zadanie refaktoryzacyjne: ustaw `"kind": "refactor"` i w AC jasno „bez nowych
   testów" / „zadanie refaktoryzacyjne".
 - NIE łącz w jednym zadaniu monolitów: nowej powierzchni API + testu end-to-end
-  headless + wpisu ROZSTRZYGNIĘTE w docs — **rozbij** na mniejsze przyrosty
+  headless + wpisu rozstrzygnięcia projektowego — **rozbij** na mniejsze przyrosty
   (wzorzec a/b/c). Po wpisie w failures.md z `coder_red:` / `micro_cap:` następny
   wsad musi pociąć padłe zadanie drobniej.
+- Nowe rozstrzygnięcie projektowe: jednoliniowy wpis w docs/DECISIONS.md (id,
+  tytuł, jedno zdanie). DESIGN.md aktualizuj TYLKO opisem stanu obecnego (nowa
+  reguła/wartość), bez rozbudowanego wpisu „ROZSTRZYGNIĘTE (ID, …)" — ta historia
+  należy do DECISIONS.md, nie do DESIGN.md.
 
 Zaktualizuj BACKLOG.md (statusy) i rozwiń docs/DESIGN.md, jeśli decyzja projektowa
 tego wymaga. Ukończone pozycje przenoś do BACKLOG-ARCHIVE.md, by BACKLOG nie puchł.

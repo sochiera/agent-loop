@@ -163,6 +163,15 @@ class Config:
     # Fail zadania już na starcie, gdy nie ma kryteriów w pliku ani w JSON planisty.
     fail_on_empty_criteria: bool = os.environ.get("FORGE_FAIL_ON_EMPTY_CRITERIA", "0") == "1"
 
+    # --- Higiena docs/DESIGN.md: kompaktowanie zamiast okresowego refaktoru --
+    # Próg rozmiaru DESIGN.md (bajty) — po przekroczeniu PLAN WSADOWY (nowy
+    # model, phase_plan_batch) dostaje polecenie wstawienia jednego zadania
+    # kompaktującego (ROZSTRZYGNIĘTE → docs/DECISIONS.md, DESIGN.md zostaje
+    # opisem stanu obecnego). 0 = wyłączone.
+    # UWAGA: dotyczy WYŁĄCZNIE legacy_mode=False — stary przebieg (phase_plan)
+    # nie sprawdza tego progu i DESIGN.md może tam rosnąć bez ograniczeń.
+    design_compact_bytes: int = int(os.environ.get("FORGE_DESIGN_COMPACT_BYTES", "40000"))
+
     def effective_verify_targets(self, declared: list[str]) -> list[str]:
         """Targety po nadpisaniu użytkownika ("" = deklaracja bootstrapu)."""
         override = self.verify_targets_override.strip().lower()
