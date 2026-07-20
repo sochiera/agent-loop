@@ -73,7 +73,27 @@ Najmniejsza grywalna pętla, single-player vs jedno księstwo AI:
 
 ## Poza zakresem (na start)
 Scenariuszowa kampania/fabuła, multiplayer sieciowy, magia/fantastyka, oddziały
-masowe (np. 60 ludzi w jednostce), zaawansowana grafika i dźwięk, edytor map.
+masowe (np. 60 ludzi w jednostce), grafika AAA/dźwięk, edytor map.
+
+## Warstwa wizualna (zmiana zakresu — dopisana po starcie projektu)
+> Poprzednia wersja tego briefu w ogóle nie planowała grafiki poza rdzeniem
+> logiki. To poniższe jest świadomym rozszerzeniem zakresu, nie sprzecznością
+> do zignorowania — potraktuj jako nowy wymóg, nie sugestię.
+
+Rdzeń logiki (strategia + bitwa) zostaje jak dotąd oddzielony od prezentacji.
+Niemniej gra ma dostać **minimalną, ale realną warstwę wizualną** — nie tylko
+tekstowy/headless output:
+- Mapa strategiczna: widok regionów/osad/party w 2D (może być prosty,
+  schematyczny — nie chodzi o AAA, chodzi o to, żeby dało się grać patrząc,
+  a nie czytając logi).
+- Bitwa: siatka heksów renderowana wizualnie, z jednostkami i terenem
+  widocznymi na ekranie, sterowanie myszą/klawiaturą.
+- Silnik/biblioteka do wyboru przez agenta bootstrapu (np. pygame, arcade,
+  albo web/canvas) — ma uzasadnić decyzję w `docs/ARCHITECTURE.md`, tak samo
+  jak wybór języka.
+- To ma być **realne zadanie w BACKLOG.md**, nie punkt odłożony bezterminowo
+  na „później". Jeśli rdzeń (logika strategii + bitwy) jest już w dużej
+  mierze gotowy, warstwa wizualna to następny priorytet, nie ostatni.
 
 ## Kwestie techniczne
 - Rdzeń logiki (strategia + bitwa) **oddzielony od prezentacji**, żeby dało się go
