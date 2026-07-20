@@ -607,6 +607,135 @@ class ConfigPlan5Test(unittest.TestCase):
         self.assertEqual(cfg.max_done_rejects, 3)
         self.assertEqual(cfg.done_reject_policy, "review_if_green")
         self.assertTrue(cfg.keep_failed_ref)
+        self.assertFalse(cfg.fail_on_empty_criteria)
+
+
+class FailOnEmptyCriteriaTest(MicroLoopPlan5Base):
+    def test_fail_immediate_when_empty_canon_and_flag(self) -> None:
+        from forge.orchestrate import _run_micro_loop, _start_task
+        with tempfile.TemporaryDirectory() as project:
+            _init_repo(project)
+            rel = ".forge/tasks/task-empty.md"
+            path = Path(project, rel)
+            path.parent.mkdir(parents=True)
+            path.write_text("# Z\n\n## Cel\nbez AC\n", encoding="utf-8")
+            cfg = Config(git_push=False, fail_on_empty_criteria=True,
+                         max_micro_cycles=5)
+            state = State(
+                bootstrapped=True, test_cmd="true", build_cmd="",
+                task_queue=[{
+                    "id": "task-empty", "title": "Puste", "file": rel,
+                    "criteria": [], "test_globs": ["tests/**"], "code_globs": [],
+                }],
+            )
+            _start_task(cfg, project, state)
+            self.assertTrue(state.fail_immediate)
+            self.assertTrue((state.fail_reason or "").startswith("done_map:"))
+            with patch("forge.orchestrate.run_agent_session") as sess:
+                out = _run_micro_loop(cfg, project, state,
+                                      lambda ph: os.path.join(project, "log"))
+            self.assertFalse(out)
+            sess.assert_not_called()
+
+
+class PolicyContinueTest(MicroLoopPlan5Base):
+    def test_continue_does_not_escalate_at_reject_limit(self) -> None:
+        from forge.orchestrate import _run_micro_loop
+        with tempfile.TemporaryDirectory() as project:
+            _init_repo(project)
+            self._task_file(project)
+            cfg = Config(max_micro_cycles=4, max_done_rejects=2,
+                         done_reject_policy="continue",
+                         max_green_retries=0, git_push=False)
+            state = self._state()
+            bad = ('```json\n{"action":"done","criteria_map":['
+                   '{"criterion":"INNE","status":"justified","why":"'
+                   + ("y" * 25) + '"}]}\n```')
+
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None,
+                     model=None, effort=None):
+                return bad, "sess"
+
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake), \
+                 patch("forge.orchestrate.run_gate", return_value=(True, "")), \
+                 patch("forge.orchestrate._task_gate", return_value=(True, "")):
+                out = _run_micro_loop(cfg, project, state,
+                                      lambda ph: os.path.join(project, "log"))
+
+            # Zużywa cykle do micro_cap, nie escalate/review.
+            self.assertFalse(out)
+            self.assertNotEqual(state.phase, "review")
+            self.assertTrue((state.fail_reason or "").startswith("micro_cap:"))
+            self.assertGreaterEqual(state.done_reject_count, 2)
+
+
+class RejectFeedbackIncludesCanonTest(MicroLoopPlan5Base):
+    def test_reject_reasons_include_full_canon_texts(self) -> None:
+        from forge.orchestrate import _run_micro_loop
+        with tempfile.TemporaryDirectory() as project:
+            _init_repo(project)
+            self._task_file(project, "# Z\n\n## Kryteria akceptacji\n"
+                            "- [ ] pełne kryterium alfa z długim tekstem\n"
+                            "- [ ] pełne kryterium beta\n")
+            cfg = Config(max_micro_cycles=2, max_done_rejects=5,
+                         done_reject_policy="continue",
+                         max_green_retries=0, git_push=False)
+            state = self._state(current_task={
+                "id": "task-001", "title": "Zad",
+                "file": ".forge/tasks/task-001.md",
+                "criteria": ["skrót"], "test_globs": ["tests/**"],
+                "code_globs": ["src/**"],
+            })
+            bad = ('```json\n{"action":"done","criteria_map":['
+                   '{"criterion":"INNE","status":"justified","why":"'
+                   + ("y" * 25) + '"}]}\n```')
+            seen_prompts = []
+
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None,
+                     model=None, effort=None):
+                seen_prompts.append(prompt)
+                return bad, "sess"
+
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake), \
+                 patch("forge.orchestrate.run_gate", return_value=(True, "")), \
+                 patch("forge.orchestrate._task_gate", return_value=(True, "")):
+                _run_micro_loop(cfg, project, state,
+                                lambda ph: os.path.join(project, "log"))
+
+            # Drugi prompt testera powinien dostać pełny kanon z poprzedniego rejectu.
+            self.assertGreaterEqual(len(seen_prompts), 2)
+            self.assertIn("pełne kryterium alfa", seen_prompts[1])
+            self.assertIn("KANON", seen_prompts[1])
+
+
+class EscalationStateTest(MicroLoopPlan5Base):
+    def test_escalate_stores_map_errors_on_state(self) -> None:
+        from forge.orchestrate import _run_micro_loop
+        with tempfile.TemporaryDirectory() as project:
+            _init_repo(project)
+            self._task_file(project)
+            cfg = Config(max_micro_cycles=12, max_done_rejects=2,
+                         done_reject_policy="review_if_green",
+                         max_green_retries=0, git_push=False)
+            state = self._state()
+            bad = ('```json\n{"action":"done","criteria_map":['
+                   '{"criterion":"INNE","status":"justified","why":"'
+                   + ("y" * 25) + '"}]}\n```')
+
+            def fake(name, prompt, cfg_, proj, log, *, session_id=None,
+                     model=None, effort=None):
+                return bad, "sess"
+
+            with patch("forge.orchestrate.run_agent_session", side_effect=fake), \
+                 patch("forge.orchestrate.run_gate", return_value=(True, "")), \
+                 patch("forge.orchestrate._task_gate", return_value=(True, "")):
+                out = _run_micro_loop(cfg, project, state,
+                                      lambda ph: os.path.join(project, "log"))
+
+            self.assertEqual(out, "escalate")
+            self.assertTrue(state.done_escalated)
+            self.assertTrue(state.escalation_map_errors)
+            self.assertTrue(any("kryterium" in e for e in state.escalation_map_errors))
 
 
 if __name__ == "__main__":

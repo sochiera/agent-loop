@@ -1512,9 +1512,6 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
             verdict = extract_json(out) or {"action": "no_test", "reason": "brak werdyktu JSON"}
             state.done_reject_reasons = []  # skonsumowane w prompcie powyżej
             action = verdict.get("action")
-            journal_append(project, cfg,
-                           f"cykl {c}, tester: {action} "
-                           f"({verdict.get('about') or verdict.get('reason') or ''})".rstrip())
 
             if action == "done":
                 # Odśwież kanon z dysku (PLAN-5: plik > JSON).
@@ -1529,7 +1526,11 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                     state.done_reject_count += 1
                     log("DONE odrzucony: " + "; ".join(map_errors)[:400]
                         + f" — k={state.done_reject_count}.")
-                    state.done_reject_reasons = map_errors
+                    # Pełny kanon w feedbacku (skróty w errorach nie wystarczają do 1:1).
+                    state.done_reject_reasons = list(map_errors) + [
+                        "KANON (pełne teksty checkboxów — przepisz criterion dosłownie):",
+                        *[f"  • {crit}" for crit in canon],
+                    ]
                     state.micro_cycle = c  # zużyj cykl, by nie zapętlić w nieskończoność
                     state.micro_sub = "test"
                     journal_append(
@@ -1544,6 +1545,9 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                             return outcome
                     save_checkpoint(project, state)
                     continue
+                journal_append(project, cfg,
+                               f"cykl {c}, tester: done "
+                               f"({verdict.get('about') or ''})".rstrip())
                 # Kryteria "justified" przeszły walidację formy — merytorykę
                 # rozstrzygnie recenzent (dostaje je jawnie w prompcie).
                 state.justified_criteria = [
@@ -1567,6 +1571,10 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                 state.phase = "review"
                 save_checkpoint(project, state)
                 return "done"
+
+            journal_append(project, cfg,
+                           f"cykl {c}, tester: {action} "
+                           f"({verdict.get('about') or verdict.get('reason') or ''})".rstrip())
 
             if action == "wrote_test":
                 state.done_reject_count = 0
