@@ -3,8 +3,9 @@
 Orkiestrator, który w kółko odpala agentów CLI, aż skończą się limity subskrypcji.
 Buduje **grę albo dowolny inny program** — agent bootstrapu sam rozpoznaje z briefu
 rodzaj produktu (`game`/`app`) i dostosowuje słownictwo planowania. Rolę każdego
-agenta może pełnić **dowolne narzędzie CLI** (claude, codex, a przez szablon
-komendy także grok, Kiro i inne — patrz „Dowolny agent CLI").
+agenta może pełnić **dowolne narzędzie CLI** — wbudowane `claude`, `codex`/`gpt`,
+gotowe do użycia `grok` i `kiro`, a przez szablon komendy także dowolne inne —
+patrz „Dowolny agent CLI — pełna dowolność ról".
 
 **Domyślny model (mikro-TDD ping-pong).** Claude planuje wsadowo (kilka zadań w
 przód), a każde zadanie realizuje para instancji Codeksa w rytmie red→green→refactor:
@@ -144,7 +145,8 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 | Opóźnienie startu | brak | `--sleep 30s`, `--sleep 5m`, `--sleep 2h` |
 | Timeout agenta | 3600 s | `FORGE_AGENT_TIMEOUT=...` |
 | Push do remote | włączony (`origin`) | `FORGE_GIT_PUSH=0`, `FORGE_GIT_REMOTE=...` |
-| Recenzent zadania | agent testera, ŚWIEŻY kontekst | `FORGE_REVIEWER_AGENT/MODEL/EFFORT` |
+| Recenzent zadania | agent testera, ŚWIEŻY kontekst | `--reviewer-agent/model/effort` lub `FORGE_REVIEWER_AGENT/MODEL/EFFORT` |
+| Weryfikator celu | agent planisty | `--verifier-agent/model/effort` lub `FORGE_VERIFIER_AGENT/MODEL/EFFORT` |
 | Globy toolchainu testów (extra) | heurystyka + deklaracja bootstrapu | `FORGE_TOOLCHAIN_GLOBS` (CSV) |
 | Rotacja sesji ról co K cykli | `6` (0 = wyłączona) | `FORGE_SESSION_ROTATE_CYCLES` |
 | Sufit skrótu dziennika zadania | `8000` znaków | `FORGE_JOURNAL_TAIL_CHARS` |
@@ -212,11 +214,50 @@ Projekt: `docs/PLAN-4-BRAMKI-I-KONTEKST.md`. W skrócie:
   o pliki każdego cyklu); porażka zadania czyści resztę wsadu planowania —
   plan budowany przy założeniu sukcesu jest przeplanowywany z `failures.md`.
 
-## Dowolny agent CLI (claude, codex, grok, Kiro, …)
+## Dowolny agent CLI — pełna dowolność ról (claude, gpt, grok, Kiro, …)
 
-Każdą rolę — planistę, testera, kodera — może pełnić dowolny agent CLI. `claude`
-i `codex` mają wbudowaną obsługę. Inne narzędzie wpinasz **bez zmian w kodzie**,
-podając szablon jego komendy w zmiennej `FORGE_AGENT_<NAZWA>_CMD`:
+Każdą rolę — **planistę, testera, kodera, recenzenta, weryfikatora** — może
+pełnić inny agent CLI, z innym modelem. Zero ograniczeń co do kombinacji: np.
+Fable planuje, GPT (Codex) pisze testy, Grok pisze kod, a Sonnet recenzuje:
+
+```bash
+python3 -m forge.orchestrate --non-interactive \
+  --planner-agent claude --planner-model claude-fable-5 --planner-effort high \
+  --tester-agent  gpt   --codex-effort high \
+  --coder-agent   grok \
+  --reviewer-agent claude --reviewer-model claude-sonnet-5
+```
+
+(albo równoważnie przez zmienne środowiskowe `FORGE_PLANNER_AGENT`,
+`FORGE_TESTER_AGENT`, `FORGE_CODER_AGENT`, `FORGE_REVIEWER_AGENT` + `*_MODEL`/`*_EFFORT`
+— patrz tabela pokręteł niżej; jest też `FORGE_VERIFIER_AGENT` dla roli
+weryfikatora celu).
+
+### Agenci wbudowani i wspierani z gotowa
+
+| Nazwa | Co to jest | Obsługa |
+|---|---|---|
+| `claude` | Claude Code CLI | wbudowana (sesje przez dziennik zadania, `--output-format json`) |
+| `codex` / `gpt` | Codex CLI (OpenAI, modele GPT) | wbudowana, z ciągłością sesji (`codex exec resume`) — `gpt` to wygodny alias na `codex` |
+| `grok` | xAI Grok Build CLI (`grok`) | gotowy domyślny szablon (`grok -p {prompt} -m {model} --always-approve`), nadpisywalny |
+| `kiro` | Kiro CLI (AWS, `kiro-cli`) | gotowy domyślny szablon (`kiro-cli chat --no-interactive --trust-all-tools {prompt}`); model ustawiasz w `~/.kiro/settings/cli.json` (headless nie ma dziś flagi `--model`) |
+
+`grok` i `kiro` działają "z pudełka" pod swoją nazwą — bez ustawiania żadnej
+zmiennej środowiskowej — bo mają wbudowany domyślny szablon komendy (zgodny z
+oficjalną dokumentacją, stan 2026-07). Jeśli Twoja wersja CLI ma inne flagi,
+nadpisz go tak samo jak dla zupełnie nowego narzędzia (patrz niżej).
+
+> **Effort dla grok/kiro.** Domyślne szablony **nie** przekazują `effort`
+> (Grok/Kiro nie mają dziś odpowiednika flagi „reasoning effort" w headless).
+> Ustawienie `--coder-effort`/`FORGE_CODER_EFFORT` dla tych agentów jest więc
+> **po cichu ignorowane** — jeśli Twoja wersja CLI to obsługuje, dodaj
+> `{effort}` do własnego `FORGE_AGENT_<NAZWA>_CMD`.
+
+### Zupełnie inny/nieznany CLI
+
+Dowolne inne narzędzie (aider, własny skrypt, inna wersja grok/kiro, …) wpinasz
+**bez zmian w kodzie**, podając szablon jego komendy w zmiennej
+`FORGE_AGENT_<NAZWA>_CMD` — to samo działa, by NADPISAĆ domyślny szablon `grok`/`kiro`:
 
 ```bash
 export FORGE_AGENT_GROK_CMD='grok --model {model} --exec {prompt} --out {output}'
@@ -235,10 +276,11 @@ Kontrakt, którego forge nie wyegzekwuje za Ciebie (CLI bywają różne):
 - finalny blok ```json wypisz na **stdout** albo do pliku `{output}`; diagnostykę na stderr,
 - zużycia tokenów generyka nie znamy — nie trafia do `.forge/usage.jsonl`.
 
-Tylko `codex` wznawia sesje (`codex exec resume`) — dający ciągły kontekst per
-zadanie. Pozostali agenci są bezsesyjni: ciągłość zapewnia im **dziennik zadania**
-(`.forge/task_journal.md`), który orkiestrator dokleja do promptu. To ta sama
-filozofia „pamięć w repo" — działa dla każdego CLI, tylko trochę drożej tokenowo.
+Tylko `codex`/`gpt` wznawia sesje (`codex exec resume`) — dający ciągły kontekst
+per zadanie. Pozostali agenci są bezsesyjni: ciągłość zapewnia im **dziennik
+zadania** (`.forge/task_journal.md`), który orkiestrator dokleja do promptu. To
+ta sama filozofia „pamięć w repo" — działa dla każdego CLI, tylko trochę drożej
+tokenowo.
 
 ## Co powstaje w `game/`
 

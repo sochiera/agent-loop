@@ -416,6 +416,7 @@ def run_agent(name: str, prompt: str, cfg: Config, project_dir: str, log_path: s
 
     mcp_config wspiera tylko claude (inni agenci konfigurują MCP po swojemu,
     np. codex w ~/.codex/config.toml) — dla nich jest ignorowany."""
+    name = adapters.canonical_agent(name)
     if name == "claude":
         return run_claude(prompt, cfg, project_dir, log_path, model=model,
                           effort=effort, mcp_config=mcp_config)
@@ -437,6 +438,7 @@ def run_agent_session(name: str, prompt: str, cfg: Config, project_dir: str,
 
     codex → sesja z resume (zwraca id). Pozostali agenci są bezsesyjni: jedno
     wywołanie, id=None; ciągłość zapewnia im dziennik zadania (patrz orchestrate)."""
+    name = adapters.canonical_agent(name)
     if name == "codex":
         return run_codex_session(prompt, cfg, project_dir, log_path,
                                  session_id=session_id, model=model, effort=effort)

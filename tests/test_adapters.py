@@ -79,6 +79,26 @@ class GenericSpecTest(unittest.TestCase):
         self.assertFalse(adapters.supports_resume("claude"))
         self.assertFalse(adapters.supports_resume("grok"))
 
+    def test_gpt_alias_resolves_to_codex(self) -> None:
+        self.assertEqual(adapters.canonical_agent("gpt"), "codex")
+        self.assertEqual(adapters.canonical_agent("chatgpt"), "codex")
+        self.assertEqual(adapters.canonical_agent("claude"), "claude")
+        self.assertTrue(adapters.is_builtin("gpt"))
+        self.assertTrue(adapters.supports_resume("gpt"))
+
+    def test_grok_and_kiro_have_known_default_templates_without_env(self) -> None:
+        grok_spec = adapters.generic_spec("grok", {})
+        self.assertIsNotNone(grok_spec)
+        self.assertEqual(adapters.generic_bin(grok_spec), "grok")
+        kiro_spec = adapters.generic_spec("kiro", {})
+        self.assertIsNotNone(kiro_spec)
+        self.assertEqual(adapters.generic_bin(kiro_spec), "kiro-cli")
+
+    def test_env_template_overrides_known_default(self) -> None:
+        env = {"FORGE_AGENT_GROK_CMD": "moj-grok {prompt}"}
+        spec = adapters.generic_spec("grok", env)
+        self.assertEqual(adapters.generic_bin(spec), "moj-grok")
+
 
 class ConfigRoleResolutionTest(unittest.TestCase):
     def test_roles_default_to_codex_with_inheritance(self) -> None:
@@ -104,6 +124,25 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         cfg = Config(planner_agent="claude", tester_agent="codex", coder_agent="grok")
         self.assertEqual(set(cfg.agents_in_use()), {"claude", "codex", "grok"})
         self.assertEqual(set(Config(legacy_mode=True).agents_in_use()), {"claude", "codex"})
+
+    def test_gpt_role_inherits_codex_model_like_codex(self) -> None:
+        cfg = Config(tester_agent="gpt", codex_model="gpt-x", codex_effort="high")
+        self.assertEqual(cfg.role("tester"), ("gpt", "gpt-x", "high"))
+
+    def test_reviewer_alias_inherits_tester_model_effort(self) -> None:
+        # reviewer="gpt", tester="codex" to ta sama binarka → recenzent dziedziczy
+        # KONKRETNY model/effort testera, nie globalny fallback codex_model.
+        cfg = Config(tester_agent="codex", tester_model="custom-m", tester_effort="high",
+                     reviewer_agent="gpt", codex_model="fallback-m", codex_effort="low")
+        self.assertEqual(cfg.role("reviewer"), ("gpt", "custom-m", "high"))
+
+    def test_agents_in_use_dedups_aliases(self) -> None:
+        # planner=gpt i tester=codex to jedna binarka — preflight nie może jej
+        # liczyć dwa razy (ani dublować komunikatu o braku).
+        cfg = Config(planner_agent="gpt", tester_agent="codex", coder_agent="codex")
+        canon = [adapters.canonical_agent(a) for a in cfg.agents_in_use()]
+        self.assertEqual(len(canon), len(set(canon)))
+        self.assertEqual(set(canon), {"codex"})
 
 
 class RunGenericAgentTest(unittest.TestCase):
