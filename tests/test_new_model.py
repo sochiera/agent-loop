@@ -130,10 +130,10 @@ class StateRoundtripTest(unittest.TestCase):
 
 class RunGateTest(unittest.TestCase):
     def test_green_and_red_with_tail(self) -> None:
-        green, tail = run_gate("/tmp", "", "python -c pass", 10)
+        green, tail = run_gate("/tmp", "", "python3 -c pass", 10)
         self.assertTrue(green)
         self.assertEqual(tail, "")
-        red, tail = run_gate("/tmp", "", "python -c \"import sys;sys.exit(1)\"", 10)
+        red, tail = run_gate("/tmp", "", "python3 -c \"import sys;sys.exit(1)\"", 10)
         self.assertFalse(red)
 
     def test_missing_test_cmd_is_red(self) -> None:

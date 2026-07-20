@@ -72,6 +72,20 @@ class State:
     # Kryteria "justified" z przyjętej mapy — recenzent dostaje je jawnie
     # do merytorycznego rozstrzygnięcia. Czyszczone przy zamknięciu zadania.
     justified_criteria: list[dict] = field(default_factory=list)
+    # PLAN-5: kolejne odrzucenia mapy DONE w zadaniu (reset przy wrote_test /
+    # udanym code-cycle / zaakceptowanej mapie).
+    done_reject_count: int = 0
+    # Szczegółowy powód porażki micro-pętli dla _fail_task (prefiksy done_map:/…).
+    fail_reason: str = ""
+    # Natychmiastowy fail na starcie micro (np. fail_on_empty_criteria) — bez
+    # kruchego matchowania fraz w fail_reason.
+    fail_immediate: bool = False
+    # Kontekst eskalacji DONE → review (map_errors + kanon); czyszczone z zadaniem.
+    escalation_notes: list[str] = field(default_factory=list)
+    # Surowa lista błędów mapy przy eskalacji (bez re-parsu notes).
+    escalation_map_errors: list[str] = field(default_factory=list)
+    # True gdy weszliśmy do review przez limit rejectów mapy (nie przez OK mapę).
+    done_escalated: bool = False
 
     # --- Weryfikacja celu (PLAN-3): profil + checkpoint cyklu ---------------
     # Profil deklaruje bootstrap (jak test_cmd — serce stack-agnostyczności).

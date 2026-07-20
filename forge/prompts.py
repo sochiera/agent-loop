@@ -258,6 +258,16 @@ Numeruj zadania od {start_index:03d}. Dla KAŻDEGO zadania zapisz plik
 ## Poza zakresem
 <czego świadomie NIE robimy w tym zadaniu>
 
+Zasady planowania (twarde):
+- Kryteria w JSON: skopiuj **dosłownie** teksty checkboxów z pliku zadania
+  (orkiestrator i tak czyta checkboxy z pliku jako kanon; rozjazd = log).
+- Zadanie refaktoryzacyjne: ustaw `"kind": "refactor"` i w AC jasno „bez nowych
+  testów" / „zadanie refaktoryzacyjne".
+- NIE łącz w jednym zadaniu monolitów: nowej powierzchni API + testu end-to-end
+  headless + wpisu ROZSTRZYGNIĘTE w docs — **rozbij** na mniejsze przyrosty
+  (wzorzec a/b/c). Po wpisie w failures.md z `coder_red:` / `micro_cap:` następny
+  wsad musi pociąć padłe zadanie drobniej.
+
 Zaktualizuj BACKLOG.md (statusy) i rozwiń docs/DESIGN.md, jeśli decyzja projektowa
 tego wymaga. Ukończone pozycje przenoś do BACKLOG-ARCHIVE.md, by BACKLOG nie puchł.
 
@@ -265,23 +275,45 @@ Na końcu zwróć WYŁĄCZNIE (globy MUSZĄ zgadzać się z plikami zadań{fix_n
 ```json
 {{"no_more_tasks": false, "tasks": [
   {{"id": "task-{start_index:03d}", "title": "<tytuł>", "file": ".forge/tasks/task-{start_index:03d}.md",
-   "criteria": ["<kryterium 1>", "<kryterium 2>"],
-   "test_globs": ["tests/..."], "code_globs": ["src/..."]{fix_fields}}}
+   "criteria": ["<dosłowny tekst checkboxa 1>", "<dosłowny tekst checkboxa 2>"],
+   "test_globs": ["tests/..."], "code_globs": ["src/..."],
+   "kind": "feature"{fix_fields}}}
 ]}}
 ```
+(dla refaktoru: `"kind": "refactor"`; dla zwykłego przyrostu możesz pominąć kind
+albo podać `"feature"`).
 Ustaw "no_more_tasks": true i pustą listę "tasks" TYLKO gdy MVP z DESIGN.md jest
 w pełni zaimplementowane i przetestowane, a BACKLOG nie ma sensownych kroków."""
 
 
 def write_test_prompt(task_file: str, test_cmd: str,
-                      reject_reasons: list[str] | None = None) -> str:
+                      reject_reasons: list[str] | None = None,
+                      refactor: bool = False) -> str:
     rejected = ""
     if reject_reasons:
         bullets = "\n".join(f"- {r}" for r in reject_reasons)
+        form_hints = any(
+            "plik" in r or "nazwa" in r or "covered" in r or "ref" in r.lower()
+            for r in reject_reasons)
+        hint = ("Błędy formy mapy (ref/test) popraw w polu test / status; "
+                if form_hints else "")
         rejected = (f"\nTWOJA POPRZEDNIA MAPA KRYTERIÓW (DONE) ZOSTAŁA ODRZUCONA "
                     f"z powodów:\n{bullets}\n"
+                    f"{hint}"
                     "Uzupełnij brakujące pokrycie testem albo popraw mapę — nie "
-                    "zgaduj, odnieś się do każdego powodu.\n")
+                    "zgaduj, odnieś się do każdego powodu. Orkiestrator porównuje "
+                    "kryteria z **checkboxami** sekcji Kryteria akceptacji w pliku "
+                    "zadania (nie ze skrótami planisty).\n")
+    refactor_block = ""
+    if refactor:
+        refactor_block = """
+TO ZADANIE REFAKTORYZACYJNE (kind=refactor / AC bez nowych testów):
+- Preferuj status "justified" dla kryteriów strukturalnych (prywatne helpery,
+  dedup, bez zmiany publicznego API) z merytorycznym "why".
+- "covered" tylko gdy wskazujesz ISTNIEJĄCE testy regresji (bez dodawania plików
+  testowych / nowych asercji na prywatne API, jeśli AC tego zabrania).
+- Sensowny krok bez nowego testu: action "no_test".
+"""
     return f"""{SHARED_PRINCIPLES}
 
 ROLA: TESTER. Dyktujesz specyfikację przez testy. NIE piszesz kodu produkcyjnego.
@@ -289,7 +321,11 @@ ROLA: TESTER. Dyktujesz specyfikację przez testy. NIE piszesz kodu produkcyjneg
 Bieżące zadanie: {task_file} (przeczytaj: cel, KRYTERIA AKCEPTACJI, Kontrakt API,
 Ścieżki testów). Przejrzyj istniejące testy i kod, ustal CZEGO JESZCZE BRAKUJE
 względem kryteriów.
-{rejected}
+
+KANON KRYTERIÓW: orkiestrator waliduje mapę DONE wyłącznie względem tekstów
+checkboxów z sekcji „Kryteria akceptacji" w pliku zadania (po znormalizowaniu
+spacji). Przepisz je dosłownie w polu "criterion".
+{refactor_block}{rejected}
 
 Wybierz DOKŁADNIE jedno:
 A) Napisz JEDEN nowy test na brakującą funkcjonalność. Wymogi twarde:
@@ -300,8 +336,10 @@ B) Jeśli sensownego testu nie da się teraz napisać (np. czysto strukturalny k
    zadeklaruj to jawnie — koder wykona krok bez testu.
 C) Jeśli WSZYSTKIE kryteria są już spełnione i cały pakiet zielony — zakończ zadanie.
    Wtedy zmapuj KAŻDE kryterium akceptacji (przepisz jego DOKŁADNY tekst z pliku
-   zadania) na test, który je pokrywa: status "covered" + pole "test". Kryterium
-   niesprawdzalne testem oznacz statusem "justified" i wyjaśnij w polu "why".
+   zadania — checkbox) na test, który je pokrywa: status "covered" + pole "test"
+   (jeden ref `ścieżka::nazwa`, albo tablica refów; NIE sklejaj wielu testów
+   średnikiem w jednym stringu — wolno tablica JSON). Kryterium niesprawdzalne
+   testem oznacz statusem "justified" i wyjaśnij w polu "why".
    Mapa bez któregoś kryterium zostanie odrzucona.
 
 Na końcu zwróć WYŁĄCZNIE jeden z bloków:
@@ -357,7 +395,8 @@ nie Twoja deklaracja — ale zmiany w testach MUSISZ zadeklarować):
 def review_task_prompt(task_file: str, test_cmd: str, *, start_tag: str = "",
                        changed: list[str] | None = None,
                        toolchain_changes: list[str] | None = None,
-                       justified: list[dict] | None = None) -> str:
+                       justified: list[dict] | None = None,
+                       escalation: dict | None = None) -> str:
     diff_hint = (f"`git diff {start_tag}`" if start_tag
                  else "`git diff` względem punktu startu zadania")
     files_block = ""
@@ -379,6 +418,25 @@ def review_task_prompt(task_file: str, test_cmd: str, *, start_tag: str = "",
             "Kryteria oznaczone przez testera jako 'justified' (bez testu) — "
             "rozstrzygnij KAŻDE merytorycznie (nietrafne uzasadnienie = 'changes'):\n"
             + rows + "\n")
+    escalation_block = ""
+    if escalation:
+        crits = escalation.get("criteria") or []
+        errs = escalation.get("map_errors") or []
+        n = escalation.get("reject_count", "?")
+        crit_lines = "\n".join(f"- {c}" for c in crits) or "- (brak listy — przeczytaj plik zadania)"
+        err_lines = "\n".join(f"- {e}" for e in errs) or "- (brak szczegółów)"
+        escalation_block = f"""
+ESKALACJA DONE (bezpiecznik budżetu — mapa kryteriów NIE została zaakceptowana
+mechanicznie po {n} odrzuceniach; suite jest zielona). To NIE jest self-cert
+testera. MUSISZ jawnie odnieść się do KAŻDEGO kryterium z kanonu poniżej
+(spełnione / niespełnione / wymaga zmian). Bez tego nie wolno „approve".
+
+Kanon kryteriów (checkboxy z pliku zadania):
+{crit_lines}
+
+Powody odrzuceń mapy testera:
+{err_lines}
+"""
     return f"""{SHARED_PRINCIPLES}
 
 ROLA: RECENZENT (świeże oko — nie brałeś udziału w implementacji). Zadanie
@@ -387,7 +445,7 @@ teraz kodu — oceniasz.
 
 Bieżące zadanie: {task_file}. Obejrzyj zmiany całego zadania: {diff_hint}
 oraz nowe pliki.
-{files_block}{toolchain_block}{justified_block}
+{files_block}{toolchain_block}{justified_block}{escalation_block}
 Oceń:
 - Czy WSZYSTKIE kryteria akceptacji są realnie spełnione i pokryte testami?
 - Czy testy sprawdzają zachowanie (nie tautologie/atrapy)? Czy któryś test został

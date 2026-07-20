@@ -152,6 +152,19 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 | Sufit skrótu dziennika zadania | `8000` znaków | `FORGE_JOURNAL_TAIL_CHARS` |
 | Testy read-only na turę kodera | włączone | `FORGE_LOCK_TESTS=0` |
 | Re-plan wsadu po porażce zadania | włączony | `FORGE_REPLAN_ON_FAILURE=0` |
+| Sufit kolejnych odrzuceń mapy DONE | `3` | `FORGE_MAX_DONE_REJECTS` |
+| Policy po limicie mapy DONE | `review_if_green` | `FORGE_DONE_REJECT_POLICY` (`review_if_green` / `fail` / `continue`) |
+| Branch `forge/failed/<id>` przed rollbackiem | włączony | `FORGE_KEEP_FAILED_REF=0` |
+| Fail startu przy pustych kryteriach | wyłączony | `FORGE_FAIL_ON_EMPTY_CRITERIA=1` |
+
+### Kanon kryteriów (PLAN-5)
+
+Orkiestrator waliduje mapę DONE względem **checkboxów** sekcji „Kryteria
+akceptacji” w pliku `.forge/tasks/task-NNN.md` (nie względem skrótów z JSON
+planisty). Brak checkboxów → fallback na `criteria` z planu; brak obu → DONE
+niemożliwe. Po limicie odrzuceń mapy przy zielonej suitie domyślnie eskalacja
+do recenzji (bezpiecznik budżetu, nie self-cert testera). Po porażce zadania
+lokalny branch `forge/failed/<id>` trzyma HEAD z pracą (w tym residual WIP).
 
 > **Uwaga o Opusie na Pro $20:** Opus w każdej fazie wyczerpie tygodniowy limit
 > bardzo szybko. Gdy zacznie boleć, zejdź na `--claude-model sonnet` — pętla
@@ -239,7 +252,7 @@ weryfikatora celu).
 |---|---|---|
 | `claude` | Claude Code CLI | wbudowana (sesje przez dziennik zadania, `--output-format json`) |
 | `codex` / `gpt` | Codex CLI (OpenAI, modele GPT) | wbudowana, z ciągłością sesji (`codex exec resume`) — `gpt` to wygodny alias na `codex` |
-| `grok` | xAI Grok Build CLI (`grok`) | gotowy domyślny szablon (`grok -p {prompt} -m {model} --always-approve`), nadpisywalny |
+| `grok` | xAI Grok Build CLI (`grok`) | gotowy domyślny szablon (`grok -p {prompt} -m {model} --effort {effort} --always-approve`), nadpisywalny |
 | `kiro` | Kiro CLI (AWS, `kiro-cli`) | gotowy domyślny szablon (`kiro-cli chat --no-interactive --trust-all-tools {prompt}`); model ustawiasz w `~/.kiro/settings/cli.json` (headless nie ma dziś flagi `--model`) |
 
 `grok` i `kiro` działają "z pudełka" pod swoją nazwą — bez ustawiania żadnej

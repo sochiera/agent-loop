@@ -301,9 +301,13 @@ class ValidateCriteriaMapTest(unittest.TestCase):
                 project)
             self.assertEqual(errors, [])
 
-    def test_no_criteria_is_trivially_valid(self) -> None:
+    def test_no_criteria_is_rejected_as_empty_canon(self) -> None:
+        # PLAN-5: pusty kanon ≠ „wszystko pokryte" (wcześniej trivially valid).
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(self._validate([], [], tmp), [])
+            errors = self._validate([], [], tmp)
+            self.assertTrue(errors)
+            self.assertTrue(any("brak kryteri" in e.lower() or "kanon" in e.lower()
+                                for e in errors))
 
 
 # =====================================================================

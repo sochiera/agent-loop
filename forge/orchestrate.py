@@ -39,6 +39,20 @@ def log(msg: str) -> None:
 
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+# xAI Grok Build CLI: `--effort low|medium|high` (docs.x.ai/build/cli/reference).
+GROK_EFFORTS = ("low", "medium", "high")
+KNOWN_AGENT_EFFORTS = {"claude": CLAUDE_EFFORTS, "codex": CODEX_EFFORTS, "grok": GROK_EFFORTS}
+# Podpowiedzi modeli — TYLKO dla wygody (unikanie literówek przy ręcznym wpisywaniu,
+# np. "fable" zamiast poprawnego aliasu Claude Code). Lista wybieralna numerem, ale
+# każde inne wpisane hasło jest akceptowane bez walidacji — modele wychodzą
+# częściej niż zdążymy zaktualizować tę listę, więc to podpowiedź, nie ograniczenie.
+KNOWN_AGENT_MODELS: dict[str, tuple[str, ...]] = {
+    # Aliasy Claude Code CLI — zawsze wskazują na najnowszy model danej rodziny.
+    "claude": ("opus", "sonnet", "haiku", "fable"),
+    # xAI Grok Build (docs.x.ai/developers/models, stan: 2026-07) — sprawdź
+    # `grok models list` jeśli lista zdążyła się zmienić.
+    "grok": ("grok-4.5", "grok-4.3", "grok-build-0.1"),
+}
 PLANNER_AGENTS = ("claude", "codex")
 _DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)([smh]?)$", re.IGNORECASE)
 
@@ -92,6 +106,22 @@ def _ask_value(label: str, default: str, *, display_default: str | None = None) 
     return input(f"{label} [{shown}]: ").strip() or default
 
 
+def _ask_model(label: str, default: str, canon: str, *, display_default: str | None = None) -> str:
+    """Jak _ask_value, ale dla znanego agenta dopisuje numerowane podpowiedzi
+    modeli (KNOWN_AGENT_MODELS). Wpisanie numeru wybiera podpowiedź; dowolny
+    inny tekst przechodzi bez zmian — to podpowiedź, nie walidacja."""
+    choices = KNOWN_AGENT_MODELS.get(canon)
+    if not choices:
+        return _ask_value(label, default, display_default=display_default)
+    menu = ", ".join(f"{i}={m}" for i, m in enumerate(choices, start=1))
+    value = _ask_value(f"{label} — {menu}", default, display_default=display_default)
+    if value.isdigit():
+        idx = int(value) - 1
+        if 0 <= idx < len(choices):
+            return choices[idx]
+    return value
+
+
 def _ask_effort(label: str, default: str, allowed: tuple[str, ...]) -> str:
     choices = "/".join(allowed)
     while True:
@@ -101,8 +131,37 @@ def _ask_effort(label: str, default: str, allowed: tuple[str, ...]) -> str:
         print(f"Niepoprawny effort: {value!r}. Wybierz jedną z: {choices}.")
 
 
+def _ask_role_settings(cfg: Config, agent_attr: str, model_attr: str, effort_attr: str,
+                       title: str, *, allow_blank_agent: str = "") -> None:
+    """Zapytaj o agenta/model/effort jednej roli (tester/koder/recenzent/weryfikator).
+
+    allow_blank_agent: jeśli niepuste, puste pole agenta jest poprawne i oznacza
+    dziedziczenie (opisane w tym tekście) — dotyczy recenzenta i weryfikatora."""
+    current_agent = getattr(cfg, agent_attr)
+    hint = f"claude/codex/gpt/grok/kiro/inny{', puste = ' + allow_blank_agent if allow_blank_agent else ''}"
+    new_agent = _ask_value(f"Agent {title} ({hint})", current_agent,
+                          display_default=current_agent or allow_blank_agent or "codex")
+    setattr(cfg, agent_attr, new_agent)
+
+    canon = adapters.canonical_agent(new_agent) if new_agent else ""
+    cur_model = getattr(cfg, model_attr)
+    new_model = _ask_model(
+        f"Model {title} ({new_agent or allow_blank_agent or 'domyślny'})", cur_model, canon,
+        display_default=cur_model or "puste = domyślny agenta",
+    )
+    setattr(cfg, model_attr, new_model)
+
+    known_efforts = KNOWN_AGENT_EFFORTS.get(canon)
+    cur_effort = getattr(cfg, effort_attr)
+    if known_efforts:  # wbudowany agent → waliduj wobec znanych poziomów
+        setattr(cfg, effort_attr, _ask_effort(f"Effort {title}", cur_effort or "medium", known_efforts))
+    else:              # generyczny/dziedziczony → effort to dowolny string
+        setattr(cfg, effort_attr, _ask_value(
+            f"Effort {title}", cur_effort, display_default=cur_effort or "puste = domyślny agenta"))
+
+
 def prompt_agent_settings(cfg: Config) -> None:
-    """Pobierz modele i effort obu ról przed uruchomieniem pętli."""
+    """Pobierz agenta/model/effort każdej roli przed uruchomieniem pętli."""
     print("\nKonfiguracja agentów (Enter zachowuje wartość domyślną):")
     previous_agent = cfg.planner_agent
     # Wolny wybór — poza claude/codex dozwolony dowolny agent generyczny.
@@ -112,22 +171,47 @@ def prompt_agent_settings(cfg: Config) -> None:
     if cfg.planner_agent != previous_agent:
         cfg.planner_model = {"claude": "opus", "codex": cfg.codex_model}.get(canon, "")
         cfg.planner_effort = {"claude": "high", "codex": cfg.codex_effort}.get(canon, "medium")
-    cfg.planner_model = _ask_value(
-        f"Model do planowania ({cfg.planner_agent})", cfg.planner_model,
+    cfg.planner_model = _ask_model(
+        f"Model do planowania ({cfg.planner_agent})", cfg.planner_model, canon,
         display_default=cfg.planner_model or "z konfiguracji CLI",
     )
-    planner_efforts = {"claude": CLAUDE_EFFORTS, "codex": CODEX_EFFORTS}.get(canon)
+    planner_efforts = KNOWN_AGENT_EFFORTS.get(canon)
     if planner_efforts:  # wbudowany agent → waliduj wobec znanych poziomów
         cfg.planner_effort = _ask_effort("Effort planowania", cfg.planner_effort, planner_efforts)
     else:               # generyczny → effort to dowolny string
         cfg.planner_effort = _ask_value("Effort planowania", cfg.planner_effort)
-    cfg.codex_model = _ask_value(
-        "Model do implementacji (Codex)", cfg.codex_model,
-        display_default=cfg.codex_model or "z config.toml",
-    )
-    cfg.codex_effort = _ask_effort(
-        "Effort implementacji", cfg.codex_effort, CODEX_EFFORTS
-    )
+
+    if cfg.legacy_mode:
+        # Tryb legacy: implement/fix zawsze na Codeksie — role tester/koder/
+        # recenzent/weryfikator nie istnieją w tym przebiegu, więc Codeks jest
+        # zawsze w użyciu i pytamy o niego bez warunku.
+        cfg.codex_model = _ask_value(
+            "Model do implementacji (Codex)", cfg.codex_model,
+            display_default=cfg.codex_model or "z config.toml",
+        )
+        cfg.codex_effort = _ask_effort("Effort implementacji", cfg.codex_effort, CODEX_EFFORTS)
+        print()
+        return
+
+    _ask_role_settings(cfg, "tester_agent", "tester_model", "tester_effort", "testera")
+    _ask_role_settings(cfg, "coder_agent", "coder_model", "coder_effort", "kodera")
+    _ask_role_settings(cfg, "reviewer_agent", "reviewer_model", "reviewer_effort",
+                       "recenzenta", allow_blank_agent="agent testera")
+    _ask_role_settings(cfg, "verifier_agent", "verifier_model", "verifier_effort",
+                       "weryfikatora", allow_blank_agent="agent planisty")
+
+    # Model/effort globalny Codeksa — pytamy TYLKO jeśli jakaś rola faktycznie
+    # rozwiązuje się do Codeksa (dziedziczą go role z agent=codex bez własnego
+    # modelu). Gdy nikt nie używa Codeksa (np. wszystkie role na grok), pytanie
+    # byłoby mylącym szumem.
+    if "codex" in {adapters.canonical_agent(a) for a in cfg.agents_in_use()}:
+        cfg.codex_model = _ask_value(
+            "Domyślny model Codeksa (dziedziczą role z agentem=codex bez własnego modelu)",
+            cfg.codex_model, display_default=cfg.codex_model or "z config.toml",
+        )
+        cfg.codex_effort = _ask_effort(
+            "Domyślny effort Codeksa", cfg.codex_effort, CODEX_EFFORTS
+        )
     print()
 
 
@@ -680,22 +764,199 @@ def _verify_protected_globs(project: str, cfg: Config, state: State) -> list[str
 
 _MIN_JUSTIFIED_WHY = 20  # znaków — "bo tak" nie jest uzasadnieniem
 
+# Nagłówki sekcji kryteriów (poziom 2): prefiks, nie exact — planista bywa
+# dopisywał „(MVP)", „— TDD" itd.
+_CHECKBOX_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.*)$")
+# Markery refaktoru: unikamy gołego „bez nowych testów …wydajnościowych".
+# „bez nowych testów" tylko gdy zaraz koniec / interpunkcja / „ani …".
+_REFACTOR_MARKER_RE = re.compile(
+    r"(?:zadanie\s+refaktoryzacyjne|"
+    r"nie\s+dodaje\s+nowych\s+testów|"
+    r"bez\s+nowych\s+testów(?=\s*(?:ani\b|[.;:]|$)))",
+    re.IGNORECASE,
+)
+
+
+def _is_criteria_header(title: str) -> bool:
+    """Czy nagłówek ## to sekcja kryteriów (z ewentualnym dopiskiem)."""
+    t = (title or "").strip().casefold()
+    if not t:
+        return False
+    if t.startswith("kryteria akceptacji") or t.startswith("acceptance criteria"):
+        return True
+    # Samo „Kryteria" / „Kryteria:” — bez „Kryteria jakości kodu" w Celu.
+    if t == "kryteria" or t.startswith("kryteria ") or t.startswith("kryteria:"):
+        return True
+    return False
+
+
+def parse_task_criteria(markdown: str) -> list[str]:
+    """Wyciągnij teksty checkboxów z sekcji Kryteria akceptacji pliku zadania.
+
+    Wieloliniowe i zagnieżdżone bulletu bez ``[ ]`` doklejane są do bieżącego
+    kryterium. Checkboxy poza sekcją są ignorowane."""
+    if not markdown:
+        return []
+    lines = markdown.splitlines()
+    in_section = False
+    criteria: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            text = " ".join(" ".join(current).split())
+            if text:
+                criteria.append(text)
+        current = []
+
+    for line in lines:
+        heading = re.match(r"^##\s+(.+?)\s*$", line)
+        if heading:
+            title = heading.group(1).strip()
+            if _is_criteria_header(title):
+                flush()
+                in_section = True
+                continue
+            if in_section:
+                flush()
+                in_section = False
+            continue
+        if not in_section:
+            continue
+        m = _CHECKBOX_RE.match(line)
+        if m:
+            flush()
+            current = [m.group(2).strip()]
+            continue
+        if current and line.strip():
+            current.append(line.strip())
+    flush()
+    return criteria
+
+
+def resolve_task_criteria(project: str, task: dict) -> tuple[list[str], str]:
+    """Kanon kryteriów: plik zadania > JSON planisty > empty.
+
+    Zwraca ``(criteria, source)`` gdzie source ∈
+    ``file`` | ``planner_fallback`` | ``empty``."""
+    rel = (task or {}).get("file", "") or ""
+    body = ""
+    if rel:
+        path = os.path.join(project, rel)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                body = f.read()
+        except OSError:
+            body = ""
+    file_crit = parse_task_criteria(body) if body else []
+    json_crit = [c for c in ((task or {}).get("criteria") or []) if str(c).strip()]
+    if file_crit:
+        if json_crit:
+            fn = {_norm_criterion(c) for c in file_crit}
+            jn = {_norm_criterion(c) for c in json_crit}
+            if fn != jn:
+                log("TASK: kryteria JSON ≠ plik — używam pliku")
+        return file_crit, "file"
+    if json_crit:
+        log("TASK: brak checkboxów w pliku — fallback na criteria JSON planisty")
+        return list(json_crit), "planner_fallback"
+    return [], "empty"
+
+
+def is_refactor_task(task: dict, body: str = "") -> bool:
+    """Czy zadanie jest refaktoryzacyjne (kind lub markery w criteria/body).
+
+    Markery są wąskie (regex), żeby „bez nowych testów wydajnościowych"
+    w Poza zakresem nie włączało ścieżki refactor."""
+    if (task or {}).get("kind") == "refactor":
+        return True
+    parts = [body or ""]
+    for c in (task or {}).get("criteria") or []:
+        parts.append(str(c))
+    blob = " ".join(parts)
+    return bool(_REFACTOR_MARKER_RE.search(blob))
+
+
+def build_task_from_plan(project: str, raw: dict) -> dict:
+    """Zbuduj element kolejki z JSON planisty: kind, resolve criteria, globs."""
+    rel = raw.get("file", "")
+    task = {
+        "id": raw.get("id") or os.path.splitext(os.path.basename(rel))[0],
+        "title": raw.get("title", "(zadanie)"),
+        "file": rel,
+        "criteria": list(raw.get("criteria") or []),
+        "test_globs": list(raw.get("test_globs") or []),
+        "code_globs": list(raw.get("code_globs") or []),
+        "fixes": str(raw.get("fixes") or ""),
+        "repro_cmd": str(raw.get("repro_cmd") or ""),
+        "kind": str(raw.get("kind") or ""),
+    }
+    canon, source = resolve_task_criteria(project, task)
+    task["criteria"] = canon
+    task["criteria_source"] = source
+    return task
+
+
+def _strip_pytest_param(seg: str) -> str:
+    """``test_foo[param]`` → ``test_foo`` (parametry pytest na końcu segmentu)."""
+    return re.sub(r"\[[^\]]*\]$", "", seg or "")
+
+
+def _split_test_refs(test_field) -> list[str]:
+    """Pole ``test`` z mapy: string, lista, lub string ze ``;`` / newline."""
+    if test_field is None:
+        return []
+    if isinstance(test_field, list):
+        return [str(x).strip() for x in test_field if str(x).strip()]
+    text = str(test_field).strip()
+    if not text:
+        return []
+    if ";" in text or "\n" in text:
+        parts = re.split(r"[;\n]+", text)
+        return [p.strip() for p in parts if p.strip()]
+    return [text]
+
+
+def _validate_one_test_ref(ref: str, project: str, test_globs: list[str]) -> str | None:
+    """None jeśli OK, inaczej komunikat błędu dla jednego refu path[::name]."""
+    path, _, name = ref.partition("::")
+    path = path.strip().replace("\\", "/")
+    full = os.path.join(project, path)
+    if not os.path.isfile(full):
+        return f"'{ref}': plik {path} nie istnieje w projekcie"
+    if not _is_test_path(path, test_globs):
+        return f"'{ref}': {path} nie jest ścieżką testową zadania"
+    name = name.strip()
+    if not name:
+        return None
+    try:
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        content = ""
+    missing = []
+    for seg in name.split("::"):
+        if not seg:
+            continue
+        bare = _strip_pytest_param(seg)
+        if bare and bare not in content:
+            missing.append(seg)
+    if missing:
+        return f"'{ref}': nazwa '{name}' nie występuje w {path}"
+    return None
+
 
 def validate_criteria_map(criteria: list[str], criteria_map: list[dict],
                           project: str, test_globs: list[str]) -> list[str]:
-    """Walidacja mapy kryterium→test przy DONE (PLAN-4, Z2). Zwraca listę
-    powodów odrzucenia (pusta = mapa przyjęta) — powody wracają do testera
-    w kolejnym prompcie, żeby bounded-retry nie palił cykli na zgadywanie.
+    """Walidacja mapy kryterium→test przy DONE (PLAN-4 Z2 + PLAN-5).
 
-    Koniec samocertyfikacji: "covered" musi wskazywać ISTNIEJĄCY plik będący
-    ścieżką testową zadania, a segmenty nazwy po "::" muszą występować w jego
-    treści (node id pytest/unittest bywa dwuczłonowy: "Klasa::metoda" — cały
-    ogon nigdy nie występuje jako jeden literał, bo plik ma "class Klasa" i
-    "def metoda" osobno; sprawdzamy więc każdy człon z osobna);
-    "justified" wymaga merytorycznego "why" (wpisy justified nie znikają —
-    wołający przekazuje je recenzentowi do rozstrzygnięcia). Odhaczamy
-    kryteria z listy zadania, nie liczymy wpisów mapy — duplikaty i wpisy
-    o zmyślonych kryteriach nie zastępują brakującego pokrycia."""
+    Pusty kanon kryteriów → zawsze błąd (DONE niemożliwe).
+    ``test``: string, lista refów, lub string ze średnikami (PLAN-5).
+    Segmenty nazwy: strip parametrów pytest ``[…]`` przed szukaniem w pliku.
+    """
+    if not criteria:
+        return ["brak kryteriów akceptacji w zadaniu (kanon pusty)"]
     errors: list[str] = []
     satisfied: set[str] = set()
     for entry in criteria_map:
@@ -704,34 +965,19 @@ def validate_criteria_map(criteria: list[str], criteria_map: list[dict],
         crit_norm = _norm_criterion(entry.get("criterion", ""))
         status = entry.get("status")
         if status == "covered":
-            ref = str(entry.get("test") or "").strip()
-            if not ref:
+            refs = _split_test_refs(entry.get("test"))
+            if not refs:
                 errors.append(f"kryterium {entry.get('criterion', '?')!r}: "
                               "'covered' bez pola 'test'")
                 continue
-            path, _, name = ref.partition("::")
-            path = path.strip().replace("\\", "/")
-            full = os.path.join(project, path)
-            if not os.path.isfile(full):
-                errors.append(f"'{ref}': plik {path} nie istnieje w projekcie")
-                continue
-            if not _is_test_path(path, test_globs):
-                errors.append(f"'{ref}': {path} nie jest ścieżką testową zadania")
-                continue
-            name = name.strip()
-            if name:
-                try:
-                    with open(full, "r", encoding="utf-8", errors="replace") as f:
-                        content = f.read()
-                except OSError:
-                    content = ""
-                # Każdy segment osobno ("Klasa::metoda" → "Klasa" i "metoda"),
-                # nie cały ogon jako jeden literał — patrz komentarz funkcji.
-                missing = [seg for seg in name.split("::") if seg and seg not in content]
-                if missing:
-                    errors.append(f"'{ref}': nazwa '{name}' nie występuje w {path}")
-                    continue
-            satisfied.add(crit_norm)
+            ref_ok = True
+            for ref in refs:
+                err = _validate_one_test_ref(ref, project, test_globs)
+                if err:
+                    errors.append(err)
+                    ref_ok = False
+            if ref_ok:
+                satisfied.add(crit_norm)
         elif status == "justified":
             why = str(entry.get("why") or "").strip()
             if len(why) < _MIN_JUSTIFIED_WHY:
@@ -742,7 +988,8 @@ def validate_criteria_map(criteria: list[str], criteria_map: list[dict],
             satisfied.add(crit_norm)
     for c in criteria:
         if _norm_criterion(c) and _norm_criterion(c) not in satisfied:
-            errors.append(f"kryterium bez ważnego pokrycia/uzasadnienia: {c!r}")
+            short = c if len(c) <= 60 else c[:57] + "…"
+            errors.append(f"kryterium bez ważnego pokrycia/uzasadnienia: {short!r}")
     return errors
 
 
@@ -1072,16 +1319,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     for t in (data.get("tasks") or []):
         rel = t.get("file", "")
         if rel and os.path.exists(os.path.join(project, rel)):
-            tasks.append({
-                "id": t.get("id") or os.path.splitext(os.path.basename(rel))[0],
-                "title": t.get("title", "(zadanie)"), "file": rel,
-                "criteria": t.get("criteria") or [],
-                "test_globs": t.get("test_globs") or [],
-                "code_globs": t.get("code_globs") or [],
-                # Zadania naprawcze weryfikacji (PLAN-3): id problemu + bramka repro.
-                "fixes": str(t.get("fixes") or ""),
-                "repro_cmd": str(t.get("repro_cmd") or ""),
-            })
+            tasks.append(build_task_from_plan(project, t))
         else:
             log(f"PLAN: pomijam zadanie bez pliku na dysku: {t.get('id') or rel!r}")
     state.task_queue = tasks
@@ -1105,6 +1343,9 @@ def _write_current_task_pointer(project: str, task: dict) -> None:
 
 def _start_task(cfg: Config, project: str, state: State) -> None:
     task = state.task_queue.pop(0)
+    canon, source = resolve_task_criteria(project, task)
+    task["criteria"] = canon
+    task["criteria_source"] = source
     state.current_task = task
     state.current_task_title = task.get("title", "(zadanie)")
     state.task_start_tag = f"forge/{task.get('id', 'task')}-start"
@@ -1119,10 +1360,23 @@ def _start_task(cfg: Config, project: str, state: State) -> None:
     state.repro_runs = 0
     state.review_notes = []
     state.fix_attempt = 0
+    state.done_reject_count = 0
+    state.fail_reason = ""
+    state.escalation_notes = []
+    state.escalation_map_errors = []
+    state.done_escalated = False
     state.phase = "micro"
     _write_current_task_pointer(project, task)
     journal_reset(project, cfg, state.current_task_title)
-    log(f"START zadania: {state.current_task_title} (tag {state.task_start_tag})")
+    log(f"START zadania: {state.current_task_title} (tag {state.task_start_tag}; "
+        f"criteria_source={source}, n={len(canon)})")
+    if source == "empty":
+        log("UWAGA: brak kryteriów akceptacji (plik bez checkboxów i pusty JSON).")
+        if cfg.fail_on_empty_criteria:
+            state.fail_reason = (
+                "done_map: brak kryteriów akceptacji na starcie zadania "
+                "(kanon pusty)")
+            state.fail_immediate = True
 
 
 def _clear_task(state: State) -> None:
@@ -1143,6 +1397,12 @@ def _clear_task(state: State) -> None:
     state.tests_green = False
     state.done_reject_reasons = []
     state.justified_criteria = []
+    state.done_reject_count = 0
+    state.fail_reason = ""
+    state.fail_immediate = False
+    state.escalation_notes = []
+    state.escalation_map_errors = []
+    state.done_escalated = False
 
 
 def _task_gate(cfg: Config, project: str, state: State) -> tuple[bool, str]:
@@ -1168,16 +1428,66 @@ def _task_gate(cfg: Config, project: str, state: State) -> tuple[bool, str]:
     return True, ""
 
 
+def _apply_done_reject_policy(cfg: Config, project: str, state: State,
+                              map_errors: list[str], canon: list[str], c: int):
+    """Po limicie kolejnych rejectów mapy: escalate | False (fail). None = kontynuuj."""
+    policy = (cfg.done_reject_policy or "review_if_green").strip().lower()
+    if policy == "continue":
+        return None
+    if policy == "fail":
+        state.fail_reason = (
+            f"done_map: DONE odrzucone {state.done_reject_count} razy: "
+            + "; ".join(map_errors)[:300])
+        log(state.fail_reason)
+        return False
+    # review_if_green (default)
+    green, tail = _task_gate(cfg, project, state)
+    if not green:
+        state.fail_reason = (
+            f"done_map: mapa DONE ×{state.done_reject_count} + bramka czerwona: "
+            + (tail or "")[:200])
+        log(state.fail_reason)
+        return False
+    notes = [f"odrzuceń mapy: {state.done_reject_count}"]
+    notes.extend(map_errors[:12])
+    notes.append("KANON kryteriów:")
+    notes.extend(f"- {crit[:100]}" for crit in canon[:20])
+    state.escalation_notes = notes
+    state.escalation_map_errors = list(map_errors)
+    state.done_escalated = True
+    state.justified_criteria = []  # nie udajemy zaakceptowanej mapy
+    journal_append(
+        project, cfg,
+        f"DONE_ESCALATE after {state.done_reject_count} rejects; "
+        f"criteria_source={state.current_task.get('criteria_source', '?')}; gate=green")
+    log(f"ESKALACJA DONE → review (po {state.done_reject_count} rejectach mapy, "
+        "bramka zielona).")
+    state.phase = "review"
+    state.micro_cycle = c
+    save_checkpoint(project, state)
+    return "escalate"
+
+
 def _run_micro_loop(cfg: Config, project: str, state: State, logf):
     """Pętla b/c: tester dyktuje jeden test, koder zazielenia i refaktoryzuje.
 
-    Zwraca: "done" gdy tester orzekł DONE po zielonej bramce; "smell" gdy
-    recenzję wymusił nadmiar 'no_test' (bramka NIE odpalona); False gdy zadanie
-    padło. Rozróżnienie „done" vs „smell" decyduje, czy pętla recenzji może
-    zaufać świeżej zieleni, czy musi sama zgatować drzewo."""
+    Zwraca: "done" gdy tester orzekł DONE po zielonej bramce; "escalate" gdy
+    limit rejectów mapy + policy review_if_green (bramka zmierzona zielona);
+    "smell" gdy recenzję wymusił nadmiar 'no_test' (bramka NIE odpalona);
+    False gdy zadanie padło. ``done``/``escalate`` → gate_green w review."""
+    if state.fail_immediate:
+        return False
     task = state.current_task
     task_file = task.get("file", "")
     test_globs = task.get("test_globs") or []
+    task_body = ""
+    try:
+        with open(os.path.join(project, task_file), "r", encoding="utf-8",
+                  errors="replace") as f:
+            task_body = f.read()
+    except OSError:
+        pass
+    refactor = is_refactor_task(task, task_body)
 
     def gate() -> tuple[bool, str]:
         return run_gate(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
@@ -1185,6 +1495,9 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
     while True:
         if state.micro_cycle >= cfg.max_micro_cycles:
             log(f"Limit mikro-cykli ({cfg.max_micro_cycles}) — zadanie nieukończone.")
+            state.fail_reason = (
+                state.fail_reason
+                or f"micro_cap: mikro-TDD nieukończone (cykli={state.micro_cycle})")
             return False
         c = state.micro_cycle + 1
 
@@ -1193,7 +1506,8 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
             out = _session_call(cfg, project, state, "tester",
                                 prompts.write_test_prompt(
                                     task_file, state.test_cmd,
-                                    reject_reasons=state.done_reject_reasons),
+                                    reject_reasons=state.done_reject_reasons,
+                                    refactor=refactor),
                                 logf(f"c{c:02d}-test"))
             verdict = extract_json(out) or {"action": "no_test", "reason": "brak werdyktu JSON"}
             state.done_reject_reasons = []  # skonsumowane w prompcie powyżej
@@ -1203,15 +1517,31 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                            f"({verdict.get('about') or verdict.get('reason') or ''})".rstrip())
 
             if action == "done":
+                # Odśwież kanon z dysku (PLAN-5: plik > JSON).
+                canon, source = resolve_task_criteria(project, task)
+                task["criteria"] = canon
+                task["criteria_source"] = source
+                state.current_task = task
                 map_errors = validate_criteria_map(
-                    task.get("criteria") or [], verdict.get("criteria_map") or [],
+                    canon, verdict.get("criteria_map") or [],
                     project, test_globs)
                 if map_errors:
+                    state.done_reject_count += 1
                     log("DONE odrzucony: " + "; ".join(map_errors)[:400]
-                        + " — kolejny cykl.")
+                        + f" — k={state.done_reject_count}.")
                     state.done_reject_reasons = map_errors
                     state.micro_cycle = c  # zużyj cykl, by nie zapętlić w nieskończoność
                     state.micro_sub = "test"
+                    journal_append(
+                        project, cfg,
+                        f"cykl {c}, tester: done ODRZUCONY "
+                        f"(k={state.done_reject_count}): "
+                        + "; ".join(map_errors)[:200])
+                    if state.done_reject_count >= cfg.max_done_rejects:
+                        outcome = _apply_done_reject_policy(
+                            cfg, project, state, map_errors, canon, c)
+                        if outcome is not None:
+                            return outcome
                     save_checkpoint(project, state)
                     continue
                 # Kryteria "justified" przeszły walidację formy — merytorykę
@@ -1221,6 +1551,10 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                     for e in (verdict.get("criteria_map") or [])
                     if isinstance(e, dict) and e.get("status") == "justified"]
                 state.done_reject_reasons = []
+                state.done_reject_count = 0
+                state.done_escalated = False
+                state.escalation_notes = []
+                state.escalation_map_errors = []
                 green, _ = _task_gate(cfg, project, state)
                 if not green:
                     log("DONE zgłoszony przy CZERWONEJ bramce — naprawa kodem.")
@@ -1233,6 +1567,9 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                 state.phase = "review"
                 save_checkpoint(project, state)
                 return "done"
+
+            if action == "wrote_test":
+                state.done_reject_count = 0
 
             if action == "no_test":
                 if task.get("repro_cmd"):
@@ -1319,6 +1656,9 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                        f"({verdict.get('notes') or ''})".rstrip())
         if not green:
             log("Koder nie zazielenił bramki w limicie prób — porażka zadania.")
+            state.fail_reason = (
+                f"coder_red: koder nie zazielenił bramki "
+                f"(cykl {c}, próby={cfg.max_green_retries + 1})")
             return False
 
         declared = [tc.get("file", "") for tc in (verdict.get("test_changes") or [])
@@ -1334,6 +1674,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
             green, _ = _task_gate(cfg, project, state)
             if not green:
                 log("Po wycofaniu niedozwolonych zmian testów bramka czerwona — porażka.")
+                state.fail_reason = "coder_red: po wycofaniu niedozwolonych zmian testów bramka czerwona"
                 return False
 
         protected = _verify_protected_globs(project, cfg, state)
@@ -1349,6 +1690,9 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                 green, _ = _task_gate(cfg, project, state)
                 if not green:
                     log("Po wycofaniu zmian w plikach weryfikacji bramka czerwona — porażka.")
+                    state.fail_reason = (
+                        "coder_red: po wycofaniu chronionych ścieżek weryfikacji "
+                        "bramka czerwona")
                     return False
 
         tc_globs = effective_toolchain_globs(cfg, state)
@@ -1371,6 +1715,9 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                 green, _ = _task_gate(cfg, project, state)
                 if not green:
                     log("Po wycofaniu zmian toolchainu bramka czerwona — porażka.")
+                    state.fail_reason = (
+                        "coder_red: po wycofaniu niedozwolonego toolchainu "
+                        "bramka czerwona")
                     return False
 
         # Anty-osłabianie v2: zbiór wejściowy MECHANICZNIE z diffu (deklaracja
@@ -1396,6 +1743,9 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
             green, _ = _task_gate(cfg, project, state)
             if not green:
                 log("Po przywróceniu testów/toolchainu bramka czerwona — porażka zadania.")
+                state.fail_reason = (
+                    "coder_red: po przywróceniu testów/toolchainu (anty-osłabianie) "
+                    "bramka czerwona")
                 return False
 
         final_changed = changed_files(project, "HEAD", runtime_dir=cfg.runtime_dir,
@@ -1407,6 +1757,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
         state.micro_sub = "test"
         state.cycle_test_files = []
         state.pending_no_test = False
+        state.done_reject_count = 0  # udany code-cycle — seria rejectów mapy przerwana
         if cfg.session_rotate_cycles and c % cfg.session_rotate_cycles == 0:
             log(f"Rotacja sesji ról po cyklu {c} — świeży kontekst z dziennikiem "
                 "(higiena kontekstu).")
@@ -1493,13 +1844,22 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
         # znikają z .forge/usage.jsonl. session_id=None za każdym razem i
         # zwrócone id ŚWIADOMIE odrzucane — recenzent nigdy nie dziedziczy
         # pamięci poprzedniej rundy (fresh-context, PLAN-4 Z2).
+        escalation = None
+        if state.done_escalated:
+            escalation = {
+                "reject_count": state.done_reject_count,
+                "map_errors": list(state.escalation_map_errors
+                                  or state.done_reject_reasons or []),
+                "criteria": list((state.current_task or {}).get("criteria") or []),
+            }
         out, _reviewer_sid = run_agent_session(
             agent,
             prompts.review_task_prompt(
                 task_file, state.test_cmd,
                 start_tag=state.task_start_tag,
                 changed=changed, toolchain_changes=toolchain_changed,
-                justified=state.justified_criteria),
+                justified=state.justified_criteria,
+                escalation=escalation),
             cfg, project, logf(f"review-r{state.fix_attempt}"),
             session_id=None, model=model, effort=effort)
         review = extract_json(out) or {"verdict": "changes", "notes": ["Brak werdyktu JSON."]}
@@ -1534,10 +1894,35 @@ def _fail_task(cfg: Config, project: str, state: State, n: int, reason: str) -> 
     detail = reason
     if state.review_notes:
         detail += " | uwagi: " + "; ".join(state.review_notes[:5])
-    log(f"NIEPOWODZENIE zadania '{title}': {detail}")
-    record_failure(project, cfg, state, title, detail)
+    metrics = (f" cykli={state.micro_cycle} done_reject={state.done_reject_count} "
+               f"sub={state.micro_sub} "
+               f"criteria_source={state.current_task.get('criteria_source', '?')}")
+    log(f"NIEPOWODZENIE zadania '{title}': {detail}{metrics}")
+    # PLAN-5: zachowaj HEAD (i residual WIP) na branchu przed rollbackiem.
+    failed_ref = ""
+    short_sha = ""
+    task_id = (state.current_task or {}).get("id") or "task"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(task_id)).strip("-") or "task"
+    if cfg.keep_failed_ref:
+        try:
+            if has_changes(project):
+                commit_all(project, f"wip: failed {title}")
+            branch = f"forge/failed/{slug}"
+            git(project, "branch", "-f", branch, "HEAD", check=False)
+            failed_ref = branch
+            short_sha = git(project, "rev-parse", "--short", "HEAD",
+                            check=False).stdout.strip()
+            log(f"Artefakt porażki: {branch} @ {short_sha}")
+        except Exception as exc:  # best-effort — fail task i tak idzie dalej
+            log(f"Nie udało się zapisać forge/failed/*: {exc}")
+    fail_line = detail
+    if failed_ref:
+        fail_line = f"{detail} | ref={failed_ref} sha={short_sha}"
+    # Najpierw reset: `git clean -fd` usunąłby nieignorowane `.forge/` jeśli
+    # failures.md zapisalibyśmy przed clean (testy bez ensure_repo/.gitignore).
     _reset_to_tag(project, state.task_start_tag)  # lokalnie — nic nie było pushowane
     _delete_tag(project, state.task_start_tag)
+    record_failure(project, cfg, state, title, fail_line)
     if cfg.replan_on_failure and state.task_queue:
         # Wsad był planowany przy założeniu sukcesu tego zadania — porażka
         # falsyfikuje wejście zadań następnych (PLAN-4, Z3). Planista
@@ -1841,22 +2226,25 @@ def _task_iteration(cfg: Config, project: str, state: State) -> bool:
     else:
         log(f"WZNAWIAM fazę '{state.phase}': {state.current_task_title}")
 
-    fresh_from_done = False
+    fresh_gate = False
     if state.phase == "micro":
         outcome = _run_micro_loop(cfg, project, state, logf)
         if not outcome:
-            _fail_task(cfg, project, state, n, f"mikro-TDD nieukończone (cykli={state.micro_cycle})")
+            reason = (state.fail_reason
+                      or f"micro_cap: mikro-TDD nieukończone (cykli={state.micro_cycle})")
+            state.fail_reason = ""
+            _fail_task(cfg, project, state, n, reason)
             return True
-        # Świeżą, zieloną bramkę mamy TYLKO gdy tester orzekł DONE (uruchomił ją
-        # tuż przed wyjściem). Wymuszona recenzja przez smell no_test nie gatowała
-        # drzewa — niech pętla recenzji zrobi to sama.
-        fresh_from_done = (outcome == "done")
+        # Świeża zieleń bramki: zaakceptowane DONE albo eskalacja po limicie mapy
+        # (gate zmierzona w policy). Smell no_test nie gatował drzewa.
+        fresh_gate = outcome in {"done", "escalate"}
 
     if state.phase in {"review", "fix_review"}:
-        if _run_review_loop(cfg, project, state, logf, gate_green=fresh_from_done):
+        if _run_review_loop(cfg, project, state, logf, gate_green=fresh_gate):
             _finish_task(cfg, project, state, n)
         else:
-            _fail_task(cfg, project, state, n, "recenzja nie zaakceptowała / bramka czerwona")
+            _fail_task(cfg, project, state, n,
+                       "review: recenzja nie zaakceptowała / bramka czerwona")
     return True
 
 
@@ -1998,8 +2386,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Effort waliduj tylko dla wbudowanych agentów o znanym zbiorze poziomów;
     # dla generycznego CLI effort to dowolny string przekazywany przez szablon.
-    allowed_planner_efforts = {"claude": CLAUDE_EFFORTS, "codex": CODEX_EFFORTS}.get(
-        adapters.canonical_agent(cfg.planner_agent))
+    allowed_planner_efforts = KNOWN_AGENT_EFFORTS.get(adapters.canonical_agent(cfg.planner_agent))
     if allowed_planner_efforts and cfg.planner_effort not in allowed_planner_efforts:
         ap.error(f"effort {cfg.planner_effort!r} nie jest obsługiwany przez {cfg.planner_agent}")
 

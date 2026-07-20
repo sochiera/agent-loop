@@ -151,6 +151,18 @@ class Config:
     # założeniu sukcesu) — planista przeplanowuje z failures.md.
     replan_on_failure: bool = os.environ.get("FORGE_REPLAN_ON_FAILURE", "1") != "0"
 
+    # --- PLAN-5: bramka DONE / kanon kryteriów / failed-ref -------------------
+    # Po tylu kolejnych odrzuceniach mapy kryteriów przy DONE — eskalacja
+    # (policy), zamiast palić cały max_micro_cycles na poprawianie JSON-a.
+    max_done_rejects: int = int(os.environ.get("FORGE_MAX_DONE_REJECTS", "3"))
+    # review_if_green | fail | continue — patrz docs/PLAN-5-DONE-KRYTERIA-I-PĘTLE.md.
+    done_reject_policy: str = os.environ.get(
+        "FORGE_DONE_REJECT_POLICY", "review_if_green").strip().lower() or "review_if_green"
+    # Przed rollbackiem przy porażce: branch forge/failed/<id> na HEAD (+ residual commit).
+    keep_failed_ref: bool = os.environ.get("FORGE_KEEP_FAILED_REF", "1") != "0"
+    # Fail zadania już na starcie, gdy nie ma kryteriów w pliku ani w JSON planisty.
+    fail_on_empty_criteria: bool = os.environ.get("FORGE_FAIL_ON_EMPTY_CRITERIA", "0") == "1"
+
     def effective_verify_targets(self, declared: list[str]) -> list[str]:
         """Targety po nadpisaniu użytkownika ("" = deklaracja bootstrapu)."""
         override = self.verify_targets_override.strip().lower()
