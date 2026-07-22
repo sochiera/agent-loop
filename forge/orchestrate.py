@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import difflib
 import json
 import os
 import re
@@ -1290,6 +1291,121 @@ def _verify_feedback_path(project: str, cfg: Config, state: State) -> str:
     return path if os.path.exists(path) else ""
 
 
+_BRIEF_NOTICE_CHAR_CAP = 4000  # jak design_compact_notice — prompt tani tokenowo
+
+
+def _read_brief(cfg: Config) -> str | None:
+    if not cfg.brief_path or not os.path.exists(cfg.brief_path):
+        return None
+    with open(cfg.brief_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _brief_snapshot_paths(project: str, cfg: Config) -> tuple[str, str]:
+    """Dwa pliki: treść ostatnio uzgodnionego briefu + ścieżka źródłowa, z
+    której pochodzi (żeby zmiana --brief/CWD między uruchomieniami nie
+    porównała ze sobą dwóch niepowiązanych dokumentów)."""
+    base = os.path.join(project, cfg.runtime_dir, "brief.snapshot")
+    return base + ".md", base + ".path"
+
+
+def _previous_brief_snapshot(project: str, cfg: Config) -> str | None:
+    content_path, path_path = _brief_snapshot_paths(project, cfg)
+    if not os.path.exists(content_path) or not os.path.exists(path_path):
+        return None
+    with open(path_path, "r", encoding="utf-8") as f:
+        recorded_path = f.read().strip()
+    if recorded_path != os.path.abspath(cfg.brief_path):
+        return None  # inny plik źródłowy — traktuj jak pierwszą synchronizację
+    with open(content_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _save_brief_snapshot(cfg: Config, project: str, current: str) -> None:
+    """Zapisz DOKŁADNIE tekst pokazany planiście — nie odczytuj pliku ponownie
+    z dysku (mógł się zmienić w trakcie długiego run_planner; TOCTOU)."""
+    content_path, path_path = _brief_snapshot_paths(project, cfg)
+    os.makedirs(os.path.dirname(content_path), exist_ok=True)
+    with open(content_path, "w", encoding="utf-8") as f:
+        f.write(current)
+    with open(path_path, "w", encoding="utf-8") as f:
+        f.write(os.path.abspath(cfg.brief_path))
+
+
+def _cap_notice_text(text: str) -> str:
+    if len(text) <= _BRIEF_NOTICE_CHAR_CAP:
+        return text
+    overflow = len(text) - _BRIEF_NOTICE_CHAR_CAP
+    return (text[:_BRIEF_NOTICE_CHAR_CAP]
+            + f"\n… [obcięto {overflow} znaków — pełna treść w pliku briefu na dysku]")
+
+
+def _brief_amendment_notice(cfg: Config, project: str, current: str, *, stalls: int = 0) -> str:
+    """Notatka dryfu briefu dla planu wsadowego: brief bywa dopisywany/zmieniany
+    długo po bootstrapie (jedynym miejscu, gdzie był dotąd czytany), więc taka
+    zmiana inaczej nigdy nie dotrze do planisty. Snapshot żyje w .forge/ (nie
+    w STATE.json) — funkcja jest w pełni addytywna, stare projekty bez śladu
+    poprzedniej synchronizacji dostają pełny brief przy najbliższym planowaniu.
+
+    ``current`` jest przekazywany przez wołającego (odczytany RAZ na początku
+    fazy planowania), nie czytany tu ponownie — inaczej zmiana pliku w trakcie
+    run_planner mogłaby zostać po cichu oznaczona jako 'uzgodniona', mimo że
+    planista jej nie widział. ``stalls`` eskaluje ton, gdy poprzednie wsady
+    nie zwróciły niczego, co dałoby się zapisać jako uzgodnione (patrz
+    _update_brief_amend_stalls) — bez tego nagabywanie byłoby bezzębne."""
+    escalation = ""
+    if stalls > 0:
+        escalation = (
+            f"\nTO JUŻ {stalls}. WSAD BEZ REAKCJI na tę zmianę briefu — TYM RAZEM "
+            "zadanie ją uwzględniające MUSI się znaleźć w tej kolejce.\n"
+        )
+    prev = _previous_brief_snapshot(project, cfg)
+    if prev is None:
+        return (
+            "BRIEF ŚLEDZONY PIERWSZY RAZ — poniżej pełna treść pliku briefu "
+            f"({cfg.brief_path}). Skonfrontuj z docs/DESIGN.md i BACKLOG.md: to, "
+            "co już zrealizowane, zostaw bez zmian; nowe lub zmienione wymagania "
+            "i priorytety wpisz jako zadania na czoło kolejki — jeśli unieważniają "
+            "zaplanowane, nieukończone pozycje BACKLOG.md, jawnie je "
+            f"wstrzymaj/usuń zamiast po cichu pomijać.\n{escalation}\n"
+            f"--- BRIEF ---\n{_cap_notice_text(current)}"
+        )
+    if prev == current:
+        return ""
+    diff = "\n".join(difflib.unified_diff(
+        prev.splitlines(), current.splitlines(),
+        fromfile="brief (poprzednio uzgodniony)", tofile="brief (teraz)", lineterm=""))
+    return (
+        "BRIEF ZMIENIŁ SIĘ od ostatniego uzgodnienia — to rozkaz zmiany "
+        "zakresu/priorytetów, nie sugestia. Zaktualizuj docs/DESIGN.md i "
+        "BACKLOG.md zgodnie z różnicą poniżej; jeśli unieważnia to zaplanowane, "
+        "nieukończone pozycje BACKLOG.md, jawnie je wstrzymaj/usuń zamiast po "
+        f"cichu ignorować.\n{escalation}\n"
+        f"--- DIFF BRIEFU (unified) ---\n{_cap_notice_text(diff)}"
+    )
+
+
+def _update_brief_amend_stalls(state: State, cfg: Config, project: str, brief_delta: str,
+                               current_brief: str | None, tasks: list[dict], data: dict) -> None:
+    """Zapisz snapshot TYLKO gdy planista faktycznie zwrócił używalny wsad
+    (zadania albo jawne no_more_tasks) — inaczej zepsuty JSON planisty cicho
+    'skonsumowałby' zmianę briefu bez żadnego realnego uzgodnienia (review,
+    znalezisko #1). ``brief_delta`` puste = notatki nie było w tym wsadzie —
+    nic do śledzenia."""
+    if not brief_delta:
+        return
+    engaged = bool(tasks) or bool(data.get("no_more_tasks"))
+    if engaged:
+        _save_brief_snapshot(cfg, project, current_brief or "")
+        if state.brief_amend_stalls:
+            log("PLAN: zmiana briefu w końcu uwzględniona — reset licznika ignorowań.")
+        state.brief_amend_stalls = 0
+    else:
+        state.brief_amend_stalls += 1
+        log(f"PLAN: planista NIE zwrócił używalnego wsadu mimo zmiany briefu "
+            f"({state.brief_amend_stalls}. raz z rzędu) — notatka wróci w kolejnym wsadzie.")
+
+
 def _design_compact_notice(cfg: Config, project: str, state: State) -> str:
     """Notatka kompaktowania DESIGN.md dla planu wsadowego, gdy plik przerósł
     Config.design_compact_bytes (0 = wyłączone). Kryteria otwartych design_gap
@@ -1341,6 +1457,12 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     if feedback_path:
         log(f"PLAN: przekazuję feedback weryfikacji: {feedback_path}")
     design_compact = _design_compact_notice(cfg, project, state)
+    current_brief = _read_brief(cfg)
+    brief_delta = (_brief_amendment_notice(cfg, project, current_brief,
+                                           stalls=state.brief_amend_stalls)
+                  if current_brief is not None else "")
+    if brief_delta:
+        log("PLAN: brief zmienił się od ostatniego uzgodnienia — przekazuję różnicę planiście.")
     ci_warning = ""
     if (cfg.ci_early_warn and state.ci_status_cmd
             and "ci" in _active_verify_targets(cfg, state)):
@@ -1357,7 +1479,8 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     out = run_planner(prompts.plan_batch_prompt(cfg.batch_size, start, state.project_kind,
                                                 verify_feedback_path=feedback_path,
                                                 ci_warning=ci_warning,
-                                                design_compact=design_compact),
+                                                design_compact=design_compact,
+                                                brief_delta=brief_delta),
                       cfg, project, logf("plan"))
     commit_all(project, "docs: plan wsadowy i backlog", cfg)  # pliki zadań, docs, backlog
     data = extract_json(out) or {}
@@ -1371,6 +1494,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     state.task_queue = tasks
     log(f"PLAN: kolejka {len(tasks)} zadań.")
     _update_design_compact_stalls(state, design_compact, tasks)
+    _update_brief_amend_stalls(state, cfg, project, brief_delta, current_brief, tasks, data)
     return {"no_more_tasks": bool(data.get("no_more_tasks")) and not tasks}
 
 

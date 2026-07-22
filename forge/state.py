@@ -115,6 +115,13 @@ class State:
     # zadania "kind": "refactor" w odpowiedzi na notatkę (patrz orchestrate).
     design_compact_stalls: int = 0
 
+    # Ile kolejnych wsadów planista nie zwrócił używalnego wyniku (żadnych
+    # zadań ani no_more_tasks) mimo pokazanej zmiany briefu — bez tego
+    # licznika snapshot briefu i tak zapisałby się na ślepo po zepsutym
+    # JSON-ie planisty, cicho gubiąc wymaganie na zawsze (review). Reset przy
+    # wsadzie, który faktycznie coś zwrócił (patrz orchestrate).
+    brief_amend_stalls: int = 0
+
     @classmethod
     def load(cls, path: str) -> "State":
         if os.path.exists(path):

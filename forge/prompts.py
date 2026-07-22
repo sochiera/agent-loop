@@ -269,7 +269,7 @@ DODATKOWE zadanie `"kind": "refactor"` kompaktujące DESIGN.md do stanu obecnego
 
 def plan_batch_prompt(batch_size: int, start_index: int, kind: str = "app",
                       verify_feedback_path: str = "", ci_warning: str = "",
-                      design_compact: str = "") -> str:
+                      design_compact: str = "", brief_delta: str = "") -> str:
     feedback = ""
     if verify_feedback_path:
         feedback = f"""
@@ -283,6 +283,7 @@ starcie, zielony na koniec. Plików workflow CI i skryptów weryfikacji wolno
 dotykać wyłącznie w zadaniu naprawiającym problem klasy verify_defect.
 """
     warning = f"\nUWAGA: {ci_warning}\n" if ci_warning else ""
+    brief_block = f"\n{brief_delta}\n" if brief_delta else ""
     fix_note = ('; pola "fixes" i "repro_cmd" TYLKO dla zadań naprawczych'
                 if verify_feedback_path else "")
     fix_fields = (',\n   "fixes": "<id problemu lub pomiń>", '
@@ -295,7 +296,7 @@ to obniża koszt stały planowania na zadanie.
 
 Przeczytaj: docs/DESIGN.md, docs/ARCHITECTURE.md, BACKLOG.md, `git log --oneline -20`
 oraz .forge/failures.md jeśli istnieje (zadania, które padły — rozbij je drobniej).
-{feedback}{warning}{design_compact}
+{feedback}{warning}{design_compact}{brief_block}
 
 Zaplanuj do {batch_size} NASTĘPNYCH zadań w stronę {mvp_phrase(kind)}, każde =
 najmniejszy wartościowy, testowalny przyrost. Oceń też stan kodu: jeśli narósł
