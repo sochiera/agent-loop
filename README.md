@@ -138,16 +138,16 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 | Rozmiar wsadu planowania | `5` | `--batch-size N` lub `FORGE_BATCH_SIZE` |
 | Sufit mikro-cykli/zadanie | `12` | `--max-micro-cycles N` lub `FORGE_MAX_MICRO_CYCLES` |
 | Dogrywki „zazielenienia"/cykl | `2` | `FORGE_MAX_GREEN_RETRIES` |
-| Agent testera | `codex` | `--tester-agent NAZWA` lub `FORGE_TESTER_AGENT` |
-| Agent kodera | `codex` | `--coder-agent NAZWA` lub `FORGE_CODER_AGENT` |
-| Model/effort testera | z `codex_model`/`effort` | `--tester-model/--tester-effort` lub `FORGE_TESTER_*` |
-| Model/effort kodera | z `codex_model`/`effort` | `--coder-model/--coder-effort` lub `FORGE_CODER_*` |
+| Agent testera | `opencode` | `--tester-agent NAZWA` lub `FORGE_TESTER_AGENT` |
+| Agent kodera | `opencode` | `--coder-agent NAZWA` lub `FORGE_CODER_AGENT` |
+| Model/effort testera | `neuralwatt/glm-5.2-short-fast-flex` | `--tester-model/--tester-effort` lub `FORGE_TESTER_*` |
+| Model/effort kodera | `neuralwatt/kimi-k2.7-code-flex` | `--coder-model/--coder-effort` lub `FORGE_CODER_*` |
 | Limit iteracji | bez limitu | `--max-iters 20` |
 | Opóźnienie startu | brak | `--sleep 30s`, `--sleep 5m`, `--sleep 2h` |
 | Timeout agenta | 3600 s | `FORGE_AGENT_TIMEOUT=...` |
 | Push do remote | włączony (`origin`) | `FORGE_GIT_PUSH=0`, `FORGE_GIT_REMOTE=...` |
-| Recenzent zadania | agent testera, ŚWIEŻY kontekst | `--reviewer-agent/model/effort` lub `FORGE_REVIEWER_AGENT/MODEL/EFFORT` |
-| Weryfikator celu | agent planisty | `--verifier-agent/model/effort` lub `FORGE_VERIFIER_AGENT/MODEL/EFFORT` |
+| Recenzent zadania | `opencode` / `neuralwatt/glm-5.2-flex`, ŚWIEŻY kontekst | `--reviewer-agent/model/effort` lub `FORGE_REVIEWER_AGENT/MODEL/EFFORT` |
+| Weryfikator celu | `opencode` / `neuralwatt/qwen3.5-397b` | `--verifier-agent/model/effort` lub `FORGE_VERIFIER_AGENT/MODEL/EFFORT` |
 | Globy toolchainu testów (extra) | heurystyka + deklaracja bootstrapu | `FORGE_TOOLCHAIN_GLOBS` (CSV) |
 | Rotacja sesji ról co K cykli | `6` (0 = wyłączona) | `FORGE_SESSION_ROTATE_CYCLES` |
 | Sufit skrótu dziennika zadania | `8000` znaków | `FORGE_JOURNAL_TAIL_CHARS` |
@@ -197,7 +197,7 @@ naprawdę działa w środowisku docelowym. Szczegóły projektu:
 - **Ochrona przed osłabianiem:** workflow CI, skrypty weryfikacji i testy
   targetowe (`verify_test_globs`) są wycofywane z diffu, chyba że zadanie
   naprawia problem klasy `verify_defect` z rejestru.
-- Pokrętła: `FORGE_VERIFIER_AGENT/MODEL/EFFORT` (domyślnie planista),
+- Pokrętła: `FORGE_VERIFIER_AGENT/MODEL/EFFORT` (domyślnie `opencode`/`neuralwatt/qwen3.5-397b`; pusty agent = rola planisty),
   `FORGE_CI_TIMEOUT` (45 min), `FORGE_VERIFY_TIMEOUT`, `FORGE_FLASH_RETRIES`,
   `FORGE_MAX_REPRO_RUNS`, `FORGE_CI_EARLY_WARN` (ostrzeżenie o czerwonym CI
   przy każdym planowaniu), `FORGE_VERIFIER_MCP_CONFIG` (plik MCP doklejany
@@ -220,9 +220,10 @@ Projekt: `docs/PLAN-4-BRAMKI-I-KONTEKST.md`. W skrócie:
 - **Recenzent ≠ autor.** Recenzja zadania idzie w świeżym kontekście (bez sesji
   testera/kodera i bez dziennika), z kontekstem budowanym przez orkiestrator:
   tag startu zadania, lista zmian, zmiany toolchainu, kryteria `justified` do
-  rozstrzygnięcia. Domyślnie to agent testera; **zalecana dywersyfikacja** —
-  wspólny model to wspólne ślepe punkty, np. `FORGE_REVIEWER_AGENT=claude`
-  przy koderze-Codeksie (decyzja kosztowa).
+  rozstrzygnięcia. Domyślnie `opencode`/`neuralwatt/glm-5.2-flex` (pusty agent
+  spada na agenta testera); **zalecana dywersyfikacja** — wspólny model to
+  wspólne ślepe punkty, np. `FORGE_REVIEWER_AGENT=claude` przy koderze-Codeksie
+  (decyzja kosztowa).
 - **Higiena kontekstu.** Sesje ról rotują co `FORGE_SESSION_ROTATE_CYCLES`
   cykli (świeża sesja startuje z dziennika zadania, wzbogacanego mechanicznie
   o pliki każdego cyklu); porażka zadania czyści resztę wsadu planowania —

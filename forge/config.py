@@ -93,20 +93,20 @@ class Config:
     max_green_retries: int = int(os.environ.get("FORGE_MAX_GREEN_RETRIES", "2"))
     # Agent CLI każdej roli nowego modelu. "claude"/"codex" mają wbudowaną
     # obsługę; dowolna inna nazwa → agent generyczny z FORGE_AGENT_<NAME>_CMD
-    # (patrz adapters.py). Domyślnie tester i koder to codex.
-    tester_agent: str = os.environ.get("FORGE_TESTER_AGENT", "codex")
-    coder_agent: str = os.environ.get("FORGE_CODER_AGENT", "codex")
+    # (patrz adapters.py). Domyślnie tester i koder to opencode (NeuralWatt).
+    tester_agent: str = os.environ.get("FORGE_TESTER_AGENT", "opencode")
+    coder_agent: str = os.environ.get("FORGE_CODER_AGENT", "opencode")
     # Model/effort ról. Puste → agent użyje swojego domyślnego (codex: config.toml).
-    tester_model: str = os.environ.get("FORGE_TESTER_MODEL", "")
+    tester_model: str = os.environ.get("FORGE_TESTER_MODEL", "neuralwatt/glm-5.2-short-fast-flex")
     tester_effort: str = os.environ.get("FORGE_TESTER_EFFORT", "")
-    coder_model: str = os.environ.get("FORGE_CODER_MODEL", "")
+    coder_model: str = os.environ.get("FORGE_CODER_MODEL", "neuralwatt/kimi-k2.7-code-flex")
     coder_effort: str = os.environ.get("FORGE_CODER_EFFORT", "")
 
     # --- Weryfikacja celu (PLAN-3) -------------------------------------------
     # Weryfikator-QA: pusty agent = rola planisty (ocena całości to zadanie
     # mocnego modelu). Jawny agent konfiguruje się jak tester/koder.
-    verifier_agent: str = os.environ.get("FORGE_VERIFIER_AGENT", "")
-    verifier_model: str = os.environ.get("FORGE_VERIFIER_MODEL", "")
+    verifier_agent: str = os.environ.get("FORGE_VERIFIER_AGENT", "opencode")
+    verifier_model: str = os.environ.get("FORGE_VERIFIER_MODEL", "neuralwatt/qwen3.5-397b")
     verifier_effort: str = os.environ.get("FORGE_VERIFIER_EFFORT", "")
     # Nadpisanie targetów z bootstrapu: "" = decyduje bootstrap, "none" =
     # weryfikacja wyłączona, "ci,hardware" = dokładnie te targety.
@@ -136,8 +136,8 @@ class Config:
     toolchain_globs_extra: str = os.environ.get("FORGE_TOOLCHAIN_GLOBS", "")
     # Recenzent zadania: pusty agent = agent testera, ale ZAWSZE świeży
     # kontekst (bez sesji i dziennika) — autor nie recenzuje własnej pracy.
-    reviewer_agent: str = os.environ.get("FORGE_REVIEWER_AGENT", "")
-    reviewer_model: str = os.environ.get("FORGE_REVIEWER_MODEL", "")
+    reviewer_agent: str = os.environ.get("FORGE_REVIEWER_AGENT", "opencode")
+    reviewer_model: str = os.environ.get("FORGE_REVIEWER_MODEL", "neuralwatt/glm-5.2-flex")
     reviewer_effort: str = os.environ.get("FORGE_REVIEWER_EFFORT", "")
     # Rotacja sesji ról co K ukończonych mikro-cykli (0 = wyłączona) —
     # higiena kontekstu: świeża sesja z dziennikiem zamiast spuchniętej.
