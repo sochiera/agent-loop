@@ -53,6 +53,18 @@ KNOWN_AGENT_MODELS: dict[str, tuple[str, ...]] = {
     # xAI Grok Build (docs.x.ai/developers/models, stan: 2026-07) — sprawdź
     # `grok models list` jeśli lista zdążyła się zmienić.
     "grok": ("grok-4.5", "grok-4.3", "grok-build-0.1"),
+    # OpenCode CLI → NeuralWatt (api.neuralwatt.com/v1, stan: 2026-07) —
+    # sprawdź `opencode models neuralwatt`, jeśli katalog dostawcy się zmienił.
+    "opencode": (
+        "neuralwatt/glm-5.2", "neuralwatt/glm-5.2-fast", "neuralwatt/glm-5.2-flex",
+        "neuralwatt/glm-5.2-short", "neuralwatt/glm-5.2-short-fast",
+        "neuralwatt/glm-5.2-short-flex", "neuralwatt/glm-5.2-short-fast-flex",
+        "neuralwatt/kimi-k2.6", "neuralwatt/kimi-k2.6-fast", "neuralwatt/kimi-k2.6-flex",
+        "neuralwatt/kimi-k2.7-code", "neuralwatt/kimi-k2.7-code-flex",
+        "neuralwatt/qwen3.6-35b", "neuralwatt/qwen3.6-35b-fast",
+        "neuralwatt/qwen3.5-397b", "neuralwatt/qwen3.5-397b-fast",
+        "neuralwatt/gemma-4-31b",
+    ),
 }
 PLANNER_AGENTS = ("claude", "codex")
 _DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)([smh]?)$", re.IGNORECASE)
@@ -139,7 +151,7 @@ def _ask_role_settings(cfg: Config, agent_attr: str, model_attr: str, effort_att
     allow_blank_agent: jeśli niepuste, puste pole agenta jest poprawne i oznacza
     dziedziczenie (opisane w tym tekście) — dotyczy recenzenta i weryfikatora."""
     current_agent = getattr(cfg, agent_attr)
-    hint = f"claude/codex/gpt/grok/kiro/inny{', puste = ' + allow_blank_agent if allow_blank_agent else ''}"
+    hint = f"claude/codex/gpt/grok/kiro/opencode/inny{', puste = ' + allow_blank_agent if allow_blank_agent else ''}"
     new_agent = _ask_value(f"Agent {title} ({hint})", current_agent,
                           display_default=current_agent or allow_blank_agent or "codex")
     setattr(cfg, agent_attr, new_agent)
@@ -166,7 +178,7 @@ def prompt_agent_settings(cfg: Config) -> None:
     print("\nKonfiguracja agentów (Enter zachowuje wartość domyślną):")
     previous_agent = cfg.planner_agent
     # Wolny wybór — poza claude/codex dozwolony dowolny agent generyczny.
-    cfg.planner_agent = _ask_value("Agent do planowania (claude/codex/gpt/grok/kiro/inny)",
+    cfg.planner_agent = _ask_value("Agent do planowania (claude/codex/gpt/grok/kiro/opencode/inny)",
                                    cfg.planner_agent)
     canon = adapters.canonical_agent(cfg.planner_agent)
     if cfg.planner_agent != previous_agent:
@@ -2496,13 +2508,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--coder-model", default=None, help="Model agenta-kodera (nowy model).")
     ap.add_argument("--coder-effort", default=None, help="Effort agenta-kodera.")
     ap.add_argument("--reviewer-agent", default=None,
-                    help="Agent recenzenta zadania: claude, codex/gpt, grok, kiro lub "
-                         "dowolny (FORGE_AGENT_<NAME>_CMD). Domyślnie agent testera.")
+                    help="Agent recenzenta zadania: claude, codex/gpt, grok, kiro, opencode "
+                         "lub dowolny (FORGE_AGENT_<NAME>_CMD). Domyślnie agent testera.")
     ap.add_argument("--reviewer-model", default=None, help="Model agenta-recenzenta.")
     ap.add_argument("--reviewer-effort", default=None, help="Effort agenta-recenzenta.")
     ap.add_argument("--verifier-agent", default=None,
-                    help="Agent weryfikatora celu: claude, codex/gpt, grok, kiro lub "
-                         "dowolny (FORGE_AGENT_<NAME>_CMD). Domyślnie agent planisty.")
+                    help="Agent weryfikatora celu: claude, codex/gpt, grok, kiro, opencode "
+                         "lub dowolny (FORGE_AGENT_<NAME>_CMD). Domyślnie agent planisty.")
     ap.add_argument("--verifier-model", default=None, help="Model agenta-weryfikatora.")
     ap.add_argument("--verifier-effort", default=None, help="Effort agenta-weryfikatora.")
     ap.add_argument("--non-interactive", action="store_true",

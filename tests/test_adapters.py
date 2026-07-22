@@ -94,6 +94,28 @@ class GenericSpecTest(unittest.TestCase):
         self.assertIsNotNone(kiro_spec)
         self.assertEqual(adapters.generic_bin(kiro_spec), "kiro-cli")
 
+    def test_opencode_has_known_default_template_without_env(self) -> None:
+        spec = adapters.generic_spec("opencode", {})
+        self.assertIsNotNone(spec)
+        self.assertEqual(adapters.generic_bin(spec), "opencode")
+        # Model NeuralWatt bez --variant (effort pusty) — flaga znika w całości.
+        argv = adapters.expand_template(
+            spec.template,
+            {"prompt": "zrob X", "model": "neuralwatt/glm-5.2", "effort": "",
+             "project": "", "output": ""},
+        )
+        self.assertEqual(
+            argv, ["opencode", "run", "zrob X", "-m", "neuralwatt/glm-5.2", "--auto"])
+        # Model z effortem (GLM-5.2 wspiera --variant) — flaga zostaje.
+        argv_effort = adapters.expand_template(
+            spec.template,
+            {"prompt": "zrob X", "model": "neuralwatt/glm-5.2", "effort": "high",
+             "project": "", "output": ""},
+        )
+        self.assertEqual(
+            argv_effort,
+            ["opencode", "run", "zrob X", "-m", "neuralwatt/glm-5.2", "--variant", "high", "--auto"])
+
     def test_env_template_overrides_known_default(self) -> None:
         env = {"FORGE_AGENT_GROK_CMD": "moj-grok {prompt}"}
         spec = adapters.generic_spec("grok", env)

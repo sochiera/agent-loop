@@ -4,7 +4,8 @@ Orkiestrator, który w kółko odpala agentów CLI, aż skończą się limity su
 Buduje **grę albo dowolny inny program** — agent bootstrapu sam rozpoznaje z briefu
 rodzaj produktu (`game`/`app`) i dostosowuje słownictwo planowania. Rolę każdego
 agenta może pełnić **dowolne narzędzie CLI** — wbudowane `claude`, `codex`/`gpt`,
-gotowe do użycia `grok` i `kiro`, a przez szablon komendy także dowolne inne —
+gotowe do użycia `grok`, `kiro` i `opencode` (most do dostawców OpenAI-compatible,
+np. NeuralWatt), a przez szablon komendy także dowolne inne —
 patrz „Dowolny agent CLI — pełna dowolność ról".
 
 **Domyślny model (mikro-TDD ping-pong).** Claude planuje wsadowo (kilka zadań w
@@ -254,11 +255,20 @@ weryfikatora celu).
 | `codex` / `gpt` | Codex CLI (OpenAI, modele GPT) | wbudowana, z ciągłością sesji (`codex exec resume`) — `gpt` to wygodny alias na `codex` |
 | `grok` | xAI Grok Build CLI (`grok`) | gotowy domyślny szablon (`grok -p {prompt} -m {model} --effort {effort} --always-approve`), nadpisywalny |
 | `kiro` | Kiro CLI (AWS, `kiro-cli`) | gotowy domyślny szablon (`kiro-cli chat --no-interactive --trust-all-tools {prompt}`); model ustawiasz w `~/.kiro/settings/cli.json` (headless nie ma dziś flagi `--model`) |
+| `opencode` | OpenCode CLI (`opencode`, opencode.ai) — most do dowolnego dostawcy OpenAI-compatible skonfigurowanego w `~/.config/opencode/opencode.json` | gotowy domyślny szablon (`opencode run {prompt} -m {model} --variant {effort} --auto`); model podajesz jako `<provider>/<id>`, np. `neuralwatt/glm-5.2` — pełna lista podpowiedzi NeuralWatt w `KNOWN_AGENT_MODELS["opencode"]` (orchestrate.py) |
 
-`grok` i `kiro` działają "z pudełka" pod swoją nazwą — bez ustawiania żadnej
-zmiennej środowiskowej — bo mają wbudowany domyślny szablon komendy (zgodny z
+`grok`, `kiro` i `opencode` działają "z pudełka" pod swoją nazwą — bez ustawiania
+żadnej zmiennej środowiskowej — bo mają wbudowany domyślny szablon komendy (zgodny z
 oficjalną dokumentacją, stan 2026-07). Jeśli Twoja wersja CLI ma inne flagi,
 nadpisz go tak samo jak dla zupełnie nowego narzędzia (patrz niżej).
+
+> **NeuralWatt przez OpenCode.** `opencode` sam w sobie nie jest dostawcą modeli —
+> to CLI, które mówi z dowolnym API zgodnym z OpenAI. Provider `neuralwatt`
+> (baseURL `https://api.neuralwatt.com/v1`) jest skonfigurowany globalnie w
+> `~/.config/opencode/opencode.json`; klucz API czyta z `NEURALWATT_API_KEY`
+> (plik `~/.config/opencode/neuralwatt.env`, źródłowany w `.bashrc`, `chmod 600`).
+> `--variant` (`{effort}`) działa tylko dla modeli z `reasoning_effort` (rodzina
+> `glm-5.2*`) — dla pozostałych zostaw effort pusty.
 
 > **Effort dla grok/kiro.** Domyślne szablony **nie** przekazują `effort`
 > (Grok/Kiro nie mają dziś odpowiednika flagi „reasoning effort" w headless).

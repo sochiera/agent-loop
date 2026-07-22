@@ -84,6 +84,10 @@ class AskModelTest(unittest.TestCase):
     def test_unknown_agent_has_no_menu(self, _input: Mock) -> None:
         self.assertEqual(_ask_model("Model", "", "kiro"), "whatever")
 
+    @patch("builtins.input", return_value="1")
+    def test_opencode_digit_picks_neuralwatt_suggestion(self, _input: Mock) -> None:
+        self.assertEqual(_ask_model("Model", "", "opencode"), "neuralwatt/glm-5.2")
+
 
 class AgentSettingsTest(unittest.TestCase):
     @patch("builtins.input", side_effect=[
