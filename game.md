@@ -100,3 +100,45 @@ tekstowy/headless output:
   rozwijać w TDD. Wybór języka/silnika zostawiamy agentowi bootstrapu — ma
   uzasadnić decyzję w `docs/ARCHITECTURE.md`.
 - Można wykorzystać kod/zasoby z Battle for Wesnoth, ale to opcjonalne.
+
+
+
+-------------------------------
+## ZMIANA / DECYZJA: KLIENT GODOT NA LINUX (obowiązuje TERAZ)
+
+> Świadoma zmiana zakresu, nie sugestia. Nadpisuje luźniejsze zapisy o
+> warstwie wizualnej powyżej oraz dotychczasową praktykę „czytelnego dumpa
+> HTML". Planista w następnym przebiegu ma wpisać to do `docs/DESIGN.md` i
+> ustawić jako bieżący priorytet w `BACKLOG.md`.
+
+**Decyzja:** warstwa wizualna to natywna gra 2D w **Godot 4**, dystrybuowana
+jako pojedyncza aplikacja na **Linux x86-64** — gracz nie odpala terminala,
+Pythona ani Godota-developera ręcznie. Gotowe open source assety (CC0, np.
+Kenney/OpenGameArt) są OK.
+
+**Priorytet:** budowa klienta Godota jest priorytetem, nie zadaniem
+odłożonym na „później". Jeśli rdzeń logiki (kampania + bitwa) jest już w
+dużej mierze gotowy, kolejne zadania mają rozwijać **widoczną, grywalną
+grę** — nie tylko dokładać kolejne reguły/mechaniki bez warstwy, w której
+dałoby się ich użyć. Planista nie może w nieskończoność priorytetyzować
+mechaniki kosztem grafiki/klienta.
+
+**Niezmienniki (nie do negocjacji):**
+- Rdzeń `tbb` pozostaje **jedynym źródłem reguł gry** (stan kampanii,
+  ekonomia, bitwa, zapis/odczyt). Godot nie duplikuje logiki gry; Python nie
+  zależy od Godota ani żadnego UI.
+- Komunikacja Godot↔Python przez jawny, testowalny interfejs (stan gry jako
+  JSON). Konkretny transport/kształt API (HTTP, socket, inny), podział na
+  sceny/węzły Godota i kolejność prac **wybiera i uzasadnia agent
+  bootstrapu/planista** w `docs/ARCHITECTURE.md` — jak dotąd z wyborem
+  języka/silnika.
+- Istniejący klient HTML/SVG zostaje wyłącznie jako narzędzie diagnostyczne —
+  nie jest już docelowym klientem gry.
+- Gotowe dopiero, gdy użytkownik uruchamia natywną aplikację na Linuksie i bez
+  terminala może: zarządzać osadą, przemieszczać armię, rozegrać bitwę,
+  zapisać i wczytać stan.
+
+Szczegółowe, **niewiążące** notatki projektowe (przykładowe node'y Godota,
+szkic API, sugerowany podział scen i kolejność prac) — w `godot-notes.md`.
+To inspiracja, nie specyfikacja: agent może je wykorzystać, zmienić albo
+zignorować, jeśli uzasadni lepsze rozwiązanie w `ARCHITECTURE.md`.
