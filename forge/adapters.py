@@ -73,7 +73,10 @@ KNOWN_TEMPLATES: dict[str, str] = {
     # --variant obsługuje tylko część modeli (capabilities.reasoning_effort,
     # np. rodzina glm-5.2); dla reszty zostaw effort pusty — {effort} sam
     # zniknie z komendy (patrz reguła pomijania pustych placeholderów wyżej).
-    "opencode": "opencode run {prompt} -m {model} --variant {effort} --auto",
+    # --dir {project} jest KONIECZNE: `opencode run` nie dziedziczy cwd procesu
+    # (subprocess cwd=project to za mało) — bez tej flagi agent operuje na
+    # jakimś swoim domyślnym/ostatnio używanym katalogu, nie na projekcie.
+    "opencode": "opencode run {prompt} -m {model} --variant {effort} --auto --dir {project}",
 }
 
 
