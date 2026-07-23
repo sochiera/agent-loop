@@ -124,7 +124,12 @@ class GenericSpecTest(unittest.TestCase):
 
 class ConfigRoleResolutionTest(unittest.TestCase):
     def test_roles_default_to_codex_with_inheritance(self) -> None:
-        cfg = Config(codex_model="gpt-x", codex_effort="high")
+        # tester/coder="codex" jawnie — domyślny agent Config() to teraz opencode,
+        # ale mechanizm dziedziczenia codex_model/effort dla roli=codex musi
+        # nadal działać, niezależnie od tego, co jest domyślnym agentem.
+        cfg = Config(tester_agent="codex", coder_agent="codex",
+                     tester_model="", coder_model="",
+                     codex_model="gpt-x", codex_effort="high")
         self.assertEqual(cfg.role("tester"), ("codex", "gpt-x", "high"))
         self.assertEqual(cfg.role("coder"), ("codex", "gpt-x", "high"))
 
@@ -136,32 +141,35 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         self.assertEqual(cfg.role("planner"), ("codex", "gpt-x", "high"))
 
     def test_generic_role_does_not_inherit_codex_model(self) -> None:
-        cfg = Config(coder_agent="grok", codex_model="gpt-x")
+        cfg = Config(coder_agent="grok", coder_model="", codex_model="gpt-x")
         agent, model, effort = cfg.role("coder")
         self.assertEqual(agent, "grok")
         self.assertEqual(model, "")   # generic → nie dziedziczy modelu codeksa
         self.assertEqual(effort, "")
 
     def test_agents_in_use_reflects_mode(self) -> None:
-        cfg = Config(planner_agent="claude", tester_agent="codex", coder_agent="grok")
+        cfg = Config(planner_agent="claude", tester_agent="codex", coder_agent="grok",
+                     reviewer_agent="", verifier_agent="")
         self.assertEqual(set(cfg.agents_in_use()), {"claude", "codex", "grok"})
         self.assertEqual(set(Config(legacy_mode=True).agents_in_use()), {"claude", "codex"})
 
     def test_gpt_role_inherits_codex_model_like_codex(self) -> None:
-        cfg = Config(tester_agent="gpt", codex_model="gpt-x", codex_effort="high")
+        cfg = Config(tester_agent="gpt", tester_model="", codex_model="gpt-x", codex_effort="high")
         self.assertEqual(cfg.role("tester"), ("gpt", "gpt-x", "high"))
 
     def test_reviewer_alias_inherits_tester_model_effort(self) -> None:
         # reviewer="gpt", tester="codex" to ta sama binarka → recenzent dziedziczy
         # KONKRETNY model/effort testera, nie globalny fallback codex_model.
         cfg = Config(tester_agent="codex", tester_model="custom-m", tester_effort="high",
-                     reviewer_agent="gpt", codex_model="fallback-m", codex_effort="low")
+                     reviewer_agent="gpt", reviewer_model="",
+                     codex_model="fallback-m", codex_effort="low")
         self.assertEqual(cfg.role("reviewer"), ("gpt", "custom-m", "high"))
 
     def test_agents_in_use_dedups_aliases(self) -> None:
         # planner=gpt i tester=codex to jedna binarka — preflight nie może jej
         # liczyć dwa razy (ani dublować komunikatu o braku).
-        cfg = Config(planner_agent="gpt", tester_agent="codex", coder_agent="codex")
+        cfg = Config(planner_agent="gpt", tester_agent="codex", coder_agent="codex",
+                     reviewer_agent="", verifier_agent="")
         canon = [adapters.canonical_agent(a) for a in cfg.agents_in_use()]
         self.assertEqual(len(canon), len(set(canon)))
         self.assertEqual(set(canon), {"codex"})

@@ -353,7 +353,21 @@ w pełni zaimplementowane i przetestowane, a BACKLOG nie ma sensownych kroków."
 
 def write_test_prompt(task_file: str, test_cmd: str,
                       reject_reasons: list[str] | None = None,
-                      refactor: bool = False) -> str:
+                      refactor: bool = False,
+                      gate_not_red_count: int = 0) -> str:
+    gate_hint = ""
+    if gate_not_red_count:
+        gate_hint = (
+            f"\nUWAGA: Twój poprzedni test (próba {gate_not_red_count}) PRZESZEDŁ OD "
+            "RAZU — bramka go odrzuciła (TDD wymaga czerwieni PRZED implementacją). "
+            "Dwie możliwe przyczyny — rozróżnij, zanim napiszesz kolejny test:\n"
+            "(a) test nie celuje w faktycznie brakujące zachowanie — popraw cel testu;\n"
+            "(b) to kryterium jest JUŻ spełnione przez istniejący, wystarczająco ogólny "
+            "kod (dobra generalizacja, NIE błąd). Jeśli to (b) — NIE pisz kolejnego "
+            "zbędnego testu: wybierz opcję C (DONE) dla TEGO kryterium, mapując je na "
+            "już istniejący test, który je pokrywa; inne, faktycznie niepokryte "
+            "kryteria nadal testuj normalnie (opcja A).\n"
+        )
     rejected = ""
     if reject_reasons:
         bullets = "\n".join(f"- {r}" for r in reject_reasons)
@@ -390,7 +404,7 @@ względem kryteriów.
 KANON KRYTERIÓW: orkiestrator waliduje mapę DONE wyłącznie względem tekstów
 checkboxów z sekcji „Kryteria akceptacji" w pliku zadania (po znormalizowaniu
 spacji). Przepisz je dosłownie w polu "criterion".
-{refactor_block}{rejected}
+{refactor_block}{rejected}{gate_hint}
 
 Wybierz DOKŁADNIE jedno:
 A) Napisz JEDEN nowy test na brakującą funkcjonalność. Wymogi twarde:
@@ -485,12 +499,32 @@ def review_task_prompt(task_file: str, test_cmd: str, *, start_tag: str = "",
             + rows + "\n")
     escalation_block = ""
     if escalation:
+        reason = escalation.get("reason", "done_reject")
         crits = escalation.get("criteria") or []
-        errs = escalation.get("map_errors") or []
-        n = escalation.get("reject_count", "?")
         crit_lines = "\n".join(f"- {c}" for c in crits) or "- (brak listy — przeczytaj plik zadania)"
-        err_lines = "\n".join(f"- {e}" for e in errs) or "- (brak szczegółów)"
-        escalation_block = f"""
+        if reason == "gate_not_red":
+            n = escalation.get("attempts", "?")
+            escalation_block = f"""
+ESKALACJA: GATE NIE CZERWIENIAŁA ({n}× z rzędu nowy test testera przechodził
+od razu — bramka odrzuciła każdą próbę). To NIE jest automatycznie defekt.
+DWIE możliwe przyczyny — rozróżnij je per kryterium, nie zgaduj zbiorczo:
+(a) tester celuje źle / pisze test, który nie sprawdza realnie brakującego
+    zachowania — kryterium NIE jest pokryte, napisz konkretnie czego brakuje;
+(b) implementacja jest już wystarczająco ogólna i kryterium jest NAPRAWDĘ
+    spełnione przez wcześniejszy przyrost (dobra generalizacja, nie błąd) —
+    wtedy uznaj kryterium za spełnione, WSKAZUJĄC który istniejący test je
+    faktycznie pokrywa.
+Rozstrzygnij KAŻDE kryterium z kanonu poniżej osobno wg (a) czy (b); "changes"
+tylko dla kryteriów naprawdę niespełnionych/niepokrytych.
+
+Kanon kryteriów (checkboxy z pliku zadania):
+{crit_lines}
+"""
+        else:
+            errs = escalation.get("map_errors") or []
+            n = escalation.get("reject_count", "?")
+            err_lines = "\n".join(f"- {e}" for e in errs) or "- (brak szczegółów)"
+            escalation_block = f"""
 ESKALACJA DONE (bezpiecznik budżetu — mapa kryteriów NIE została zaakceptowana
 mechanicznie po {n} odrzuceniach; suite jest zielona). To NIE jest self-cert
 testera. MUSISZ jawnie odnieść się do KAŻDEGO kryterium z kanonu poniżej

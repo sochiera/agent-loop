@@ -56,6 +56,15 @@ class State:
     pending_no_test: bool = False
     # Ile razy tester zadeklarował „brak sensownego testu" w tym zadaniu (smell, jeśli dużo).
     no_test_count: int = 0
+    # Ile razy bramka NIE zczerwieniała (nowy test przeszedł od razu) w tym
+    # zadaniu — analogiczny smell do no_test_count, żeby seria takich
+    # odrzuceń wymusiła recenzję zamiast cicho zużyć cały sufit mikro-cykli.
+    gate_not_red_count: int = 0
+    # Numer próby (=gate_not_red_count w momencie odrzucenia), gdy OSTATNI cykl
+    # testera skończył się gate_not_red — jednorazowy sygnał do promptu testera
+    # w NASTĘPNYM wywołaniu (konsumowany i zerowany, jak done_reject_reasons);
+    # 0 = ostatni cykl nie skończył się tak, nie pokazuj podpowiedzi.
+    last_gate_not_red_attempt: int = 0
     # Tag gita ustawiony na starcie zadania — punkt rollbacku przy porażce zadania.
     task_start_tag: str = ""
     # Ile razy w bieżącym zadaniu uruchomiono repro (sufit chroni sprzęt:
@@ -86,6 +95,11 @@ class State:
     escalation_map_errors: list[str] = field(default_factory=list)
     # True gdy weszliśmy do review przez limit rejectów mapy (nie przez OK mapę).
     done_escalated: bool = False
+    # True gdy weszliśmy do review przez smell gate_not_red (seria testów,
+    # które przeszły od razu) — recenzent dostaje inny kontekst niż przy
+    # done_escalated, bo przyczyna bywa dwojaka (zły test testera ALBO kod
+    # już wystarczająco ogólny, więc kryterium naprawdę jest spełnione).
+    gate_not_red_escalated: bool = False
 
     # --- Weryfikacja celu (PLAN-3): profil + checkpoint cyklu ---------------
     # Profil deklaruje bootstrap (jak test_cmd — serce stack-agnostyczności).

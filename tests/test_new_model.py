@@ -190,7 +190,8 @@ class MicroLoopTest(unittest.TestCase):
             self._init_repo(project)
             os.makedirs(os.path.join(project, "tests"))
             os.makedirs(os.path.join(project, "src"))
-            cfg = Config(max_micro_cycles=5, max_green_retries=1, git_push=False)
+            cfg = Config(max_micro_cycles=5, max_green_retries=1, git_push=False,
+                        tester_agent="codex", coder_agent="codex")
             state = State(test_cmd="pytest", build_cmd="",
                           current_task_title="Ruch",
                           current_task={"id": "task-001", "title": "Ruch",
@@ -234,7 +235,8 @@ class MicroLoopTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self._init_repo(project)
             os.makedirs(os.path.join(project, "tests"))
-            cfg = Config(max_micro_cycles=1, max_green_retries=1, git_push=False)
+            cfg = Config(max_micro_cycles=1, max_green_retries=1, git_push=False,
+                        tester_agent="codex", coder_agent="codex")
             state = State(test_cmd="pytest", build_cmd="",
                           current_task={"id": "task-001", "title": "Ruch",
                                         "file": ".forge/tasks/task-001.md",
@@ -400,6 +402,30 @@ class NoTestSmellTest(unittest.TestCase):
             self.assertEqual(state.no_test_count, 3)
 
 
+class GateNotRedSmellTest(unittest.TestCase):
+    def test_excessive_gate_not_red_forces_review(self) -> None:
+        with tempfile.TemporaryDirectory() as project:
+            subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+            # próg = max(2, 6//3) = 2 → 3. test, który przechodzi od razu,
+            # wymusza recenzję (analogicznie do smellu no_test).
+            cfg = Config(max_micro_cycles=6, git_push=False)
+            state = State(test_cmd="pytest", current_task_title="T",
+                          current_task={"file": "f", "criteria": [], "test_globs": ["tests/**"]},
+                          phase="micro", micro_sub="test", gate_not_red_count=2)
+
+            with patch("forge.orchestrate._session_call",
+                       return_value='```json\n{"action":"wrote_test","about":"x"}\n```'), \
+                 patch("forge.orchestrate.run_gate", return_value=(True, "")):
+                reached = _run_micro_loop(cfg, project, state, lambda ph: "/tmp/log")
+
+            # "smell" (nie "done") — bramka BYŁA odpalana (zawsze zielona),
+            # ale nigdy świeżo zmierzona jako fresh_gate dla review.
+            self.assertEqual(reached, "smell")
+            self.assertEqual(state.phase, "review")
+            self.assertEqual(state.gate_not_red_count, 3)
+            self.assertTrue(state.gate_not_red_escalated)
+
+
 class ReviewLoopGateEconomyTest(unittest.TestCase):
     def _state(self) -> State:
         return State(phase="review", current_task={"file": "f"},
@@ -491,7 +517,7 @@ class SessionLossFallbackTest(unittest.TestCase):
         from forge.agents import AgentError
         from forge.orchestrate import _session_call, journal_append, journal_reset
         with tempfile.TemporaryDirectory() as project:
-            cfg = Config()
+            cfg = Config(tester_agent="codex")
             state = State(tester_session="stary-id")
             journal_reset(project, cfg, "Ruch")
             journal_append(project, cfg, "cykl 1, tester: wrote_test (ruch po heksach)")
@@ -524,7 +550,8 @@ class SessionLossFallbackTest(unittest.TestCase):
             with patch("forge.orchestrate.run_agent_session",
                        side_effect=AgentError("agent zwrócił kod 1. Ogon:\nSyntaxError")):
                 with self.assertRaisesRegex(AgentError, "SyntaxError"):
-                    _session_call(Config(), project, state, "coder", "P", "/tmp/log")
+                    _session_call(Config(coder_agent="codex"), project, state,
+                                 "coder", "P", "/tmp/log")
             self.assertEqual(state.coder_session, "id")  # sesja nieskasowana
 
 
@@ -613,7 +640,8 @@ class TaskIterationEndToEndTest(unittest.TestCase):
             os.makedirs(os.path.join(project, "src"))
             tasks_dir = Path(project) / ".forge" / "tasks"
             tasks_dir.mkdir(parents=True)
-            cfg = Config(max_micro_cycles=5, max_green_retries=1, git_push=False)
+            cfg = Config(max_micro_cycles=5, max_green_retries=1, git_push=False,
+                        tester_agent="codex", coder_agent="codex")
             state = State(bootstrapped=True, test_cmd="pytest", build_cmd="", phase="idle")
 
             def fake_planner(prompt, cfg_, proj, log):

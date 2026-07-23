@@ -39,6 +39,7 @@ class VerifierConfigTest(unittest.TestCase):
         cfg.planner_agent = "claude"
         cfg.tester_agent = cfg.coder_agent = "codex"
         cfg.verifier_agent = "grok"
+        cfg.reviewer_agent = ""  # izoluj od domyślnego opencode — dziedziczy testera (codex)
 
         self.assertEqual(cfg.agents_in_use(), ["claude", "codex", "grok"])
 
@@ -48,6 +49,7 @@ class VerifierConfigTest(unittest.TestCase):
         cfg.planner_agent = "claude"
         cfg.tester_agent = cfg.coder_agent = "codex"
         cfg.verifier_agent = ""
+        cfg.reviewer_agent = ""  # izoluj od domyślnego opencode — dziedziczy testera (codex)
 
         self.assertEqual(cfg.agents_in_use(), ["claude", "codex"])
 

@@ -94,8 +94,8 @@ class AgentSettingsTest(unittest.TestCase):
         "claude", "opus", "high",             # planista
         "grok", "grok-4.5", "high",           # tester
         "grok", "grok-4.5", "medium",         # koder
-        "", "", "",                           # recenzent (dziedziczy testera → grok)
-        "", "", "",                           # weryfikator (dziedziczy planistę → claude)
+        "", "", "",                           # recenzent (Enter = domyślny opencode)
+        "", "", "",                           # weryfikator (Enter = domyślny opencode)
     ])
     def test_prompts_for_every_role_and_skips_codex_when_unused(self, _input: Mock) -> None:
         cfg = Config()
@@ -111,19 +111,19 @@ class AgentSettingsTest(unittest.TestCase):
         self.assertEqual(cfg.coder_agent, "grok")
         self.assertEqual(cfg.coder_model, "grok-4.5")
         self.assertEqual(cfg.coder_effort, "medium")
-        self.assertEqual(cfg.reviewer_agent, "")
-        self.assertEqual(cfg.verifier_agent, "")
+        self.assertEqual(cfg.reviewer_agent, "opencode")
+        self.assertEqual(cfg.verifier_agent, "opencode")
         # Żadna rola nie używa Codeksa → pytanie o niego nie powinno paść
         # (gdyby padło, side_effect wyczerpałby się i input rzuciłby StopIteration).
         self.assertEqual(_input.call_count, 15)
 
     @patch("builtins.input", side_effect=[
         "claude", "opus", "high",             # planista
-        "", "", "",                           # tester → domyślnie codex
-        "", "", "",                           # koder → domyślnie codex
+        "codex", "", "",                      # tester → jawnie codex (domyślny to opencode)
+        "", "", "",                           # koder → domyślnie opencode
         "", "", "",                           # recenzent
         "", "", "",                           # weryfikator
-        "gpt-test", "xhigh",                  # Codeks w użyciu → pytanie pada
+        "gpt-test", "xhigh",                  # Codeks w użyciu (tester) → pytanie pada
     ])
     def test_asks_for_codex_defaults_when_a_role_uses_it(self, _input: Mock) -> None:
         cfg = Config()
@@ -131,7 +131,7 @@ class AgentSettingsTest(unittest.TestCase):
         prompt_agent_settings(cfg)
 
         self.assertEqual(cfg.tester_agent, "codex")
-        self.assertEqual(cfg.coder_agent, "codex")
+        self.assertEqual(cfg.coder_agent, "opencode")
         self.assertEqual(cfg.codex_model, "gpt-test")
         self.assertEqual(cfg.codex_effort, "xhigh")
 

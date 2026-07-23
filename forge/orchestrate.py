@@ -1540,6 +1540,8 @@ def _start_task(cfg: Config, project: str, state: State) -> None:
     state.cycle_test_files = []
     state.pending_no_test = False
     state.no_test_count = 0
+    state.gate_not_red_count = 0
+    state.last_gate_not_red_attempt = 0
     state.repro_runs = 0
     state.review_notes = []
     state.fix_attempt = 0
@@ -1548,6 +1550,7 @@ def _start_task(cfg: Config, project: str, state: State) -> None:
     state.escalation_notes = []
     state.escalation_map_errors = []
     state.done_escalated = False
+    state.gate_not_red_escalated = False
     state.phase = "micro"
     _write_current_task_pointer(project, task)
     journal_reset(project, cfg, state.current_task_title)
@@ -1573,6 +1576,8 @@ def _clear_task(state: State) -> None:
     state.cycle_test_files = []
     state.pending_no_test = False
     state.no_test_count = 0
+    state.gate_not_red_count = 0
+    state.last_gate_not_red_attempt = 0
     state.repro_runs = 0
     state.task_start_tag = ""
     state.review_notes = []
@@ -1586,6 +1591,7 @@ def _clear_task(state: State) -> None:
     state.escalation_notes = []
     state.escalation_map_errors = []
     state.done_escalated = False
+    state.gate_not_red_escalated = False
 
 
 def _task_gate(cfg: Config, project: str, state: State) -> tuple[bool, str]:
@@ -1656,7 +1662,10 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
 
     Zwraca: "done" gdy tester orzekł DONE po zielonej bramce; "escalate" gdy
     limit rejectów mapy + policy review_if_green (bramka zmierzona zielona);
-    "smell" gdy recenzję wymusił nadmiar 'no_test' (bramka NIE odpalona);
+    "smell" gdy recenzję wymusił nadmiar 'no_test' (bramka NIE odpalona) albo
+    serii "gate nie poczerwieniała" (bramka odpalana za każdym razem, tylko
+    że wciąż zielona — ostatni wynik i tak NIE liczy się jako fresh_gate,
+    review i tak zmierzy ją sam);
     False gdy zadanie padło. ``done``/``escalate`` → gate_green w review."""
     if state.fail_immediate:
         return False
@@ -1690,10 +1699,12 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                                 prompts.write_test_prompt(
                                     task_file, state.test_cmd,
                                     reject_reasons=state.done_reject_reasons,
-                                    refactor=refactor),
+                                    refactor=refactor,
+                                    gate_not_red_count=state.last_gate_not_red_attempt),
                                 logf(f"c{c:02d}-test"))
             verdict = extract_json(out) or {"action": "no_test", "reason": "brak werdyktu JSON"}
             state.done_reject_reasons = []  # skonsumowane w prompcie powyżej
+            state.last_gate_not_red_attempt = 0  # skonsumowane w prompcie powyżej
             action = verdict.get("action")
 
             if action == "done":
@@ -1740,6 +1751,7 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                 state.done_reject_reasons = []
                 state.done_reject_count = 0
                 state.done_escalated = False
+                state.gate_not_red_escalated = False
                 state.escalation_notes = []
                 state.escalation_map_errors = []
                 green, _ = _task_gate(cfg, project, state)
@@ -1817,6 +1829,25 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                 continue
             log("Bramka NIE zczerwieniała: nowy test przechodzi od razu → odrzucam.")
             revert_paths(project, tests_here)
+            state.gate_not_red_count += 1
+            threshold = max(2, cfg.max_micro_cycles // 3)
+            if state.gate_not_red_count > threshold:
+                # Seria "test przechodzi od razu" ma DWIE możliwe przyczyny —
+                # tester źle celuje w test ALBO kod jest już wystarczająco
+                # ogólny i kryterium jest naprawdę spełnione (to nie defekt).
+                # Nie rozstrzygamy tego mechanicznie: jak przy smellu no_test,
+                # oddajemy ocenę recenzentowi zamiast cicho zużyć resztę
+                # sufitu mikro-cykli do porażki zadania.
+                log(f"SMELL: {state.gate_not_red_count}× 'gate nie poczerwieniała' "
+                    f"(> {threshold}) — wymuszam recenzję.")
+                journal_append(project, cfg,
+                               f"smell gate_not_red ({state.gate_not_red_count}) "
+                               "→ wymuszona recenzja")
+                state.gate_not_red_escalated = True
+                state.phase = "review"
+                save_checkpoint(project, state)
+                return "smell"
+            state.last_gate_not_red_attempt = state.gate_not_red_count
             state.micro_cycle = c  # zużyj cykl (bounded retry)
             state.micro_sub = "test"
             save_checkpoint(project, state)
@@ -2038,9 +2069,16 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
         escalation = None
         if state.done_escalated:
             escalation = {
+                "reason": "done_reject",
                 "reject_count": state.done_reject_count,
                 "map_errors": list(state.escalation_map_errors
                                   or state.done_reject_reasons or []),
+                "criteria": list((state.current_task or {}).get("criteria") or []),
+            }
+        elif state.gate_not_red_escalated:
+            escalation = {
+                "reason": "gate_not_red",
+                "attempts": state.gate_not_red_count,
                 "criteria": list((state.current_task or {}).get("criteria") or []),
             }
         out, _reviewer_sid = run_agent_session(

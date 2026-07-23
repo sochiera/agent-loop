@@ -318,7 +318,8 @@ class DoneRejectEscalationTest(MicroLoopPlan5Base):
                 "def test_a():\n    pass\n", encoding="utf-8")
             cfg = Config(max_micro_cycles=12, max_done_rejects=3,
                          done_reject_policy="review_if_green",
-                         max_green_retries=0, git_push=False, lock_tests=False)
+                         max_green_retries=0, git_push=False, lock_tests=False,
+                         tester_agent="codex", coder_agent="codex")
             state = self._state()
             # Zła mapa (nie pasuje do c1) — 3× done
             bad = ('```json\n{"action":"done","criteria_map":['
@@ -346,7 +347,8 @@ class DoneRejectEscalationTest(MicroLoopPlan5Base):
             self._task_file(project)
             cfg = Config(max_micro_cycles=12, max_done_rejects=3,
                          done_reject_policy="review_if_green",
-                         max_green_retries=0, git_push=False)
+                         max_green_retries=0, git_push=False,
+                         tester_agent="codex", coder_agent="codex")
             state = self._state()
             bad = ('```json\n{"action":"done","criteria_map":['
                    '{"criterion":"INNE","status":"justified","why":"'
@@ -372,7 +374,8 @@ class DoneRejectEscalationTest(MicroLoopPlan5Base):
             self._task_file(project)
             cfg = Config(max_micro_cycles=12, max_done_rejects=2,
                          done_reject_policy="fail",
-                         max_green_retries=0, git_push=False)
+                         max_green_retries=0, git_push=False,
+                         tester_agent="codex", coder_agent="codex")
             state = self._state()
             bad = ('```json\n{"action":"done","criteria_map":['
                    '{"criterion":"INNE","status":"justified","why":"'
@@ -400,7 +403,8 @@ class DoneRejectEscalationTest(MicroLoopPlan5Base):
             Path(project, "tests").mkdir(exist_ok=True)
             cfg = Config(max_micro_cycles=12, max_done_rejects=5,
                          done_reject_policy="continue",
-                         max_green_retries=0, git_push=False, lock_tests=False)
+                         max_green_retries=0, git_push=False, lock_tests=False,
+                         tester_agent="codex", coder_agent="codex")
             state = self._state()
             calls = {"n": 0}
             bad = ('```json\n{"action":"done","criteria_map":['
@@ -646,7 +650,8 @@ class PolicyContinueTest(MicroLoopPlan5Base):
             self._task_file(project)
             cfg = Config(max_micro_cycles=4, max_done_rejects=2,
                          done_reject_policy="continue",
-                         max_green_retries=0, git_push=False)
+                         max_green_retries=0, git_push=False,
+                         tester_agent="codex", coder_agent="codex")
             state = self._state()
             bad = ('```json\n{"action":"done","criteria_map":['
                    '{"criterion":"INNE","status":"justified","why":"'
@@ -679,7 +684,8 @@ class RejectFeedbackIncludesCanonTest(MicroLoopPlan5Base):
                             "- [ ] pełne kryterium beta\n")
             cfg = Config(max_micro_cycles=2, max_done_rejects=5,
                          done_reject_policy="continue",
-                         max_green_retries=0, git_push=False)
+                         max_green_retries=0, git_push=False,
+                         tester_agent="codex", coder_agent="codex")
             state = self._state(current_task={
                 "id": "task-001", "title": "Zad",
                 "file": ".forge/tasks/task-001.md",
@@ -716,7 +722,8 @@ class EscalationStateTest(MicroLoopPlan5Base):
             self._task_file(project)
             cfg = Config(max_micro_cycles=12, max_done_rejects=2,
                          done_reject_policy="review_if_green",
-                         max_green_retries=0, git_push=False)
+                         max_green_retries=0, git_push=False,
+                         tester_agent="codex", coder_agent="codex")
             state = self._state()
             bad = ('```json\n{"action":"done","criteria_map":['
                    '{"criterion":"INNE","status":"justified","why":"'

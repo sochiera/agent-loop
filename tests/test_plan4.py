@@ -315,8 +315,12 @@ class ValidateCriteriaMapTest(unittest.TestCase):
 # =====================================================================
 
 class ReviewerRoleConfigTest(unittest.TestCase):
-    def test_default_reviewer_is_tester_role(self) -> None:
-        cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high")
+    def test_blank_reviewer_agent_inherits_tester_role(self) -> None:
+        # reviewer_agent="" (jawnie, bo domyślny Config() to teraz opencode)
+        # nadal dziedziczy w całości rolę testera — mechanizm inheritance
+        # istnieje niezależnie od tego, co jest domyślnym agentem.
+        cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high",
+                     reviewer_agent="", reviewer_model="")
         self.assertEqual(cfg.role("reviewer"), cfg.role("tester"))
 
     def test_explicit_reviewer_agent_wins(self) -> None:
@@ -334,12 +338,12 @@ class ReviewerRoleConfigTest(unittest.TestCase):
         # testera) — dziś jest po cichu ignorowane, bo role('reviewer') zwraca
         # role('tester') w całości zamiast pozwolić na częściowe nadpisanie.
         cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high",
-                     reviewer_model="o3")
+                     reviewer_agent="", reviewer_model="o3")
         self.assertEqual(cfg.role("reviewer"), ("codex", "o3", "high"))
 
     def test_reviewer_effort_override_applies_without_explicit_reviewer_agent(self) -> None:
         cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high",
-                     reviewer_effort="low")
+                     reviewer_agent="", reviewer_model="", reviewer_effort="low")
         self.assertEqual(cfg.role("reviewer"), ("codex", "m1", "low"))
 
 
@@ -414,7 +418,8 @@ class SessionRotationTest(MicroLoopWiringBase):
         with tempfile.TemporaryDirectory() as project:
             self._init_repo(project)
             cfg = Config(max_micro_cycles=5, max_green_retries=0,
-                         session_rotate_cycles=1, git_push=False)
+                         session_rotate_cycles=1, git_push=False,
+                         tester_agent="codex", coder_agent="codex")
             state = self._state()
             seen = []
 
@@ -456,7 +461,7 @@ class MechanicalWeakeningWiringTest(MicroLoopWiringBase):
         with tempfile.TemporaryDirectory() as project:
             self._init_repo(project, {"package.json": self.PKG})
             cfg = Config(max_micro_cycles=1, max_green_retries=0, git_push=False,
-                         lock_tests=False)
+                         lock_tests=False, tester_agent="codex", coder_agent="codex")
             state = self._state()
             calls = {"n": 0}
 
@@ -495,7 +500,7 @@ class MechanicalWeakeningWiringTest(MicroLoopWiringBase):
         with tempfile.TemporaryDirectory() as project:
             self._init_repo(project)
             cfg = Config(max_micro_cycles=1, max_green_retries=0, git_push=False,
-                         lock_tests=False)
+                         lock_tests=False, tester_agent="codex", coder_agent="codex")
             state = self._state()
             calls = {"n": 0}
 
@@ -530,7 +535,7 @@ class NoTestToolchainRevertTest(MicroLoopWiringBase):
         with tempfile.TemporaryDirectory() as project:
             self._init_repo(project, {"package.json": self.PKG})
             cfg = Config(max_micro_cycles=1, max_green_retries=0, git_push=False,
-                         lock_tests=False)
+                         lock_tests=False, tester_agent="codex", coder_agent="codex")
             state = self._state()
             calls = {"n": 0}
 
@@ -567,7 +572,7 @@ class NoTestToolchainRevertTest(MicroLoopWiringBase):
         with tempfile.TemporaryDirectory() as project:
             self._init_repo(project, {"package.json": self.PKG})
             cfg = Config(max_micro_cycles=1, max_green_retries=0, git_push=False,
-                         lock_tests=False)
+                         lock_tests=False, tester_agent="codex", coder_agent="codex")
             task = dict(self._state().current_task)
             task["code_globs"] = []  # planista nie zadeklarował — nie "zakaż"
             state = self._state(current_task=task)
@@ -600,7 +605,7 @@ class LockTestsDuringCoderTest(MicroLoopWiringBase):
         with tempfile.TemporaryDirectory() as project:
             self._init_repo(project)
             cfg = Config(max_micro_cycles=5, max_green_retries=0, git_push=False,
-                         lock_tests=True)
+                         lock_tests=True, tester_agent="codex", coder_agent="codex")
             state = self._state()
             seen = {}
             calls = {"n": 0}
@@ -643,7 +648,7 @@ class JournalEnrichmentTest(MicroLoopWiringBase):
         with tempfile.TemporaryDirectory() as project:
             self._init_repo(project)
             cfg = Config(max_micro_cycles=1, max_green_retries=0, git_push=False,
-                         lock_tests=False)
+                         lock_tests=False, tester_agent="codex", coder_agent="codex")
             state = self._state()
             journal_reset(project, cfg, "Ruch")
             calls = {"n": 0}
@@ -678,7 +683,7 @@ class SessionCallJournalMidTaskTest(unittest.TestCase):
     def _call(self, state: State) -> tuple[str, object]:
         from forge.orchestrate import _session_call, journal_append, journal_reset
         with tempfile.TemporaryDirectory() as project:
-            cfg = Config()  # codex → agent wznawialny
+            cfg = Config(tester_agent="codex")  # codex → agent wznawialny
             journal_reset(project, cfg, "Ruch")
             journal_append(project, cfg, "cykl 1, tester: wrote_test (ruch po heksach)")
             seen = {}
