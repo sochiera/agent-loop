@@ -167,7 +167,6 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         cfg = Config(planner_agent="claude", tester_agent="codex", coder_agent="grok",
                      reviewer_agent="", verifier_agent="")
         self.assertEqual(set(cfg.agents_in_use()), {"claude", "codex", "grok"})
-        self.assertEqual(set(Config(legacy_mode=True).agents_in_use()), {"claude", "codex"})
 
     def test_gpt_alias_uses_codex_matrix(self) -> None:
         cfg = Config(tester_agent="gpt", tester_model="", codex_model="gpt-x", codex_effort="high")

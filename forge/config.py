@@ -123,8 +123,6 @@ class AgentCmd:
 
 @dataclass
 class Config:
-    # Katalog projektu gry (tam powstaje kod, docs, git repo).
-    project_dir: str = "game"
     # Plik z briefem gry (wejście od użytkownika).
     brief_path: str = "game.md"
 
@@ -139,17 +137,10 @@ class Config:
     codex_model: str = os.environ.get("FORGE_CODEX_MODEL", "")
     codex_effort: str = os.environ.get("FORGE_CODEX_EFFORT", "medium")
 
-    # --- Nowy model: mikro-TDD ping-pong (Codex-tester ↔ Codex-koder) -------
-    # legacy_mode=False → pętla docelowa (plan wsadowy → mikro-TDD → review Codeksa).
-    # legacy_mode=True  → stary przebieg plan→implement→review(Claude)→fix.
-    legacy_mode: bool = os.environ.get("FORGE_LEGACY_MODE", "0") == "1"
     # Ile zadań planista produkuje jednym wywołaniem (koszt stały planisty ÷ batch).
     batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "5"))
-    # Twardy sufit mikro-cykli (test→kod→refaktor) na jedno zadanie: chroni budżet
-    # i rozmiar rosnącej sesji. Po przekroczeniu — porażka zadania i podział przez planistę.
-    max_micro_cycles: int = int(os.environ.get("FORGE_MAX_MICRO_CYCLES", "12"))
-    # Ile dogrywek „zazielenienia" w obrębie jednego mikro-cyklu, zanim zadanie padnie.
-    max_green_retries: int = int(os.environ.get("FORGE_MAX_GREEN_RETRIES", "2"))
+    # Mały bezpiecznik: większe zadanie ma zostać ponownie rozplanowane.
+    max_tdd_rounds: int = int(os.environ.get("FORGE_MAX_TDD_ROUNDS", "4"))
     # Agent CLI każdej roli nowego modelu. "claude"/"codex" mają wbudowaną
     # obsługę; dowolna inna nazwa → agent generyczny z FORGE_AGENT_<NAME>_CMD
     # (patrz adapters.py). Domyślnie tester i koder to opencode (NeuralWatt).
@@ -170,10 +161,8 @@ class Config:
     # Nadpisanie targetów z bootstrapu: "" = decyduje bootstrap, "none" =
     # weryfikacja wyłączona, "ci,hardware" = dokładnie te targety.
     verify_targets_override: str = os.environ.get("FORGE_VERIFY_TARGETS", "")
-    # Bezpiecznik absolutny cykli; głównym mechanizmem stopu jest stall
-    # (kolejne cykle bez postępu wg verify_ledger.progress_made).
+    # Prosty bezpiecznik absolutny cykli końcowej weryfikacji.
     max_verify_cycles: int = int(os.environ.get("FORGE_MAX_VERIFY_CYCLES", "8"))
-    max_stall_cycles: int = int(os.environ.get("FORGE_MAX_STALL_CYCLES", "2"))
     # Polling CI: backoff start→sufit; timeout całego oczekiwania na werdykt CI.
     ci_timeout_s: int = int(os.environ.get("FORGE_CI_TIMEOUT", "2700"))
     ci_poll_start_s: int = int(os.environ.get("FORGE_CI_POLL_START", "30"))
@@ -182,59 +171,18 @@ class Config:
     verify_timeout_s: int = int(os.environ.get("FORGE_VERIFY_TIMEOUT", "1800"))
     # Flash bywa flaky z natury (USB) — darmowe ponowienia przed diagnozą.
     flash_retries: int = int(os.environ.get("FORGE_FLASH_RETRIES", "1"))
-    # Sufit uruchomień repro w jednym zadaniu naprawczym (chroni sprzęt i czas).
-    max_repro_runs_per_task: int = int(os.environ.get("FORGE_MAX_REPRO_RUNS", "6"))
-    # Tani ci_status_cmd HEAD przy każdym planowaniu (ostrzeżenie w prompcie).
-    ci_early_warn: bool = os.environ.get("FORGE_CI_EARLY_WARN", "1") != "0"
     # Plik konfiguracji MCP doklejany do claude TYLKO w roli weryfikatora.
     verifier_mcp_config: str = os.environ.get("FORGE_VERIFIER_MCP_CONFIG", "")
 
-    # --- PLAN-4: uszczelnienie bramek i higiena kontekstu --------------------
-    # Dodatkowe globy toolchainu testowego (CSV), doklejane do heurystyki
-    # wbudowanej i deklaracji bootstrapu (State.test_toolchain_globs).
-    toolchain_globs_extra: str = os.environ.get("FORGE_TOOLCHAIN_GLOBS", "")
     # Recenzent zadania: pusty agent = agent testera, ale ZAWSZE świeży
     # kontekst (bez sesji i dziennika) — autor nie recenzuje własnej pracy.
     reviewer_agent: str = os.environ.get("FORGE_REVIEWER_AGENT", "opencode")
     reviewer_model: str = os.environ.get("FORGE_REVIEWER_MODEL", "neuralwatt/glm-5.2-flex")
     reviewer_effort: str = os.environ.get("FORGE_REVIEWER_EFFORT", "")
-    # Bootstrap zawsze ustala architekturę; przed jego commitem świeży
-    # recenzent może zażądać poprawek. 0 wyłącza bramkę świadomie.
-    max_bootstrap_arch_reviews: int = int(
-        os.environ.get("FORGE_MAX_BOOTSTRAP_ARCH_REVIEWS", "2")
-    )
-    # Rotacja sesji ról co K ukończonych mikro-cykli (0 = wyłączona) —
-    # higiena kontekstu: świeża sesja z dziennikiem zamiast spuchniętej.
-    session_rotate_cycles: int = int(os.environ.get("FORGE_SESSION_ROTATE_CYCLES", "4"))
-    # Sufit skrótu dziennika doklejanego do promptu (pełny dziennik na dysku).
-    journal_tail_chars: int = int(os.environ.get("FORGE_JOURNAL_TAIL_CHARS", "8000"))
-    # Blokada zapisu (chmod a-w) testów cyklu na czas tury kodera — tani
-    # deterrent, NIE bariera; właściwą bramką pozostaje kontrola diffu.
-    lock_tests: bool = os.environ.get("FORGE_LOCK_TESTS", "1") != "0"
-    # Porażka zadania czyści resztę kolejki wsadu (plan był budowany przy
-    # założeniu sukcesu) — planista przeplanowuje z failures.md.
-    replan_on_failure: bool = os.environ.get("FORGE_REPLAN_ON_FAILURE", "1") != "0"
 
-    # --- PLAN-5: bramka DONE / kanon kryteriów / failed-ref -------------------
-    # Po tylu kolejnych odrzuceniach mapy kryteriów przy DONE — eskalacja
-    # (policy), zamiast palić cały max_micro_cycles na poprawianie JSON-a.
-    max_done_rejects: int = int(os.environ.get("FORGE_MAX_DONE_REJECTS", "3"))
-    # review_if_green | fail | continue — szczegóły: docs/PIPELINE.md.
-    done_reject_policy: str = os.environ.get(
-        "FORGE_DONE_REJECT_POLICY", "review_if_green").strip().lower() or "review_if_green"
     # Przed rollbackiem przy porażce: branch forge/failed/<id> na HEAD (+ residual commit).
     keep_failed_ref: bool = os.environ.get("FORGE_KEEP_FAILED_REF", "1") != "0"
-    # Fail zadania już na starcie, gdy nie ma kryteriów w pliku ani w JSON planisty.
-    fail_on_empty_criteria: bool = os.environ.get("FORGE_FAIL_ON_EMPTY_CRITERIA", "0") == "1"
 
-    # --- Higiena docs/DESIGN.md: kompaktowanie zamiast okresowego refaktoru --
-    # Próg rozmiaru DESIGN.md (bajty) — po przekroczeniu PLAN WSADOWY (nowy
-    # model, phase_plan_batch) dostaje polecenie wstawienia jednego zadania
-    # kompaktującego (ROZSTRZYGNIĘTE → docs/DECISIONS.md, DESIGN.md zostaje
-    # opisem stanu obecnego). 0 = wyłączone.
-    # UWAGA: dotyczy WYŁĄCZNIE legacy_mode=False — stary przebieg (phase_plan)
-    # nie sprawdza tego progu i DESIGN.md może tam rosnąć bez ograniczeń.
-    design_compact_bytes: int = int(os.environ.get("FORGE_DESIGN_COMPACT_BYTES", "40000"))
 
     def effective_verify_targets(self, declared: list[str]) -> list[str]:
         """Targety po nadpisaniu użytkownika ("" = deklaracja bootstrapu)."""
@@ -290,7 +238,11 @@ class Config:
         if name not in configured:
             raise ValueError(f"nieznana rola: {name}")
 
-        agent, legacy_model, legacy_effort = configured[name]
+        agent, configured_model, configured_effort = configured[name]
+        # Jawne ustawienie planisty jest intencją operatora; routing trudności
+        # dotyczy wykonawców pojedynczego zadania.
+        if name in {"planner", "planner_escalation", "bootstrap"} and configured_model:
+            return (agent, *self._role_model_effort(agent, configured_model, configured_effort))
         canonical = adapters.canonical_agent(agent)
         level = self.model_level(name, difficulty)
         fixed = MODEL_LEVEL_ROUTING.get(canonical, {}).get(level)
@@ -298,7 +250,7 @@ class Config:
             return (agent, *fixed)
         return (
             agent,
-            *self._role_model_effort(agent, legacy_model, legacy_effort),
+            *self._role_model_effort(agent, configured_model, configured_effort),
         )
 
     def model_level(
@@ -326,11 +278,8 @@ class Config:
         Deduplikacja po nazwie KANONICZNEJ — 'gpt' i 'codex' to ta sama binarka,
         więc preflight nie sprawdza jej dwa razy (i nie dubluje komunikatu o
         braku). Zachowujemy pierwszą napotkaną nazwę wyświetlaną (dla logów)."""
-        if self.legacy_mode:
-            names = [self.planner_agent, "codex"]
-        else:
-            names = [self.planner_agent, self.tester_agent, self.coder_agent,
-                     self.role("verifier")[0], self.role("reviewer")[0]]
+        names = [self.planner_agent, self.tester_agent, self.coder_agent,
+                 self.role("verifier")[0], self.role("reviewer")[0]]
         seen: dict[str, str] = {}
         for name in names:
             seen.setdefault(adapters.canonical_agent(name), name)
@@ -354,9 +303,6 @@ class Config:
     git_push: bool = os.environ.get("FORGE_GIT_PUSH", "1") != "0"
     git_remote: str = os.environ.get("FORGE_GIT_REMOTE", "origin")
 
-    # --- Sterowanie pętlą ---------------------------------------------------
-    max_iterations: int = int(os.environ.get("FORGE_MAX_ITERS", "0"))  # 0 = bez limitu
-    max_fix_attempts: int = 3          # ile rund review→fix na jedno zadanie
     # Backoff przy limitach (sekundy): rośnie geometrycznie do sufitu.
     backoff_start_s: int = 60
     backoff_max_s: int = 3600
@@ -366,9 +312,6 @@ class Config:
 
     # Timeout pojedynczego wywołania agenta (sekundy). Duże, bo TDD bywa długie.
     agent_timeout_s: int = int(os.environ.get("FORGE_AGENT_TIMEOUT", "3600"))
-
-    # Nazwa pliku-stopu: utwórz go w project_dir, by grzecznie zatrzymać pętlę.
-    stop_file: str = "STOP"
 
     # Katalog runtime orkiestratora wewnątrz projektu (logi, bieżące zadanie).
     runtime_dir: str = ".forge"

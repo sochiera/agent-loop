@@ -142,3 +142,7 @@ Szczegółowe, **niewiążące** notatki projektowe (przykładowe node'y Godota,
 szkic API, sugerowany podział scen i kolejność prac) — w `godot-notes.md`.
 To inspiracja, nie specyfikacja: agent może je wykorzystać, zmienić albo
 zignorować, jeśli uzasadni lepsze rozwiązanie w `ARCHITECTURE.md`.
+
+
+---------------
+Nowa zmiana: w agent-loop zostało dodane review dla kroku bootstrap oraz podział na trudność zadań przy planowaniu. Warto uwzględnić.

@@ -22,13 +22,11 @@ import sys
 _PHASE_GROUPS: list[tuple[str, str]] = [
     (r"^bootstrap", "bootstrap"),
     (r"^plan", "plan"),
-    (r"^c\d+-test", "micro-test"),
-    (r"^c\d+-code", "micro-code"),
-    (r"^review-fix", "review-fix"),
+    (r"^tester", "tester"),
+    (r"^coder", "coder"),
+    (r"^corrections", "corrections"),
     (r"^review", "review"),
     (r"^verify", "verify"),
-    (r"^implement", "implement (legacy)"),
-    (r"^fix", "fix (legacy)"),
 ]
 
 

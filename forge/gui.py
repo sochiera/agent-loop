@@ -109,7 +109,7 @@ def line_kind(line: str) -> str:
         return "error"
     if any(word in upper for word in ("UKOŃCZONE", "ZWERYFIKOWANY", "ZIELON", "PREFLIGHT OK", "PUSH →")):
         return "success"
-    if any(word in upper for word in ("UWAGA", "LIMIT", "WZNAWIAM", "SMELL", "ROLLBACK")):
+    if any(word in upper for word in ("UWAGA", "LIMIT", "WZNAWIAM")):
         return "warning"
     if "===" in line or "##########" in line or re.search(r"\b(PLAN|TESTER|KODER|RECENZJA)\b", upper):
         return "phase"

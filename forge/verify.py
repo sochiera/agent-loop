@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
-import shlex
 import time
 
 from .config import Config
@@ -104,47 +103,3 @@ def collect_evidence(project: str, state: State, cfg: Config, cycle_dir: str,
         rc = _one_target(project, state, cfg, target, log_path, sha, sleep)
         results[target] = {"rc": rc, "log": log_path}
     return results
-
-
-def confirm_env_issue(project: str, state: State, cfg: Config, target: str,
-                      confirm_dir: str, *, sha: str, sleep=time.sleep) -> bool:
-    """Mechaniczne potwierdzenie env_issue zgłoszonego przez agenta (PLAN-3,
-    sekcja 7): pełna powtórka dowodów wskazanego targetu. True = nadal
-    czerwono (potwierdzone — stop); False = zielono (klasyfikacja odrzucona,
-    bieg trwa). Dla hardware najpierw probe_cmd — odpiętej płytki nie
-    flashujemy."""
-    log_path = os.path.join(confirm_dir, f"{target}-confirm.log")
-    if target == "hardware" and state.probe_cmd:
-        if _run_logged(project, state.probe_cmd, cfg.verify_timeout_s, log_path) != 0:
-            return True
-    return _one_target(project, state, cfg, target, log_path, sha, sleep) != 0
-
-
-def run_repro(project: str, repro_cmd: str, timeout: int) -> tuple[bool, str]:
-    """Bramka reprodukcji problemu: (zielony?, ogon wyjścia przy czerwieni).
-
-    Kontrakt repro-skryptu: rc≠0 = bug obecny, rc==0 = naprawiony."""
-    rc, out = run_shellfree(project, repro_cmd, timeout)
-    green = rc == 0
-    return green, ("" if green else (out or "")[-1500:])
-
-
-def verify_script_paths(project: str, state: State) -> list[str]:
-    """Ścieżki skryptów użytych w komendach profilu weryfikacji (istniejące
-    pliki repo wskazane jako argumenty, np. 'scripts/smoke.sh' w
-    'bash scripts/smoke.sh'). Wchodzą do chronionych ścieżek — najtańszą
-    "naprawą" czerwonej weryfikacji nie może być edycja jej skryptu."""
-    paths: set[str] = set()
-    for cmd in (state.smoke_cmd, state.flash_cmd, state.target_cmd,
-                state.probe_cmd, state.ci_status_cmd, state.ci_logs_cmd):
-        try:
-            tokens = shlex.split(cmd or "")
-        except ValueError:
-            continue
-        # tokens[0] też: skrypt bywa wywoływany bezpośrednio ("./scripts/x.sh"),
-        # nie tylko przez interpreter — prawdziwa binarka (bash, python3) i tak
-        # nie jest plikiem w repo, więc warunek isfile ją odsiewa.
-        for tok in tokens:
-            if os.path.isfile(os.path.join(project, tok)):
-                paths.add(tok.replace("\\", "/"))
-    return sorted(paths)

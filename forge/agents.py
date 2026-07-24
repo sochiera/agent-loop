@@ -382,7 +382,7 @@ def _codex_argv(a, cfg: Config, project_dir: str, last_msg: str, prompt: str,
                 *, json_stream: bool = False, resume_id: str | None = None) -> list[str]:
     """JEDNO miejsce prawdy o kontrakcie CLI Codeksa (flagi, sandbox, prompt).
 
-    Rozjazd między wywołaniem legacy a sesyjnym oznaczałby różny posture
+    Rozjazd między wywołaniem jednorazowym a sesyjnym oznaczałby różny posture
     sandboxa dla różnych ról — dlatego różnice ograniczają się do --json
     i podkomendy resume."""
     # `codex exec resume` ma węższy zestaw opcji niż zwykłe `codex exec`.

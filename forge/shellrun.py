@@ -7,7 +7,9 @@ a nie może importować orkiestratora (cykl importów).
 """
 from __future__ import annotations
 
+import os
 import shlex
+import signal
 import subprocess
 
 
@@ -23,10 +25,26 @@ def run_shellfree(project: str, cmd: str, timeout: int) -> tuple[int | None, str
     if not argv:
         return None, "pusta komenda"
     try:
-        proc = subprocess.run(argv, cwd=project, shell=False, text=True,
-                              capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return None, "TIMEOUT"
+        proc = subprocess.Popen(
+            argv, cwd=project, shell=False, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True)
     except OSError as exc:
         return None, f"nie udało się uruchomić ({exc})"
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+        return None, "TIMEOUT"
+    return proc.returncode, (stdout or "") + (stderr or "")
