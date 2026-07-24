@@ -148,7 +148,8 @@ class ConfigRoleResolutionTest(unittest.TestCase):
     def test_codex_planner_is_always_strong(self) -> None:
         cfg = Config(planner_agent="codex", planner_model="", planner_effort="",
                      codex_model="gpt-x", codex_effort="high")
-        self.assertEqual(cfg.role("planner"), ("codex", "gpt-5.6-sol", "high"))
+        self.assertEqual(cfg.role("planner"), ("codex", "gpt-5.6-sol", "medium"))
+        self.assertEqual(cfg.role("bootstrap"), ("codex", "gpt-5.6-sol", "high"))
 
     def test_known_generic_role_uses_fixed_matrix(self) -> None:
         cfg = Config(coder_agent="grok", coder_model="", codex_model="gpt-x")

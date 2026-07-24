@@ -39,8 +39,8 @@ MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
         "economy": ("gpt-5.6-luna", "low"),
         "efficient": ("gpt-5.6-terra", "low"),
         "balanced": ("gpt-5.6-terra", "medium"),
-        "strong": ("gpt-5.6-sol", "high"),
-        "max": ("gpt-5.6-sol", "max"),
+        "strong": ("gpt-5.6-sol", "medium"),
+        "max": ("gpt-5.6-sol", "high"),
     },
     "claude": {
         "economy": ("haiku", ""),

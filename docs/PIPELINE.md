@@ -184,7 +184,7 @@ Konkretna translacja poziomów jest następująca:
 
 | Provider | economy | efficient | balanced | strong | max |
 |---|---|---|---|---|---|
-| Codex / GPT | Luna / low | Terra / low | Terra / medium | Sol / high | Sol / max |
+| Codex / GPT | Luna / low | Terra / low | Terra / medium | Sol / medium | Sol / high |
 | Claude | Haiku / — | Sonnet / low | Sonnet / medium | Sonnet / high | Opus / max |
 | Grok | 4.5 / low, mały budżet | 4.5 / low | 4.5 / medium | 4.5 / high | 4.5 / high, max budżet |
 | OpenCode | GLM 5.2 / low | GLM 5.2 / medium | GLM 5.2 / medium | GLM 5.2 / high | GLM 5.2 / high |
