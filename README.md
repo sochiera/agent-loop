@@ -85,6 +85,21 @@ python3 -m forge.report game
 python3 -m forge.orchestrate --brief game.md --project game
 ```
 
+### Natywne GUI
+
+Na Linuksie z GTK 4 możesz wybrać plik briefu i katalog projektu przez systemowe
+okna, ustawić każdej roli agenta, a następnie obserwować kolorowany status pracy
+na żywo. Model i effort dobiera automatycznie profil trudności zadania:
+
+```bash
+python3 -m forge.gui
+```
+
+GUI uruchamia ten sam orkiestrator w trybie nieinteraktywnym. Przycisk
+„Zatrzymaj” wysyła bezpieczne przerwanie, dzięki czemu bieżący checkpoint
+zostaje zapisany. Ostatnie ścieżki, wybory wszystkich ról, rozmiar okna i
+położenie separatora są pamiętane w `~/.config/forge/gui.json`.
+
 Start można opóźnić parametrem `--sleep`; liczba bez sufiksu oznacza sekundy,
 a dostępne sufiksy to `s`, `m` i `h`:
 
@@ -92,16 +107,15 @@ a dostępne sufiksy to `s`, `m` i `h`:
 python3 -m forge.orchestrate --sleep 45m
 ```
 
-Przy starcie program kolejno pyta, czy planistą ma być Claude czy Codex, następnie
-o jego model i effort, a potem o model i effort implementatora (Codex). Wybrany
-planista wykonuje bootstrap, planowanie i review. Enter zachowuje pokazaną wartość
-domyślną. W skryptach i zadaniach bez terminala pytania można wyłączyć flagą
-`--non-interactive` i podać ustawienia flagami, np.:
+Przy starcie program pyta wyłącznie o agenta dla każdej roli. Enter zachowuje
+pokazaną wartość domyślną; model i effort wynikają z trudności zadania. W
+skryptach i zadaniach bez terminala pytania można wyłączyć flagą
+`--non-interactive` i podać agentów flagami, np.:
 
 ```bash
 python3 -m forge.orchestrate --non-interactive \
-  --planner-agent codex --planner-model gpt-5.6-sol --planner-effort high \
-  --codex-model gpt-5.6-sol --codex-effort high
+  --planner-agent codex --tester-agent codex --coder-agent grok \
+  --reviewer-agent claude --verifier-agent opencode
 ```
 
 Zostaw działające — pętla leci sama. Zatrzymanie: utwórz plik `game/STOP`
@@ -128,10 +142,8 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 | Co | Domyślnie | Jak zmienić |
 |---|---|---|
 | Agent planujący | `claude` | `--planner-agent codex` lub `FORGE_PLANNER_AGENT` |
-| Model planisty | `opus` dla Claude | `--planner-model ...` lub `FORGE_PLANNER_MODEL` |
-| Effort planisty | `high` dla Claude | `--planner-effort medium` lub `FORGE_PLANNER_EFFORT` |
-| Model Codex | z `~/.codex/config.toml` | `--codex-model ...` lub `FORGE_CODEX_MODEL` |
-| Effort Codex | `medium` | `--codex-effort high` lub `FORGE_CODEX_EFFORT` |
+| Routing model/effort | stała mapa agent × rola × trudność | planista przypisuje `simple` / `standard` / `complex` |
+| Model/effort Codex w trybie legacy | z `~/.codex/config.toml` / `medium` | `--codex-model`, `--codex-effort` lub `FORGE_CODEX_*` |
 | Sandbox Codeksa | `danger-full-access` (pełny dostęp) | zawęź: `FORGE_CODEX_SANDBOX=workspace-write` |
 | Ścieżka do Claude | `claude` | `FORGE_CLAUDE_BIN=/path/claude` |
 | Tryb pętli | mikro-TDD (nowy) | `--legacy` lub `FORGE_LEGACY_MODE=1` |
@@ -140,16 +152,14 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 | Dogrywki „zazielenienia"/cykl | `2` | `FORGE_MAX_GREEN_RETRIES` |
 | Agent testera | `opencode` | `--tester-agent NAZWA` lub `FORGE_TESTER_AGENT` |
 | Agent kodera | `opencode` | `--coder-agent NAZWA` lub `FORGE_CODER_AGENT` |
-| Model/effort testera | `neuralwatt/glm-5.2-short-fast-flex` | `--tester-model/--tester-effort` lub `FORGE_TESTER_*` |
-| Model/effort kodera | `neuralwatt/kimi-k2.7-code-flex` | `--coder-model/--coder-effort` lub `FORGE_CODER_*` |
 | Limit iteracji | bez limitu | `--max-iters 20` |
 | Opóźnienie startu | brak | `--sleep 30s`, `--sleep 5m`, `--sleep 2h` |
 | Timeout agenta | 3600 s | `FORGE_AGENT_TIMEOUT=...` |
 | Push do remote | włączony (`origin`) | `FORGE_GIT_PUSH=0`, `FORGE_GIT_REMOTE=...` |
-| Recenzent zadania | `opencode` / `neuralwatt/glm-5.2-flex`, ŚWIEŻY kontekst | `--reviewer-agent/model/effort` lub `FORGE_REVIEWER_AGENT/MODEL/EFFORT` |
-| Weryfikator celu | `opencode` / `neuralwatt/qwen3.5-397b` | `--verifier-agent/model/effort` lub `FORGE_VERIFIER_AGENT/MODEL/EFFORT` |
+| Recenzent zadania | `opencode`, ŚWIEŻY kontekst | `--reviewer-agent` lub `FORGE_REVIEWER_AGENT` |
+| Weryfikator celu | `opencode` | `--verifier-agent` lub `FORGE_VERIFIER_AGENT` |
 | Globy toolchainu testów (extra) | heurystyka + deklaracja bootstrapu | `FORGE_TOOLCHAIN_GLOBS` (CSV) |
-| Rotacja sesji ról co K cykli | `6` (0 = wyłączona) | `FORGE_SESSION_ROTATE_CYCLES` |
+| Rotacja sesji ról co K cykli | `4` (0 = wyłączona) | `FORGE_SESSION_ROTATE_CYCLES` |
 | Sufit skrótu dziennika zadania | `8000` znaków | `FORGE_JOURNAL_TAIL_CHARS` |
 | Testy read-only na turę kodera | włączone | `FORGE_LOCK_TESTS=0` |
 | Re-plan wsadu po porażce zadania | włączony | `FORGE_REPLAN_ON_FAILURE=0` |
@@ -220,7 +230,7 @@ Projekt: `docs/PLAN-4-BRAMKI-I-KONTEKST.md`. W skrócie:
 - **Recenzent ≠ autor.** Recenzja zadania idzie w świeżym kontekście (bez sesji
   testera/kodera i bez dziennika), z kontekstem budowanym przez orkiestrator:
   tag startu zadania, lista zmian, zmiany toolchainu, kryteria `justified` do
-  rozstrzygnięcia. Domyślnie `opencode`/`neuralwatt/glm-5.2-flex` (pusty agent
+  rozstrzygnięcia. Domyślnie `opencode` (pusty agent
   spada na agenta testera); **zalecana dywersyfikacja** — wspólny model to
   wspólne ślepe punkty, np. `FORGE_REVIEWER_AGENT=claude` przy koderze-Codeksie
   (decyzja kosztowa).
@@ -232,21 +242,52 @@ Projekt: `docs/PLAN-4-BRAMKI-I-KONTEKST.md`. W skrócie:
 ## Dowolny agent CLI — pełna dowolność ról (claude, gpt, grok, Kiro, …)
 
 Każdą rolę — **planistę, testera, kodera, recenzenta, weryfikatora** — może
-pełnić inny agent CLI, z innym modelem. Zero ograniczeń co do kombinacji: np.
-Fable planuje, GPT (Codex) pisze testy, Grok pisze kod, a Sonnet recenzuje:
+pełnić inny agent CLI. Użytkownik wybiera tylko agentów; planista klasyfikuje
+zadania, a orkiestrator dobiera model i effort ze stałej mapy:
 
 ```bash
 python3 -m forge.orchestrate --non-interactive \
-  --planner-agent claude --planner-model claude-fable-5 --planner-effort high \
-  --tester-agent  gpt   --codex-effort high \
+  --planner-agent gpt \
+  --tester-agent  gpt \
   --coder-agent   grok \
-  --reviewer-agent claude --reviewer-model claude-sonnet-5
+  --reviewer-agent claude \
+  --verifier-agent opencode
 ```
 
 (albo równoważnie przez zmienne środowiskowe `FORGE_PLANNER_AGENT`,
-`FORGE_TESTER_AGENT`, `FORGE_CODER_AGENT`, `FORGE_REVIEWER_AGENT` + `*_MODEL`/`*_EFFORT`
-— patrz tabela pokręteł niżej; jest też `FORGE_VERIFIER_AGENT` dla roli
-weryfikatora celu).
+`FORGE_TESTER_AGENT`, `FORGE_CODER_AGENT`, `FORGE_REVIEWER_AGENT` i
+`FORGE_VERIFIER_AGENT`).
+
+### Automatyczny routing trudności
+
+Planista zapisuje przy każdym zadaniu `difficulty`, `risk_flags` i krótkie
+uzasadnienie. `simple` oznacza lokalną zmianę jednej powierzchni, `standard` —
+typowy przyrost, a `complex` — m.in. architekturę, publiczne API, migrację,
+toolchain/CI, sprzęt, refaktor lub naprawę po weryfikacji. Orkiestrator może
+poziom tylko **podnieść**, nigdy obniżyć. Stare kolejki bez tego pola wznawiają
+się jako `standard`.
+
+Dla Codex/GPT mapa jest następująca:
+
+| Rola | `simple` | `standard` | `complex` |
+|---|---|---|---|
+| Planista | Sol / high | Sol / high | Sol / high |
+| Tester | Terra / medium | Terra / medium | Sol / medium |
+| Koder | Luna / medium | Terra / low | Terra / medium |
+| Recenzent | Sol / medium | Sol / medium | Sol / medium |
+| Weryfikator | Terra / medium | Terra / medium | Terra / medium |
+
+Dla Claude: planista zawsze `opus/high`; tester `sonnet/medium`,
+`sonnet/high`, `opus/high`; koder `sonnet/low`, `sonnet/medium`,
+`opus/medium`; recenzent `sonnet/high`, `sonnet/high`, `opus/high`;
+weryfikator zawsze `sonnet/high`. Grok używa `grok-4.5` i zwiększa effort
+od `low` do `high`. OpenCode przełącza testera między szybkim GLM dla `simple`
+a pełnym GLM dla trudniejszych zadań, kodera kieruje do Kimi Code, recenzenta
+do GLM, a planistę/weryfikatora do Qwen 397B. Pełna, wykonywalna mapa znajduje
+się w `forge/config.py` (`ROLE_ROUTING`).
+
+Pola `*_MODEL`/`*_EFFORT` pozostają kompatybilnościowym fallbackiem wyłącznie
+dla własnych, nieznanych CLI. Dla znanych agentów nie nadpisują polityki.
 
 ### Agenci wbudowani i wspierani z gotowa
 
@@ -256,7 +297,7 @@ weryfikatora celu).
 | `codex` / `gpt` | Codex CLI (OpenAI, modele GPT) | wbudowana, z ciągłością sesji (`codex exec resume`) — `gpt` to wygodny alias na `codex` |
 | `grok` | xAI Grok Build CLI (`grok`) | gotowy domyślny szablon (`grok -p {prompt} -m {model} --effort {effort} --always-approve`), nadpisywalny |
 | `kiro` | Kiro CLI (AWS, `kiro-cli`) | gotowy domyślny szablon (`kiro-cli chat --no-interactive --trust-all-tools {prompt}`); model ustawiasz w `~/.kiro/settings/cli.json` (headless nie ma dziś flagi `--model`) |
-| `opencode` | OpenCode CLI (`opencode`, opencode.ai) — most do dowolnego dostawcy OpenAI-compatible skonfigurowanego w `~/.config/opencode/opencode.json` | gotowy domyślny szablon (`opencode run {prompt} -m {model} --variant {effort} --auto`); model podajesz jako `<provider>/<id>`, np. `neuralwatt/glm-5.2` — pełna lista podpowiedzi NeuralWatt w `KNOWN_AGENT_MODELS["opencode"]` (orchestrate.py) |
+| `opencode` | OpenCode CLI (`opencode`, opencode.ai) — most do dowolnego dostawcy OpenAI-compatible skonfigurowanego w `~/.config/opencode/opencode.json` | gotowy domyślny szablon (`opencode run {prompt} -m {model} --variant {effort} --auto`); model wybiera macierz routingu |
 
 `grok`, `kiro` i `opencode` działają "z pudełka" pod swoją nazwą — bez ustawiania
 żadnej zmiennej środowiskowej — bo mają wbudowany domyślny szablon komendy (zgodny z
@@ -271,11 +312,8 @@ nadpisz go tak samo jak dla zupełnie nowego narzędzia (patrz niżej).
 > `--variant` (`{effort}`) działa tylko dla modeli z `reasoning_effort` (rodzina
 > `glm-5.2*`) — dla pozostałych zostaw effort pusty.
 
-> **Effort dla grok/kiro.** Domyślne szablony **nie** przekazują `effort`
-> (Grok/Kiro nie mają dziś odpowiednika flagi „reasoning effort" w headless).
-> Ustawienie `--coder-effort`/`FORGE_CODER_EFFORT` dla tych agentów jest więc
-> **po cichu ignorowane** — jeśli Twoja wersja CLI to obsługuje, dodaj
-> `{effort}` do własnego `FORGE_AGENT_<NAZWA>_CMD`.
+> **Effort dla Kiro.** Headless Kiro nie przyjmuje wyboru modelu ani effortu;
+> mapa pozostawia oba pola puste. Grok dostaje `--effort` zgodnie z profilem.
 
 ### Zupełnie inny/nieznany CLI
 

@@ -123,29 +123,35 @@ class GenericSpecTest(unittest.TestCase):
 
 
 class ConfigRoleResolutionTest(unittest.TestCase):
-    def test_roles_default_to_codex_with_inheritance(self) -> None:
-        # tester/coder="codex" jawnie — domyślny agent Config() to teraz opencode,
-        # ale mechanizm dziedziczenia codex_model/effort dla roli=codex musi
-        # nadal działać, niezależnie od tego, co jest domyślnym agentem.
+    def test_codex_roles_follow_difficulty_matrix(self) -> None:
         cfg = Config(tester_agent="codex", coder_agent="codex",
                      tester_model="", coder_model="",
                      codex_model="gpt-x", codex_effort="high")
-        self.assertEqual(cfg.role("tester"), ("codex", "gpt-x", "high"))
-        self.assertEqual(cfg.role("coder"), ("codex", "gpt-x", "high"))
+        self.assertEqual(cfg.role("tester", "simple"),
+                         ("codex", "gpt-5.6-terra", "medium"))
+        self.assertEqual(cfg.role("tester", "complex"),
+                         ("codex", "gpt-5.6-sol", "medium"))
+        self.assertEqual(cfg.role("coder", "simple"),
+                         ("codex", "gpt-5.6-luna", "medium"))
+        self.assertEqual(cfg.role("coder", "standard"),
+                         ("codex", "gpt-5.6-terra", "low"))
 
-    def test_codex_planner_backfills_empty_effort(self) -> None:
-        # Pusty planner_effort dla codeksa dziedziczy codex_effort — inaczej
-        # -c model_reasoning_effort="" wywala codeksa.
+    def test_codex_planner_is_always_strong(self) -> None:
         cfg = Config(planner_agent="codex", planner_model="", planner_effort="",
                      codex_model="gpt-x", codex_effort="high")
-        self.assertEqual(cfg.role("planner"), ("codex", "gpt-x", "high"))
+        self.assertEqual(cfg.role("planner"), ("codex", "gpt-5.6-sol", "high"))
 
-    def test_generic_role_does_not_inherit_codex_model(self) -> None:
+    def test_known_generic_role_uses_fixed_matrix(self) -> None:
         cfg = Config(coder_agent="grok", coder_model="", codex_model="gpt-x")
         agent, model, effort = cfg.role("coder")
         self.assertEqual(agent, "grok")
-        self.assertEqual(model, "")   # generic → nie dziedziczy modelu codeksa
-        self.assertEqual(effort, "")
+        self.assertEqual(model, "grok-4.5")
+        self.assertEqual(effort, "medium")
+
+    def test_unknown_generic_role_keeps_legacy_fields(self) -> None:
+        cfg = Config(coder_agent="my-cli", coder_model="my-model",
+                     coder_effort="cheap", codex_model="gpt-x")
+        self.assertEqual(cfg.role("coder"), ("my-cli", "my-model", "cheap"))
 
     def test_agents_in_use_reflects_mode(self) -> None:
         cfg = Config(planner_agent="claude", tester_agent="codex", coder_agent="grok",
@@ -153,17 +159,15 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         self.assertEqual(set(cfg.agents_in_use()), {"claude", "codex", "grok"})
         self.assertEqual(set(Config(legacy_mode=True).agents_in_use()), {"claude", "codex"})
 
-    def test_gpt_role_inherits_codex_model_like_codex(self) -> None:
+    def test_gpt_alias_uses_codex_matrix(self) -> None:
         cfg = Config(tester_agent="gpt", tester_model="", codex_model="gpt-x", codex_effort="high")
-        self.assertEqual(cfg.role("tester"), ("gpt", "gpt-x", "high"))
+        self.assertEqual(cfg.role("tester"), ("gpt", "gpt-5.6-terra", "medium"))
 
-    def test_reviewer_alias_inherits_tester_model_effort(self) -> None:
-        # reviewer="gpt", tester="codex" to ta sama binarka → recenzent dziedziczy
-        # KONKRETNY model/effort testera, nie globalny fallback codex_model.
+    def test_reviewer_alias_uses_reviewer_matrix(self) -> None:
         cfg = Config(tester_agent="codex", tester_model="custom-m", tester_effort="high",
                      reviewer_agent="gpt", reviewer_model="",
                      codex_model="fallback-m", codex_effort="low")
-        self.assertEqual(cfg.role("reviewer"), ("gpt", "custom-m", "high"))
+        self.assertEqual(cfg.role("reviewer"), ("gpt", "gpt-5.6-sol", "medium"))
 
     def test_agents_in_use_dedups_aliases(self) -> None:
         # planner=gpt i tester=codex to jedna binarka — preflight nie może jej

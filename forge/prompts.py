@@ -34,6 +34,25 @@ Jesteś jednym z agentów w automatycznej pętli budującej oprogramowanie. Zasa
 """
 
 
+def micro_principles(*, resume: bool) -> str:
+    """Zasady dla mikro-TDD, krótsze po pierwszej turze tej samej sesji.
+
+    Pełny manifest na każdym ``resume`` nie zwiększa bezpieczeństwa bramek —
+    ich egzekwowanie jest mechaniczne — za to rozdyma historię. Kontrakt roli
+    i format JSON pozostają w każdym bieżącym poleceniu.
+    """
+    if resume:
+        return """\
+To jest kontynuacja tej samej sesji i tego samego zadania. Korzystaj z dotychczasowego
+kontekstu; doczytaj wyłącznie pliki potrzebne do TEGO kroku. Nie commituj.
+"""
+    return """\
+Jesteś agentem mikro-TDD. Pamięć jest w repo: przeczytaj plik bieżącego zadania,
+wskazane testy i właściwy kod; nie czytaj rutynowo DESIGN.md, ARCHITECTURE.md ani
+BACKLOG.md, chyba że ten krok rzeczywiście tego wymaga. Jeden mały krok, bez commitów.
+"""
+
+
 def mvp_phrase(kind: str) -> str:
     """Słownictwo MVP zależne od rodzaju produktu rozpoznanego przy bootstrapie."""
     return "grywalnego MVP" if kind == "game" else "działającego MVP"
@@ -316,12 +335,27 @@ Numeruj zadania od {start_index:03d}. Dla KAŻDEGO zadania zapisz plik
 <globy plików testowych, np. tests/test_walka.py>
 ## Ścieżki kodu
 <globy plików implementacji>
+## Trudność
+<simple|standard|complex — jedno zdanie uzasadnienia>
 ## Poza zakresem
 <czego świadomie NIE robimy w tym zadaniu>
 
 Zasady planowania (twarde):
 - Kryteria w JSON: skopiuj **dosłownie** teksty checkboxów z pliku zadania
   (orkiestrator i tak czyta checkboxy z pliku jako kanon; rozjazd = log).
+- Dla każdego zadania przypisz `"difficulty"`:
+  - `"simple"` tylko dla lokalnej zmiany na jednej powierzchni kodu/testów, bez
+    publicznego API, migracji, toolchainu/CI, sprzętu, refaktoru i naprawy po
+    wcześniejszej porażce;
+  - `"standard"` dla typowego przyrostu wymagającego kilku kroków;
+  - `"complex"` dla zmian architektury/publicznego API, migracji, wielu modułów,
+    współbieżności, bezpieczeństwa, sprzętu/CI/toolchainu, refaktoru albo naprawy
+    z repro/weryfikacji.
+  Dodaj `"risk_flags"` (używaj m.in. `public_api`, `migration`, `multi_module`,
+  `architecture`, `concurrency`, `security`, `toolchain`, `ci`, `hardware`,
+  `verification`, `previous_failure`; pusta lista gdy brak) oraz
+  `"routing_reason"` (jedno konkretne zdanie). Nie zaniżaj poziomu dla oszczędności:
+  orkiestrator mechanicznie eskaluje oczywiste ryzyka i nigdy nie obniża profilu.
 - Zadanie refaktoryzacyjne: ustaw `"kind": "refactor"` i w AC jasno „bez nowych
   testów" / „zadanie refaktoryzacyjne".
 - NIE łącz w jednym zadaniu monolitów: nowej powierzchni API + testu end-to-end
@@ -342,7 +376,8 @@ Na końcu zwróć WYŁĄCZNIE (globy MUSZĄ zgadzać się z plikami zadań{fix_n
   {{"id": "task-{start_index:03d}", "title": "<tytuł>", "file": ".forge/tasks/task-{start_index:03d}.md",
    "criteria": ["<dosłowny tekst checkboxa 1>", "<dosłowny tekst checkboxa 2>"],
    "test_globs": ["tests/..."], "code_globs": ["src/..."],
-   "kind": "feature"{fix_fields}}}
+   "kind": "feature", "difficulty": "standard", "risk_flags": [],
+   "routing_reason": "<dlaczego ten poziom>"{fix_fields}}}
 ]}}
 ```
 (dla refaktoru: `"kind": "refactor"`; dla zwykłego przyrostu możesz pominąć kind
@@ -354,7 +389,7 @@ w pełni zaimplementowane i przetestowane, a BACKLOG nie ma sensownych kroków."
 def write_test_prompt(task_file: str, test_cmd: str,
                       reject_reasons: list[str] | None = None,
                       refactor: bool = False,
-                      gate_not_red_count: int = 0) -> str:
+                      gate_not_red_count: int = 0, *, resume: bool = False) -> str:
     gate_hint = ""
     if gate_not_red_count:
         gate_hint = (
@@ -393,7 +428,7 @@ TO ZADANIE REFAKTORYZACYJNE (kind=refactor / AC bez nowych testów):
   testowych / nowych asercji na prywatne API, jeśli AC tego zabrania).
 - Sensowny krok bez nowego testu: action "no_test".
 """
-    return f"""{SHARED_PRINCIPLES}
+    return f"""{micro_principles(resume=resume)}
 
 ROLA: TESTER. Dyktujesz specyfikację przez testy. NIE piszesz kodu produkcyjnego.
 
@@ -437,12 +472,12 @@ Na końcu zwróć WYŁĄCZNIE jeden z bloków:
 
 
 def code_and_refactor_prompt(task_file: str, test_cmd: str,
-                             no_test: bool, test_tail: str = "") -> str:
+                             no_test: bool, test_tail: str = "", *, resume: bool = False) -> str:
     goal = ("Zaimplementuj brakującą funkcjonalność kroku (tester nie dodał testu — "
             "kieruj się kryteriami zadania)." if no_test else
             "Doprowadź NOWY (czerwony) test do zieleni najprostszym kodem.")
     tail = f"\n\nOgon ostatniej bramki testów (jeśli był czerwony):\n{test_tail}\n" if test_tail else ""
-    return f"""{SHARED_PRINCIPLES}
+    return f"""{micro_principles(resume=resume)}
 
 ROLA: KODER. Piszesz kod produkcyjny. {goal}
 
@@ -562,9 +597,9 @@ lub
 ```"""
 
 
-def fix_review_prompt(notes: list[str], test_cmd: str) -> str:
+def fix_review_prompt(notes: list[str], test_cmd: str, *, resume: bool = False) -> str:
     bullet = "\n".join(f"- {n}" for n in notes) or "- (brak konkretów — utwardź testy i kod)"
-    return f"""{SHARED_PRINCIPLES}
+    return f"""{micro_principles(resume=resume)}
 
 ROLA: KODER (poprawki po recenzji). Zastosuj WSZYSTKIE uwagi recenzenta.
 

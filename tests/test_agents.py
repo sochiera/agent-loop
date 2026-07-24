@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from forge.agents import run_claude, run_codex, run_codex_session, run_planner
@@ -56,6 +58,28 @@ class AgentArgumentsTest(unittest.TestCase):
         self.assertNotIn("--color", argv)
         self.assertLess(argv.index("--json"), argv.index("session-123"))
         self.assertEqual(argv[-2:], ["session-123", "continue"])
+
+    def test_resumed_codex_usage_logs_only_increment_since_previous_turn(self) -> None:
+        first = ('{"type":"thread.started","thread_id":"usage-test"}\n'
+                 '{"type":"turn.completed","usage":{"input_tokens":100,'
+                 '"cached_input_tokens":80,"output_tokens":10}}')
+        second = ('{"type":"turn.completed","usage":{"input_tokens":160,'
+                  '"cached_input_tokens":125,"output_tokens":16}}')
+        with tempfile.TemporaryDirectory() as project, \
+             patch("forge.agents._run_with_backoff", side_effect=[first, second]):
+            cfg = Config()
+            run_codex_session("first", cfg, project, "/tmp/first.log")
+            run_codex_session("second", cfg, project, "/tmp/second.log",
+                              session_id="usage-test")
+
+            rows = [json.loads(line) for line in
+                    Path(project, cfg.runtime_dir, "usage.jsonl").read_text().splitlines()]
+
+        self.assertEqual(rows[0]["usage"]["input_tokens"], 100)
+        self.assertEqual(rows[1]["usage"]["input_tokens"], 60)
+        self.assertEqual(rows[1]["usage"]["cached_input_tokens"], 45)
+        self.assertEqual(rows[1]["usage"]["output_tokens"], 6)
+        self.assertEqual(rows[1]["usage_cumulative"]["input_tokens"], 160)
 
 
 if __name__ == "__main__":

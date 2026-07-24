@@ -15,6 +15,99 @@ from dataclasses import dataclass, field
 from . import adapters
 
 
+TASK_DIFFICULTIES = ("simple", "standard", "complex")
+DEFAULT_TASK_DIFFICULTY = "standard"
+
+# Użytkownik wybiera narzędzie/agenta dla roli. Konkretny model i effort są
+# polityką projektu, nie pokrętłem pojedynczego uruchomienia. Dzięki temu
+# wznowienie zadania odtwarza ten sam routing bez zależności od interaktywnej
+# konfiguracji. Planner i verifier celowo nie tanieją wraz z profilem zadania:
+# ich odpowiedzialność obejmuje odpowiednio cały plan i cały produkt.
+ROLE_ROUTING: dict[str, dict[str, dict[str, tuple[str, str]]]] = {
+    "codex": {
+        "planner": {d: ("gpt-5.6-sol", "high") for d in TASK_DIFFICULTIES},
+        "tester": {
+            "simple": ("gpt-5.6-terra", "medium"),
+            "standard": ("gpt-5.6-terra", "medium"),
+            "complex": ("gpt-5.6-sol", "medium"),
+        },
+        "coder": {
+            "simple": ("gpt-5.6-luna", "medium"),
+            "standard": ("gpt-5.6-terra", "low"),
+            "complex": ("gpt-5.6-terra", "medium"),
+        },
+        "reviewer": {d: ("gpt-5.6-sol", "medium") for d in TASK_DIFFICULTIES},
+        "verifier": {d: ("gpt-5.6-terra", "medium") for d in TASK_DIFFICULTIES},
+    },
+    "claude": {
+        "planner": {d: ("opus", "high") for d in TASK_DIFFICULTIES},
+        "tester": {
+            "simple": ("sonnet", "medium"),
+            "standard": ("sonnet", "high"),
+            "complex": ("opus", "high"),
+        },
+        "coder": {
+            "simple": ("sonnet", "low"),
+            "standard": ("sonnet", "medium"),
+            "complex": ("opus", "medium"),
+        },
+        "reviewer": {
+            "simple": ("sonnet", "high"),
+            "standard": ("sonnet", "high"),
+            "complex": ("opus", "high"),
+        },
+        "verifier": {d: ("sonnet", "high") for d in TASK_DIFFICULTIES},
+    },
+    "grok": {
+        "planner": {d: ("grok-4.5", "high") for d in TASK_DIFFICULTIES},
+        "tester": {
+            "simple": ("grok-4.5", "low"),
+            "standard": ("grok-4.5", "medium"),
+            "complex": ("grok-4.5", "high"),
+        },
+        "coder": {
+            "simple": ("grok-4.5", "low"),
+            "standard": ("grok-4.5", "medium"),
+            "complex": ("grok-4.5", "high"),
+        },
+        "reviewer": {
+            "simple": ("grok-4.5", "medium"),
+            "standard": ("grok-4.5", "high"),
+            "complex": ("grok-4.5", "high"),
+        },
+        "verifier": {d: ("grok-4.5", "high") for d in TASK_DIFFICULTIES},
+    },
+    "opencode": {
+        "planner": {
+            d: ("neuralwatt/qwen3.5-397b", "") for d in TASK_DIFFICULTIES
+        },
+        "tester": {
+            "simple": ("neuralwatt/glm-5.2-short-fast-flex", "low"),
+            "standard": ("neuralwatt/glm-5.2-flex", "medium"),
+            "complex": ("neuralwatt/glm-5.2-flex", "high"),
+        },
+        "coder": {
+            "simple": ("neuralwatt/kimi-k2.7-code-flex", ""),
+            "standard": ("neuralwatt/kimi-k2.7-code-flex", ""),
+            "complex": ("neuralwatt/kimi-k2.7-code-flex", ""),
+        },
+        "reviewer": {
+            "simple": ("neuralwatt/glm-5.2-flex", "medium"),
+            "standard": ("neuralwatt/glm-5.2-flex", "high"),
+            "complex": ("neuralwatt/glm-5.2-flex", "high"),
+        },
+        "verifier": {
+            d: ("neuralwatt/qwen3.5-397b", "") for d in TASK_DIFFICULTIES
+        },
+    },
+    # Kiro sam zarządza wyborem modelu; puste wartości nie dodają flag CLI.
+    "kiro": {
+        role: {d: ("", "") for d in TASK_DIFFICULTIES}
+        for role in ("planner", "tester", "coder", "reviewer", "verifier")
+    },
+}
+
+
 _DEFAULT_PLANNER_AGENT = os.environ.get("FORGE_PLANNER_AGENT", "claude")
 _DEFAULT_PLANNER_MODEL = os.environ.get(
     "FORGE_PLANNER_MODEL",
@@ -141,7 +234,7 @@ class Config:
     reviewer_effort: str = os.environ.get("FORGE_REVIEWER_EFFORT", "")
     # Rotacja sesji ról co K ukończonych mikro-cykli (0 = wyłączona) —
     # higiena kontekstu: świeża sesja z dziennikiem zamiast spuchniętej.
-    session_rotate_cycles: int = int(os.environ.get("FORGE_SESSION_ROTATE_CYCLES", "6"))
+    session_rotate_cycles: int = int(os.environ.get("FORGE_SESSION_ROTATE_CYCLES", "4"))
     # Sufit skrótu dziennika doklejanego do promptu (pełny dziennik na dysku).
     journal_tail_chars: int = int(os.environ.get("FORGE_JOURNAL_TAIL_CHARS", "8000"))
     # Blokada zapisu (chmod a-w) testów cyklu na czas tury kodera — tani
@@ -189,37 +282,49 @@ class Config:
             return (model or self.codex_model, effort or self.codex_effort)
         return (model, effort)
 
-    def role(self, name: str) -> tuple[str, str, str]:
-        """(agent, model, effort) dla roli: 'planner' | 'tester' | 'coder'."""
-        if name == "planner":
-            return (self.planner_agent,
-                    *self._role_model_effort(self.planner_agent, self.planner_model, self.planner_effort))
-        if name == "tester":
-            return (self.tester_agent,
-                    *self._role_model_effort(self.tester_agent, self.tester_model, self.tester_effort))
-        if name == "coder":
-            return (self.coder_agent,
-                    *self._role_model_effort(self.coder_agent, self.coder_model, self.coder_effort))
+    def role(
+        self, name: str, difficulty: str = DEFAULT_TASK_DIFFICULTY
+    ) -> tuple[str, str, str]:
+        """Zwróć ``(agent, model, effort)`` z ustalonej polityki routingu.
+
+        Nieznane/customowe CLI zachowują zgodność wsteczną i korzystają z pól
+        ``*_model``/``*_effort``. Brak profilu w starym STATE.json oznacza
+        bezpieczne ``standard``.
+        """
+        if difficulty not in TASK_DIFFICULTIES:
+            difficulty = DEFAULT_TASK_DIFFICULTY
+
+        configured: dict[str, tuple[str, str, str]] = {
+            "planner": (self.planner_agent, self.planner_model, self.planner_effort),
+            "tester": (self.tester_agent, self.tester_model, self.tester_effort),
+            "coder": (self.coder_agent, self.coder_model, self.coder_effort),
+        }
         if name == "verifier":
             if not self.verifier_agent:  # domyślnie rola planisty w całości
-                return self.role("planner")
-            return (self.verifier_agent,
-                    *self._role_model_effort(self.verifier_agent,
-                                             self.verifier_model, self.verifier_effort))
-        if name == "reviewer":
-            # Domyślnie agent testera, ALE świeży kontekst. reviewer_model/effort
-            # muszą działać nawet bez jawnego reviewer_agent — inaczej
-            # FORGE_REVIEWER_MODEL/EFFORT z README są po cichu ignorowane.
+                return self.role("planner", difficulty)
+            configured[name] = (
+                self.verifier_agent, self.verifier_model, self.verifier_effort
+            )
+        elif name == "reviewer":
             agent = self.reviewer_agent or self.tester_agent
-            t_agent, t_model, t_effort = self.role("tester")
-            # Dziedziczenie ma sens, gdy to TO SAMO narzędzie — porównaj po
-            # nazwie kanonicznej, żeby recenzent-"gpt" dziedziczył po testerze-
-            # "codex" (alias), zamiast spadać na globalny codex_model/effort.
+            t_agent, t_model, t_effort = self.role("tester", difficulty)
             same_tool = adapters.canonical_agent(agent) == adapters.canonical_agent(t_agent)
             model = self.reviewer_model or (t_model if same_tool else "")
             effort = self.reviewer_effort or (t_effort if same_tool else "")
-            return (agent, *self._role_model_effort(agent, model, effort))
-        raise ValueError(f"nieznana rola: {name}")
+            configured[name] = (agent, model, effort)
+
+        if name not in configured:
+            raise ValueError(f"nieznana rola: {name}")
+
+        agent, legacy_model, legacy_effort = configured[name]
+        canonical = adapters.canonical_agent(agent)
+        fixed = ROLE_ROUTING.get(canonical, {}).get(name, {}).get(difficulty)
+        if fixed is not None:
+            return (agent, *fixed)
+        return (
+            agent,
+            *self._role_model_effort(agent, legacy_model, legacy_effort),
+        )
 
     def tester(self) -> tuple[str, str]:
         """(model, effort) testera — zgodność wsteczna; patrz role('tester')."""

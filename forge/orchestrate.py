@@ -25,7 +25,7 @@ from . import adapters, prompts, verify, verify_ledger
 from .agents import (AgentError, LimitExhausted, agent_supports_resume,
                      extract_json, run_agent, run_agent_session, run_codex,
                      run_planner)
-from .config import Config
+from .config import Config, DEFAULT_TASK_DIFFICULTY, TASK_DIFFICULTIES
 from .shellrun import run_shellfree as _run_shellfree
 from .state import State
 
@@ -144,55 +144,20 @@ def _ask_effort(label: str, default: str, allowed: tuple[str, ...]) -> str:
         print(f"Niepoprawny effort: {value!r}. Wybierz jedną z: {choices}.")
 
 
-def _ask_role_settings(cfg: Config, agent_attr: str, model_attr: str, effort_attr: str,
-                       title: str, *, allow_blank_agent: str = "") -> None:
-    """Zapytaj o agenta/model/effort jednej roli (tester/koder/recenzent/weryfikator).
-
-    allow_blank_agent: jeśli niepuste, puste pole agenta jest poprawne i oznacza
-    dziedziczenie (opisane w tym tekście) — dotyczy recenzenta i weryfikatora."""
+def _ask_role_agent(cfg: Config, agent_attr: str, title: str,
+                    *, allow_blank_agent: str = "") -> None:
+    """Zapytaj tylko o agenta roli; model/effort dobiera stała macierz."""
     current_agent = getattr(cfg, agent_attr)
     hint = f"claude/codex/gpt/grok/kiro/opencode/inny{', puste = ' + allow_blank_agent if allow_blank_agent else ''}"
     new_agent = _ask_value(f"Agent {title} ({hint})", current_agent,
                           display_default=current_agent or allow_blank_agent or "codex")
     setattr(cfg, agent_attr, new_agent)
 
-    canon = adapters.canonical_agent(new_agent) if new_agent else ""
-    cur_model = getattr(cfg, model_attr)
-    new_model = _ask_model(
-        f"Model {title} ({new_agent or allow_blank_agent or 'domyślny'})", cur_model, canon,
-        display_default=cur_model or "puste = domyślny agenta",
-    )
-    setattr(cfg, model_attr, new_model)
-
-    known_efforts = KNOWN_AGENT_EFFORTS.get(canon)
-    cur_effort = getattr(cfg, effort_attr)
-    if known_efforts:  # wbudowany agent → waliduj wobec znanych poziomów
-        setattr(cfg, effort_attr, _ask_effort(f"Effort {title}", cur_effort or "medium", known_efforts))
-    else:              # generyczny/dziedziczony → effort to dowolny string
-        setattr(cfg, effort_attr, _ask_value(
-            f"Effort {title}", cur_effort, display_default=cur_effort or "puste = domyślny agenta"))
-
-
 def prompt_agent_settings(cfg: Config) -> None:
-    """Pobierz agenta/model/effort każdej roli przed uruchomieniem pętli."""
-    print("\nKonfiguracja agentów (Enter zachowuje wartość domyślną):")
-    previous_agent = cfg.planner_agent
-    # Wolny wybór — poza claude/codex dozwolony dowolny agent generyczny.
+    """Pobierz wyłącznie agenta każdej roli; routing modelu jest stały."""
+    print("\nKonfiguracja agentów (model i effort dobiera profil trudności):")
     cfg.planner_agent = _ask_value("Agent do planowania (claude/codex/gpt/grok/kiro/opencode/inny)",
                                    cfg.planner_agent)
-    canon = adapters.canonical_agent(cfg.planner_agent)
-    if cfg.planner_agent != previous_agent:
-        cfg.planner_model = {"claude": "opus", "codex": cfg.codex_model}.get(canon, "")
-        cfg.planner_effort = {"claude": "high", "codex": cfg.codex_effort}.get(canon, "medium")
-    cfg.planner_model = _ask_model(
-        f"Model do planowania ({cfg.planner_agent})", cfg.planner_model, canon,
-        display_default=cfg.planner_model or "z konfiguracji CLI",
-    )
-    planner_efforts = KNOWN_AGENT_EFFORTS.get(canon)
-    if planner_efforts:  # wbudowany agent → waliduj wobec znanych poziomów
-        cfg.planner_effort = _ask_effort("Effort planowania", cfg.planner_effort, planner_efforts)
-    else:               # generyczny → effort to dowolny string
-        cfg.planner_effort = _ask_value("Effort planowania", cfg.planner_effort)
 
     if cfg.legacy_mode:
         # Tryb legacy: implement/fix zawsze na Codeksie — role tester/koder/
@@ -206,25 +171,12 @@ def prompt_agent_settings(cfg: Config) -> None:
         print()
         return
 
-    _ask_role_settings(cfg, "tester_agent", "tester_model", "tester_effort", "testera")
-    _ask_role_settings(cfg, "coder_agent", "coder_model", "coder_effort", "kodera")
-    _ask_role_settings(cfg, "reviewer_agent", "reviewer_model", "reviewer_effort",
-                       "recenzenta", allow_blank_agent="agent testera")
-    _ask_role_settings(cfg, "verifier_agent", "verifier_model", "verifier_effort",
-                       "weryfikatora", allow_blank_agent="agent planisty")
-
-    # Model/effort globalny Codeksa — pytamy TYLKO jeśli jakaś rola faktycznie
-    # rozwiązuje się do Codeksa (dziedziczą go role z agent=codex bez własnego
-    # modelu). Gdy nikt nie używa Codeksa (np. wszystkie role na grok), pytanie
-    # byłoby mylącym szumem.
-    if "codex" in {adapters.canonical_agent(a) for a in cfg.agents_in_use()}:
-        cfg.codex_model = _ask_value(
-            "Domyślny model Codeksa (dziedziczą role z agentem=codex bez własnego modelu)",
-            cfg.codex_model, display_default=cfg.codex_model or "z config.toml",
-        )
-        cfg.codex_effort = _ask_effort(
-            "Domyślny effort Codeksa", cfg.codex_effort, CODEX_EFFORTS
-        )
+    _ask_role_agent(cfg, "tester_agent", "testera")
+    _ask_role_agent(cfg, "coder_agent", "kodera")
+    _ask_role_agent(cfg, "reviewer_agent", "recenzenta",
+                    allow_blank_agent="agent testera")
+    _ask_role_agent(cfg, "verifier_agent", "weryfikatora",
+                    allow_blank_agent="agent planisty")
     print()
 
 
@@ -891,9 +843,65 @@ def is_refactor_task(task: dict, body: str = "") -> bool:
     return bool(_REFACTOR_MARKER_RE.search(blob))
 
 
+_COMPLEX_RISK_FLAGS = {
+    "architecture", "ci", "concurrency", "data_migration", "hardware",
+    "migration", "multi_module", "previous_failure", "public_api", "security", "toolchain",
+    "verification",
+}
+
+
+def _normalized_risk_flags(raw: dict) -> list[str]:
+    value = raw.get("risk_flags") or []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [
+        str(flag).strip().lower().replace("-", "_").replace(" ", "_")
+        for flag in value
+        if str(flag).strip()
+    ]
+
+
+def resolve_task_difficulty(raw: dict) -> tuple[str, bool, list[str]]:
+    """Znormalizuj propozycję planisty i mechanicznie eskaluj jawne ryzyko.
+
+    Zwraca ``(effective, escalated, reasons)``. Orkiestrator nigdy nie obniża
+    profilu. Starsze zadania bez pola ``difficulty`` trafiają do ``standard``.
+    """
+    original = str(raw.get("difficulty") or "").strip().lower()
+    if not original:
+        return DEFAULT_TASK_DIFFICULTY, False, ["legacy_default"]
+    requested = original
+    reasons: list[str] = []
+    if requested not in TASK_DIFFICULTIES:
+        requested = DEFAULT_TASK_DIFFICULTY
+        reasons.append("invalid_difficulty")
+
+    effective = requested
+    flags = set(_normalized_risk_flags(raw))
+    hard_flags = sorted(flags & _COMPLEX_RISK_FLAGS)
+    if (hard_flags or raw.get("fixes") or raw.get("repro_cmd")
+            or str(raw.get("kind") or "").strip().lower() == "refactor"):
+        if effective != "complex":
+            effective = "complex"
+            reasons.extend(hard_flags or ["repair_or_refactor"])
+    elif effective == "simple":
+        # Kilka powierzchni plikowych zwykle wymaga koordynacji, nawet gdy
+        # planista ocenił samą zmianę jako lokalną.
+        code_globs = {str(x).strip() for x in raw.get("code_globs") or [] if str(x).strip()}
+        test_globs = {str(x).strip() for x in raw.get("test_globs") or [] if str(x).strip()}
+        if len(code_globs) > 1 or len(test_globs) > 1:
+            effective = "standard"
+            reasons.append("multiple_surfaces")
+    return effective, effective != original, reasons
+
+
 def build_task_from_plan(project: str, raw: dict) -> dict:
     """Zbuduj element kolejki z JSON planisty: kind, resolve criteria, globs."""
     rel = raw.get("file", "")
+    difficulty, escalated, escalation_reasons = resolve_task_difficulty(raw)
+    requested = str(raw.get("difficulty") or DEFAULT_TASK_DIFFICULTY).strip().lower()
     task = {
         "id": raw.get("id") or os.path.splitext(os.path.basename(rel))[0],
         "title": raw.get("title", "(zadanie)"),
@@ -904,6 +912,12 @@ def build_task_from_plan(project: str, raw: dict) -> dict:
         "fixes": str(raw.get("fixes") or ""),
         "repro_cmd": str(raw.get("repro_cmd") or ""),
         "kind": str(raw.get("kind") or ""),
+        "difficulty": difficulty,
+        "difficulty_requested": requested,
+        "difficulty_escalated": escalated,
+        "difficulty_escalation_reasons": escalation_reasons,
+        "risk_flags": _normalized_risk_flags(raw),
+        "routing_reason": str(raw.get("routing_reason") or "").strip(),
     }
     canon, source = resolve_task_criteria(project, task)
     task["criteria"] = canon
@@ -1142,7 +1156,10 @@ def _session_call(cfg: Config, project: str, state: State, role: str,
     z dziennikiem. Agent bezsesyjny (claude/generic) → jedno wywołanie z
     dziennikiem zadania jako kontekstem. Aktualizuje id sesji w stanie."""
     attr = "tester_session" if role == "tester" else "coder_session"
-    agent, model, effort = cfg.role(role)
+    difficulty = (state.current_task or {}).get(
+        "difficulty", DEFAULT_TASK_DIFFICULTY
+    )
+    agent, model, effort = cfg.role(role, difficulty)
 
     if not agent_supports_resume(agent):
         return run_agent(agent, _with_journal(project, cfg, prompt),
@@ -1500,7 +1517,14 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     for t in (data.get("tasks") or []):
         rel = t.get("file", "")
         if rel and os.path.exists(os.path.join(project, rel)):
-            tasks.append(build_task_from_plan(project, t))
+            task = build_task_from_plan(project, t)
+            tasks.append(task)
+            if task["difficulty_escalated"]:
+                log(
+                    f"PLAN: profil {task['id']} podniesiony "
+                    f"{task['difficulty_requested']} → {task['difficulty']} "
+                    f"({', '.join(task['difficulty_escalation_reasons'])})"
+                )
         else:
             log(f"PLAN: pomijam zadanie bez pliku na dysku: {t.get('id') or rel!r}")
     state.task_queue = tasks
@@ -1526,6 +1550,8 @@ def _write_current_task_pointer(project: str, task: dict) -> None:
 
 def _start_task(cfg: Config, project: str, state: State) -> None:
     task = state.task_queue.pop(0)
+    if task.get("difficulty") not in TASK_DIFFICULTIES:
+        task["difficulty"] = DEFAULT_TASK_DIFFICULTY
     canon, source = resolve_task_criteria(project, task)
     task["criteria"] = canon
     task["criteria_source"] = source
@@ -1554,8 +1580,15 @@ def _start_task(cfg: Config, project: str, state: State) -> None:
     state.phase = "micro"
     _write_current_task_pointer(project, task)
     journal_reset(project, cfg, state.current_task_title)
+    difficulty = task["difficulty"]
+    routes = ", ".join(
+        f"{role}={agent}/{model or 'default'}/{effort or 'default'}"
+        for role in ("tester", "coder", "reviewer")
+        for agent, model, effort in [cfg.role(role, difficulty)]
+    )
     log(f"START zadania: {state.current_task_title} (tag {state.task_start_tag}; "
-        f"criteria_source={source}, n={len(canon)})")
+        f"difficulty={difficulty}, criteria_source={source}, n={len(canon)})")
+    log(f"ROUTING [{difficulty}]: {routes}")
     if source == "empty":
         log("UWAGA: brak kryteriów akceptacji (plik bez checkboxów i pusty JSON).")
         if cfg.fail_on_empty_criteria:
@@ -1700,7 +1733,8 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
                                     task_file, state.test_cmd,
                                     reject_reasons=state.done_reject_reasons,
                                     refactor=refactor,
-                                    gate_not_red_count=state.last_gate_not_red_attempt),
+                                    gate_not_red_count=state.last_gate_not_red_attempt,
+                                    resume=bool(state.tester_session)),
                                 logf(f"c{c:02d}-test"))
             verdict = extract_json(out) or {"action": "no_test", "reason": "brak werdyktu JSON"}
             state.done_reject_reasons = []  # skonsumowane w prompcie powyżej
@@ -1864,7 +1898,8 @@ def _run_micro_loop(cfg: Config, project: str, state: State, logf):
             for attempt in range(cfg.max_green_retries + 1):
                 out = _session_call(cfg, project, state, "coder",
                                     prompts.code_and_refactor_prompt(
-                                        task_file, state.test_cmd, no_test, tail),
+                                        task_file, state.test_cmd, no_test, tail,
+                                        resume=bool(state.coder_session)),
                                     logf(f"c{c:02d}-code{attempt}"))
                 verdict = extract_json(out) or {}
                 green, tail = _task_gate(cfg, project, state)
@@ -2012,7 +2047,9 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
         if state.phase == "fix_review":
             log(f"--- POPRAWKI PO RECENZJI (koder) runda {state.fix_attempt + 1} ---")
             out = _session_call(cfg, project, state, "coder",
-                                prompts.fix_review_prompt(state.review_notes, state.test_cmd),
+                                prompts.fix_review_prompt(
+                                    state.review_notes, state.test_cmd,
+                                    resume=bool(state.coder_session)),
                                 logf(f"review-fix{state.fix_attempt + 1}"))
             protected = _verify_protected_globs(project, cfg, state)
             if protected:
@@ -2056,7 +2093,10 @@ def _run_review_loop(cfg: Config, project: str, state: State, logf, *,
         # buduje mechanicznie orkiestrator: diff od taga startu, zmiany
         # toolchainu, kryteria justified do rozstrzygnięcia.
         log("--- RECENZJA CAŁOŚCI (świeży kontekst) ---")
-        agent, model, effort = cfg.role("reviewer")
+        difficulty = (state.current_task or {}).get(
+            "difficulty", DEFAULT_TASK_DIFFICULTY
+        )
+        agent, model, effort = cfg.role("reviewer", difficulty)
         changed = changed_files(project, state.task_start_tag or "HEAD",
                                 runtime_dir=cfg.runtime_dir, stop_file=cfg.stop_file)
         toolchain_changed = [p for p in changed
@@ -2527,10 +2567,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="Opóźnij start, np. 30, 30s, 5m albo 2h.")
     ap.add_argument("--planner-agent", default=None,
                     help="Agent planisty: claude, codex lub dowolny (FORGE_AGENT_<NAME>_CMD).")
-    ap.add_argument("--planner-model", "--claude-model", dest="planner_model", default=None)
-    ap.add_argument("--planner-effort", "--claude-effort", dest="planner_effort", default=None)
-    ap.add_argument("--codex-model", default=None)
-    ap.add_argument("--codex-effort", default=None, choices=CODEX_EFFORTS)
+    # Zachowane, ale ukryte dla zgodności customowych agentów i trybu legacy.
+    # Dla znanych agentów nowego modelu stała macierz ma pierwszeństwo.
+    ap.add_argument("--planner-model", "--claude-model", dest="planner_model",
+                    default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--planner-effort", "--claude-effort", dest="planner_effort",
+                    default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--codex-model", default=None,
+                    help="Model implementatora Codeks w trybie --legacy.")
+    ap.add_argument("--codex-effort", default=None, choices=CODEX_EFFORTS,
+                    help="Effort implementatora Codeks w trybie --legacy.")
     ap.add_argument("--legacy", action="store_true", default=None,
                     help="Stary przebieg plan→implement→review(Claude)→fix.")
     ap.add_argument("--batch-size", type=int, default=None,
@@ -2539,24 +2585,24 @@ def main(argv: list[str] | None = None) -> int:
                     help="Sufit mikro-cykli TDD na zadanie (nowy model).")
     ap.add_argument("--tester-agent", default=None,
                     help="Agent testera: claude, codex lub dowolny (FORGE_AGENT_<NAME>_CMD).")
-    ap.add_argument("--tester-model", default=None, help="Model agenta-testera (nowy model).")
-    ap.add_argument("--tester-effort", default=None, help="Effort agenta-testera.")
+    ap.add_argument("--tester-model", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--tester-effort", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--coder-agent", default=None,
                     help="Agent kodera: claude, codex lub dowolny (FORGE_AGENT_<NAME>_CMD).")
-    ap.add_argument("--coder-model", default=None, help="Model agenta-kodera (nowy model).")
-    ap.add_argument("--coder-effort", default=None, help="Effort agenta-kodera.")
+    ap.add_argument("--coder-model", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--coder-effort", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--reviewer-agent", default=None,
                     help="Agent recenzenta zadania: claude, codex/gpt, grok, kiro, opencode "
                          "lub dowolny (FORGE_AGENT_<NAME>_CMD). Domyślnie agent testera.")
-    ap.add_argument("--reviewer-model", default=None, help="Model agenta-recenzenta.")
-    ap.add_argument("--reviewer-effort", default=None, help="Effort agenta-recenzenta.")
+    ap.add_argument("--reviewer-model", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--reviewer-effort", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--verifier-agent", default=None,
                     help="Agent weryfikatora celu: claude, codex/gpt, grok, kiro, opencode "
                          "lub dowolny (FORGE_AGENT_<NAME>_CMD). Domyślnie agent planisty.")
-    ap.add_argument("--verifier-model", default=None, help="Model agenta-weryfikatora.")
-    ap.add_argument("--verifier-effort", default=None, help="Effort agenta-weryfikatora.")
+    ap.add_argument("--verifier-model", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--verifier-effort", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--non-interactive", action="store_true",
-                    help="Nie pytaj o modele i effort; użyj flag/env/dom wartości.")
+                    help="Nie pytaj o agentów; użyj flag/env/dom wartości.")
     ap.add_argument("--check", action="store_true", help="Tylko preflight i wyjście.")
     args = ap.parse_args(argv)
 
@@ -2612,12 +2658,6 @@ def main(argv: list[str] | None = None) -> int:
         cfg.verifier_model = args.verifier_model
     if args.verifier_effort:
         cfg.verifier_effort = args.verifier_effort
-
-    # Effort waliduj tylko dla wbudowanych agentów o znanym zbiorze poziomów;
-    # dla generycznego CLI effort to dowolny string przekazywany przez szablon.
-    allowed_planner_efforts = KNOWN_AGENT_EFFORTS.get(adapters.canonical_agent(cfg.planner_agent))
-    if allowed_planner_efforts and cfg.planner_effort not in allowed_planner_efforts:
-        ap.error(f"effort {cfg.planner_effort!r} nie jest obsługiwany przez {cfg.planner_agent}")
 
     if not args.check and not args.non_interactive:
         if sys.stdin.isatty():

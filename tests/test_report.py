@@ -46,6 +46,19 @@ class SummarizeTest(unittest.TestCase):
         self.assertIn("micro-code", table)
         self.assertIn("RAZEM", table)
 
+    def test_legacy_resumed_codex_counter_is_not_summed(self) -> None:
+        rows = summarize([
+            {"agent": "codex", "phase": "c01-test", "resumed": False,
+             "usage": {"input_tokens": 100}},
+            {"agent": "codex", "phase": "c02-test", "resumed": True,
+             "usage": {"input_tokens": 1_000}},  # dawny licznik sesji
+            {"agent": "codex", "phase": "c03-test", "resumed": True,
+             "usage_cumulative": {"input_tokens": 1_100},
+             "usage": {"input_tokens": 100}},
+        ])
+        self.assertEqual(rows[("codex", "micro-test")]["calls"], 2)
+        self.assertEqual(rows[("codex", "micro-test")]["in"], 200)
+
 
 class EndToEndReportTest(unittest.TestCase):
     def test_reads_jsonl_and_survives_garbage_lines(self) -> None:

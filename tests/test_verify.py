@@ -24,14 +24,14 @@ class VerifierConfigTest(unittest.TestCase):
 
         self.assertEqual(cfg.role("verifier"), ("claude", "opus", "high"))
 
-    def test_explicit_verifier_does_not_inherit_planner_model(self) -> None:
+    def test_explicit_verifier_uses_fixed_role_matrix(self) -> None:
         cfg = Config()
         cfg.planner_agent, cfg.planner_model = "claude", "opus"
         cfg.verifier_agent, cfg.verifier_model, cfg.verifier_effort = "codex", "", "low"
         cfg.codex_model = "gpt-test"
 
-        # codex z pustym modelem dziedziczy codex_model (jak tester/koder), nie opusa.
-        self.assertEqual(cfg.role("verifier"), ("codex", "gpt-test", "low"))
+        self.assertEqual(cfg.role("verifier"),
+                         ("codex", "gpt-5.6-terra", "medium"))
 
     def test_agents_in_use_includes_explicit_verifier(self) -> None:
         cfg = Config()

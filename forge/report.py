@@ -6,6 +6,10 @@ Uruchomienie:
 Agreguje wiersze zapisane przez agents.log_usage per (agent, faza) i podaje
 sumy — to jest narzędzie do rozstrzygania pytań "gdzie idą tokeny" danymi,
 nie odczuciem (patrz docs/ANALIZA-TOKENY-I-NOWY-MODEL.md, sekcja 2.1).
+
+Stare wiersze Codexa z ``resumed=true`` (sprzed telemetrycznej migracji) są
+pomijane: zawierają skumulowany licznik całej sesji, więc ich zsumowanie
+fałszywie wielokrotnie naliczałoby te same tokeny.
 """
 from __future__ import annotations
 
@@ -72,6 +76,12 @@ def summarize(records: list[dict]) -> dict:
     rows: dict[tuple[str, str], dict] = {}
     for rec in records:
         agent = str(rec.get("agent") or "?")
+        if (agent == "codex" and rec.get("resumed") is True
+                and "usage_cumulative" not in rec):
+            # Legacy: przed poprawką run_codex_session zapisywał pełny licznik
+            # sesji jako koszt pojedynczego resume. Pierwsze wywołania (False)
+            # pozostają użyteczne, a wznowienia bezpiecznie odrzucamy.
+            continue
         group = normalize_phase(str(rec.get("phase") or ""))
         inp, cached, out = _tokens(rec.get("usage") or {})
         row = rows.setdefault((agent, group),

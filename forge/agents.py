@@ -120,9 +120,10 @@ def extract_session_id(stream: str) -> str | None:
 def extract_codex_usage(stream: str) -> dict:
     """Zużycie tokenów z JSONL Codeksa.
 
-    Ścieżka główna: sumuj pola `usage` ze zdarzeń `turn.completed` (jedno
-    wywołanie exec może mieć wiele tur). Fallback dla starszych formatów:
-    generyczny skan znanych kluczy (ostatnia wartość wygrywa)."""
+    ``turn.completed`` w obecnym Codex CLI zawiera licznik sesji; jego różnicę
+    względem poprzedniego wywołania oblicza ``run_codex_session``. Tutaj
+    zachowujemy pełny licznik z danego wywołania. Fallback dla starszych
+    formatów: generyczny skan znanych kluczy (ostatnia wartość wygrywa)."""
     turn_totals: dict = {}
     fallback: dict = {}
     for line in (stream or "").splitlines():
@@ -134,9 +135,12 @@ def extract_codex_usage(stream: str) -> dict:
         except json.JSONDecodeError:
             continue
         if obj.get("type") == "turn.completed" and isinstance(obj.get("usage"), dict):
-            for key, val in obj["usage"].items():
-                if isinstance(val, (int, float)):
-                    turn_totals[key] = turn_totals.get(key, 0) + val
+            # Ostatni event jest najbardziej kompletnym licznikiem tej sesji.
+            # Sumowanie wielu eventów dublowałoby wcześniejsze wartości.
+            turn_totals = {
+                key: val for key, val in obj["usage"].items()
+                if isinstance(val, (int, float))
+            }
             continue
         for key in ("input_tokens", "output_tokens", "cached_input_tokens",
                     "total_tokens", "reasoning_output_tokens"):
@@ -172,6 +176,62 @@ def log_usage(project_dir: str, cfg: Config, record: dict) -> None:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         pass  # pomiar nigdy nie wywraca pętli
+
+
+_CODEX_USAGE_KEYS = (
+    "input_tokens", "cached_input_tokens", "output_tokens",
+    "reasoning_output_tokens", "total_tokens",
+)
+_codex_usage_baselines: dict[str, dict] = {}
+
+
+def _last_codex_usage_baseline(project_dir: str, cfg: Config, session_id: str) -> dict | None:
+    """Odczytaj ostatni licznik skumulowany sesji, także po restarcie forge.
+
+    Codex CLI 0.144 raportuje w ``turn.completed`` licznik od początku wątku,
+    nie przyrost bieżącego ``exec resume``. Wiersz z poprzedniego uruchomienia
+    jest więc potrzebny, aby raport nie liczył tej samej historii ponownie.
+    """
+    if session_id in _codex_usage_baselines:
+        return _codex_usage_baselines[session_id]
+    path = os.path.join(project_dir, cfg.runtime_dir, "usage.jsonl")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rows = f.readlines()
+    except OSError:
+        return None
+    for line in reversed(rows):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("agent") != "codex" or row.get("session_id") != session_id:
+            continue
+        cumulative = row.get("usage_cumulative")
+        if isinstance(cumulative, dict):
+            _codex_usage_baselines[session_id] = cumulative
+            return cumulative
+    return None
+
+
+def _usage_delta(cumulative: dict, baseline: dict | None) -> dict | None:
+    """Zamień licznik skumulowany Codeksa w przyrost albo oznacz brak bazowej.
+
+    Zmniejszenie licznika oznacza zmianę formatu CLI albo niepasującą bazę;
+    wtedy nie zgadujemy i nie zanieczyszczamy raportu.
+    """
+    if baseline is None:
+        return None
+    delta: dict = {}
+    for key in _CODEX_USAGE_KEYS:
+        current = cumulative.get(key)
+        previous = baseline.get(key, 0)
+        if not isinstance(current, (int, float)):
+            continue
+        if not isinstance(previous, (int, float)) or current < previous:
+            return None
+        delta[key] = current - previous
+    return delta
 
 
 def extract_json(text: str) -> dict | None:
@@ -382,18 +442,30 @@ def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
 
     Gdy ``session_id`` podany — wznawia sesję (``codex exec resume <id>``);
     inaczej startuje nową i przechwytuje jej id ze strumienia ``--json``.
-    Zwraca (ostatnia wiadomość agenta, session_id). Loguje zużycie tokenów."""
+    Zwraca (ostatnia wiadomość agenta, session_id). Loguje przyrost zużycia
+    tokenów, nie licznik skumulowany zwracany przez ``exec resume``."""
     a = _codex_agent(cfg, model, effort)
     last_msg = _prepare_last_msg_file(project_dir, cfg)
     argv = _codex_argv(a, cfg, project_dir, last_msg, prompt,
                        json_stream=True, resume_id=session_id)
     stream = _run_with_backoff(argv, project_dir, cfg, log_path)
     sid = session_id or extract_session_id(stream)
-    usage = extract_codex_usage(stream)
-    if usage:
-        log_usage(project_dir, cfg, {"agent": "codex", "phase": _phase_from_log(log_path),
-                                     "model": a.model, "effort": a.effort,
-                                     "resumed": bool(session_id), "usage": usage})
+    cumulative = extract_codex_usage(stream)
+    if cumulative and sid:
+        baseline = _last_codex_usage_baseline(project_dir, cfg, sid)
+        # Nowa sesja ma licznik zaczynający się od zera, więc jej pierwszy
+        # raport jest dokładnym przyrostem. Dla starej sesji bez zapisanej bazy
+        # nie zapisujemy fałszywie całej historii jako nowej tury.
+        usage = cumulative if session_id is None else _usage_delta(cumulative, baseline)
+        _codex_usage_baselines[sid] = cumulative
+        record = {"agent": "codex", "phase": _phase_from_log(log_path),
+                  "model": a.model, "effort": a.effort, "resumed": bool(session_id),
+                  "session_id": sid, "usage_cumulative": cumulative}
+        if usage is not None:
+            record["usage"] = usage
+        else:
+            record["usage_unavailable"] = True
+        log_usage(project_dir, cfg, record)
     return _read_last_msg(last_msg), sid
 
 

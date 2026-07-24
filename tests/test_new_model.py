@@ -10,9 +10,10 @@ from unittest.mock import Mock, patch
 from forge.agents import extract_codex_usage, extract_session_id
 from forge.config import Config
 from forge.orchestrate import (_next_task_index, _path_matches, _run_micro_loop,
-                               _task_iteration, coder_test_violations,
+                               _task_iteration, build_task_from_plan,
+                               coder_test_violations,
                                phase_plan_batch, red_gate_ok, role_paths_ok,
-                               run_gate)
+                               run_gate, resolve_task_difficulty)
 from forge.state import State
 
 
@@ -61,6 +62,46 @@ class PureGateTest(unittest.TestCase):
         self.assertEqual(viol, [])
 
 
+class TaskDifficultyTest(unittest.TestCase):
+    def test_legacy_task_defaults_to_standard(self) -> None:
+        self.assertEqual(
+            resolve_task_difficulty({}),
+            ("standard", False, ["legacy_default"]),
+        )
+
+    def test_simple_multiple_surfaces_is_escalated_to_standard(self) -> None:
+        difficulty, escalated, reasons = resolve_task_difficulty({
+            "difficulty": "simple",
+            "code_globs": ["src/a.py", "src/b.py"],
+            "test_globs": ["tests/test_a.py"],
+        })
+        self.assertEqual(difficulty, "standard")
+        self.assertTrue(escalated)
+        self.assertIn("multiple_surfaces", reasons)
+
+    def test_hard_risk_is_escalated_to_complex(self) -> None:
+        difficulty, escalated, reasons = resolve_task_difficulty({
+            "difficulty": "standard",
+            "risk_flags": ["public_api"],
+        })
+        self.assertEqual(difficulty, "complex")
+        self.assertTrue(escalated)
+        self.assertIn("public_api", reasons)
+
+    def test_task_persists_routing_audit_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as project:
+            task = build_task_from_plan(project, {
+                "id": "task-001",
+                "difficulty": "simple",
+                "risk_flags": [],
+                "routing_reason": "Lokalna zmiana jednego modułu.",
+            })
+        self.assertEqual(task["difficulty"], "simple")
+        self.assertEqual(task["difficulty_requested"], "simple")
+        self.assertFalse(task["difficulty_escalated"])
+        self.assertEqual(task["routing_reason"], "Lokalna zmiana jednego modułu.")
+
+
 class SessionParsingTest(unittest.TestCase):
     def test_thread_started_real_format(self) -> None:
         # Dokładny kształt z dokumentacji codex exec --json (2026).
@@ -77,9 +118,11 @@ class SessionParsingTest(unittest.TestCase):
                   '{"type":"turn.completed","usage":{"input_tokens":100,'
                   '"cached_input_tokens":0,"output_tokens":10}}')
         usage = extract_codex_usage(stream)
-        self.assertEqual(usage["input_tokens"], 24863)   # suma tur
-        self.assertEqual(usage["output_tokens"], 132)
-        self.assertEqual(usage["cached_input_tokens"], 24448)
+        # Wznowiona sesja raportuje licznik skumulowany — ostatni event jest
+        # jedyną właściwą bazą do policzenia przyrostu przez run_codex_session.
+        self.assertEqual(usage["input_tokens"], 100)
+        self.assertEqual(usage["output_tokens"], 10)
+        self.assertEqual(usage["cached_input_tokens"], 0)
 
     def test_session_id_from_jsonl_event(self) -> None:
         stream = '{"type":"session.created","session_id":"abc-123"}\n{"type":"item"}'
@@ -319,6 +362,10 @@ class ProjectKindTest(unittest.TestCase):
         self.assertEqual(p.mvp_phrase("app"), "działającego MVP")
         self.assertIn("grywalnego MVP", p.plan_batch_prompt(5, 1, "game"))
         self.assertIn("działającego MVP", p.plan_batch_prompt(5, 1, "app"))
+        plan = p.plan_batch_prompt(5, 1, "app")
+        self.assertIn('"difficulty"', plan)
+        self.assertIn('"risk_flags"', plan)
+        self.assertIn('"routing_reason"', plan)
         # Prompt bootstrapu jest neutralny i prosi o klasyfikację.
         boot = p.bootstrap_prompt("dowolny brief")
         self.assertIn("BRIEF PRODUKTU", boot)
@@ -360,7 +407,7 @@ class SessionlessAgentTest(unittest.TestCase):
         from forge.orchestrate import _session_call, journal_append, journal_reset
         with tempfile.TemporaryDirectory() as project:
             cfg = Config(coder_agent="grok")  # generyczny → bezsesyjny
-            state = State()
+            state = State(current_task={"difficulty": "complex"})
             journal_reset(project, cfg, "Zadanie")
             journal_append(project, cfg, "cykl 1, tester: wrote_test (walidacja wejścia)")
             seen = {}
@@ -368,6 +415,8 @@ class SessionlessAgentTest(unittest.TestCase):
             def fake_run_agent(name, prompt, cfg_, proj, log, *, model="", effort=""):
                 seen["name"] = name
                 seen["prompt"] = prompt
+                seen["model"] = model
+                seen["effort"] = effort
                 return "gotowe"
 
             with patch("forge.orchestrate.run_agent", side_effect=fake_run_agent):
@@ -375,6 +424,8 @@ class SessionlessAgentTest(unittest.TestCase):
 
             self.assertEqual(out, "gotowe")
             self.assertEqual(seen["name"], "grok")
+            self.assertEqual((seen["model"], seen["effort"]),
+                             ("grok-4.5", "high"))
             self.assertIn("DZIENNIKA", seen["prompt"])          # kontekst doklejony
             self.assertIn("walidacja wejścia", seen["prompt"])
             self.assertTrue(seen["prompt"].endswith("ZRÓB"))

@@ -91,13 +91,9 @@ class AskModelTest(unittest.TestCase):
 
 class AgentSettingsTest(unittest.TestCase):
     @patch("builtins.input", side_effect=[
-        "claude", "opus", "high",             # planista
-        "grok", "grok-4.5", "high",           # tester
-        "grok", "grok-4.5", "medium",         # koder
-        "", "", "",                           # recenzent (Enter = domyślny opencode)
-        "", "", "",                           # weryfikator (Enter = domyślny opencode)
+        "claude", "grok", "grok", "", "",
     ])
-    def test_prompts_for_every_role_and_skips_codex_when_unused(self, _input: Mock) -> None:
+    def test_prompts_only_for_agent_of_every_role(self, _input: Mock) -> None:
         cfg = Config()
 
         prompt_agent_settings(cfg)
@@ -106,54 +102,44 @@ class AgentSettingsTest(unittest.TestCase):
         self.assertEqual(cfg.planner_model, "opus")
         self.assertEqual(cfg.planner_effort, "high")
         self.assertEqual(cfg.tester_agent, "grok")
-        self.assertEqual(cfg.tester_model, "grok-4.5")
-        self.assertEqual(cfg.tester_effort, "high")
         self.assertEqual(cfg.coder_agent, "grok")
-        self.assertEqual(cfg.coder_model, "grok-4.5")
-        self.assertEqual(cfg.coder_effort, "medium")
         self.assertEqual(cfg.reviewer_agent, "opencode")
         self.assertEqual(cfg.verifier_agent, "opencode")
-        # Żadna rola nie używa Codeksa → pytanie o niego nie powinno paść
-        # (gdyby padło, side_effect wyczerpałby się i input rzuciłby StopIteration).
-        self.assertEqual(_input.call_count, 15)
+        self.assertEqual(_input.call_count, 5)
 
     @patch("builtins.input", side_effect=[
-        "claude", "opus", "high",             # planista
-        "codex", "", "",                      # tester → jawnie codex (domyślny to opencode)
-        "", "", "",                           # koder → domyślnie opencode
-        "", "", "",                           # recenzent
-        "", "", "",                           # weryfikator
-        "gpt-test", "xhigh",                  # Codeks w użyciu (tester) → pytanie pada
+        "claude", "codex", "", "", "",
     ])
-    def test_asks_for_codex_defaults_when_a_role_uses_it(self, _input: Mock) -> None:
+    def test_does_not_ask_for_codex_model_when_role_uses_it(self, _input: Mock) -> None:
         cfg = Config()
 
         prompt_agent_settings(cfg)
 
         self.assertEqual(cfg.tester_agent, "codex")
         self.assertEqual(cfg.coder_agent, "opencode")
-        self.assertEqual(cfg.codex_model, "gpt-test")
-        self.assertEqual(cfg.codex_effort, "xhigh")
+        self.assertEqual(cfg.codex_model, "")
+        self.assertEqual(cfg.codex_effort, "medium")
+        self.assertEqual(_input.call_count, 5)
 
-    @patch("builtins.input", side_effect=["", "", "wrong", "medium", "", "high"])
-    def test_enter_uses_defaults_and_invalid_effort_is_retried(self, _input: Mock) -> None:
+    @patch("builtins.input", side_effect=["", "", "wrong", "high"])
+    def test_legacy_codex_effort_is_still_validated(self, _input: Mock) -> None:
         cfg = Config(planner_agent="claude", planner_model="sonnet", planner_effort="high",
                      codex_model="", codex_effort="medium", legacy_mode=True)
 
         prompt_agent_settings(cfg)
 
         self.assertEqual(cfg.planner_model, "sonnet")
-        self.assertEqual(cfg.planner_effort, "medium")
+        self.assertEqual(cfg.planner_effort, "high")
         self.assertEqual(cfg.codex_model, "")
         self.assertEqual(cfg.codex_effort, "high")
 
-    @patch("builtins.input", side_effect=["", "", "", "", ""])
+    @patch("builtins.input", side_effect=["", "", ""])
     def test_legacy_mode_skips_role_prompts(self, _input: Mock) -> None:
         cfg = Config(legacy_mode=True)
 
         prompt_agent_settings(cfg)
 
-        self.assertEqual(_input.call_count, 5)  # planista (3) + Codex (2), bez ról
+        self.assertEqual(_input.call_count, 3)  # planista-agent + Codex (2), bez ról
 
 class BuildGateTest(unittest.TestCase):
     @patch("forge.orchestrate.run_tests")

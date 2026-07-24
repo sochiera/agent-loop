@@ -315,36 +315,32 @@ class ValidateCriteriaMapTest(unittest.TestCase):
 # =====================================================================
 
 class ReviewerRoleConfigTest(unittest.TestCase):
-    def test_blank_reviewer_agent_inherits_tester_role(self) -> None:
-        # reviewer_agent="" (jawnie, bo domyślny Config() to teraz opencode)
-        # nadal dziedziczy w całości rolę testera — mechanizm inheritance
-        # istnieje niezależnie od tego, co jest domyślnym agentem.
+    def test_blank_reviewer_agent_inherits_tester_agent_not_model(self) -> None:
         cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high",
                      reviewer_agent="", reviewer_model="")
-        self.assertEqual(cfg.role("reviewer"), cfg.role("tester"))
+        self.assertEqual(cfg.role("reviewer"),
+                         ("codex", "gpt-5.6-sol", "medium"))
 
     def test_explicit_reviewer_agent_wins(self) -> None:
         cfg = Config(reviewer_agent="claude", reviewer_model="sonnet",
                      reviewer_effort="medium")
-        self.assertEqual(cfg.role("reviewer"), ("claude", "sonnet", "medium"))
+        self.assertEqual(cfg.role("reviewer"), ("claude", "sonnet", "high"))
 
     def test_agents_in_use_includes_reviewer(self) -> None:
         cfg = Config(reviewer_agent="grok")
         self.assertIn("grok", cfg.agents_in_use())
 
-    def test_reviewer_model_override_applies_without_explicit_reviewer_agent(self) -> None:
-        # Dokumentowane w README pokrętło FORGE_REVIEWER_MODEL musi działać
-        # także gdy FORGE_REVIEWER_AGENT nie jest ustawiony (default = agent
-        # testera) — dziś jest po cichu ignorowane, bo role('reviewer') zwraca
-        # role('tester') w całości zamiast pozwolić na częściowe nadpisanie.
+    def test_reviewer_model_override_is_ignored_for_known_agent(self) -> None:
         cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high",
                      reviewer_agent="", reviewer_model="o3")
-        self.assertEqual(cfg.role("reviewer"), ("codex", "o3", "high"))
+        self.assertEqual(cfg.role("reviewer"),
+                         ("codex", "gpt-5.6-sol", "medium"))
 
-    def test_reviewer_effort_override_applies_without_explicit_reviewer_agent(self) -> None:
+    def test_reviewer_effort_override_is_ignored_for_known_agent(self) -> None:
         cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high",
                      reviewer_agent="", reviewer_model="", reviewer_effort="low")
-        self.assertEqual(cfg.role("reviewer"), ("codex", "m1", "low"))
+        self.assertEqual(cfg.role("reviewer"),
+                         ("codex", "gpt-5.6-sol", "medium"))
 
 
 # =====================================================================
@@ -775,6 +771,17 @@ class PromptsPlan4Test(unittest.TestCase):
         import forge.prompts as p
         prompt = p.code_and_refactor_prompt("f.md", "pytest", False)
         self.assertIn("toolchain", prompt.lower())
+
+    def test_micro_resume_prompt_keeps_role_contract_without_broad_reading_order(self) -> None:
+        import forge.prompts as p
+        first = p.write_test_prompt("f.md", "pytest", resume=False)
+        resumed = p.write_test_prompt("f.md", "pytest", resume=True)
+        coder = p.code_and_refactor_prompt("f.md", "pytest", False, resume=True)
+        self.assertIn("nie czytaj rutynowo DESIGN.md", first)
+        self.assertIn("kontynuacja tej samej sesji", resumed)
+        self.assertNotIn("ARCHITECTURE.md", resumed)
+        self.assertIn('"action": "done"', resumed)
+        self.assertIn("Nie osłabiaj testu", coder)
 
     def test_review_prompt_surfaces_mechanical_context(self) -> None:
         import forge.prompts as p
