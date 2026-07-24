@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 from .agents import (AgentError, LimitExhausted, agent_supports_resume, extract_json,
-                     run_agent, run_agent_session, run_planner)
+                     log, run_agent, run_agent_session, run_planner)
 from .config import Config, DEFAULT_TASK_DIFFICULTY, TASK_DIFFICULTIES
 from . import prompts
 from . import verify
@@ -138,8 +138,10 @@ def build_task_from_plan(project: str, raw: dict) -> dict:
 def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     feedback = Path(project, cfg.runtime_dir, "verification", "latest-feedback.md")
     failures = Path(project, cfg.runtime_dir, "failures.md")
+    start_index = _next_task_index(project)
+    log(f"Planowanie: proszę planistę o maks. {cfg.batch_size} zadań od task-{start_index:03d}…")
     plan_prompt = prompts.plan_batch_prompt(
-        cfg.batch_size, _next_task_index(project), state.project_kind,
+        cfg.batch_size, start_index, state.project_kind,
         verify_feedback_path=str(feedback) if feedback.exists() else "",
         failure_feedback_path=str(failures) if failures.exists() else "")
     data = _decision_with_retry(
@@ -153,12 +155,17 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
             tasks.append(task)
     if not tasks and not data.get("no_more_tasks"):
         raise AgentError("planista nie utworzył żadnego poprawnego zadania")
+    if tasks:
+        log(f"Planowanie: utworzono {len(tasks)} zadań: {', '.join(t['id'] for t in tasks)}")
+    elif data.get("no_more_tasks"):
+        log("Planowanie: planista zgłosił brak dalszych zadań.")
     state.task_queue = tasks
     commit_all(project, "docs: plan wsadowy i backlog", cfg)
     return {"no_more_tasks": bool(data.get("no_more_tasks")) and not tasks}
 
 
 def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
+    log("Bootstrap: analiza briefu i budowa szkieletu projektu…")
     brief = Path(cfg.brief_path).read_text(encoding="utf-8")
     bootstrap = prompts.bootstrap_prompt(brief)
     data = _decision_with_retry(
@@ -175,12 +182,15 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     state.verify_targets = list(profile.get("targets") or [])
     for key in ("smoke_cmd", "flash_cmd", "target_cmd", "ci_status_cmd", "ci_logs_cmd"):
         setattr(state, key, str(profile.get(key, "")))
+    log(f"Bootstrap: test_cmd={state.test_cmd!r} build_cmd={state.build_cmd!r} kind={state.project_kind!r}")
     if not build_then_test(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s):
         raise AgentError("testy bootstrapu nie przeszły")
+    log("Bootstrap: testy początkowe zielone.")
     reviewer, model, effort = cfg.role("reviewer", "complex")
     tree = _tree_fingerprint(project)
     review_prompt = prompts.bootstrap_architecture_review_prompt(
         cfg.brief_path, state.test_cmd)
+    log("Bootstrap: recenzja architektury (świeży, read-only recenzent)…")
     verdict = _decision_with_retry(
         review_prompt,
         lambda value: run_agent(
@@ -192,6 +202,7 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     if verdict.status != "approve":
         raise AgentError("recenzja architektury bootstrapu wymaga zmian")
     state.bootstrapped = True
+    log("Bootstrap: recenzja zaakceptowana, commituję.")
     commit_all(project, "chore: bootstrap projektu", cfg)
 
 
@@ -280,6 +291,7 @@ def _clear_task_state(state: State) -> None:
 
 def _fail_task(cfg: Config, project: str, state: State, reason: str) -> None:
     task_id = state.current_task.get("id", "task")
+    log(f"Zadanie {task_id} PORZUCONE: {reason}")
     artifact = Path(project, cfg.runtime_dir, "failed", task_id)
     artifact.mkdir(parents=True, exist_ok=True)
     artifact.joinpath("reason.txt").write_text(reason + "\n", encoding="utf-8")
@@ -329,26 +341,32 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         _write_current_task(project, task)
         state.task_phase = "tester"
         _checkpoint(project, state, "tester")
+        log(f"Zadanie {task['id']} — {task['title']} (trudność: {task['difficulty']})")
     if state.task_phase in {"", "tester", "coder"}:
         def run_tester(handoff: str):
             prompt = prompts.tester_task_prompt(
                 task["file"], state.test_cmd, handoff=handoff,
                 resume=bool(state.tester_session))
-            return _decision_with_retry(
+            decision = _decision_with_retry(
                 prompt,
                 lambda value: _call_role(
                     cfg, project, state, "tester", value, logf("tester")),
                 parse_tester_decision)
+            log(f"  [{task['id']}] runda {state.tdd_round + 1}: tester → {decision.status}"
+                + (f" ({str(decision.data.get('reason', ''))[:200]})" if decision.data.get("reason") else ""))
+            return decision
 
         def run_coder(decision):
             prompt = prompts.coder_task_prompt(
                 task["file"], decision.data.get("command") or state.test_cmd,
                 decision=decision.data, resume=bool(state.coder_session))
-            return _decision_with_retry(
+            result = _decision_with_retry(
                 prompt,
                 lambda value: _call_role(
                     cfg, project, state, "coder", value, logf("coder")),
                 parse_coder_decision)
+            log(f"  [{task['id']}] runda {state.tdd_round + 1}: koder → {result.status}")
+            return result
 
         outcome = run_tdd_loop(
             state=state, max_rounds=cfg.max_tdd_rounds,
@@ -361,9 +379,11 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         if outcome != "review":
             _fail_task(cfg, project, state, outcome)
             return True
+        log(f"Zadanie {task['id']}: pętla TDD zielona, sprawdzam granicę przed review.")
         _checkpoint(project, state, "review")
     if state.task_phase == "review":
         green, results = _run_boundary(project, state, task, cfg)
+        log(f"Zadanie {task['id']}: granica testowa przed review — {'ZIELONA' if green else 'CZERWONA'}")
         if not green:
             state.tester_handoff = "Granica przed review jest czerwona: " + " | ".join(results)
             state.tdd_round += 1
@@ -376,12 +396,14 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         review_prompt = prompts.review_task_prompt_kiss(
             task["file"], start_tag=state.task_start_tag,
             changed=_changed(project, state.task_start_tag), test_results=results)
+        log(f"Zadanie {task['id']}: recenzja (świeży kontekst)…")
         review = _decision_with_retry(
             review_prompt,
             lambda value: run_agent(
                 reviewer, value, cfg, project, logf("review"),
                 model=model, effort=effort),
             parse_review_decision)
+        log(f"Zadanie {task['id']}: recenzja → {review.status}")
         if _tree_fingerprint(project) != tree:
             _fail_task(cfg, project, state, "blocked: reviewer zmienił drzewo"); return True
         if review.status == "changes":
@@ -396,6 +418,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 state.corrections_tree_hash = _tree_fingerprint(project)
                 _checkpoint(project, state, "corrections")
             if state.corrections_tree_hash == _tree_fingerprint(project):
+                log(f"Zadanie {task['id']}: poprawki po recenzji — {'; '.join(state.review_notes)[:300]}")
                 correction_prompt = prompts.corrections_prompt(
                     task["file"], state.review_notes, state.test_cmd,
                     targeted_test_cmd=task.get("targeted_test_cmd", ""),
@@ -407,6 +430,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                     lambda value: _call_role(
                         cfg, project, state, "coder", value, logf("corrections")),
                     parse_coder_decision)
+                log(f"Zadanie {task['id']}: poprawki → {correction.status}")
                 if correction.status != "green":
                     _fail_task(cfg, project, state, "poprawki review nie zostały wykonane"); return True
             state.corrections_done = True
@@ -420,6 +444,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         return True
     commit_all(project, f"feat: {task['title']}", cfg)
     git(project, "tag", "-d", state.task_start_tag, check=False)
+    log(f"Zadanie {task['id']} UKOŃCZONE i zacommitowane: {task['title']}")
     _clear_task_state(state)
     _checkpoint(project, state, "")
     return True
@@ -435,13 +460,16 @@ def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
         raise AgentError(f"weryfikacja celu przekroczyła limit {cfg.max_verify_cycles} cykli")
     state.task_phase = "verify_goal"
     state.verify_cycle += 1
+    log(f"Weryfikacja celu: cykl {state.verify_cycle}/{cfg.max_verify_cycles}, targety={targets}")
     cycle_dir = str(Path(project, cfg.runtime_dir, "verification", f"cycle-{state.verify_cycle}"))
     evidence = verify.collect_evidence(project, state, cfg, cycle_dir, sha=git(project, "rev-parse", "HEAD").stdout.strip(), targets=targets)
+    log("Weryfikacja celu: dowody → " + ", ".join(f"{name}=rc{item.get('rc')}" for name, item in evidence.items()))
     if any(item.get("rc") != 0 for item in evidence.values()):
         feedback = Path(project, cfg.runtime_dir, "verification", "latest-feedback.md")
         feedback.parent.mkdir(parents=True, exist_ok=True)
         feedback.write_text("Weryfikacja celu: czerwony dowód\n" + "\n".join(f"- {name}: rc={item.get('rc')}" for name, item in evidence.items()), encoding="utf-8")
         state.task_phase = ""
+        log("Weryfikacja celu: czerwony dowód — wracam do planowania z feedbackiem.")
         return True
     agent, model, effort = cfg.role("verifier", DEFAULT_TASK_DIFFICULTY)
     verify_prompt = prompts.verify_goal_prompt(
@@ -458,14 +486,17 @@ def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
         # Weryfikacja celu jest tolerancyjna: nieparsowalny werdykt po korekcie
         # nie ubija całej pętli, tylko wraca do planowania jak zwykłe "changes".
         data = {"verdict": "changes", "notes": ["weryfikator nie zwrócił poprawnego werdyktu"]}
+    log(f"Weryfikacja celu: werdykt={data.get('verdict')}")
     if data.get("verdict") in {"complete", "pass", "approve"}:
         state.task_phase = ""
+        log("Weryfikacja celu: CEL OSIĄGNIĘTY — kończę pętlę.")
         return False
     feedback = Path(project, cfg.runtime_dir, "verification", "latest-feedback.md")
     feedback.parent.mkdir(parents=True, exist_ok=True)
     notes = data.get("notes", [])
     feedback.write_text("Weryfikacja celu wymaga zmian:\n" + "\n".join(f"- {note}" for note in notes), encoding="utf-8")
     state.task_phase = ""
+    log("Weryfikacja celu: wymaga zmian — wracam do planowania.")
     return True
 
 
@@ -546,15 +577,21 @@ def main(argv: list[str] | None = None) -> int:
     runtime_path = Path(args.project, cfg.runtime_dir, "STATE.json")
     if path != runtime_path:
         state.save(str(runtime_path)); path = runtime_path
+    log(f"Start Forge — project={args.project} brief={args.brief} "
+        f"batch_size={cfg.batch_size} max_tdd_rounds={cfg.max_tdd_rounds}")
     count = 0
     try:
         while not args.max_iters or count < args.max_iters:
+            log(f"--- iteracja {count + 1}"
+                + (f"/{args.max_iters}" if args.max_iters else "") + " ---")
             if not one_iteration(cfg, args.project, state): break
             state.save(str(path)); count += 1
     except (AgentError, InvalidDecision, LimitExhausted) as exc:
         state.save(str(path))
-        print(f"Forge zatrzymany bezpiecznie: {exc}. Checkpoint zapisano w {path}.", file=__import__("sys").stderr)
+        print(f"Forge zatrzymany bezpiecznie: {exc}. Checkpoint zapisano w {path}.",
+              file=__import__("sys").stderr, flush=True)
         return 3 if isinstance(exc, LimitExhausted) else 1
+    log("Forge: pętla zakończona (brak dalszej pracy lub limit iteracji).")
     return 0
 
 

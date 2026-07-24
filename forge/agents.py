@@ -33,6 +33,11 @@ def _ts() -> str:
     return _dt.datetime.now().strftime("%H:%M:%S")
 
 
+def log(msg: str) -> None:
+    """Log operacyjny na stdout (GUI/konsola czytają go na żywo) — zawsze flush."""
+    print(f"[{_ts()}] {msg}", flush=True)
+
+
 def _looks_like_limit(text: str) -> bool:
     return bool(_LIMIT_RE.search(text or ""))
 
@@ -256,39 +261,47 @@ def extract_json(text: str) -> dict | None:
 def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
                       stdin_text: str | None = None) -> str:
     """Uruchom komendę; przy limicie backoff i ponów; zwróć (stdout+stderr)."""
+    phase = _phase_from_log(log_path)
     delay = cfg.backoff_start_s
     last_output = ""
     for attempt in range(cfg.max_limit_retries + 1):
+        started = time.monotonic()
+        log(f"  agent[{phase}] start: {argv[0]} (próba {attempt + 1})")
         try:
             proc = subprocess.run(
                 argv, cwd=cwd, input=stdin_text, text=True,
                 capture_output=True, timeout=cfg.agent_timeout_s,
             )
         except subprocess.TimeoutExpired as e:
+            log(f"  agent[{phase}] TIMEOUT po {cfg.agent_timeout_s}s")
             raise AgentError(f"timeout po {cfg.agent_timeout_s}s: {' '.join(argv[:2])}") from e
 
         output = (proc.stdout or "") + "\n" + (proc.stderr or "")
         last_output = output
         _append_log(log_path, argv, output, proc.returncode)
+        elapsed = time.monotonic() - started
 
         if proc.returncode == 0:
+            log(f"  agent[{phase}] koniec: rc=0, {elapsed:.0f}s, wyjście {len(output)} znaków")
             return proc.stdout or output
 
         # Kod != 0 — limit czy realny błąd?
         if _looks_like_limit(output):
             if attempt >= cfg.max_limit_retries:
+                log(f"  agent[{phase}] LIMIT wyczerpany po {attempt} ponowieniach.")
                 raise LimitExhausted(
                     f"Limit nadal aktywny po {attempt} ponowieniach — zatrzymuję."
                 )
             wake = _dt.datetime.now() + _dt.timedelta(seconds=delay)
-            print(f"  [{_ts()}] LIMIT wykryty. Backoff {delay}s "
-                  f"(przewidywane wznowienie ~{wake.strftime('%H:%M:%S')}), "
-                  f"próba {attempt + 1}/{cfg.max_limit_retries}.")
+            log(f"  agent[{phase}] LIMIT wykryty. Backoff {delay}s "
+                f"(przewidywane wznowienie ~{wake.strftime('%H:%M:%S')}), "
+                f"próba {attempt + 1}/{cfg.max_limit_retries}.")
             time.sleep(delay)
             delay = min(int(delay * cfg.backoff_factor), cfg.backoff_max_s)
             continue
 
         # Realny błąd — nie zapętlaj.
+        log(f"  agent[{phase}] BŁĄD: rc={proc.returncode}, {elapsed:.0f}s")
         raise AgentError(f"agent zwrócił kod {proc.returncode}. Ogon:\n{output[-1500:]}")
 
     raise LimitExhausted(f"Wyczerpano ponowienia. Ostatnie:\n{last_output[-800:]}")

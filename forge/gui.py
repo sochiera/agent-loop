@@ -23,6 +23,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from .config import Config, ROLE_MODEL_LEVELS
+from . import report
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,6 +33,7 @@ SETTINGS_PATH = Path(
 MAX_LOG_LINES = 5_000
 STOP_TERM_DELAY_S = 8
 STOP_KILL_DELAY_S = 5
+SESSION_LOG_NAME = "gui_run.log"
 AGENTS = ("claude", "codex", "opencode", "grok", "kiro")
 ROLE_DEFS = (
     ("planner", "Planista", "Tworzy plan i dzieli pracę na zadania"),
@@ -67,6 +69,13 @@ def save_settings(settings: dict[str, Any], path: Path = SETTINGS_PATH) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
+
+
+def resolve_project(project: str) -> Path:
+    """Ta sama reguła co w orkiestratorze: proces ma cwd=ROOT, więc ścieżka
+    względna projektu jest względna do ROOT, nie do bieżącego katalogu GUI."""
+    path = Path(project).expanduser()
+    return path if path.is_absolute() else ROOT / path
 
 
 def build_launch(
@@ -194,6 +203,7 @@ class ForgeWindow(Adw.ApplicationWindow):
         self._closing = False
         self.stop_requested = False
         self._chooser: Gtk.FileChooserNative | None = None
+        self._session_log_fh: Any = None
 
         header = Adw.HeaderBar()
         title = Adw.WindowTitle(title="Forge", subtitle="Orkiestrator agentów")
@@ -221,6 +231,7 @@ class ForgeWindow(Adw.ApplicationWindow):
         toolbar.set_content(self._build_content())
         self.set_content(toolbar)
         self.connect("close-request", self._close_requested)
+        self._load_previous_run()
 
     def _build_content(self) -> Gtk.Widget:
         split = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -420,6 +431,60 @@ class ForgeWindow(Adw.ApplicationWindow):
         mark = self.log_buffer.create_mark(None, self.log_buffer.get_end_iter(), False)
         self.log_view.scroll_to_mark(mark, 0.05, True, 0.0, 1.0)
         self.log_buffer.delete_mark(mark)
+        if self._session_log_fh is not None:
+            try:
+                self._session_log_fh.write(line.rstrip() + "\n")
+                self._session_log_fh.flush()
+            except OSError:
+                pass
+
+    def _load_previous_run(self) -> None:
+        """Po (re)starcie GUI pokaż log i statystyki poprzedniego biegu forge,
+        zanim jeszcze cokolwiek uruchomimy — nawet jeśli poprzedni proces
+        zginął bez pożegnania (SIGKILL, awaria)."""
+        project = resolve_project(self.project.get_text())
+        log_path = project / ".forge" / SESSION_LOG_NAME
+        if not log_path.is_file():
+            return
+        try:
+            content = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        if not content.strip():
+            return
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(log_path.stat().st_mtime))
+        self._append_log(f"===== Log poprzedniego uruchomienia ({stamp}) — {project} =====")
+        for line in content.splitlines():
+            self._append_log(line)
+        try:
+            stats = report.usage_summary(str(project))
+        except OSError:
+            stats = ""
+        if stats:
+            self._append_log("")
+            self._append_log("===== Zużycie tokenów (łącznie w tym projekcie) =====")
+            for line in stats.splitlines():
+                self._append_log(line)
+        self._append_log("")
+        self._append_log("===== Gotowy do nowego uruchomienia =====")
+
+    def _open_session_log(self) -> None:
+        self._close_session_log()
+        project = resolve_project(self.project.get_text())
+        try:
+            runtime = project / ".forge"
+            runtime.mkdir(parents=True, exist_ok=True)
+            self._session_log_fh = open(runtime / SESSION_LOG_NAME, "w", encoding="utf-8")
+        except OSError:
+            self._session_log_fh = None
+
+    def _close_session_log(self) -> None:
+        if self._session_log_fh is not None:
+            try:
+                self._session_log_fh.close()
+            except OSError:
+                pass
+            self._session_log_fh = None
 
     def _set_running(self, running: bool, label: str | None = None) -> None:
         self.start_button.set_sensitive(not running)
@@ -463,6 +528,7 @@ class ForgeWindow(Adw.ApplicationWindow):
             return
 
         self.log_buffer.set_text("")
+        self._open_session_log()
         self.started_at = time.monotonic()
         self.stop_requested = False
         self._set_running(True)
@@ -496,6 +562,7 @@ class ForgeWindow(Adw.ApplicationWindow):
             self._show_error(
                 f"Proces zakończył się kodem {code} (actual elapsed: {self._format_elapsed(elapsed)})."
             )
+        self._close_session_log()
         if self._closing:
             self.destroy()
         return GLib.SOURCE_REMOVE

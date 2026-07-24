@@ -138,9 +138,9 @@ class Config:
     codex_effort: str = os.environ.get("FORGE_CODEX_EFFORT", "medium")
 
     # Ile zadań planista produkuje jednym wywołaniem (koszt stały planisty ÷ batch).
-    batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "5"))
+    batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "10"))
     # Mały bezpiecznik: większe zadanie ma zostać ponownie rozplanowane.
-    max_tdd_rounds: int = int(os.environ.get("FORGE_MAX_TDD_ROUNDS", "4"))
+    max_tdd_rounds: int = int(os.environ.get("FORGE_MAX_TDD_ROUNDS", "20"))
     # Agent CLI każdej roli nowego modelu. "claude"/"codex" mają wbudowaną
     # obsługę; dowolna inna nazwa → agent generyczny z FORGE_AGENT_<NAME>_CMD
     # (patrz adapters.py). Domyślnie tester i koder to opencode (NeuralWatt).

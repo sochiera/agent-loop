@@ -5,9 +5,11 @@ import tempfile
 from pathlib import Path
 
 from forge.gui import (
+    ROOT,
     build_launch,
     line_kind,
     load_settings,
+    resolve_project,
     save_settings,
     trim_log_buffer,
 )
@@ -60,6 +62,17 @@ class GuiLaunchTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "tester.agent"):
             build_launch("brief.md", "project", roles)
+
+
+class GuiResolveProjectTest(unittest.TestCase):
+    def test_relative_project_resolves_against_root(self) -> None:
+        # Podprocess orkiestratora startuje z cwd=ROOT, więc ścieżka względna
+        # projektu w GUI musi rozwiązywać się tak samo, inaczej odczyt
+        # poprzedniego logu/statystyk trafi w złe miejsce.
+        self.assertEqual(resolve_project("game"), ROOT / "game")
+
+    def test_absolute_project_is_unchanged(self) -> None:
+        self.assertEqual(resolve_project("/tmp/some-project"), Path("/tmp/some-project"))
 
 
 class GuiStatusTest(unittest.TestCase):

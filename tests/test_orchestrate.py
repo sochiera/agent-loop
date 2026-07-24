@@ -37,7 +37,7 @@ def test_timeout_terminates_whole_process_group() -> None:
 
 def test_kiss_config_has_only_tdd_limit() -> None:
     cfg = Config()
-    assert cfg.max_tdd_rounds == 4
+    assert cfg.max_tdd_rounds == 20
     assert not hasattr(cfg, "legacy_mode")
 
 
