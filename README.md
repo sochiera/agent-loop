@@ -142,7 +142,7 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 | Co | Domyślnie | Jak zmienić |
 |---|---|---|
 | Agent planujący | `claude` | `--planner-agent codex` lub `FORGE_PLANNER_AGENT` |
-| Routing model/effort | stała mapa agent × rola × trudność | planista przypisuje `simple` / `standard` / `complex` |
+| Routing model/effort | rola × trudność → poziom, potem provider → model/effort | planista przypisuje `simple` / `standard` / `complex` |
 | Model/effort Codex w trybie legacy | z `~/.codex/config.toml` / `medium` | `--codex-model`, `--codex-effort` lub `FORGE_CODEX_*` |
 | Sandbox Codeksa | `danger-full-access` (pełny dostęp) | zawęź: `FORGE_CODEX_SANDBOX=workspace-write` |
 | Ścieżka do Claude | `claude` | `FORGE_CLAUDE_BIN=/path/claude` |
@@ -187,8 +187,8 @@ lokalny branch `forge/failed/<id>` trzyma HEAD z pracą (w tym residual WIP).
 
 Gdy planista orzeknie `no_more_tasks`, pętla NIE kończy pracy: startuje
 **weryfikacja celu** — świeży agent (weryfikator-QA) sprawdza, czy całość
-naprawdę działa w środowisku docelowym. Szczegóły projektu:
-`docs/PLAN-3-WERYFIKACJA.md`.
+naprawdę działa w środowisku docelowym. Szczegóły opisuje
+`docs/PIPELINE.md`.
 
 - **Profil deklaruje bootstrap** w `STATE.json` (jak `test_cmd`): targety
   (`smoke`/`ci`/`hardware`) i komendy — `smoke_cmd`, `flash_cmd`+`target_cmd`
@@ -208,7 +208,7 @@ naprawdę działa w środowisku docelowym. Szczegóły projektu:
 - **Ochrona przed osłabianiem:** workflow CI, skrypty weryfikacji i testy
   targetowe (`verify_test_globs`) są wycofywane z diffu, chyba że zadanie
   naprawia problem klasy `verify_defect` z rejestru.
-- Pokrętła: `FORGE_VERIFIER_AGENT/MODEL/EFFORT` (domyślnie `opencode`/`neuralwatt/qwen3.5-397b`; pusty agent = rola planisty),
+- Pokrętła: `FORGE_VERIFIER_AGENT/MODEL/EFFORT` (domyślnie `opencode`; model i effort wybiera polityka routingu; pusty agent = provider planisty),
   `FORGE_CI_TIMEOUT` (45 min), `FORGE_VERIFY_TIMEOUT`, `FORGE_FLASH_RETRIES`,
   `FORGE_MAX_REPRO_RUNS`, `FORGE_CI_EARLY_WARN` (ostrzeżenie o czerwonym CI
   przy każdym planowaniu), `FORGE_VERIFIER_MCP_CONFIG` (plik MCP doklejany
@@ -216,7 +216,7 @@ naprawdę działa w środowisku docelowym. Szczegóły projektu:
 
 ## Uszczelnienie bramek i higiena kontekstu (PLAN-4)
 
-Projekt: `docs/PLAN-4-BRAMKI-I-KONTEKST.md`. W skrócie:
+Szczegóły opisuje `docs/PIPELINE.md`. W skrócie:
 
 - **Toolchain testowy pod ochroną.** Pliki konfigurujące uruchamianie testów
   (`package.json`, `pytest.ini`, `Makefile`… + deklaracja bootstrapu
@@ -268,24 +268,23 @@ toolchain/CI, sprzęt, refaktor lub naprawę po weryfikacji. Orkiestrator może
 poziom tylko **podnieść**, nigdy obniżyć. Stare kolejki bez tego pola wznawiają
 się jako `standard`.
 
-Dla Codex/GPT mapa jest następująca:
+`difficulty` i `model_level` to dwa niezależne wymiary. Poziomy to `economy`,
+`efficient`, `balanced`, `strong` i `max`. Najpierw polityka roli
+mapuje trudność na poziom, a dopiero potem wybrany provider mapuje poziom na
+konkretny model i effort. Dlatego `max` nie oznacza jednego modelu globalnie.
 
 | Rola | `simple` | `standard` | `complex` |
 |---|---|---|---|
-| Planista | Sol / high | Sol / high | Sol / high |
-| Tester | Terra / medium | Terra / medium | Sol / medium |
-| Koder | Luna / medium | Terra / low | Terra / medium |
-| Recenzent | Sol / medium | Sol / medium | Sol / medium |
-| Weryfikator | Terra / medium | Terra / medium | Terra / medium |
+| Bootstrap | max | max | max |
+| Planista | strong | strong | strong (eskalacja: max) |
+| Tester | efficient | balanced | balanced |
+| Koder — pierwsza próba | economy | efficient | balanced |
+| Recenzent | efficient | balanced | strong |
+| Weryfikator | economy (lub brak AI) | efficient | balanced |
 
-Dla Claude: planista zawsze `opus/high`; tester `sonnet/medium`,
-`sonnet/high`, `opus/high`; koder `sonnet/low`, `sonnet/medium`,
-`opus/medium`; recenzent `sonnet/high`, `sonnet/high`, `opus/high`;
-weryfikator zawsze `sonnet/high`. Grok używa `grok-4.5` i zwiększa effort
-od `low` do `high`. OpenCode przełącza testera między szybkim GLM dla `simple`
-a pełnym GLM dla trudniejszych zadań, kodera kieruje do Kimi Code, recenzenta
-do GLM, a planistę/weryfikatora do Qwen 397B. Pełna, wykonywalna mapa znajduje
-się w `forge/config.py` (`ROLE_ROUTING`).
+Pełną tabelę translacji provider → model/effort zawiera `docs/PIPELINE.md`.
+Wykonywalna polityka jest w `forge/config.py` (`ROLE_MODEL_LEVELS` i
+`MODEL_LEVEL_ROUTING`).
 
 Pola `*_MODEL`/`*_EFFORT` pozostają kompatybilnościowym fallbackiem wyłącznie
 dla własnych, nieznanych CLI. Dla znanych agentów nie nadpisują polityki.
@@ -314,7 +313,9 @@ nadpisz go tak samo jak dla zupełnie nowego narzędzia (patrz niżej).
 > `glm-5.2*`) — dla pozostałych zostaw effort pusty.
 
 > **Effort dla Kiro.** Headless Kiro nie przyjmuje wyboru modelu ani effortu;
-> mapa pozostawia oba pola puste. Grok dostaje `--effort` zgodnie z profilem.
+> domyślny szablon ignoruje routing i korzysta z `~/.kiro/settings/cli.json`.
+> Własny szablon z `{model}` i `{effort}` może wykorzystać wartości z mapy.
+> Grok dostaje `--effort` zgodnie z profilem.
 
 ### Zupełnie inny/nieznany CLI
 

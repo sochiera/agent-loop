@@ -64,8 +64,9 @@ KNOWN_TEMPLATES: dict[str, str] = {
     # (docs.x.ai/build/cli/reference). --always-approve — pełna autonomia,
     # spójnie z pozostałymi agentami forge.
     "grok": "grok -p {prompt} -m {model} --effort {effort} --always-approve",
-    # Kiro CLI (AWS): headless mode nie ma dziś flagi wyboru modelu — model
-    # ustawiasz w ~/.kiro/settings/cli.json (kiro.dev/docs/cli/headless).
+    # Kiro CLI (AWS): headless mode nie ma dziś flag wyboru modelu ani effortu.
+    # Routing Kiro jest więc tylko metadanymi dla własnego szablonu użytkownika;
+    # ten domyślny szablon zawsze korzysta z ustawień ~/.kiro/settings/cli.json.
     "kiro": "kiro-cli chat --no-interactive --trust-all-tools {prompt}",
     # OpenCode CLI (opencode.ai/docs/cli) jako most do dowolnego dostawcy
     # OpenAI-compatible skonfigurowanego w ~/.config/opencode/opencode.json —

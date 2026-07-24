@@ -5,7 +5,7 @@ Uruchomienie:
 
 Agreguje wiersze zapisane przez agents.log_usage per (agent, faza) i podaje
 sumy — to jest narzędzie do rozstrzygania pytań "gdzie idą tokeny" danymi,
-nie odczuciem (patrz docs/ANALIZA-TOKENY-I-NOWY-MODEL.md, sekcja 2.1).
+nie odczuciem (patrz dokumentacja pipeline'u).
 
 Stare wiersze Codexa z ``resumed=true`` (sprzed telemetrycznej migracji) są
 pomijane: zawierają skumulowany licznik całej sesji, więc ich zsumowanie

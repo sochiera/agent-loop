@@ -122,6 +122,10 @@ class State:
     verify_stall: int = 0
     verify_sha: str = ""
     verify_problems: list[dict] = field(default_factory=list)
+    # Najwyższa trudność ukończonego zadania od poprzedniego bootstrapu.
+    # Weryfikacja celu obejmuje cały przyrost, więc używa tego profilu zamiast
+    # arbitralnego ``standard``. Puste pole w starym STATE.json oznacza standard.
+    verify_scope_difficulty: str = ""
 
     # Ile kolejnych wsadów planista ZIGNOROWAŁ notatkę o kompaktowaniu DESIGN.md
     # (Config.design_compact_bytes) — bez tego licznika nagabywanie byłoby

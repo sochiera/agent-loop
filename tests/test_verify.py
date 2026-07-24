@@ -22,7 +22,7 @@ class VerifierConfigTest(unittest.TestCase):
         cfg.planner_agent, cfg.planner_model, cfg.planner_effort = "claude", "opus", "high"
         cfg.verifier_agent = ""
 
-        self.assertEqual(cfg.role("verifier"), ("claude", "opus", "high"))
+        self.assertEqual(cfg.role("verifier"), ("claude", "sonnet", "low"))
 
     def test_explicit_verifier_uses_fixed_role_matrix(self) -> None:
         cfg = Config()
@@ -31,7 +31,7 @@ class VerifierConfigTest(unittest.TestCase):
         cfg.codex_model = "gpt-test"
 
         self.assertEqual(cfg.role("verifier"),
-                         ("codex", "gpt-5.6-terra", "medium"))
+                         ("codex", "gpt-5.6-terra", "low"))
 
     def test_agents_in_use_includes_explicit_verifier(self) -> None:
         cfg = Config()
@@ -71,6 +71,27 @@ class VerifierConfigTest(unittest.TestCase):
         self.assertGreaterEqual(cfg.flash_retries, 1)
         self.assertGreater(cfg.max_repro_runs_per_task, 1)
         self.assertTrue(cfg.ci_early_warn)
+
+    def test_verifier_uses_highest_completed_task_difficulty(self) -> None:
+        cfg = Config(verifier_agent="codex")
+        state = State(verify_scope_difficulty="complex", verify_cycle=1)
+        evidence = {"smoke": {"rc": 0, "log": "s.log"}}
+        with mock.patch("forge.orchestrate.run_agent",
+                        return_value='{"verdict":"pass","problems":[]}') as run:
+            orchestrate._accept_verdict(cfg, "/proj", state, evidence,
+                                        "/cdir", lambda ph: "/log")
+        self.assertEqual(run.call_args.kwargs["model"], "gpt-5.6-terra")
+        self.assertEqual(run.call_args.kwargs["effort"], "medium")
+
+    def test_completed_task_monotonically_sets_verification_scope(self) -> None:
+        cfg = Config(git_push=False)
+        state = State(current_task_title="złożone", current_task={"difficulty": "complex"},
+                      verify_scope_difficulty="simple")
+        with mock.patch("forge.orchestrate.commit_all"), \
+             mock.patch("forge.orchestrate._delete_tag"), \
+             mock.patch("forge.orchestrate.save_checkpoint"):
+            orchestrate._finish_task(cfg, "/proj", state, 1)
+        self.assertEqual(state.verify_scope_difficulty, "complex")
 
 
 

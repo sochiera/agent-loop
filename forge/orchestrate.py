@@ -398,7 +398,9 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     log("=== BOOTSTRAP ===")
     with open(cfg.brief_path, "r", encoding="utf-8") as f:
         brief = f.read()
-    out = run_planner(prompts.bootstrap_prompt(brief), cfg, project, logf("bootstrap"))
+    out = run_planner(
+        prompts.bootstrap_prompt(brief), cfg, project, logf("bootstrap"), role="bootstrap"
+    )
     data = extract_json(out)
     if not data:
         raise AgentError("Bootstrap nie zwrócił poprawnego obiektu JSON.")
@@ -438,7 +440,7 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
             repair_out = run_planner(
                 prompts.bootstrap_architecture_fix_prompt(
                     review_notes, data["test_cmd"], os.path.abspath(cfg.brief_path)
-                ), cfg, project, logf(f"bootstrap-architecture-fix-{attempt}")
+                ), cfg, project, logf(f"bootstrap-architecture-fix-{attempt}"), role="bootstrap"
             )
             repaired = extract_json(repair_out)
             if not repaired:
@@ -485,7 +487,10 @@ def phase_implement(cfg: Config, project: str, test_cmd: str, logf) -> dict:
 
 def phase_review(cfg: Config, project: str, test_cmd: str, green: bool, logf) -> dict:
     log(f"--- REVIEW ({cfg.planner_agent}) ---")
-    out = run_planner(prompts.review_prompt(test_cmd, green), cfg, project, logf("review"))
+    out = run_planner(
+        prompts.review_prompt(test_cmd, green), cfg, project, logf("review"),
+        role="planner_escalation",
+    )
     return extract_json(out) or {"verdict": "changes", "notes": ["Brak werdyktu JSON — wymagam poprawek."]}
 
 
@@ -2226,6 +2231,12 @@ def _finish_task(cfg: Config, project: str, state: State, n: int) -> None:
         push(project, cfg)  # pojedynczy push całego, zielonego zadania
     _delete_tag(project, state.task_start_tag)
     state.last_done = state.current_task_title
+    difficulty = state.current_task.get("difficulty", DEFAULT_TASK_DIFFICULTY)
+    levels = {name: i for i, name in enumerate(TASK_DIFFICULTIES)}
+    previous = state.verify_scope_difficulty
+    if (difficulty in levels
+            and (previous not in levels or levels[difficulty] > levels[previous])):
+        state.verify_scope_difficulty = difficulty
     state.iteration = n
     log(f"ZADANIE UKOŃCZONE: {state.last_done} 🎉")
     _clear_task(state)
@@ -2335,7 +2346,11 @@ def _accept_verdict(cfg: Config, project: str, state: State, evidence: dict,
     Odrzucenie (zły JSON, nieodhaczone problemy z N-1, nowy code_bug bez
     repro_cmd) daje JEDNO ponowienie z listą powodów; potem AgentError —
     checkpoint zostaje, człowiek widzi log."""
-    agent, model, effort = cfg.role("verifier")
+    # Weryfikator ocenia cały przyrost od bootstrapu: profil to najwyższa
+    # trudność ukończonego zadania. Stare checkpointy bez tego pola zachowują
+    # dotychczasowy, bezpieczny default ``standard``.
+    difficulty = state.verify_scope_difficulty or DEFAULT_TASK_DIFFICULTY
+    agent, model, effort = cfg.role("verifier", difficulty)
     prev_path = (os.path.join(project, cfg.runtime_dir, "verification",
                               f"cycle-{state.verify_cycle - 1}", "problems.json")
                  if state.verify_problems else "")

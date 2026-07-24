@@ -4,7 +4,7 @@ Werdykt weryfikatora to nie "pass/fail + esej", tylko parsowalny rejestr
 problemów z trwałymi id i statusami. Na tym rejestrze orkiestrator egzekwuje
 mechanicznie: kompletność odhaczania między cyklami, ważność zastrzeżeń
 behawioralnych (design_gap musi cytować kryterium z DESIGN.md), postęp
-(stall-licznik) i bramkę PASS. Patrz docs/PLAN-3-WERYFIKACJA.md, sekcje 4 i 6.
+(stall-licznik) i bramkę PASS. Szczegóły opisuje docs/PIPELINE.md.
 """
 from __future__ import annotations
 

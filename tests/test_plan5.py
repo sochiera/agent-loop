@@ -1,6 +1,6 @@
 """Testy PLAN-5: kanon kryteriów, limit DONE-reject, multi-ref, refactor, failed-ref.
 
-TDD: sekcje odpowiadają taskom T5.1–T5.6 z docs/PLAN-5-DONE-KRYTERIA-I-PĘTLE.md.
+TDD dla bramki DONE i kanonu kryteriów.
 """
 from __future__ import annotations
 

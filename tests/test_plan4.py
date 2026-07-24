@@ -319,12 +319,12 @@ class ReviewerRoleConfigTest(unittest.TestCase):
         cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high",
                      reviewer_agent="", reviewer_model="")
         self.assertEqual(cfg.role("reviewer"),
-                         ("codex", "gpt-5.6-sol", "medium"))
+                         ("codex", "gpt-5.6-terra", "medium"))
 
     def test_explicit_reviewer_agent_wins(self) -> None:
         cfg = Config(reviewer_agent="claude", reviewer_model="sonnet",
                      reviewer_effort="medium")
-        self.assertEqual(cfg.role("reviewer"), ("claude", "sonnet", "high"))
+        self.assertEqual(cfg.role("reviewer"), ("claude", "sonnet", "medium"))
 
     def test_agents_in_use_includes_reviewer(self) -> None:
         cfg = Config(reviewer_agent="grok")
@@ -334,13 +334,13 @@ class ReviewerRoleConfigTest(unittest.TestCase):
         cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high",
                      reviewer_agent="", reviewer_model="o3")
         self.assertEqual(cfg.role("reviewer"),
-                         ("codex", "gpt-5.6-sol", "medium"))
+                         ("codex", "gpt-5.6-terra", "medium"))
 
     def test_reviewer_effort_override_is_ignored_for_known_agent(self) -> None:
         cfg = Config(tester_agent="codex", tester_model="m1", tester_effort="high",
                      reviewer_agent="", reviewer_model="", reviewer_effort="low")
         self.assertEqual(cfg.role("reviewer"),
-                         ("codex", "gpt-5.6-sol", "medium"))
+                         ("codex", "gpt-5.6-terra", "medium"))
 
 
 # =====================================================================

@@ -427,7 +427,7 @@ class SessionlessAgentTest(unittest.TestCase):
             self.assertEqual(out, "gotowe")
             self.assertEqual(seen["name"], "grok")
             self.assertEqual((seen["model"], seen["effort"]),
-                             ("grok-4.5", "high"))
+                             ("grok-4.5", "medium"))
             self.assertIn("DZIENNIKA", seen["prompt"])          # kontekst doklejony
             self.assertIn("walidacja wejścia", seen["prompt"])
             self.assertTrue(seen["prompt"].endswith("ZRÓB"))

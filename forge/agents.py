@@ -522,8 +522,9 @@ def agent_supports_resume(name: str) -> bool:
     return adapters.supports_resume(name)
 
 
-def run_planner(prompt: str, cfg: Config, project_dir: str, log_path: str) -> str:
-    """Uruchom planistę wybranym agentem CLI z jego modelem i effort."""
-    agent, model, effort = cfg.role("planner")
+def run_planner(prompt: str, cfg: Config, project_dir: str, log_path: str,
+                *, role: str = "planner") -> str:
+    """Uruchom rolę planisty/bootstrapu z jej modelem i effort."""
+    agent, model, effort = cfg.role(role)
     return run_agent(agent, prompt, cfg, project_dir, log_path,
                      model=model, effort=effort)

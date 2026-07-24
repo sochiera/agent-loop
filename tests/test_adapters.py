@@ -128,13 +128,22 @@ class ConfigRoleResolutionTest(unittest.TestCase):
                      tester_model="", coder_model="",
                      codex_model="gpt-x", codex_effort="high")
         self.assertEqual(cfg.role("tester", "simple"),
-                         ("codex", "gpt-5.6-terra", "medium"))
+                         ("codex", "gpt-5.6-terra", "low"))
         self.assertEqual(cfg.role("tester", "complex"),
-                         ("codex", "gpt-5.6-sol", "medium"))
+                         ("codex", "gpt-5.6-terra", "medium"))
         self.assertEqual(cfg.role("coder", "simple"),
-                         ("codex", "gpt-5.6-luna", "medium"))
+                         ("codex", "gpt-5.6-luna", "low"))
         self.assertEqual(cfg.role("coder", "standard"),
                          ("codex", "gpt-5.6-terra", "low"))
+
+    def test_task_complexity_and_model_level_are_separate(self) -> None:
+        cfg = Config(tester_agent="codex")
+        self.assertEqual(cfg.model_level("tester", "simple"), "efficient")
+        self.assertEqual(cfg.model_level("tester", "standard"), "balanced")
+        self.assertEqual(cfg.model_level("tester", "complex"), "balanced")
+        self.assertEqual(cfg.model_level("planner", "simple"), "strong")
+        self.assertEqual(cfg.model_level("planner_escalation", "simple"), "max")
+        self.assertEqual(cfg.model_level("bootstrap", "standard"), "max")
 
     def test_codex_planner_is_always_strong(self) -> None:
         cfg = Config(planner_agent="codex", planner_model="", planner_effort="",
@@ -146,7 +155,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         agent, model, effort = cfg.role("coder")
         self.assertEqual(agent, "grok")
         self.assertEqual(model, "grok-4.5")
-        self.assertEqual(effort, "medium")
+        self.assertEqual(effort, "low")
 
     def test_unknown_generic_role_keeps_legacy_fields(self) -> None:
         cfg = Config(coder_agent="my-cli", coder_model="my-model",
@@ -167,7 +176,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         cfg = Config(tester_agent="codex", tester_model="custom-m", tester_effort="high",
                      reviewer_agent="gpt", reviewer_model="",
                      codex_model="fallback-m", codex_effort="low")
-        self.assertEqual(cfg.role("reviewer"), ("gpt", "gpt-5.6-sol", "medium"))
+        self.assertEqual(cfg.role("reviewer"), ("gpt", "gpt-5.6-terra", "medium"))
 
     def test_agents_in_use_dedups_aliases(self) -> None:
         # planner=gpt i tester=codex to jedna binarka — preflight nie może jej
@@ -177,6 +186,26 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         canon = [adapters.canonical_agent(a) for a in cfg.agents_in_use()]
         self.assertEqual(len(canon), len(set(canon)))
         self.assertEqual(set(canon), {"codex"})
+
+    def test_known_generic_routing_reaches_template_arguments(self) -> None:
+        """Routing providera musi trafić do argv, nie tylko do Config.role()."""
+        for agent, role, difficulty, expected in (
+            ("grok", "coder", "complex", ("grok-4.5", "medium")),
+            ("opencode", "reviewer", "complex",
+             ("neuralwatt/glm-5.2-flex", "high")),
+        ):
+            cfg = Config(**{f"{role}_agent": agent})
+            _, model, effort = cfg.role(role, difficulty)
+            spec = adapters.generic_spec(agent, {})
+            self.assertIsNotNone(spec)
+            argv = adapters.expand_template(
+                spec.template,
+                {"prompt": "p", "model": model, "effort": effort,
+                 "project": "/project", "output": ""},
+            )
+            self.assertEqual((model, effort), expected)
+            self.assertIn(model, argv)
+            self.assertIn(effort, argv)
 
 
 class RunGenericAgentTest(unittest.TestCase):

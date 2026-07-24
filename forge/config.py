@@ -17,93 +17,59 @@ from . import adapters
 
 TASK_DIFFICULTIES = ("simple", "standard", "complex")
 DEFAULT_TASK_DIFFICULTY = "standard"
+MODEL_LEVELS = ("economy", "efficient", "balanced", "strong", "max")
+
+# Trudność opisuje zakres zadania, a poziom modelu politykę routingu providera.
+ROLE_MODEL_LEVELS: dict[str, dict[str, str]] = {
+    "bootstrap": {d: "max" for d in TASK_DIFFICULTIES},
+    "planner": {d: "strong" for d in TASK_DIFFICULTIES},
+    "planner_escalation": {d: "max" for d in TASK_DIFFICULTIES},
+    "tester": {"simple": "efficient", "standard": "balanced", "complex": "balanced"},
+    "coder": {"simple": "economy", "standard": "efficient", "complex": "balanced"},
+    "reviewer": {"simple": "efficient", "standard": "balanced", "complex": "strong"},
+    "verifier": {"simple": "economy", "standard": "efficient", "complex": "balanced"},
+}
 
 # Użytkownik wybiera narzędzie/agenta dla roli. Konkretny model i effort są
 # polityką projektu, nie pokrętłem pojedynczego uruchomienia. Dzięki temu
 # wznowienie zadania odtwarza ten sam routing bez zależności od interaktywnej
-# konfiguracji. Planner i verifier celowo nie tanieją wraz z profilem zadania:
-# ich odpowiedzialność obejmuje odpowiednio cały plan i cały produkt.
-ROLE_ROUTING: dict[str, dict[str, dict[str, tuple[str, str]]]] = {
+# konfiguracji. Poziom modelu wynika osobno z roli i trudności zadania.
+MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
     "codex": {
-        "planner": {d: ("gpt-5.6-sol", "high") for d in TASK_DIFFICULTIES},
-        "tester": {
-            "simple": ("gpt-5.6-terra", "medium"),
-            "standard": ("gpt-5.6-terra", "medium"),
-            "complex": ("gpt-5.6-sol", "medium"),
-        },
-        "coder": {
-            "simple": ("gpt-5.6-luna", "medium"),
-            "standard": ("gpt-5.6-terra", "low"),
-            "complex": ("gpt-5.6-terra", "medium"),
-        },
-        "reviewer": {d: ("gpt-5.6-sol", "medium") for d in TASK_DIFFICULTIES},
-        "verifier": {d: ("gpt-5.6-terra", "medium") for d in TASK_DIFFICULTIES},
+        "economy": ("gpt-5.6-luna", "low"),
+        "efficient": ("gpt-5.6-terra", "low"),
+        "balanced": ("gpt-5.6-terra", "medium"),
+        "strong": ("gpt-5.6-sol", "high"),
+        "max": ("gpt-5.6-sol", "max"),
     },
     "claude": {
-        "planner": {d: ("opus", "high") for d in TASK_DIFFICULTIES},
-        "tester": {
-            "simple": ("sonnet", "medium"),
-            "standard": ("sonnet", "high"),
-            "complex": ("opus", "high"),
-        },
-        "coder": {
-            "simple": ("sonnet", "low"),
-            "standard": ("sonnet", "medium"),
-            "complex": ("opus", "medium"),
-        },
-        "reviewer": {
-            "simple": ("sonnet", "high"),
-            "standard": ("sonnet", "high"),
-            "complex": ("opus", "high"),
-        },
-        "verifier": {d: ("sonnet", "high") for d in TASK_DIFFICULTIES},
+        "economy": ("haiku", ""),
+        "efficient": ("sonnet", "low"),
+        "balanced": ("sonnet", "medium"),
+        "strong": ("sonnet", "high"),
+        "max": ("opus", "max"),
     },
     "grok": {
-        "planner": {d: ("grok-4.5", "high") for d in TASK_DIFFICULTIES},
-        "tester": {
-            "simple": ("grok-4.5", "low"),
-            "standard": ("grok-4.5", "medium"),
-            "complex": ("grok-4.5", "high"),
-        },
-        "coder": {
-            "simple": ("grok-4.5", "low"),
-            "standard": ("grok-4.5", "medium"),
-            "complex": ("grok-4.5", "high"),
-        },
-        "reviewer": {
-            "simple": ("grok-4.5", "medium"),
-            "standard": ("grok-4.5", "high"),
-            "complex": ("grok-4.5", "high"),
-        },
-        "verifier": {d: ("grok-4.5", "high") for d in TASK_DIFFICULTIES},
+        "economy": ("grok-4.5", "low"),
+        "efficient": ("grok-4.5", "low"),
+        "balanced": ("grok-4.5", "medium"),
+        "strong": ("grok-4.5", "high"),
+        "max": ("grok-4.5", "high"),
     },
     "opencode": {
-        "planner": {
-            d: ("neuralwatt/qwen3.5-397b", "") for d in TASK_DIFFICULTIES
-        },
-        "tester": {
-            "simple": ("neuralwatt/glm-5.2-short-fast-flex", "low"),
-            "standard": ("neuralwatt/glm-5.2-flex", "medium"),
-            "complex": ("neuralwatt/glm-5.2-flex", "high"),
-        },
-        "coder": {
-            "simple": ("neuralwatt/kimi-k2.7-code-flex", ""),
-            "standard": ("neuralwatt/kimi-k2.7-code-flex", ""),
-            "complex": ("neuralwatt/kimi-k2.7-code-flex", ""),
-        },
-        "reviewer": {
-            "simple": ("neuralwatt/glm-5.2-flex", "medium"),
-            "standard": ("neuralwatt/glm-5.2-flex", "high"),
-            "complex": ("neuralwatt/glm-5.2-flex", "high"),
-        },
-        "verifier": {
-            d: ("neuralwatt/qwen3.5-397b", "") for d in TASK_DIFFICULTIES
-        },
+        "economy": ("neuralwatt/glm-5.2-short-fast-flex", "low"),
+        "efficient": ("neuralwatt/glm-5.2-flex", "medium"),
+        "balanced": ("neuralwatt/glm-5.2-flex", "medium"),
+        "strong": ("neuralwatt/glm-5.2-flex", "high"),
+        "max": ("neuralwatt/glm-5.2-flex", "high"),
     },
-    # Kiro sam zarządza wyborem modelu; puste wartości nie dodają flag CLI.
+    # Kiro użyje tych wartości tylko, gdy jego szablon CLI zawiera {model}/{effort}.
     "kiro": {
-        role: {d: ("", "") for d in TASK_DIFFICULTIES}
-        for role in ("planner", "tester", "coder", "reviewer", "verifier")
+        "economy": ("sonnet-4.6", "low"),
+        "efficient": ("sonnet-4.6", "medium"),
+        "balanced": ("sonnet-4.6", "high"),
+        "strong": ("opus-4.6", "medium"),
+        "max": ("opus-4.6", "high"),
     },
 }
 
@@ -253,7 +219,7 @@ class Config:
     # Po tylu kolejnych odrzuceniach mapy kryteriów przy DONE — eskalacja
     # (policy), zamiast palić cały max_micro_cycles na poprawianie JSON-a.
     max_done_rejects: int = int(os.environ.get("FORGE_MAX_DONE_REJECTS", "3"))
-    # review_if_green | fail | continue — patrz docs/PLAN-5-DONE-KRYTERIA-I-PĘTLE.md.
+    # review_if_green | fail | continue — szczegóły: docs/PIPELINE.md.
     done_reject_policy: str = os.environ.get(
         "FORGE_DONE_REJECT_POLICY", "review_if_green").strip().lower() or "review_if_green"
     # Przed rollbackiem przy porażce: branch forge/failed/<id> na HEAD (+ residual commit).
@@ -290,7 +256,7 @@ class Config:
     def role(
         self, name: str, difficulty: str = DEFAULT_TASK_DIFFICULTY
     ) -> tuple[str, str, str]:
-        """Zwróć ``(agent, model, effort)`` z ustalonej polityki routingu.
+        """Zwróć ``(agent, model, effort)`` z polityki rola → poziom → provider.
 
         Nieznane/customowe CLI zachowują zgodność wsteczną i korzystają z pól
         ``*_model``/``*_effort``. Brak profilu w starym STATE.json oznacza
@@ -301,14 +267,17 @@ class Config:
 
         configured: dict[str, tuple[str, str, str]] = {
             "planner": (self.planner_agent, self.planner_model, self.planner_effort),
+            "planner_escalation": (self.planner_agent, self.planner_model, self.planner_effort),
+            # Bootstrap używa agenta planisty, lecz ma własną politykę poziomu.
+            "bootstrap": (self.planner_agent, self.planner_model, self.planner_effort),
             "tester": (self.tester_agent, self.tester_model, self.tester_effort),
             "coder": (self.coder_agent, self.coder_model, self.coder_effort),
         }
         if name == "verifier":
-            if not self.verifier_agent:  # domyślnie rola planisty w całości
-                return self.role("planner", difficulty)
             configured[name] = (
-                self.verifier_agent, self.verifier_model, self.verifier_effort
+                (self.verifier_agent or self.planner_agent),
+                self.verifier_model if self.verifier_agent else self.planner_model,
+                self.verifier_effort if self.verifier_agent else self.planner_effort,
             )
         elif name == "reviewer":
             agent = self.reviewer_agent or self.tester_agent
@@ -323,13 +292,25 @@ class Config:
 
         agent, legacy_model, legacy_effort = configured[name]
         canonical = adapters.canonical_agent(agent)
-        fixed = ROLE_ROUTING.get(canonical, {}).get(name, {}).get(difficulty)
+        level = self.model_level(name, difficulty)
+        fixed = MODEL_LEVEL_ROUTING.get(canonical, {}).get(level)
         if fixed is not None:
             return (agent, *fixed)
         return (
             agent,
             *self._role_model_effort(agent, legacy_model, legacy_effort),
         )
+
+    def model_level(
+        self, name: str, difficulty: str = DEFAULT_TASK_DIFFICULTY
+    ) -> str:
+        """Poziom routingu niezależny od modelu i providera."""
+        if difficulty not in TASK_DIFFICULTIES:
+            difficulty = DEFAULT_TASK_DIFFICULTY
+        try:
+            return ROLE_MODEL_LEVELS[name][difficulty]
+        except KeyError as exc:
+            raise ValueError(f"nieznana rola: {name}") from exc
 
     def tester(self) -> tuple[str, str]:
         """(model, effort) testera — zgodność wsteczna; patrz role('tester')."""

@@ -22,7 +22,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from .config import Config
+from .config import Config, ROLE_MODEL_LEVELS
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +40,10 @@ ROLE_DEFS = (
     ("reviewer", "Recenzent", "Sprawdza ukończone zadanie w świeżym kontekście"),
     ("verifier", "Weryfikator", "Ocenia, czy cały cel został osiągnięty"),
 )
+LEVEL_LABELS = {
+    "economy": "economy", "efficient": "efficient", "balanced": "balanced",
+    "strong": "strong", "max": "max",
+}
 ENV_FIELDS = {
     role: {"agent": f"FORGE_{role.upper()}_AGENT"}
     for role, _title, _description in ROLE_DEFS
@@ -140,6 +144,18 @@ class RoleCard(Gtk.Box):
         self.append(heading)
         self.append(subtitle)
 
+        levels = ROLE_MODEL_LEVELS[role]
+        routing = Gtk.Label(
+            label=("Poziom modelu  •  simple: " + LEVEL_LABELS[levels["simple"]]
+                   + "  |  standard: " + LEVEL_LABELS[levels["standard"]]
+                   + "  |  complex: " + LEVEL_LABELS[levels["complex"]]),
+            xalign=0,
+            wrap=True,
+        )
+        routing.add_css_class("caption")
+        routing.add_css_class("dim-label")
+        self.append(routing)
+
         self.agent = Gtk.DropDown(model=_string_list(AGENTS, "Agent"))
         self.agent.set_hexpand(True)
         selected = default_agent if default_agent in AGENTS else AGENTS[0]
@@ -229,14 +245,24 @@ class ForgeWindow(Adw.ApplicationWindow):
         heading = Gtk.Label(xalign=0)
         heading.set_markup("<span size='x-large' weight='bold'>Konfiguracja biegu</span>")
         info = Gtk.Label(
-            label=("Wybierz agenta dla każdej roli. Model i poziom namysłu "
-                   "dobierze stała mapa na podstawie trudności zadania."),
+            label=("Trudność zadania (simple / standard / complex) i poziom modelu "
+                   "(economy / efficient / balanced / strong / max) są niezależne. Wybierz agenta; "
+                   "provider przełoży poziom na konkretny model i effort."),
             xalign=0,
             wrap=True,
         )
         info.add_css_class("dim-label")
         config.append(heading)
         config.append(info)
+
+        policy = Gtk.Label(
+            label=("Polityka: Bootstrap = max; Planista = strong (eskalacja: max). "
+                   "Pozostałe role dobierają poziom zależnie od trudności zadania."),
+            xalign=0,
+            wrap=True,
+        )
+        policy.add_css_class("dim-label")
+        config.append(policy)
 
         paths = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         saved_brief = self.settings.get("brief", "game.md")

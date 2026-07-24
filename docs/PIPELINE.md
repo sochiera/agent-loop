@@ -163,52 +163,39 @@ zadania naprawcze z czerwonym na starcie repro. Potwierdzony `env_issue`,
 brak postępu przez 2 cykle albo 8 cykli łącznie kończy pipeline twardym
 stopem dla człowieka.
 
-## 3. Domyślne role, modele i efforty
+## 3. Domyślne role i routing modeli
 
-Bez flag i zmiennych środowiskowych:
+`task_complexity` (`simple`, `standard`, `complex`) opisuje zakres zadania.
+`model_level` (`economy`, `efficient`, `balanced`, `strong`, `max`) jest niezależną polityką doboru
+modelu wewnątrz danego providera. Routing ma dwa kroki: **rola + trudność →
+poziom**, następnie **provider + poziom → model/effort**. `max` nie oznacza
+więc jednego globalnego modelu.
 
-| Rola | Agent | Model | Effort | Moment |
+| Rola | simple | standard | complex | Moment |
 |---|---|---|---|---|
-| Planista / bootstrap | `claude` | `opus` | `high` | bootstrap i każdy plan |
-| Tester | `opencode` | `glm-5.2-short-fast-flex` (simple), `glm-5.2-flex` (standard/complex) | low / medium / high | początek mikro-cyklu |
-| Koder | `opencode` | `kimi-k2.7-code-flex` | pusty (wybiera agent) | implementacja i refaktor |
-| Recenzent | `opencode` | `glm-5.2-flex` | medium / high / high | po DONE lub smell gate |
-| Weryfikator | `opencode` | `qwen3.5-397b` | pusty (wybiera agent) | po wyczerpaniu backlogu |
+| Bootstrap | max | max | max | ustanowienie architektury |
+| Planista | strong | strong | strong | planowanie; eskalacja: max |
+| Tester | efficient | balanced | balanced | początek mikro-cyklu |
+| Koder — pierwsza próba | economy | efficient | balanced | implementacja i refaktor |
+| Recenzent | efficient | balanced | strong | po DONE lub smell gate |
+| Weryfikator | economy | efficient | balanced | po wyczerpaniu backlogu; najwyższa trudność ukończonego zadania |
 
-Pełne nazwy modeli opencode mają prefiks `neuralwatt/`. W tabeli efforty są
-w kolejności `simple / standard / complex`. Pusty effort oznacza brak
-jawnej flagi CLI.
+Konkretna translacja poziomów jest następująca:
 
-### Pełna macierz wbudowanych agentów
+| Provider | economy | efficient | balanced | strong | max |
+|---|---|---|---|---|---|
+| Codex / GPT | Luna / low | Terra / low | Terra / medium | Sol / high | Sol / max |
+| Claude | Haiku / — | Sonnet / low | Sonnet / medium | Sonnet / high | Opus / max |
+| Grok | 4.5 / low, mały budżet | 4.5 / low | 4.5 / medium | 4.5 / high | 4.5 / high, max budżet |
+| OpenCode | GLM 5.2 / low | GLM 5.2 / medium | GLM 5.2 / medium | GLM 5.2 / high | GLM 5.2 / high |
+| Kiro | Sonnet 4.6 / low | Sonnet 4.6 / medium | Sonnet 4.6 / high | Opus 4.6 / medium | Opus 4.6 / high |
 
-Format komórki: `model / effort`; kolumny to `simple / standard / complex`.
+Nazwy skrócone w tabeli rozwijają się w `MODEL_LEVEL_ROUTING`. Obecny adapter
+OpenCode nie uruchamia osobnej rundy self-review, a adapter Kiro przekaże model
+i effort tylko wtedy, gdy jego szablon CLI zawiera odpowiednie placeholdery.
 
-| Agent | Rola | simple | standard | complex |
-|---|---|---|---|---|
-| codex | planner | gpt-5.6-sol / high | gpt-5.6-sol / high | gpt-5.6-sol / high |
-| codex | tester | gpt-5.6-terra / medium | gpt-5.6-terra / medium | gpt-5.6-sol / medium |
-| codex | coder | gpt-5.6-luna / medium | gpt-5.6-terra / low | gpt-5.6-terra / medium |
-| codex | reviewer | gpt-5.6-sol / medium | gpt-5.6-sol / medium | gpt-5.6-sol / medium |
-| codex | verifier | gpt-5.6-terra / medium | gpt-5.6-terra / medium | gpt-5.6-terra / medium |
-| claude | planner | opus / high | opus / high | opus / high |
-| claude | tester | sonnet / medium | sonnet / high | opus / high |
-| claude | coder | sonnet / low | sonnet / medium | opus / medium |
-| claude | reviewer | sonnet / high | sonnet / high | opus / high |
-| claude | verifier | sonnet / high | sonnet / high | sonnet / high |
-| grok | planner | grok-4.5 / high | grok-4.5 / high | grok-4.5 / high |
-| grok | tester | grok-4.5 / low | grok-4.5 / medium | grok-4.5 / high |
-| grok | coder | grok-4.5 / low | grok-4.5 / medium | grok-4.5 / high |
-| grok | reviewer | grok-4.5 / medium | grok-4.5 / high | grok-4.5 / high |
-| grok | verifier | grok-4.5 / high | grok-4.5 / high | grok-4.5 / high |
-| opencode | planner | qwen3.5-397b / — | qwen3.5-397b / — | qwen3.5-397b / — |
-| opencode | tester | glm-5.2-short-fast-flex / low | glm-5.2-flex / medium | glm-5.2-flex / high |
-| opencode | coder | kimi-k2.7-code-flex / — | kimi-k2.7-code-flex / — | kimi-k2.7-code-flex / — |
-| opencode | reviewer | glm-5.2-flex / medium | glm-5.2-flex / high | glm-5.2-flex / high |
-| opencode | verifier | qwen3.5-397b / — | qwen3.5-397b / — | qwen3.5-397b / — |
-| kiro | każda rola | model wybiera Kiro | model wybiera Kiro | model wybiera Kiro |
-
-Niestandardowy agent korzysta z własnego szablonu CLI. Bez osobnej macierzy
-używa pól `FORGE_<ROLE>_MODEL` i `FORGE_<ROLE>_EFFORT`.
+Pełne identyfikatory modeli i mapa znajdują się w `forge/config.py` jako
+`ROLE_MODEL_LEVELS` i `MODEL_LEVEL_ROUTING`.
 
 ## 4. Limity i bramki
 
