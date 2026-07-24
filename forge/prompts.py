@@ -128,6 +128,68 @@ Na samym końcu odpowiedzi zwróć WYŁĄCZNIE blok:
 Komendy muszą działać z katalogu projektu bez interakcji."""
 
 
+def bootstrap_architecture_review_prompt(brief_path: str, test_cmd: str,
+                                        *, changes: list[str] | None = None) -> str:
+    """Świeża, niezależna recenzja bootstrapu przed commitem bazowym."""
+    prior = ""
+    if changes:
+        prior = ("\nTo jest ponowna recenzja po poprawkach do poprzednich uwag:\n"
+                 + "\n".join(f"- {note}" for note in changes) + "\n")
+    return f"""{SHARED_PRINCIPLES}
+
+ROLA: NIEZALEŻNY RECENZENT ARCHITEKTURY. Nie brałaś/eś udziału w bootstrapie.
+NIE piszesz kodu ani dokumentacji; oceniasz kandydat na bazę projektu PRZED
+pierwszym commitem. Świeży kontekst jest częścią tej bramki.
+
+Przeczytaj źródło wymagań: {brief_path}
+oraz docs/DESIGN.md, docs/ARCHITECTURE.md, docs/DECISIONS.md, BACKLOG.md,
+scaffold i `git diff`. Uruchom testy, jeśli potrzebujesz dodatkowego dowodu:
+`{test_cmd}`.{prior}
+
+Oceń konkretnie:
+- zgodność architektury i MVP z briefem, w tym pominięte wymagania;
+- granice modułów, zależności, model danych i publiczne kontrakty/API;
+- testowalność, strategię testów, bezpieczeństwo i ryzyka techniczne;
+- czy wybór stacku lub scaffold nie tworzy kosztownej, przedwczesnej decyzji.
+
+Nie zgłaszaj preferencji stylistycznych. Wydaj `changes` tylko dla realnego
+ryzyka lub niezgodności i opisz minimalną, wykonalną poprawkę. `approve`
+oznacza, że bootstrap może zostać zapisany jako wersja bazowa.
+
+Na końcu zwróć WYŁĄCZNIE:
+```json
+{{"verdict": "approve", "notes": []}}
+```
+lub
+```json
+{{"verdict": "changes", "notes": ["<konkretna poprawka>", "..."]}}
+```"""
+
+
+def bootstrap_architecture_fix_prompt(notes: list[str], test_cmd: str,
+                                     brief_path: str) -> str:
+    bullet = "\n".join(f"- {note}" for note in notes) or "- Brak szczegółów — sprawdź architekturę ponownie."
+    return f"""{SHARED_PRINCIPLES}
+
+ROLA: Architekt bootstrapu — poprawiasz kandydat na bazę projektu po niezależnej
+recenzji. Przeczytaj brief ({brief_path}), docs/ i aktualny scaffold. Zastosuj
+WYŁĄCZNIE poniższe uzasadnione uwagi; nie commituj.
+
+Uwagi:
+{bullet}
+
+Po poprawkach uruchom `{test_cmd}`. Jeśli zmieniłaś/eś komendy, stack, profil
+weryfikacji lub globy toolchainu, zwróć ich NOWE wartości. Na końcu zwróć
+WYŁĄCZNIE pełny kontrakt bootstrapu:
+```json
+{{"kind": "game|app", "stack": "<opis>", "test_cmd": "<komenda>",
+ "build_cmd": "<komenda lub pusty>", "run_cmd": "<komenda>",
+ "test_toolchain_globs": [], "verify": {{"targets": [], "smoke_cmd": "",
+ "flash_cmd": "", "target_cmd": "", "probe_cmd": "", "ci_status_cmd": "",
+ "ci_logs_cmd": "", "verify_test_globs": []}}}}
+```"""
+
+
 def plan_prompt(kind: str = "app") -> str:
     return f"""{SHARED_PRINCIPLES}
 
@@ -436,6 +498,15 @@ Bieżące zadanie: {task_file} (przeczytaj: cel, KRYTERIA AKCEPTACJI, Kontrakt A
 Ścieżki testów). Przejrzyj istniejące testy i kod, ustal CZEGO JESZCZE BRAKUJE
 względem kryteriów.
 
+ŹRÓDŁA PRAWDY (w tej kolejności): kryteria akceptacji, dokumentacja i publiczny
+kontrakt API. Kod produkcyjny wolno czytać WYŁĄCZNIE, aby zrozumieć problem i
+znaleźć punkt wejścia — NIE jest on specyfikacją oczekiwanego zachowania.
+Testuj rezultat obserwowalny dla użytkownika/konsumenta API (wartość, błąd,
+stan publiczny, komunikat lub efekt trwały). Nie uzależniaj testu od prywatnych
+metod/pól, nazw wewnętrznych modułów, kolejności wywołań ani algorytmu, chyba że
+taki szczegół jest jawnie wymagany przez kryterium lub Kontrakt API. Poprawny
+refaktor zachowujący publiczny kontrakt nie może wymagać zmiany testu.
+
 KANON KRYTERIÓW: orkiestrator waliduje mapę DONE wyłącznie względem tekstów
 checkboxów z sekcji „Kryteria akceptacji" w pliku zadania (po znormalizowaniu
 spacji). Przepisz je dosłownie w polu "criterion".
@@ -584,6 +655,9 @@ Oceń:
 - Czy WSZYSTKIE kryteria akceptacji są realnie spełnione i pokryte testami?
 - Czy testy sprawdzają zachowanie (nie tautologie/atrapy)? Czy któryś test został
   osłabiony, żeby kod przeszedł? Czy kod nie hardkoduje wyników pod asercje?
+- Czy test pozostałby poprawny po refaktorze zachowującym publiczny kontrakt?
+  Odrzuć zależność od prywatnych szczegółów implementacji, jeśli nie wymaga jej
+  kryterium akceptacji ani jawny kontrakt API.
 - Poprawność, prostota, brak wyjścia poza zakres, aktualność docs/.
 Możesz uruchomić `{test_cmd}`.
 

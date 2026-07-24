@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -354,6 +355,45 @@ def parse_verify_profile(verify, cfg: Config) -> dict:
     return {"verify_targets": targets, "verify_test_globs": globs, **fields}
 
 
+def parse_bootstrap_result(data: dict, cfg: Config) -> tuple[dict, list[str]]:
+    """Zwaliduj kontrakt JSON bootstrapu lub jego poprawki.
+
+    Poprawka architektury może świadomie zmienić stack, komendy albo profil
+    weryfikacji; obie ścieżki muszą więc przejść identyczną walidację.
+    """
+    required = ("stack", "test_cmd", "build_cmd", "run_cmd")
+    invalid = [key for key in required if not isinstance(data.get(key), str)]
+    if invalid:
+        raise AgentError(f"Bootstrap zwrócił niepoprawne pola: {', '.join(invalid)}.")
+    if not data["stack"].strip() or not data["test_cmd"].strip() or not data["run_cmd"].strip():
+        raise AgentError("Bootstrap musi określić stack oraz niepuste komendy test i run.")
+    profile = parse_verify_profile(data.get("verify"), cfg)
+    toolchain_globs = [str(g).strip() for g in (data.get("test_toolchain_globs") or [])
+                       if str(g).strip()]
+    return profile, toolchain_globs
+
+
+def bootstrap_review_manifest(project: str, runtime_dir: str) -> dict[str, str]:
+    """Odcisk plików produktu przed/po read-only recenzji bootstrapu.
+
+    Artefakty wykonawcze `.forge/` są wyłączone, bo adapter agenta może tam
+    zapisać swoją odpowiedź. Każda inna zmiana to naruszenie roli recenzenta.
+    """
+    manifest: dict[str, str] = {}
+    for root, dirs, files in os.walk(project):
+        rel_dir = os.path.relpath(root, project)
+        dirs[:] = [d for d in dirs if d not in {".git", runtime_dir}]
+        for name in files:
+            path = os.path.join(root, name)
+            rel = os.path.normpath(os.path.join(rel_dir, name)).lstrip("./")
+            try:
+                with open(path, "rb") as f:
+                    manifest[rel] = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                manifest[rel] = "<unreadable>"
+    return manifest
+
+
 def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     log("=== BOOTSTRAP ===")
     with open(cfg.brief_path, "r", encoding="utf-8") as f:
@@ -362,19 +402,53 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     data = extract_json(out)
     if not data:
         raise AgentError("Bootstrap nie zwrócił poprawnego obiektu JSON.")
-    required = ("stack", "test_cmd", "build_cmd", "run_cmd")
-    invalid = [key for key in required if not isinstance(data.get(key), str)]
-    if invalid:
-        raise AgentError(f"Bootstrap zwrócił niepoprawne pola: {', '.join(invalid)}.")
-    if not data["stack"].strip() or not data["test_cmd"].strip() or not data["run_cmd"].strip():
-        raise AgentError("Bootstrap musi określić stack oraz niepuste komendy test i run.")
-    profile = parse_verify_profile(data.get("verify"), cfg)
-    # Deklaracja toolchainu testowego (PLAN-4, Z1) — jak verify_test_globs:
-    # opcjonalna, uzupełnia wbudowaną heurystykę plików konfiguracji testów.
-    toolchain_globs = [str(g).strip() for g in (data.get("test_toolchain_globs") or [])
-                       if str(g).strip()]
+    profile, toolchain_globs = parse_bootstrap_result(data, cfg)
     if not build_then_test(project, data["build_cmd"], data["test_cmd"], cfg.agent_timeout_s):
         raise AgentError("Build/testy szkieletu po bootstrapie nie przeszły.")
+    # Bootstrap ustanawia stack i granice całego projektu, więc zawsze jest
+    # zmianą complex. Commit i State pozostają nietknięte aż do niezależnej,
+    # świeżej recenzji roli reviewer.
+    if cfg.max_bootstrap_arch_reviews > 0:
+        reviewer, model, effort = cfg.role("reviewer", "complex")
+        review_notes: list[str] = []
+        approved = False
+        for attempt in range(1, cfg.max_bootstrap_arch_reviews + 1):
+            log(f"--- ARCHITECTURE REVIEW {attempt}/{cfg.max_bootstrap_arch_reviews} ({reviewer}) ---")
+            manifest_before = bootstrap_review_manifest(project, cfg.runtime_dir)
+            review_out = run_agent(
+                reviewer,
+                prompts.bootstrap_architecture_review_prompt(
+                    os.path.abspath(cfg.brief_path), data["test_cmd"], changes=review_notes or None
+                ),
+                cfg, project, logf(f"bootstrap-architecture-review-{attempt}"),
+                model=model, effort=effort,
+            )
+            if bootstrap_review_manifest(project, cfg.runtime_dir) != manifest_before:
+                raise AgentError("Recenzent architektury zmienił pliki produktu; recenzja musi być tylko do odczytu.")
+            review = extract_json(review_out) or {}
+            if review.get("verdict") == "approve":
+                approved = True
+                break
+            review_notes = [str(note) for note in (review.get("notes") or []) if str(note).strip()]
+            if not review_notes:
+                review_notes = ["Recenzja architektury nie zwróciła poprawnego werdyktu lub wykonalnych uwag."]
+            if attempt == cfg.max_bootstrap_arch_reviews:
+                break
+            log(f"ARCHITECTURE REVIEW: changes ({len(review_notes)} uwag) — poprawiam bootstrap.")
+            repair_out = run_planner(
+                prompts.bootstrap_architecture_fix_prompt(
+                    review_notes, data["test_cmd"], os.path.abspath(cfg.brief_path)
+                ), cfg, project, logf(f"bootstrap-architecture-fix-{attempt}")
+            )
+            repaired = extract_json(repair_out)
+            if not repaired:
+                raise AgentError("Poprawka bootstrapu nie zwróciła pełnego obiektu JSON.")
+            data = repaired
+            profile, toolchain_globs = parse_bootstrap_result(data, cfg)
+            if not build_then_test(project, data["build_cmd"], data["test_cmd"], cfg.agent_timeout_s):
+                raise AgentError("Build/testy bootstrapu po poprawkach architektury nie przeszły.")
+        if not approved:
+            raise AgentError("Bootstrap nie przeszedł niezależnej recenzji architektury.")
     for key, value in profile.items():
         setattr(state, key, value)
     state.test_toolchain_globs = toolchain_globs

@@ -489,6 +489,29 @@ class WriteTestPromptPlan5Test(unittest.TestCase):
         self.assertTrue("refaktor" in p.lower() or "refactor" in p.lower()
                         or "nowych testów" in p.lower())
 
+    def test_requires_behavioral_tests_independent_of_implementation(self) -> None:
+        from forge.prompts import write_test_prompt
+        p = write_test_prompt(".forge/tasks/t.md", "pytest")
+        self.assertIn("ŹRÓDŁA PRAWDY", p)
+        self.assertIn("prywatnych", p)
+        self.assertIn("refaktor", p.lower())
+
+
+class BootstrapArchitecturePromptTest(unittest.TestCase):
+    def test_review_covers_architecture_risks_and_returns_gate_verdict(self) -> None:
+        from forge.prompts import bootstrap_architecture_review_prompt
+        p = bootstrap_architecture_review_prompt("/tmp/brief.md", "pytest")
+        self.assertIn("NIEZALEŻNY RECENZENT ARCHITEKTURY", p)
+        self.assertIn("model danych", p)
+        self.assertIn('"verdict": "approve"', p)
+
+    def test_repair_prompt_requires_full_updated_bootstrap_contract(self) -> None:
+        from forge.prompts import bootstrap_architecture_fix_prompt
+        p = bootstrap_architecture_fix_prompt(["zmień stack"], "pytest", "/tmp/brief.md")
+        self.assertIn("pełny kontrakt bootstrapu", p)
+        self.assertIn('"test_cmd"', p)
+        self.assertIn("/tmp/brief.md", p)
+
 
 class PlanBatchPromptPlan5Test(unittest.TestCase):
     def test_mentions_kind_refactor_and_literal_criteria(self) -> None:

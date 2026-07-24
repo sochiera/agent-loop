@@ -806,7 +806,8 @@ class BootstrapToolchainGlobsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             brief = Path(project) / "brief.md"
             brief.write_text("gra", encoding="utf-8")
-            cfg = Config(brief_path=str(brief), agent_timeout_s=5)
+            cfg = Config(brief_path=str(brief), agent_timeout_s=5,
+                         max_bootstrap_arch_reviews=0)
             state = State()
             payload = ('{"kind":"app","stack":"Py","test_cmd":"pytest",'
                        '"build_cmd":"","run_cmd":"x",'
@@ -824,7 +825,8 @@ class BootstrapToolchainGlobsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             brief = Path(project) / "brief.md"
             brief.write_text("gra", encoding="utf-8")
-            cfg = Config(brief_path=str(brief), agent_timeout_s=5)
+            cfg = Config(brief_path=str(brief), agent_timeout_s=5,
+                         max_bootstrap_arch_reviews=0)
             state = State()
             payload = ('{"kind":"app","stack":"Py","test_cmd":"pytest",'
                        '"build_cmd":"","run_cmd":"x"}')

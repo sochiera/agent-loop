@@ -290,7 +290,8 @@ class BootstrapVerifyProfileTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.brief = Path(self._tmp.name) / "brief.md"
         self.brief.write_text("brief", encoding="utf-8")
-        self.cfg = Config(brief_path=str(self.brief), agent_timeout_s=10)
+        self.cfg = Config(brief_path=str(self.brief), agent_timeout_s=10,
+                          max_bootstrap_arch_reviews=0)
         self.state = State()
 
     def _bootstrap(self, verify_json: str) -> None:

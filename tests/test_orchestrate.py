@@ -199,6 +199,96 @@ class BootstrapTest(unittest.TestCase):
         commit.assert_not_called()
         self.assertFalse(self.state.bootstrapped)
 
+    @patch("forge.orchestrate.commit_all")
+    @patch("forge.orchestrate.build_then_test", return_value=True)
+    @patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve","notes":[]}')
+    @patch("forge.orchestrate.run_planner", return_value=(
+        '{"stack":"Python","test_cmd":"python -m unittest",'
+        '"build_cmd":"","run_cmd":"python game.py"}'
+    ))
+    def test_bootstrap_commits_only_after_independent_architecture_approval(
+        self, planner: Mock, reviewer: Mock, _gate: Mock, commit: Mock
+    ) -> None:
+        phase_bootstrap(self.cfg, self.tmp.name, self.state, lambda phase: f"{phase}.log")
+
+        self.assertTrue(self.state.bootstrapped)
+        commit.assert_called_once()
+        self.assertEqual(planner.call_count, 1)
+        self.assertEqual(reviewer.call_count, 1)
+        prompt = reviewer.call_args.args[1]
+        self.assertIn("NIEZALEŻNY RECENZENT ARCHITEKTURY", prompt)
+        self.assertIn(str(self.brief), prompt)
+        self.assertEqual(reviewer.call_args.kwargs["model"], self.cfg.role("reviewer", "complex")[1])
+
+    @patch("forge.orchestrate.commit_all")
+    @patch("forge.orchestrate.build_then_test", return_value=True)
+    @patch("forge.orchestrate.run_agent", side_effect=[
+        '{"verdict":"changes","notes":["wydziel granicę API"]}',
+        '{"verdict":"approve","notes":[]}',
+    ])
+    @patch("forge.orchestrate.run_planner", side_effect=[
+        '{"stack":"Python","test_cmd":"python -m unittest",'
+        '"build_cmd":"","run_cmd":"python game.py"}',
+        '{"kind":"app","stack":"Rust","test_cmd":"cargo test",'
+        '"build_cmd":"cargo build","run_cmd":"cargo run",'
+        '"test_toolchain_globs":["scripts/test.sh"]}',
+    ])
+    def test_architecture_changes_are_fixed_and_re_reviewed(
+        self, planner: Mock, reviewer: Mock, gate: Mock, commit: Mock
+    ) -> None:
+        phase_bootstrap(self.cfg, self.tmp.name, self.state, lambda phase: f"{phase}.log")
+
+        self.assertEqual(reviewer.call_count, 2)
+        self.assertEqual(planner.call_count, 2)
+        self.assertEqual(gate.call_count, 2)
+        commit.assert_called_once()
+        self.assertEqual(self.state.stack, "Rust")
+        self.assertEqual(self.state.test_cmd, "cargo test")
+        self.assertEqual(self.state.test_toolchain_globs, ["scripts/test.sh"])
+
+    @patch("forge.orchestrate.commit_all")
+    @patch("forge.orchestrate.build_then_test", return_value=True)
+    @patch("forge.orchestrate.run_planner", return_value=(
+        '{"stack":"Python","test_cmd":"python -m unittest",'
+        '"build_cmd":"","run_cmd":"python game.py"}'
+    ))
+    def test_architecture_reviewer_cannot_modify_product_files(
+        self, _planner: Mock, _gate: Mock, commit: Mock
+    ) -> None:
+        def reviewer(*_args, **_kwargs) -> str:
+            (self.root / "reviewer-leak.txt").write_text("nie wolno", encoding="utf-8")
+            return '{"verdict":"approve","notes":[]}'
+
+        with patch("forge.orchestrate.run_agent", side_effect=reviewer):
+            with self.assertRaisesRegex(AgentError, "tylko do odczytu"):
+                phase_bootstrap(self.cfg, self.tmp.name, self.state, lambda phase: f"{phase}.log")
+
+        commit.assert_not_called()
+        self.assertFalse(self.state.bootstrapped)
+
+    def test_architecture_review_prompt_uses_absolute_brief_path(self) -> None:
+        from forge.prompts import bootstrap_architecture_review_prompt
+        prompt = bootstrap_architecture_review_prompt(
+            str(self.brief.resolve()), "python -m unittest"
+        )
+        self.assertIn(str(self.brief.resolve()), prompt)
+
+    @patch("forge.orchestrate.commit_all")
+    @patch("forge.orchestrate.build_then_test", return_value=True)
+    @patch("forge.orchestrate.run_agent", return_value='{"verdict":"changes","notes":["ryzyko"]}')
+    @patch("forge.orchestrate.run_planner", return_value=(
+        '{"stack":"Python","test_cmd":"python -m unittest",'
+        '"build_cmd":"","run_cmd":"python game.py"}'
+    ))
+    def test_architecture_rejection_prevents_baseline_commit(
+        self, _planner: Mock, _reviewer: Mock, _gate: Mock, commit: Mock
+    ) -> None:
+        with self.assertRaisesRegex(AgentError, "recenzji architektury"):
+            phase_bootstrap(self.cfg, self.tmp.name, self.state, lambda phase: f"{phase}.log")
+
+        commit.assert_not_called()
+        self.assertFalse(self.state.bootstrapped)
+
 
 class CommitTest(unittest.TestCase):
     @patch("forge.orchestrate.git")

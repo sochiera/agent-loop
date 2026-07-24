@@ -232,6 +232,11 @@ class Config:
     reviewer_agent: str = os.environ.get("FORGE_REVIEWER_AGENT", "opencode")
     reviewer_model: str = os.environ.get("FORGE_REVIEWER_MODEL", "neuralwatt/glm-5.2-flex")
     reviewer_effort: str = os.environ.get("FORGE_REVIEWER_EFFORT", "")
+    # Bootstrap zawsze ustala architekturę; przed jego commitem świeży
+    # recenzent może zażądać poprawek. 0 wyłącza bramkę świadomie.
+    max_bootstrap_arch_reviews: int = int(
+        os.environ.get("FORGE_MAX_BOOTSTRAP_ARCH_REVIEWS", "2")
+    )
     # Rotacja sesji ról co K ukończonych mikro-cykli (0 = wyłączona) —
     # higiena kontekstu: świeża sesja z dziennikiem zamiast spuchniętej.
     session_rotate_cycles: int = int(os.environ.get("FORGE_SESSION_ROTATE_CYCLES", "4"))

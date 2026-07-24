@@ -157,6 +157,7 @@ są ignorowane, więc repo gry zostaje czyste od metadanych narzędzia.
 | Timeout agenta | 3600 s | `FORGE_AGENT_TIMEOUT=...` |
 | Push do remote | włączony (`origin`) | `FORGE_GIT_PUSH=0`, `FORGE_GIT_REMOTE=...` |
 | Recenzent zadania | `opencode`, ŚWIEŻY kontekst | `--reviewer-agent` lub `FORGE_REVIEWER_AGENT` |
+| Rundy recenzji architektury bootstrapu | `2` | `FORGE_MAX_BOOTSTRAP_ARCH_REVIEWS` (`0` wyłącza) |
 | Weryfikator celu | `opencode` | `--verifier-agent` lub `FORGE_VERIFIER_AGENT` |
 | Globy toolchainu testów (extra) | heurystyka + deklaracja bootstrapu | `FORGE_TOOLCHAIN_GLOBS` (CSV) |
 | Rotacja sesji ról co K cykli | `4` (0 = wyłączona) | `FORGE_SESSION_ROTATE_CYCLES` |

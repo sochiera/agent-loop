@@ -379,7 +379,8 @@ class ProjectKindTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             brief = Path(project) / "brief.md"
             brief.write_text("gra taktyczna", encoding="utf-8")
-            cfg = Config(brief_path=str(brief), agent_timeout_s=5)
+            cfg = Config(brief_path=str(brief), agent_timeout_s=5,
+                         max_bootstrap_arch_reviews=0)
             state = State()
             payload = ('{"kind":"game","stack":"Py","test_cmd":"pytest",'
                        '"build_cmd":"","run_cmd":"python g.py"}')
@@ -394,7 +395,8 @@ class ProjectKindTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             brief = Path(project) / "brief.md"
             brief.write_text("narzędzie CLI", encoding="utf-8")
-            cfg = Config(brief_path=str(brief), agent_timeout_s=5)
+            cfg = Config(brief_path=str(brief), agent_timeout_s=5,
+                         max_bootstrap_arch_reviews=0)
             state = State()
             payload = ('{"stack":"Py","test_cmd":"pytest","build_cmd":"","run_cmd":"x"}')
             with patch("forge.orchestrate.run_planner", return_value=payload):
