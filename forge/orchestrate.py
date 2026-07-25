@@ -29,7 +29,8 @@ Zwróć teraz wyłącznie jeden poprawny obiekt JSON w formacie podanym wyżej.
 _TASK_STATE_FIELDS = (
     "current_task", "task_phase", "tdd_round",
     "tester_session", "coder_session", "tester_decision", "tester_handoff",
-    "coder_summary", "tester_record", "coder_record", "review_notes", "corrections_done",
+    "coder_summary", "no_change_rounds", "round_changed",
+    "tester_record", "coder_record", "review_notes", "corrections_done",
     "corrections_tree_hash", "task_start_tag", "coder_tree_hash",
 )
 
@@ -432,6 +433,8 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         _write_current_task(project, task)
         state.task_phase = "tester"
         state.tester_handoff = str(task.get("batch_handoff", "")).strip()
+        state.no_change_rounds = 0
+        state.round_changed = False
         _checkpoint(project, state, "tester")
         log(f"Zadanie {task['id']} — {task['title']} (trudność: {task['difficulty']})")
         ledger.append(project, f"{task['id']} start: {task['title']} ({task['difficulty']})")
@@ -455,6 +458,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         def run_turn(role: str, prompt: str, parser):
             """Jedna tura roli: nota mistrza, decyzja, log i wpis do dziennika
             wraz z listą plików zmienionych w tej konkretnej turze."""
+            prompt += prompts.no_change_rounds_suffix(state.no_change_rounds)
             prompt += prompts.master_note_suffix(notes.get(role, ""))
             before = _tree_manifest(project)
             result = _decision_with_retry(
@@ -464,8 +468,10 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 parser)
             # Nazwy plików pozwalają Mistrzowi zauważyć np. zmianę testu przez
             # kodera i poprosić testera o ocenę bez mechanicznego blokowania.
-            changed = _describe_turn_changes(
-                _turn_changes(before, _tree_manifest(project)))
+            changed_paths = _turn_changes(before, _tree_manifest(project))
+            if changed_paths:
+                state.round_changed = True
+            changed = _describe_turn_changes(changed_paths)
             reason = str(result.data.get("reason", ""))
             label = "tester" if role == "tester" else "koder"
             log(f"  [{task['id']}] runda {state.tdd_round + 1}: {label} → {result.status}"
@@ -476,6 +482,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
 
         def run_tester(handoff: str):
             ensure_notes(new_round=True)
+            state.round_changed = False
             confirmation = bool(
                 state.coder_summary and handoff == state.coder_summary)
             test_cmd = (
@@ -495,10 +502,13 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             ensure_notes(new_round=False)
             targeted_test_cmd = (
                 task.get("targeted_test_cmd") or state.test_cmd)
-            return run_turn("coder", prompts.coder_task_prompt(
+            result = run_turn("coder", prompts.coder_task_prompt(
                 task["file"], decision.data.get("command") or targeted_test_cmd,
                 decision=decision.data, resume=bool(state.coder_session)),
                 parse_coder_decision)
+            state.no_change_rounds = (
+                0 if state.round_changed else state.no_change_rounds + 1)
+            return result
 
         outcome = run_tdd_loop(
             state=state, max_rounds=cfg.max_tdd_rounds,

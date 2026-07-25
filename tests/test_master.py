@@ -220,6 +220,61 @@ def test_ledger_marks_turn_without_file_changes(tmp_path: Path) -> None:
                for line in lines)
 
 
+def test_two_complete_rounds_without_changes_warn_next_tester(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+    tester_answers = iter((
+        '{"status":"red"}',
+        '{"status":"red"}',
+        '{"status":"blocked","reason":"brak bezpiecznej drogi"}',
+    ))
+    tester_prompts: list[str] = []
+
+    def role_call(_cfg, _project, _state, role, prompt, _log):
+        if role == "tester":
+            tester_prompts.append(prompt)
+            return next(tester_answers)
+        return '{"status":"test_changes_needed","reason":"bez zmian"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate._fail_task"):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert "2 kolejne rundy bez zmian w plikach" in tester_prompts[2]
+    assert "zmień podejście albo zwróć `blocked`" in tester_prompts[2]
+
+
+def test_file_change_resets_no_change_round_counter(tmp_path: Path) -> None:
+    task, state, cfg = _task_repo(tmp_path)
+    state.current_task = task
+    state.task_queue = []
+    state.task_phase = "tester"
+    state.task_start_tag = "forge/task-001-start"
+    _git(tmp_path, "tag", state.task_start_tag)
+    state.no_change_rounds = 2
+    tester_answers = iter((
+        '{"status":"red"}',
+        '{"status":"blocked","reason":"done"}',
+    ))
+
+    def role_call(_cfg, project, _state, role, _prompt, _log):
+        if role == "tester":
+            answer = next(tester_answers)
+            if '"red"' in answer:
+                Path(project, "tests", "test_app.py").write_text(
+                    "changed\n", encoding="utf-8")
+            return answer
+        return '{"status":"test_changes_needed","reason":"wróć"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate._fail_task"):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert state.no_change_rounds == 0
+
+
 def test_master_is_consulted_when_resuming_straight_into_coder(tmp_path: Path) -> None:
     """Po restarcie w fazie kodera pętla omija testera — rada dla kodera
     nie może przez to zniknąć."""

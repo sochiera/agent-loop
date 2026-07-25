@@ -24,6 +24,8 @@ class State:
     tester_decision: dict = field(default_factory=dict)
     tester_handoff: str = ""
     coder_summary: str = ""
+    no_change_rounds: int = 0
+    round_changed: bool = False
     tester_record: str = ""
     coder_record: str = ""
     review_notes: list[str] = field(default_factory=list)

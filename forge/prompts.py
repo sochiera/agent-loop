@@ -97,5 +97,14 @@ def master_note_suffix(note: str) -> str:
             f"zadania): {note.strip()}")
 
 
+def no_change_rounds_suffix(rounds: int) -> str:
+    if rounds < 2:
+        return ""
+    return (
+        f"\n\nUWAGA O POSTĘPIE: {rounds} kolejne rundy bez zmian w plikach; "
+        "zmień podejście albo zwróć `blocked` z konkretnym powodem."
+    )
+
+
 def verify_goal_prompt(cycle: int, evidence: dict, cycle_dir: str, **_ignored) -> str:
     return f"""ROLA: weryfikator celu. Cykl {cycle}; dowody: {evidence}; logi: {cycle_dir}. Oceń MVP. JSON: {{"verdict":"complete","notes":[]}} albo {{"verdict":"changes","notes":["..."]}}."""
