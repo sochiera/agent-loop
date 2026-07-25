@@ -45,6 +45,48 @@ def test_failure_creates_ref_artifact_and_removes_new_file(tmp_path: Path) -> No
     assert subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/heads/forge/failed/task"], cwd=tmp_path).returncode == 0
 
 
+def test_failure_keeps_independent_tasks_and_drops_transitive_dependants(
+        tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"],
+                   cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"],
+                   cwd=tmp_path, check=True)
+    (tmp_path / "seed").write_text("seed", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".forge/\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "tag", "forge/task-001-start"],
+                   cwd=tmp_path, check=True)
+    state = State(
+        current_task={"id": "task-001"},
+        task_start_tag="forge/task-001-start",
+        task_queue=[
+            {"id": "task-002", "depends_on": ["task-001"]},
+            {"id": "task-003", "depends_on": ["task-002"]},
+            {"id": "task-004", "depends_on": []},
+            {"id": "task-005", "depends_on": ["task-999"]},
+        ],
+    )
+
+    orchestrate._fail_task(
+        Config(git_push=False), str(tmp_path), state, "kontrakt niemożliwy")
+
+    assert [task["id"] for task in state.task_queue] == [
+        "task-004", "task-005",
+    ]
+    for task in state.task_queue:
+        assert "task-001" in task["batch_handoff"]
+        assert "kontrakt niemożliwy" in task["batch_handoff"]
+
+
+def test_plan_task_normalises_dependencies() -> None:
+    task = orchestrate.build_task_from_plan(
+        "/tmp", {"id": "task-003", "depends_on": ["task-001", 2, ""]})
+
+    assert task["depends_on"] == ["task-001", "2"]
+
+
 def test_fail_task_survives_detached_head(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)

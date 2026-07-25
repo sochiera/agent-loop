@@ -37,3 +37,10 @@ def test_bootstrap_creates_informational_project_instructions() -> None:
     assert ".forge/" in prompt
     assert "runtime orkiestratora" in prompt
     assert "kontekst dostajesz w promptcie" in prompt
+
+
+def test_planner_declares_explicit_task_dependencies() -> None:
+    prompt = prompts.plan_batch_prompt(4, 1)
+
+    assert "depends_on" in prompt
+    assert "identyfikator" in prompt

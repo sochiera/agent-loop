@@ -107,11 +107,15 @@ def build_task_from_plan(project: str, raw: dict) -> dict:
     difficulty = raw.get("difficulty", DEFAULT_TASK_DIFFICULTY)
     if difficulty not in TASK_DIFFICULTIES:
         difficulty = DEFAULT_TASK_DIFFICULTY
+    dependencies = raw.get("depends_on", [])
+    if not isinstance(dependencies, (list, tuple)):
+        dependencies = [dependencies]
     return {"id": raw.get("id", "task"), "title": raw.get("title", "(bez tytułu)"),
             "file": raw.get("file", ""), "criteria": raw.get("criteria", []),
             "test_globs": raw.get("test_globs", []), "code_globs": raw.get("code_globs", []),
             "targeted_test_cmd": raw.get("targeted_test_cmd", raw.get("test_cmd", "")),
-            "repro_cmd": raw.get("repro_cmd", ""), "difficulty": difficulty}
+            "repro_cmd": raw.get("repro_cmd", ""), "difficulty": difficulty,
+            "depends_on": [str(item) for item in dependencies if str(item)]}
 
 
 def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
@@ -372,9 +376,41 @@ def _fail_task(cfg: Config, project: str, state: State, reason: str) -> None:
     failures.parent.mkdir(parents=True, exist_ok=True)
     with failures.open("a", encoding="utf-8") as target:
         target.write(f"- {task_id}: {reason}; artefakt: {artifact}\n")
-    state.task_queue.clear()
+    blocked = _dependent_task_ids(state.task_queue, task_id)
+    notice = (
+        f"{task_id} z tego wsadu został porzucony (powód: {reason}). "
+        "Jeśli twoje zadanie mimo braku jawnej zależności na nim polegało, "
+        "zwróć `blocked`."
+    )
+    remaining = []
+    for queued in state.task_queue:
+        if queued.get("id") in blocked:
+            continue
+        task = dict(queued)
+        previous = str(task.get("batch_handoff", "")).strip()
+        task["batch_handoff"] = f"{previous}\n{notice}".strip()
+        remaining.append(task)
+    state.task_queue = remaining
     _clear_task_state(state)
     _checkpoint(project, state, "")
+
+
+def _dependent_task_ids(tasks: list[dict], failed_id: str) -> set[str]:
+    """Tranzytywne domknięcie zadań zależnych od porzuconego zadania."""
+    blocked = {failed_id}
+    changed = True
+    while changed:
+        changed = False
+        for task in tasks:
+            task_id = str(task.get("id", ""))
+            dependencies = task.get("depends_on", [])
+            if isinstance(dependencies, str):
+                dependencies = [dependencies]
+            if task_id not in blocked and any(
+                    str(dependency) in blocked for dependency in dependencies):
+                blocked.add(task_id)
+                changed = True
+    return blocked
 
 
 def run_task(cfg: Config, project: str, state: State, logf) -> bool:
@@ -388,6 +424,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         git(project, "tag", state.task_start_tag)
         _write_current_task(project, task)
         state.task_phase = "tester"
+        state.tester_handoff = str(task.get("batch_handoff", "")).strip()
         _checkpoint(project, state, "tester")
         log(f"Zadanie {task['id']} — {task['title']} (trudność: {task['difficulty']})")
         ledger.append(project, f"{task['id']} start: {task['title']} ({task['difficulty']})")

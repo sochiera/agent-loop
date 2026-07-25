@@ -159,6 +159,26 @@ def test_tester_receives_task_scoped_context_in_every_prompt(tmp_path: Path) -> 
     assert "sekret innego zadania" not in tester_prompts[0]
 
 
+def test_independent_task_receives_failed_batch_handoff(tmp_path: Path) -> None:
+    task, state, cfg = _task_repo(tmp_path)
+    task["batch_handoff"] = (
+        "task-000 z tego wsadu został porzucony: kontrakt niemożliwy")
+    seen: list[str] = []
+
+    def role_call(_cfg, _project, _state, role, prompt, _log):
+        if role == "tester":
+            seen.append(prompt)
+            return '{"status":"review"}'
+        raise AssertionError("coder should not run")
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}'):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert "task-000 z tego wsadu został porzucony" in seen[0]
+
+
 def test_review_proceeds_without_automatic_boundary(tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
     with patch("forge.orchestrate._call_role", return_value='{"status":"review"}'), \
