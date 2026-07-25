@@ -86,11 +86,19 @@ def run_tests(project: str, test_cmd: str, timeout: int) -> bool:
 
 
 def build_then_test(project: str, build_cmd: str, test_cmd: str, timeout: int) -> bool:
+    return build_then_test_result(project, build_cmd, test_cmd, timeout)[0]
+
+
+def build_then_test_result(
+        project: str, build_cmd: str, test_cmd: str,
+        timeout: int) -> tuple[bool, str]:
+    """Uruchom build i pełne testy, zachowując output dla handoffu."""
     if build_cmd:
-        rc, _ = run_shellfree(project, build_cmd, timeout)
+        rc, output = run_shellfree(project, build_cmd, timeout)
         if rc != 0:
-            return False
-    return run_tests(project, test_cmd, timeout)
+            return False, output
+    rc, output = run_shellfree(project, test_cmd, timeout)
+    return rc == 0, output
 
 
 def _next_task_index(project: str) -> int:
@@ -548,6 +556,16 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         _checkpoint(project, state, "tester")
         return True
     if state.task_phase != "commit":
+        return True
+    suite_green, suite_output = build_then_test_result(
+        project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+    if not suite_green:
+        state.tester_handoff = (
+            "Deterministyczna bramka przed commitem wykazała, że pełny pakiet "
+            "jest czerwony po tym zadaniu. Oceń ogon wyniku, napraw albo zwróć "
+            f"`blocked` z konkretnym powodem:\n{suite_output[-2000:]}"
+        )
+        _checkpoint(project, state, "tester")
         return True
     commit_all(project, f"feat: {task['title']}", cfg)
     git(project, "tag", "-d", state.task_start_tag, check=False)

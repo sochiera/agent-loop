@@ -10,6 +10,7 @@ from forge.orchestrate import (
     _next_task_index,
     _transcript_log_path,
     build_then_test,
+    build_then_test_result,
     run_tests,
 )
 from forge.state import State
@@ -30,6 +31,17 @@ def test_build_failure_skips_test() -> None:
         popen.return_value.returncode = 1
         assert not build_then_test("/tmp", "make", "pytest", 10)
         tests.assert_not_called()
+
+
+def test_build_then_test_result_returns_failed_command_output() -> None:
+    with patch(
+            "forge.orchestrate.run_shellfree",
+            return_value=(1, "compiler exploded")):
+        ok, output = build_then_test_result(
+            "/tmp", "make", "pytest", 10)
+
+    assert not ok
+    assert output == "compiler exploded"
 
 
 def test_timeout_terminates_whole_process_group() -> None:

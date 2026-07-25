@@ -179,17 +179,42 @@ def test_independent_task_receives_failed_batch_handoff(tmp_path: Path) -> None:
     assert "task-000 z tego wsadu został porzucony" in seen[0]
 
 
-def test_review_proceeds_without_automatic_boundary(tmp_path: Path) -> None:
+def test_review_runs_full_suite_boundary_before_commit(tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
     with patch("forge.orchestrate._call_role", return_value='{"status":"review"}'), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_shellfree") as boundary, \
+         patch("forge.orchestrate.run_shellfree", return_value=(0, "ok")) as boundary, \
          patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}') as reviewer:
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     reviewer.assert_called_once()
-    boundary.assert_not_called()
+    boundary.assert_called_once_with(
+        str(tmp_path), state.test_cmd, cfg.agent_timeout_s)
     assert state.current_task == {}
+
+
+def test_full_suite_failure_after_review_returns_to_tester_without_commit(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+
+    with patch("forge.orchestrate._call_role",
+               return_value='{"status":"review"}'), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent",
+               return_value='{"verdict":"approve"}'), \
+         patch("forge.orchestrate.build_then_test_result",
+               return_value=(False, "FAIL integration_test\ntrace tail")) as gate:
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    gate.assert_called_once_with(
+        str(tmp_path), state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
+    assert state.current_task
+    assert state.task_phase == "tester"
+    assert "pełny pakiet" in state.tester_handoff
+    assert "FAIL integration_test" in state.tester_handoff
+    assert "napraw albo zwróć `blocked`" in state.tester_handoff
+    assert _git(
+        tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "seed"
 
 
 def test_reviewer_is_fresh_and_never_receives_author_records(tmp_path: Path) -> None:
