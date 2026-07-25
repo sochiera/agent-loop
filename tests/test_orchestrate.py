@@ -173,3 +173,27 @@ def test_housekeeping_flags_oversized_documentation_index(tmp_path) -> None:
     assert "docs/ARCHITECTURE/00-INDEX.md" in backlog
     assert "indeks" in backlog
     assert "2 KB" in backlog
+
+
+def test_fifth_planning_batch_requests_technical_debt_task(tmp_path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.test"],
+                   cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Forge Tests"],
+                   cwd=tmp_path, check=True)
+    state = State(bootstrapped=True, plan_batches=4)
+    prompts_seen: list[str] = []
+
+    def planner(prompt, *_args, **_kwargs):
+        prompts_seen.append(prompt)
+        return '{"no_more_tasks":true,"tasks":[]}'
+
+    with patch("forge.orchestrate._housekeeping"), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_planner", side_effect=planner):
+        orchestrate.phase_plan_batch(
+            Config(git_push=False), str(tmp_path), state,
+            lambda phase: phase)
+
+    assert state.plan_batches == 5
+    assert "zadaniem długu technicznego" in prompts_seen[0]

@@ -12,6 +12,7 @@ from .task_pipeline import TASK_PHASES
 class State:
     bootstrapped: bool = False
     iteration: int = 0
+    plan_batches: int = 0
     test_cmd: str = ""
     build_cmd: str = ""
     project_kind: str = "app"

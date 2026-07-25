@@ -131,11 +131,13 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     feedback = Path(project, cfg.runtime_dir, "verification", "latest-feedback.md")
     failures = Path(project, cfg.runtime_dir, "failures.md")
     start_index = _next_task_index(project)
+    next_batch = state.plan_batches + 1
     log(f"Planowanie: proszę planistę o maks. {cfg.batch_size} zadań od task-{start_index:03d}…")
     plan_prompt = prompts.plan_batch_prompt(
         cfg.batch_size, start_index, state.project_kind,
         verify_feedback_path=str(feedback) if feedback.exists() else "",
-        failure_feedback_path=str(failures) if failures.exists() else "")
+        failure_feedback_path=str(failures) if failures.exists() else "",
+        require_debt=next_batch % 5 == 0)
     # Mistrz widzi w dzienniku również historię wsadów — serię zadań ginących
     # na round_limit potrafi skomentować zanim planista utnie kolejny za grubo.
     plan_prompt += prompts.master_note_suffix(
@@ -151,6 +153,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
             tasks.append(task)
     if not tasks and not data.get("no_more_tasks"):
         raise AgentError("planista nie utworzył żadnego poprawnego zadania")
+    state.plan_batches = next_batch
     if tasks:
         log(f"Planowanie: utworzono {len(tasks)} zadań: {', '.join(t['id'] for t in tasks)}")
         ledger.append(project, f"plan: utworzono {len(tasks)} zadań "

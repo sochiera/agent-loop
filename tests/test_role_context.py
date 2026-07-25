@@ -97,3 +97,13 @@ def test_coder_updates_documentation_through_indexes() -> None:
     assert "docs/ARCHITECTURE/00-INDEX.md" in prompt
     assert "właściwego pliku wskazanego przez indeks" in prompt
     assert "nowy plik" in prompt and "wpisem w indeksie" in prompt
+
+
+def test_every_fifth_batch_requires_one_technical_debt_task() -> None:
+    normal = prompts.plan_batch_prompt(4, 1, require_debt=False)
+    fifth = prompts.plan_batch_prompt(4, 1, require_debt=True)
+
+    assert "jedno zadanie w tym wsadzie ma być zadaniem długu technicznego" \
+        not in normal
+    assert "jedno zadanie w tym wsadzie ma być zadaniem długu technicznego" \
+        in fifth
