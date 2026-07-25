@@ -68,7 +68,11 @@ def test_coder_can_return_test_feedback_to_same_tester() -> None:
         checkpoint=lambda _: None)
 
     assert result == "review"
-    assert handoffs == ["", "błędne oczekiwanie"]
+    assert handoffs[0] == ""
+    assert "PROŚBA DO CIEBIE od kodera" in handoffs[1]
+    assert "status `test_changes_needed`" in handoffs[1]
+    assert "błędne oczekiwanie" in handoffs[1]
+    assert "wykonaj ją albo uzasadnij odmowę" in handoffs[1]
 
 
 def test_coder_can_request_tester_decision_after_review_feedback() -> None:
@@ -91,7 +95,10 @@ def test_coder_can_request_tester_decision_after_review_feedback() -> None:
         checkpoint=lambda _: None)
 
     assert result == "blocked: tester zdecydował"
-    assert handoffs == ["", "uwagi review są sprzeczne z kontraktem"]
+    assert handoffs[0] == ""
+    assert "PROŚBA DO CIEBIE od kodera" in handoffs[1]
+    assert "status `tester_input_needed`" in handoffs[1]
+    assert "uwagi review są sprzeczne z kontraktem" in handoffs[1]
 
 
 def test_coder_changes_are_evaluated_by_tester_without_file_guard() -> None:

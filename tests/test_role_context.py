@@ -18,6 +18,11 @@ def test_private_role_prompts_only_allow_short_handoff() -> None:
     assert "task-001 r1 tester→red" in tester
     assert "zachować, poprawić albo przywrócić" in tester
     assert "Uwagi review rozpoczynają nowy cykl TDD" in tester
+    assert "kolekcjonuje się" in tester
+    assert "pada na asercji kontraktu" in tester
+    assert "błędzie składni/importu/nazwy" in tester
+    assert "napraw natychmiast" in tester
+    assert "SKIEROWANY DO CIEBIE" in tester
     assert "blocked" in tester
     assert "Decyzja testera" in coder and "transcript" not in coder.lower()
     assert "summary" in coder and "testerowi" in coder

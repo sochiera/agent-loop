@@ -68,6 +68,14 @@ def _as_strings(value) -> list[str]:
     return [str(value)]
 
 
+def _coder_request_handoff(status: str, reason: str) -> str:
+    detail = reason or "Koder potrzebuje decyzji albo działania testera."
+    return (
+        f"PROŚBA DO CIEBIE od kodera (status `{status}`): {detail} "
+        "— wykonaj ją albo uzasadnij odmowę w `reason`."
+    )
+
+
 def run_tdd_loop(*, state, max_rounds: int, run_tester: Callable[[str], PhaseResult],
                  run_coder: Callable[[PhaseResult], PhaseResult], checkpoint: Callable[[str], None],
                  worktree_fingerprint: Callable[[], str] | None = None) -> str:
@@ -115,8 +123,8 @@ def run_tdd_loop(*, state, max_rounds: int, run_tester: Callable[[str], PhaseRes
             state.coder_summary = ""
             if state.tdd_round >= max_rounds:
                 return f"round_limit: zadanie wymaga podziału (limit {max_rounds})"
-            handoff = result.data.get(
-                "reason", "Koder potrzebuje decyzji albo działania testera.")
+            handoff = _coder_request_handoff(
+                result.status, str(result.data.get("reason", "")))
             state.tester_handoff = handoff
             state.coder_tree_hash = ""
             state.task_phase = "tester"
