@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -162,6 +164,37 @@ class GenericSpecTest(unittest.TestCase):
 
 
 class ConfigRoleResolutionTest(unittest.TestCase):
+    def test_default_planner_model_does_not_impersonate_operator_intent(self) -> None:
+        env = os.environ.copy()
+        for key in (
+            "FORGE_PLANNER_MODEL", "FORGE_PLANNER_EFFORT",
+            "FORGE_CLAUDE_MODEL", "FORGE_CLAUDE_EFFORT",
+        ):
+            env.pop(key, None)
+        code = (
+            "from forge.config import Config; "
+            "c=Config(); "
+            "print(repr((c.planner_model,c.planner_effort,"
+            "c.role('planner'),c.role('bootstrap'))))"
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=Path(__file__).parents[1],
+            env=env, text=True, capture_output=True, check=True)
+
+        self.assertEqual(
+            result.stdout.strip(),
+            "('', '', ('claude', 'opus', 'medium'), "
+            "('claude', 'opus', 'high'))",
+        )
+
+    def test_explicit_planner_override_is_still_honoured(self) -> None:
+        cfg = Config(
+            planner_agent="claude", planner_model="sonnet",
+            planner_effort="low")
+
+        self.assertEqual(cfg.role("planner"), ("claude", "sonnet", "low"))
+
     def test_codex_roles_follow_difficulty_matrix(self) -> None:
         cfg = Config(tester_agent="codex", coder_agent="codex",
                      tester_model="", coder_model="",

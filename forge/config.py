@@ -80,18 +80,8 @@ MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
 
 
 _DEFAULT_PLANNER_AGENT = os.environ.get("FORGE_PLANNER_AGENT", "claude")
-_DEFAULT_PLANNER_MODEL = os.environ.get(
-    "FORGE_PLANNER_MODEL",
-    os.environ.get("FORGE_CLAUDE_MODEL", "opus")
-    if _DEFAULT_PLANNER_AGENT == "claude"
-    else os.environ.get("FORGE_CODEX_MODEL", ""),
-)
-_DEFAULT_PLANNER_EFFORT = os.environ.get(
-    "FORGE_PLANNER_EFFORT",
-    os.environ.get("FORGE_CLAUDE_EFFORT", "high")
-    if _DEFAULT_PLANNER_AGENT == "claude"
-    else os.environ.get("FORGE_CODEX_EFFORT", "medium"),
-)
+_DEFAULT_PLANNER_MODEL = os.environ.get("FORGE_PLANNER_MODEL", "")
+_DEFAULT_PLANNER_EFFORT = os.environ.get("FORGE_PLANNER_EFFORT", "")
 
 
 # --- Wykrywanie wyczerpanych limitów / błędów przejściowych -----------------
