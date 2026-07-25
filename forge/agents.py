@@ -342,7 +342,49 @@ def _append_log(log_path: str, argv: list[str], output: str, code: int) -> None:
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"\n===== {_ts()} rc={code} :: {' '.join(argv)} =====\n")
-        f.write(output)
+        f.write(_trim_log_stream(output))
+
+
+_LOG_OUTPUT_HEAD = 8_000
+_LOG_OUTPUT_TAIL = 2_000
+
+
+def _trim_log_stream(stream: str) -> str:
+    """Przytnij duże pola JSONL wyłącznie w kopii zapisywanej na dysku."""
+    had_final_newline = stream.endswith("\n")
+    saved: list[str] = []
+    for line in stream.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            saved.append(line)
+            continue
+        if not isinstance(event, (dict, list)):
+            saved.append(line)
+            continue
+        _trim_aggregated_output(event)
+        saved.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+    result = "\n".join(saved)
+    return result + "\n" if had_final_newline else result
+
+
+def _trim_aggregated_output(value) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "aggregated_output" and isinstance(item, str):
+                kept = _LOG_OUTPUT_HEAD + _LOG_OUTPUT_TAIL
+                if len(item) > kept:
+                    removed = len(item) - kept
+                    value[key] = (
+                        item[:_LOG_OUTPUT_HEAD]
+                        + f"\n…[obcięto {removed} znaków]…\n"
+                        + item[-_LOG_OUTPUT_TAIL:]
+                    )
+            else:
+                _trim_aggregated_output(item)
+    elif isinstance(value, list):
+        for item in value:
+            _trim_aggregated_output(item)
 
 
 # --- Konkretni agenci -------------------------------------------------------

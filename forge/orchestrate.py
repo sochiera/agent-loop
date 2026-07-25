@@ -565,7 +565,9 @@ def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
 def one_iteration(cfg: Config, project: str, state: State) -> bool:
     ensure_repo(project)
     def logf(phase: str) -> str:
-        path = Path(project, cfg.runtime_dir, "logs", f"iter-{state.iteration + 1:04d}-{phase}.log"); path.parent.mkdir(parents=True, exist_ok=True); return str(path)
+        path = _transcript_log_path(project, state.iteration + 1, phase)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
     if not state.bootstrapped:
         if git(project, "rev-parse", "--verify", "HEAD", check=False).returncode == 0:
             _require_clean(project, "bootstrapem")
@@ -579,6 +581,35 @@ def one_iteration(cfg: Config, project: str, state: State) -> bool:
             return phase_verify_goal(cfg, project, state, logf)
     state.iteration += 1
     return run_task(cfg, project, state, logf)
+
+
+_TRANSCRIPT_KEEP_ITERATIONS = 20
+
+
+def _transcript_log_path(project: str, iteration: int, phase: str) -> Path:
+    """Ścieżka surowej telemetrii poza drzewem projektu."""
+    import hashlib
+    root = Path(project).resolve()
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:10]
+    project_key = f"{root.name or 'project'}-{digest}"
+    cache = Path(os.environ.get(
+        "XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    log_dir = cache / "forge" / project_key / "logs"
+    _prune_transcript_logs(log_dir, iteration)
+    return log_dir / f"iter-{iteration:04d}-{phase}.log"
+
+
+def _prune_transcript_logs(log_dir: Path, current_iteration: int) -> None:
+    """Best-effort: zachowaj logi bieżącej i 19 poprzednich iteracji."""
+    import re
+    oldest = current_iteration - _TRANSCRIPT_KEEP_ITERATIONS + 1
+    try:
+        for path in log_dir.glob("iter-*-*.log"):
+            match = re.match(r"iter-(\d+)-", path.name)
+            if match and int(match.group(1)) < oldest:
+                path.unlink()
+    except OSError:
+        pass
 
 
 def _load_state_path(project: str, cfg: Config) -> Path:

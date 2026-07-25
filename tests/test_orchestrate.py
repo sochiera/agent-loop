@@ -4,7 +4,11 @@ import subprocess
 from unittest.mock import patch
 
 from forge.config import Config
-from forge.orchestrate import build_then_test, run_tests
+from forge.orchestrate import (
+    _transcript_log_path,
+    build_then_test,
+    run_tests,
+)
 
 
 def test_commands_run_without_shell() -> None:
@@ -38,3 +42,42 @@ def test_kiss_config_has_only_tdd_limit() -> None:
     cfg = Config()
     assert cfg.max_tdd_rounds == 10
     assert not hasattr(cfg, "legacy_mode")
+
+
+def test_transcript_logs_live_in_user_cache_not_project(
+        tmp_path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    cache = tmp_path / "cache"
+    project.mkdir()
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+
+    path = _transcript_log_path(str(project), 1, "tester")
+
+    assert path.is_relative_to(cache / "forge")
+    assert not path.is_relative_to(project)
+    assert path.name == "iter-0001-tester.log"
+
+
+def test_transcript_log_retention_keeps_last_twenty_iterations(
+        tmp_path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    cache = tmp_path / "cache"
+    project.mkdir()
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    for iteration in range(1, 26):
+        path = _transcript_log_path(str(project), iteration, "tester")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("log", encoding="utf-8")
+        extra = _transcript_log_path(str(project), iteration, "coder")
+        extra.write_text("log", encoding="utf-8")
+
+    _transcript_log_path(str(project), 26, "master")
+    remaining = sorted(
+        int(path.name.split("-")[1])
+        for path in _transcript_log_path(
+            str(project), 26, "master").parent.glob("iter-*-*.log")
+    )
+
+    assert min(remaining) == 7
+    assert max(remaining) == 25
+    assert set(remaining) == set(range(7, 26))

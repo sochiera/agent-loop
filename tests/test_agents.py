@@ -6,7 +6,13 @@ import json
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from forge.agents import run_claude, run_codex, run_codex_session, run_planner
+from forge.agents import (
+    _append_log,
+    run_claude,
+    run_codex,
+    run_codex_session,
+    run_planner,
+)
 from forge.config import Config
 
 
@@ -81,6 +87,33 @@ class AgentArgumentsTest(unittest.TestCase):
         self.assertEqual(rows[1]["usage"]["cached_input_tokens"], 45)
         self.assertEqual(rows[1]["usage"]["output_tokens"], 6)
         self.assertEqual(rows[1]["usage_cumulative"]["input_tokens"], 160)
+
+
+def test_append_log_truncates_aggregated_output_in_jsonl(tmp_path: Path) -> None:
+    log_path = tmp_path / "agent.log"
+    huge = "H" * 9000 + "M" * 5000 + "T" * 3000
+    stream = json.dumps(
+        {"type": "item.completed", "aggregated_output": huge},
+        ensure_ascii=False,
+    )
+
+    _append_log(str(log_path), ["agent"], stream, 0)
+
+    event = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+    saved = event["aggregated_output"]
+    assert saved.startswith("H" * 8000)
+    assert saved.endswith("T" * 2000)
+    assert "obcięto 7000 znaków" in saved
+    assert len(saved) < len(huge)
+    assert len(huge) == 17000  # zapis nie może zmieniać strumienia w pamięci
+
+
+def test_append_log_preserves_non_json_output(tmp_path: Path) -> None:
+    log_path = tmp_path / "agent.log"
+
+    _append_log(str(log_path), ["agent"], "zwykłe wyjście\n", 0)
+
+    assert log_path.read_text(encoding="utf-8").endswith("zwykłe wyjście\n")
 
 
 if __name__ == "__main__":
