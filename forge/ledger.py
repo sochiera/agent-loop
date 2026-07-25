@@ -14,6 +14,8 @@ import os
 
 KEEP_LINES = 80
 MAX_ENTRY = 300
+MASTER_LINES = 20
+MASTER_WIDTH = 120
 _FILE = "ledger.md"
 
 
@@ -68,3 +70,9 @@ def tail_for_task(project: str, task_id: str, limit: int = 8,
         if line.partition("] ")[2].startswith(prefix)
     ]
     return "\n".join(matching[-limit:])
+
+
+def compact_tail(project: str, runtime_dir: str = ".forge") -> str:
+    """Mały widok dziennika dla często wywoływanej roli mistrza."""
+    lines = tail(project, MASTER_LINES, runtime_dir).splitlines()
+    return "\n".join(line[:MASTER_WIDTH] for line in lines)

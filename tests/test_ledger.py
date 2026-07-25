@@ -66,6 +66,21 @@ def test_tail_for_task_does_not_match_longer_task_id(tmp_path: Path) -> None:
         str(tmp_path), "task-001", limit=8)
 
 
+def test_compact_tail_for_master_limits_lines_and_width(tmp_path: Path) -> None:
+    for index in range(30):
+        ledger.append(
+            str(tmp_path),
+            f"task-{index:03d} wpis mistrza " + "x" * 250,
+        )
+
+    lines = ledger.compact_tail(str(tmp_path)).splitlines()
+
+    assert len(lines) == 20
+    assert all(len(line) <= 120 for line in lines)
+    assert "task-010" in lines[0]
+    assert "task-029" in lines[-1]
+
+
 def test_missing_ledger_reads_as_empty(tmp_path: Path) -> None:
     assert ledger.tail(str(tmp_path)) == ""
 

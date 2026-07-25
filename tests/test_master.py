@@ -142,6 +142,22 @@ def test_master_sees_ledger_history(tmp_path: Path) -> None:
     assert "task-000 r9 koder→test_changes_needed" in master_prompts[0]
 
 
+def test_master_receives_compact_ledger_view(tmp_path: Path) -> None:
+    for index in range(30):
+        ledger.append(str(tmp_path), f"task-{index:03d} " + "x" * 250)
+
+    with patch("forge.orchestrate.run_agent", return_value="{}") as run:
+        orchestrate._master_notes(
+            Config(), str(tmp_path), lambda phase: str(tmp_path / f"{phase}.log"))
+
+    prompt = run.call_args.args[1]
+    journal = prompt.split("DZIENNIK (najstarsze u góry):\n", 1)[1]
+    journal = journal.split("\n\nJeśli proces", 1)[0]
+    lines = journal.splitlines()
+    assert len(lines) == 20
+    assert all(len(line) <= 120 for line in lines)
+
+
 def test_round_decisions_are_recorded_in_ledger(tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
     role_call, _seen = _one_round(tmp_path)
