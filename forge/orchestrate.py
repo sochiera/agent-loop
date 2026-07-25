@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import replace
@@ -93,8 +94,12 @@ def build_then_test(project: str, build_cmd: str, test_cmd: str, timeout: int) -
 
 
 def _next_task_index(project: str) -> int:
-    files = Path(project, ".forge", "tasks").glob("task-*.md")
-    ids = [int(p.stem.split("-")[-1]) for p in files if p.stem.split("-")[-1].isdigit()]
+    files = Path(project, ".forge", "tasks").rglob("task-*.md")
+    ids = [
+        int(match.group(1))
+        for path in files
+        if (match := re.match(r"task-(\d+)", path.stem))
+    ]
     return max(ids, default=0) + 1
 
 
@@ -110,6 +115,7 @@ def build_task_from_plan(project: str, raw: dict) -> dict:
 
 
 def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
+    _housekeeping(cfg, project)
     feedback = Path(project, cfg.runtime_dir, "verification", "latest-feedback.md")
     failures = Path(project, cfg.runtime_dir, "failures.md")
     start_index = _next_task_index(project)
@@ -588,20 +594,23 @@ _TRANSCRIPT_KEEP_ITERATIONS = 20
 
 def _transcript_log_path(project: str, iteration: int, phase: str) -> Path:
     """Ścieżka surowej telemetrii poza drzewem projektu."""
+    log_dir = _transcript_log_dir(project)
+    _prune_transcript_logs(log_dir, iteration)
+    return log_dir / f"iter-{iteration:04d}-{phase}.log"
+
+
+def _transcript_log_dir(project: str) -> Path:
     import hashlib
     root = Path(project).resolve()
     digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:10]
     project_key = f"{root.name or 'project'}-{digest}"
     cache = Path(os.environ.get(
         "XDG_CACHE_HOME", str(Path.home() / ".cache")))
-    log_dir = cache / "forge" / project_key / "logs"
-    _prune_transcript_logs(log_dir, iteration)
-    return log_dir / f"iter-{iteration:04d}-{phase}.log"
+    return cache / "forge" / project_key / "logs"
 
 
 def _prune_transcript_logs(log_dir: Path, current_iteration: int) -> None:
     """Best-effort: zachowaj logi bieżącej i 19 poprzednich iteracji."""
-    import re
     oldest = current_iteration - _TRANSCRIPT_KEEP_ITERATIONS + 1
     try:
         for path in log_dir.glob("iter-*-*.log"):
@@ -610,6 +619,72 @@ def _prune_transcript_logs(log_dir: Path, current_iteration: int) -> None:
                 path.unlink()
     except OSError:
         pass
+
+
+_RUNTIME_KEEP_ITEMS = 20
+_DOC_SIZE_LIMIT = 20_000
+
+
+def _housekeeping(cfg: Config, project: str) -> None:
+    """Deterministyczne sprzątanie przed planowaniem, bez udziału agenta."""
+    import shutil
+
+    runtime = Path(project, cfg.runtime_dir)
+    tasks = runtime / "tasks"
+    archive = tasks / "archive"
+    for source in sorted(tasks.glob("task-*.md")):
+        archive.mkdir(parents=True, exist_ok=True)
+        target = archive / source.name
+        if target.exists():
+            suffix = 1
+            while (archive / f"{source.stem}-{suffix}{source.suffix}").exists():
+                suffix += 1
+            target = archive / f"{source.stem}-{suffix}{source.suffix}"
+        source.replace(target)
+
+    failed = runtime / "failed"
+    artifacts = sorted(
+        (path for path in failed.iterdir() if path.is_dir()),
+        key=lambda path: path.name,
+    ) if failed.is_dir() else []
+    for artifact in artifacts[:-_RUNTIME_KEEP_ITEMS]:
+        shutil.rmtree(artifact, ignore_errors=True)
+
+    log_dir = _transcript_log_dir(project)
+    iterations = []
+    for path in log_dir.glob("iter-*-*.log"):
+        try:
+            iterations.append(int(path.name.split("-")[1]))
+        except (IndexError, ValueError):
+            continue
+    if iterations:
+        _prune_transcript_logs(log_dir, max(iterations))
+
+    _flag_oversized_docs(project)
+
+
+def _flag_oversized_docs(project: str) -> None:
+    oversized = []
+    docs = Path(project, "docs")
+    for path in docs.rglob("*.md") if docs.is_dir() else []:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > _DOC_SIZE_LIMIT:
+            oversized.append((path.relative_to(project).as_posix(), size))
+    if not oversized:
+        return
+    backlog = Path(project, "BACKLOG.md")
+    existing = backlog.read_text(encoding="utf-8") if backlog.exists() else ""
+    additions = [
+        f"- Dług dokumentacji: `{name}` ma {size // 1000} KB "
+        "— zaplanuj podział pliku.\n"
+        for name, size in oversized if f"`{name}`" not in existing
+    ]
+    if additions:
+        with backlog.open("a", encoding="utf-8") as target:
+            target.writelines(additions)
 
 
 def _load_state_path(project: str, cfg: Config) -> Path:

@@ -3,12 +3,16 @@ from __future__ import annotations
 import subprocess
 from unittest.mock import patch
 
+from forge import orchestrate
 from forge.config import Config
 from forge.orchestrate import (
+    _housekeeping,
+    _next_task_index,
     _transcript_log_path,
     build_then_test,
     run_tests,
 )
+from forge.state import State
 
 
 def test_commands_run_without_shell() -> None:
@@ -81,3 +85,66 @@ def test_transcript_log_retention_keeps_last_twenty_iterations(
     assert min(remaining) == 7
     assert max(remaining) == 25
     assert set(remaining) == set(range(7, 26))
+
+
+def test_housekeeping_archives_tasks_prunes_runtime_and_flags_large_docs(
+        tmp_path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    tasks = project / ".forge" / "tasks"
+    failed = project / ".forge" / "failed"
+    docs = project / "docs"
+    tasks.mkdir(parents=True)
+    failed.mkdir()
+    docs.mkdir()
+    for index in range(1, 4):
+        (tasks / f"task-{index:03d}.md").write_text("done", encoding="utf-8")
+    for index in range(1, 26):
+        artifact = failed / f"task-{index:03d}"
+        artifact.mkdir()
+        (artifact / "reason.txt").write_text("x", encoding="utf-8")
+    (docs / "ARCHITECTURE.md").write_text("x" * 20_001, encoding="utf-8")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    for iteration in range(1, 26):
+        log = _transcript_log_path(str(project), iteration, "tester")
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("log", encoding="utf-8")
+
+    _housekeeping(Config(), str(project))
+
+    assert not list(tasks.glob("task-*.md"))
+    assert len(list((tasks / "archive").glob("task-*.md"))) == 3
+    assert _next_task_index(str(project)) == 4
+    assert len(list(failed.iterdir())) == 20
+    assert not (failed / "task-001").exists()
+    remaining_logs = list(
+        _transcript_log_path(str(project), 26, "tester").parent.glob(
+            "iter-*-*.log"))
+    assert len({path.name.split("-")[1] for path in remaining_logs}) <= 20
+    backlog = (project / "BACKLOG.md").read_text(encoding="utf-8")
+    assert "docs/ARCHITECTURE.md" in backlog
+    assert "20" in backlog
+
+
+def test_housekeeping_runs_before_planner(tmp_path) -> None:
+    events: list[str] = []
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.test"],
+        cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Forge Tests"],
+        cwd=tmp_path, check=True)
+
+    def planner(*_args, **_kwargs):
+        events.append("planner")
+        return '{"no_more_tasks":true,"tasks":[]}'
+
+    with patch("forge.orchestrate._housekeeping",
+               side_effect=lambda *_args: events.append("housekeeping")), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_planner", side_effect=planner):
+        orchestrate.phase_plan_batch(
+            Config(git_push=False), str(tmp_path), State(bootstrapped=True),
+            lambda phase: phase)
+
+    assert events == ["housekeeping", "planner"]
