@@ -278,6 +278,39 @@ def test_confirmation_turn_is_narrow_and_uses_full_suite(tmp_path: Path) -> None
     assert "Nie oceniaj jakości implementacji" in tester_prompts[1]
 
 
+def test_nonblocking_reviewer_notes_are_added_to_backlog(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+
+    with patch("forge.orchestrate._call_role",
+               return_value='{"status":"review"}'), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent", return_value=(
+             '{"verdict":"approve","notes":'
+             '["nazwa helpera jest nieprecyzyjna"]}')), \
+         patch("forge.orchestrate.build_then_test_result",
+               return_value=(True, "ok")):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    backlog = (tmp_path / "BACKLOG.md").read_text(encoding="utf-8")
+    assert "task-001" in backlog
+    assert "nazwa helpera jest nieprecyzyjna" in backlog
+
+
+def test_blocking_reviewer_notes_do_not_enter_backlog_before_fix(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+
+    with patch("forge.orchestrate._call_role",
+               return_value='{"status":"review"}'), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent", return_value=(
+             '{"verdict":"changes","notes":["napraw kontrakt"]}')):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert not (tmp_path / "BACKLOG.md").exists()
+
+
 def test_reviewer_is_fresh_and_never_receives_author_records(tmp_path: Path) -> None:
     task, state, cfg = _task_repo(tmp_path)
     state.current_task = task

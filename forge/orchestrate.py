@@ -562,6 +562,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 "przywróć te zmiany, a następnie wybierz dalszy krok.")
             _checkpoint(project, state, "tester")
             return True
+        _append_review_backlog(project, task, review_notes)
         _checkpoint(project, state, "commit")
     if state.task_phase == "corrections":
         # Zgodność ze starymi checkpointami. Osobna, jednorazowa tura kodera
@@ -592,6 +593,25 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
     _clear_task_state(state)
     _checkpoint(project, state, "")
     return True
+
+
+def _append_review_backlog(
+        project: str, task: dict, notes: list[str]) -> None:
+    """Zachowaj nieblokujące uwagi zaakceptowanej recenzji."""
+    if not notes:
+        return
+    backlog = Path(project, "BACKLOG.md")
+    existing = backlog.read_text(encoding="utf-8") if backlog.exists() else ""
+    additions = []
+    for note in notes:
+        clean = " ".join(str(note).split())
+        if clean and clean not in existing:
+            additions.append(
+                f"- Dług po review {task.get('id', 'task')} "
+                f"({task.get('title', 'bez tytułu')}): {clean}\n")
+    if additions:
+        with backlog.open("a", encoding="utf-8") as target:
+            target.writelines(additions)
 
 
 def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
