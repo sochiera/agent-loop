@@ -476,15 +476,20 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
 
         def run_tester(handoff: str):
             ensure_notes(new_round=True)
-            targeted_test_cmd = (
-                task.get("targeted_test_cmd") or state.test_cmd)
+            confirmation = bool(
+                state.coder_summary and handoff == state.coder_summary)
+            test_cmd = (
+                state.test_cmd if confirmation
+                else task.get("targeted_test_cmd") or state.test_cmd
+            )
             return run_turn("tester", prompts.tester_task_prompt(
-                task["file"], targeted_test_cmd, handoff=handoff,
+                task["file"], test_cmd, handoff=handoff,
                 previous_decision=state.tester_decision,
                 coder_summary=state.coder_summary,
                 changed_files=_changed(project, state.task_start_tag),
                 task_ledger=ledger.tail_for_task(project, task["id"], limit=8),
-                resume=bool(state.tester_session)), parse_tester_decision)
+                resume=bool(state.tester_session),
+                confirmation=confirmation), parse_tester_decision)
 
         def run_coder(decision):
             ensure_notes(new_round=False)

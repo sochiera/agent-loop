@@ -20,13 +20,20 @@ def tester_task_prompt(
         task_file: str, test_cmd: str, *, handoff: str = "",
         previous_decision: dict | None = None, coder_summary: str = "",
         changed_files: list[str] | None = None, task_ledger: str = "",
-        resume: bool = False) -> str:
+        resume: bool = False, confirmation: bool = False) -> str:
     previous = previous_decision or {}
     previous_text = (
         f"{previous.get('status', '(brak)')} — "
         f"{previous.get('reason', '(brak powodu)')}"
     )
     changed_text = ", ".join(changed_files or []) or "(brak)"
+    if confirmation:
+        instructions = f"""TURA POTWIERDZAJĄCA po green kodera. Odpowiedz wyłącznie na dwa pytania:
+1. uruchom `{test_cmd}` i odpowiedz, czy pakiet jest zielony;
+2. czy pozostały nieprzetestowane kryteria akceptacji.
+Nie oceniaj jakości implementacji — to zadanie świeżego reviewera. Jeśli obie odpowiedzi są korzystne, wybierz review; w przeciwnym razie wybierz red, code albo blocked i podaj konkretny powód."""
+    else:
+        instructions = f"""Oceń zmiany pozostawione przez kodera albo reviewera: możesz je zachować, poprawić albo przywrócić, jeśli kontrakt wymaga czegoś innego. Uwagi review rozpoczynają nowy cykl TDD pod twoją kontrolą. Wybierz dokładnie red (minimalny czerwony test, uruchom `{test_cmd}`), code (wyłącznie istniejący test lub krok bez zachowania), review albo blocked. Zanim zwrócisz red, potwierdź, że test kolekcjonuje się i pada na asercji kontraktu, a nie na błędzie składni/importu/nazwy. Błąd kolekcji w teście, który sama napisałaś, napraw natychmiast — to nie jest czerwona bramka. Jeśli kolejne cykle review wracają bez postępu i Mistrz wskaże pętlę, zwróć blocked z konkretnym powodem."""
     return f"""ROLA: TESTER. {'Kontynuujesz własną sesję.' if resume else 'Początek prywatnej sesji.'} Przeczytaj {task_file}, handoff, aktualny diff, właściwe testy i minimum kodu.
 
 KONTEKST BIEŻĄCEGO ZADANIA:
@@ -36,7 +43,8 @@ KONTEKST BIEŻĄCEGO ZADANIA:
 - ostatnie wpisy dziennika tego zadania:
 {task_ledger or '(brak)'}
 
-Oceń zmiany pozostawione przez kodera albo reviewera: możesz je zachować, poprawić albo przywrócić, jeśli kontrakt wymaga czegoś innego. Uwagi review rozpoczynają nowy cykl TDD pod twoją kontrolą. Wybierz dokładnie red (minimalny czerwony test, uruchom `{test_cmd}`), code (wyłącznie istniejący test lub krok bez zachowania), review albo blocked. Zanim zwrócisz red, potwierdź, że test kolekcjonuje się i pada na asercji kontraktu, a nie na błędzie składni/importu/nazwy. Błąd kolekcji w teście, który sama napisałaś, napraw natychmiast — to nie jest czerwona bramka. Jeśli kolejne cykle review wracają bez postępu i Mistrz wskaże pętlę, zwróć blocked z konkretnym powodem. Nie pisz kodu produkcyjnego i nie commituj. W `reason` przekaż koderowi konkretną ocenę i następny krok. BIEŻĄCY HANDOFF SKIEROWANY DO CIEBIE: {handoff or '(brak)'}. JSON: {{"status":"red|code|review|blocked","command":"...","test_files":[],"reason":"..."}}."""
+{instructions}
+Nie pisz kodu produkcyjnego i nie commituj. W `reason` przekaż koderowi konkretną ocenę i następny krok. BIEŻĄCY HANDOFF SKIEROWANY DO CIEBIE: {handoff or '(brak)'}. JSON: {{"status":"red|code|review|blocked","command":"...","test_files":[],"reason":"..."}}."""
 
 
 def coder_task_prompt(task_file: str, test_cmd: str, *, decision: dict, resume: bool = False) -> str:

@@ -59,3 +59,15 @@ def test_planner_contract_owns_outcomes_not_test_design() -> None:
     assert "zweryfikuj" in prompt
     assert "uruchomieniem" in prompt
     assert "wynik" in prompt
+
+
+def test_confirmation_prompt_only_checks_suite_and_untested_criteria() -> None:
+    prompt = prompts.tester_task_prompt(
+        "task.md", "pytest -q", confirmation=True,
+        coder_summary="implemented")
+
+    assert "TURA POTWIERDZAJĄCA" in prompt
+    assert "czy pakiet jest zielony" in prompt
+    assert "czy pozostały nieprzetestowane kryteria akceptacji" in prompt
+    assert "Nie oceniaj jakości implementacji" in prompt
+    assert "świeżego reviewera" in prompt

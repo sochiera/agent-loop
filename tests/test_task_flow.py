@@ -241,6 +241,43 @@ def test_tdd_uses_targeted_command_but_commit_gate_uses_full_suite(
         str(tmp_path), state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
 
 
+def test_confirmation_turn_is_narrow_and_uses_full_suite(tmp_path: Path) -> None:
+    task, state, cfg = _task_repo(tmp_path)
+    tester_answers = iter((
+        '{"status":"red","reason":"VALUE ma być 1"}',
+        '{"status":"review"}',
+    ))
+    tester_prompts: list[str] = []
+
+    def role_call(_cfg, project, _state, role, prompt, _log):
+        if role == "tester":
+            tester_prompts.append(prompt)
+            answer = next(tester_answers)
+            if '"red"' in answer:
+                path = Path(project, "tests", "test_app.py")
+                path.write_text(
+                    path.read_text(encoding="utf-8")
+                    + "\ndef test_new_value():\n    assert VALUE == 1\n",
+                    encoding="utf-8")
+            return answer
+        Path(project, "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        return '{"status":"green","summary":"VALUE ustawione na 1"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent",
+               return_value='{"verdict":"approve"}'), \
+         patch("forge.orchestrate.build_then_test_result",
+               return_value=(True, "ok")):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert task["targeted_test_cmd"] in tester_prompts[0]
+    assert "TURA POTWIERDZAJĄCA" not in tester_prompts[0]
+    assert "TURA POTWIERDZAJĄCA" in tester_prompts[1]
+    assert f"uruchom `{state.test_cmd}`" in tester_prompts[1]
+    assert "Nie oceniaj jakości implementacji" in tester_prompts[1]
+
+
 def test_reviewer_is_fresh_and_never_receives_author_records(tmp_path: Path) -> None:
     task, state, cfg = _task_repo(tmp_path)
     state.current_task = task
