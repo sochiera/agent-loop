@@ -7,8 +7,10 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from forge.agents import (
+    _aggregated_output_chars,
     _append_log,
     _isolated_agent_env,
+    _run_with_backoff,
     run_agent,
     run_claude,
     run_codex,
@@ -16,6 +18,7 @@ from forge.agents import (
     run_planner,
 )
 from forge.config import Config
+from forge import ledger
 
 
 class AgentArgumentsTest(unittest.TestCase):
@@ -218,6 +221,34 @@ def test_builtin_agents_receive_isolated_environment(tmp_path: Path) -> None:
                return_value="") as codex_run:
         run_codex("prompt", Config(), str(tmp_path), str(tmp_path / "x.log"))
     assert codex_run.call_args.kwargs["env"] == {"CODEX_ISOLATED": "1"}
+
+
+def test_aggregated_output_counter_walks_jsonl_events() -> None:
+    stream = "\n".join((
+        json.dumps({"aggregated_output": "x" * 150_000}),
+        json.dumps({"nested": [{"aggregated_output": "y" * 60_001}]}),
+        json.dumps({"other_output": "z" * 500_000}),
+        "not json",
+    ))
+
+    assert _aggregated_output_chars(stream) == 210_001
+
+
+def test_large_tool_output_is_reported_to_project_ledger(
+        tmp_path: Path) -> None:
+    stream = json.dumps({"aggregated_output": "x" * 210_000})
+    process = __import__("subprocess").CompletedProcess(
+        ["agent"], 0, stdout=stream, stderr="")
+
+    with patch("forge.agents.subprocess.run", return_value=process):
+        returned = _run_with_backoff(
+            ["agent"], str(tmp_path), Config(max_limit_retries=0),
+            str(tmp_path / "agent.log"))
+
+    assert returned == stream
+    warning = ledger.tail(str(tmp_path))
+    assert "UWAGA: tura wciągnęła" in warning
+    assert "0.2 MB wyjścia narzędzi" in warning
 
 
 if __name__ == "__main__":

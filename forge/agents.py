@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from . import adapters
+from . import ledger
 from .config import Config, RATE_LIMIT_PATTERNS
 
 _LIMIT_RE = re.compile("|".join(RATE_LIMIT_PATTERNS), re.IGNORECASE)
@@ -309,7 +310,8 @@ def extract_json(text: str) -> dict | None:
 
 def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
                       stdin_text: str | None = None,
-                      env: dict[str, str] | None = None) -> str:
+                      env: dict[str, str] | None = None,
+                      ledger_project: str = "") -> str:
     """Uruchom komendę; przy limicie backoff i ponów; zwróć (stdout+stderr)."""
     phase = _phase_from_log(log_path)
     delay = cfg.backoff_start_s
@@ -330,6 +332,7 @@ def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
         output = (proc.stdout or "") + "\n" + (proc.stderr or "")
         last_output = output
         _append_log(log_path, argv, output, proc.returncode)
+        _record_large_tool_output(ledger_project or cwd, output)
         elapsed = time.monotonic() - started
 
         if proc.returncode == 0:
@@ -391,6 +394,7 @@ def _append_log(log_path: str, argv: list[str], output: str, code: int) -> None:
 
 _LOG_OUTPUT_HEAD = 8_000
 _LOG_OUTPUT_TAIL = 2_000
+_LARGE_TOOL_OUTPUT = 200_000
 
 
 def _trim_log_stream(stream: str) -> str:
@@ -431,6 +435,39 @@ def _trim_aggregated_output(value) -> None:
             _trim_aggregated_output(item)
 
 
+def _aggregated_output_chars(stream: str) -> int:
+    total = 0
+    for line in stream.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        total += _sum_aggregated_output(event)
+    return total
+
+
+def _sum_aggregated_output(value) -> int:
+    if isinstance(value, dict):
+        return sum(
+            len(item) if key == "aggregated_output" and isinstance(item, str)
+            else _sum_aggregated_output(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return sum(_sum_aggregated_output(item) for item in value)
+    return 0
+
+
+def _record_large_tool_output(project: str, stream: str) -> None:
+    size = _aggregated_output_chars(stream)
+    if size > _LARGE_TOOL_OUTPUT:
+        ledger.append(
+            project,
+            f"UWAGA: tura wciągnęła {size / 1_000_000:.1f} MB "
+            "wyjścia narzędzi",
+        )
+
+
 # --- Konkretni agenci -------------------------------------------------------
 
 def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str,
@@ -457,9 +494,11 @@ def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str,
         "--output-format", "json",
         "--dangerously-skip-permissions",  # pełna autonomia — edytuje pliki bez pytań
     ]
+    kwargs = {"env": _isolated_agent_env("claude")}
+    if usage_dir:
+        kwargs["ledger_project"] = usage_dir
     raw = _run_with_backoff(
-        argv, project_dir, cfg, log_path,
-        env=_isolated_agent_env("claude"))
+        argv, project_dir, cfg, log_path, **kwargs)
     # --output-format json → obiekt z polem "result".
     try:
         obj = json.loads(raw)
@@ -572,9 +611,10 @@ def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
     a = _codex_agent(cfg, model, effort)
     last_msg = _prepare_last_msg_file(project_dir, cfg)
     argv = _codex_argv(a, cfg, project_dir, last_msg, prompt)
-    _run_with_backoff(
-        argv, project_dir, cfg, log_path,
-        env=_isolated_agent_env("codex"))
+    kwargs = {"env": _isolated_agent_env("codex")}
+    if usage_dir:
+        kwargs["ledger_project"] = usage_dir
+    _run_with_backoff(argv, project_dir, cfg, log_path, **kwargs)
     _log_call_without_tokens(usage_dir or project_dir, cfg, log_path,
                              "codex", a.model, a.effort)
     return _read_last_msg(last_msg)
@@ -646,11 +686,13 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
                 },
             },
         }, ensure_ascii=False)
-    if process_env is None:
-        stream = _run_with_backoff(argv, project_dir, cfg, log_path)
-    else:
-        stream = _run_with_backoff(
-            argv, project_dir, cfg, log_path, env=process_env)
+    kwargs = {}
+    if process_env is not None:
+        kwargs["env"] = process_env
+    if usage_dir:
+        kwargs["ledger_project"] = usage_dir
+    stream = _run_with_backoff(
+        argv, project_dir, cfg, log_path, **kwargs)
     _log_call_without_tokens(usage_dir or project_dir, cfg, log_path,
                              spec.name, model, effort)
     if out_file:
