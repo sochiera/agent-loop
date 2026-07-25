@@ -121,6 +121,45 @@ class GenericSpecTest(unittest.TestCase):
         spec = adapters.generic_spec("grok", env)
         self.assertEqual(adapters.generic_bin(spec), "moj-grok")
 
+    def test_thin_grok_template_disables_agent_harness(self) -> None:
+        spec = adapters.thin_spec("grok", {})
+        self.assertIsNotNone(spec)
+        argv = adapters.expand_template(
+            spec.template,
+            {"prompt": "journal", "system": "rules", "schema": '{"type":"object"}',
+             "model": "grok-4.5", "effort": "low", "project": "/p",
+             "output": ""},
+        )
+        for flag in (
+            "--system-prompt-override", "--tools", "--no-subagents",
+            "--no-memory", "--disable-web-search", "--max-turns",
+            "--json-schema",
+        ):
+            self.assertIn(flag, argv)
+
+    def test_thin_opencode_template_uses_isolated_agent(self) -> None:
+        spec = adapters.thin_spec("opencode", {})
+        argv = adapters.expand_template(
+            spec.template,
+            {"prompt": "journal", "system": "rules", "schema": "{}",
+             "model": "provider/model", "effort": "", "project": "/p",
+             "output": ""},
+        )
+        self.assertIn("--pure", argv)
+        self.assertEqual(argv[argv.index("--agent") + 1], "forge-thin")
+        self.assertEqual(argv[argv.index("--format") + 1], "json")
+
+    def test_thin_template_can_be_overridden_per_agent(self) -> None:
+        env = {"FORGE_AGENT_GROK_THIN_CMD": "my-thin {system} {prompt}"}
+
+        spec = adapters.thin_spec("grok", env)
+
+        self.assertEqual(adapters.generic_bin(spec), "my-thin")
+
+    def test_codex_and_kiro_have_no_default_thin_template(self) -> None:
+        self.assertIsNone(adapters.thin_spec("codex", {}))
+        self.assertIsNone(adapters.thin_spec("kiro", {}))
+
 
 class ConfigRoleResolutionTest(unittest.TestCase):
     def test_codex_roles_follow_difficulty_matrix(self) -> None:

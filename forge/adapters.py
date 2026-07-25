@@ -8,7 +8,8 @@ w zmiennej środowiskowej:
     export FORGE_AGENT_GROK_CMD='grok --model {model} --exec {prompt} --out {output}'
     python3 -m forge.orchestrate --coder-agent grok
 
-Placeholdery szablonu: {prompt} {model} {effort} {project} {output}.
+Placeholdery szablonu: {prompt} {system} {schema} {model} {effort} {project}
+{output}.
 - Jeśli szablon zawiera {output}, wynik czytamy z TEGO pliku; inaczej ze stdout.
 - Token, który jest czystym placeholderem i rozwinie się do pustego stringa
   (np. {model} przy nieustawionym modelu), jest pomijany — nie zostawiamy pustych
@@ -40,7 +41,9 @@ BUILTIN_AGENTS = ("claude", "codex")
 # Tylko codex wznawia sesje (codex exec resume). Reszta jedzie na dzienniku.
 RESUMABLE_AGENTS = ("codex",)
 
-_PLACEHOLDERS = ("prompt", "model", "effort", "project", "output")
+_PLACEHOLDERS = (
+    "prompt", "system", "schema", "model", "effort", "project", "output",
+)
 
 # Aliasy nazw agentów — "gpt"/"chatgpt" to po prostu Codex CLI (agent OpenAI
 # napędzany modelami GPT); zamiast osobnej, mniej przetestowanej integracji
@@ -80,6 +83,22 @@ KNOWN_TEMPLATES: dict[str, str] = {
     "opencode": "opencode run {prompt} -m {model} --variant {effort} --auto --dir {project}",
 }
 
+# Tryb cienki jest potrzebą roli doradczej. Claude ma obsługę wbudowaną
+# (zachowuje własne parsowanie JSON i telemetrykę), a znane generyczne CLI
+# dostają osobny szablon. Brak wpisu oznacza bezpieczny fallback do normalnego
+# wywołania, nie błąd.
+THIN_TEMPLATES: dict[str, str] = {
+    "grok": (
+        "grok -p {prompt} -m {model} --effort {effort} "
+        "--system-prompt-override {system} --tools \"\" --no-subagents "
+        "--no-memory --disable-web-search --max-turns 1 --json-schema {schema}"
+    ),
+    "opencode": (
+        "opencode run {prompt} -m {model} --variant {effort} "
+        "--agent forge-thin --pure --format json --dir {project}"
+    ),
+}
+
 
 @dataclass
 class GenericSpec:
@@ -116,6 +135,24 @@ def env_key(name: str) -> str:
     return f"FORGE_AGENT_{name.upper()}_CMD"
 
 
+def thin_env_key(name: str) -> str:
+    return f"FORGE_AGENT_{name.upper()}_THIN_CMD"
+
+
+def _spec(name: str, template: str) -> GenericSpec | None:
+    try:
+        tokens = shlex.split(template)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    return GenericSpec(
+        name=name,
+        template=tokens,
+        uses_output_file=any("{output}" in token for token in tokens),
+    )
+
+
 def generic_spec(name: str, environ: dict | None = None) -> GenericSpec | None:
     """Zbuduj GenericSpec z FORGE_AGENT_<NAME>_CMD; brak → domyślny szablon
     znanego CLI (KNOWN_TEMPLATES), jeśli istnieje; inaczej None."""
@@ -123,14 +160,17 @@ def generic_spec(name: str, environ: dict | None = None) -> GenericSpec | None:
     template = environ.get(env_key(name), "").strip() or KNOWN_TEMPLATES.get(name, "")
     if not template:
         return None
-    try:
-        tokens = shlex.split(template)
-    except ValueError:
-        return None
-    if not tokens:
-        return None
-    return GenericSpec(name=name, template=tokens,
-                       uses_output_file=any("{output}" in t for t in tokens))
+    return _spec(name, template)
+
+
+def thin_spec(name: str, environ: dict | None = None) -> GenericSpec | None:
+    """Szablon trybu cienkiego lub ``None``, gdy adapter go nie wspiera."""
+    environ = os.environ if environ is None else environ
+    template = (
+        environ.get(thin_env_key(name), "").strip()
+        or THIN_TEMPLATES.get(name, "")
+    )
+    return _spec(name, template) if template else None
 
 
 def generic_bin(spec: GenericSpec) -> str:

@@ -49,7 +49,11 @@ def review_task_prompt_kiss(task_file: str, *, start_tag: str, changed: list[str
 
 def master_prompt(ledger_tail: str) -> str:
     """Mistrz kuźni: pilnuje PROCESU, nie kodu. Widzi wyłącznie dziennik."""
-    return f"""ROLA: MISTRZ kuźni — nadzorca procesu. Nie czytasz repo, nie uruchamiasz testów, nie zmieniasz plików. Widzisz tylko dziennik zdarzeń poniżej i sterujesz zespołem wyłącznie krótką notatką doklejaną do promptu roli.
+    return master_system_prompt() + "\n\n" + master_ledger_prompt(ledger_tail)
+
+
+def master_system_prompt() -> str:
+    return """ROLA: MISTRZ kuźni — nadzorca procesu. Nie czytasz repo, nie uruchamiasz testów, nie zmieniasz plików. Sterujesz zespołem wyłącznie krótką notatką doklejaną do promptu roli.
 
 Zasady procesu, których pilnujesz:
 - tester pisze minimalny czerwony test i nie pisze kodu produkcyjnego;
@@ -60,12 +64,21 @@ Zasady procesu, których pilnujesz:
 - `recenzja→changes` zawsze rozpoczyna nowy cykl od testera; gdy kilka kolejnych recenzji wraca bez postępu albo z tym samym problemem, napisz testerowi wprost, by zakończył pętlę statusem blocked i podał konkretny powód;
 - planista tnie zadania tak, by mieściły się w budżecie rund; seria zadań ginących na round_limit oznacza, że tnie za grubo.
 
-DZIENNIK (najstarsze u góry):
-{ledger_tail or '(pusty)'}
-
 Jeśli proces idzie normalnie, zwróć puste stringi — to odpowiedź domyślna i oczekiwana. Odezwij się tylko, gdy widzisz pętlę albo złamaną zasadę: nazwij konkretne zachowanie z dziennika i powiedz wprost, co ma zostać zrobione inaczej. Nie zmieniaj kryteriów zadania i nie sugeruj rozwiązania merytorycznego — sterujesz procesem.
 
-JSON: {{"tester":"","coder":"","planner":""}}."""
+JSON: {"tester":"","coder":"","planner":""}."""
+
+
+def master_ledger_prompt(ledger_tail: str) -> str:
+    return f"""ROLA: MISTRZ. Przeanalizuj wyłącznie poniższy dziennik procesu.
+
+DZIENNIK (najstarsze u góry):
+{ledger_tail or '(pusty)'}
+"""
+
+
+def master_json_schema() -> str:
+    return """{"type":"object","properties":{"tester":{"type":"string"},"coder":{"type":"string"},"planner":{"type":"string"}},"required":["tester","coder","planner"],"additionalProperties":false}"""
 
 
 def master_note_suffix(note: str) -> str:

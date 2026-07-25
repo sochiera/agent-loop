@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from forge.agents import (
     _append_log,
+    run_agent,
     run_claude,
     run_codex,
     run_codex_session,
@@ -114,6 +115,60 @@ def test_append_log_preserves_non_json_output(tmp_path: Path) -> None:
     _append_log(str(log_path), ["agent"], "zwykłe wyjście\n", 0)
 
     assert log_path.read_text(encoding="utf-8").endswith("zwykłe wyjście\n")
+
+
+def test_thin_claude_replaces_system_prompt_and_disables_tools(
+        tmp_path: Path) -> None:
+    cfg = Config()
+    raw = '{"result":"{\\"tester\\":\\"\\",\\"coder\\":\\"\\",\\"planner\\":\\"\\"}"}'
+    with patch("forge.agents._run_with_backoff", return_value=raw) as run:
+        run_agent(
+            "claude", "journal", cfg, str(tmp_path), str(tmp_path / "log"),
+            thin=True, system_prompt="stable rules", json_schema="{}")
+
+    argv = run.call_args.args[0]
+    assert argv[argv.index("--system-prompt") + 1] == "stable rules"
+    assert argv[argv.index("--tools") + 1] == ""
+    assert argv[argv.index("-p") + 1] == "journal"
+
+
+def test_thin_codex_falls_back_to_normal_call_with_complete_prompt(
+        tmp_path: Path) -> None:
+    with patch("forge.agents.run_codex", return_value="{}") as run:
+        run_agent(
+            "codex", "journal", Config(), str(tmp_path), str(tmp_path / "log"),
+            thin=True, system_prompt="stable rules", json_schema="{}")
+
+    prompt = run.call_args.args[0]
+    assert "stable rules" in prompt
+    assert "journal" in prompt
+
+
+def test_thin_opencode_injects_tool_free_agent_and_extracts_text_event(
+        tmp_path: Path) -> None:
+    stream = json.dumps({
+        "type": "text",
+        "part": {"text": '{"tester":"","coder":"","planner":""}'},
+    })
+    captured = {}
+
+    def backoff(argv, cwd, cfg, log_path, stdin_text=None, env=None):
+        captured["argv"] = argv
+        captured["env"] = env
+        return stream
+
+    with patch("forge.agents._run_with_backoff", side_effect=backoff):
+        result = run_agent(
+            "opencode", "journal", Config(), str(tmp_path),
+            str(tmp_path / "log"), thin=True, system_prompt="stable rules",
+            json_schema="{}")
+
+    inline = json.loads(captured["env"]["OPENCODE_CONFIG_CONTENT"])
+    agent = inline["agent"]["forge-thin"]
+    assert agent["tools"] is False
+    assert agent["prompt"] == "stable rules"
+    assert "--pure" in captured["argv"]
+    assert result == '{"tester":"","coder":"","planner":""}'
 
 
 if __name__ == "__main__":

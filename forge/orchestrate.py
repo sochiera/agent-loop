@@ -293,13 +293,16 @@ def _master_notes(cfg: Config, project: str, logf) -> dict[str, str]:
     agent, model, effort = cfg.role("master")
     # Rola doradcza nie ma prawa przespać godzin backoffu przed realną pracą.
     advisory = replace(cfg, max_limit_retries=0)
-    prompt = prompts.master_prompt(ledger.compact_tail(project))
+    prompt = prompts.master_ledger_prompt(ledger.compact_tail(project))
     try:
         with tempfile.TemporaryDirectory(prefix="forge-master-") as sandbox:
             # Sandbox jest katalogiem roboczym, ale koszt roli wołanej co rundę
             # musi trafić do telemetrii projektu, a nie zniknąć razem z nim.
             raw = run_agent(agent, prompt, advisory, sandbox, logf("master"),
-                            model=model, effort=effort, usage_dir=project)
+                            model=model, effort=effort, usage_dir=project,
+                            thin=True,
+                            system_prompt=prompts.master_system_prompt(),
+                            json_schema=prompts.master_json_schema())
         data = extract_json(raw)
     except Exception:  # noqa: BLE001 — rola doradcza nie ma prawa niczego zatrzymać
         return {}

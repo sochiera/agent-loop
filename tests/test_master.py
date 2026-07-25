@@ -158,6 +158,16 @@ def test_master_receives_compact_ledger_view(tmp_path: Path) -> None:
     assert all(len(line) <= 120 for line in lines)
 
 
+def test_master_declares_thin_advisory_role(tmp_path: Path) -> None:
+    with patch("forge.orchestrate.run_agent", return_value="{}") as run:
+        orchestrate._master_notes(
+            Config(), str(tmp_path), lambda phase: str(tmp_path / f"{phase}.log"))
+
+    assert run.call_args.kwargs["thin"] is True
+    assert "MISTRZ" in run.call_args.kwargs["system_prompt"]
+    assert '"tester"' in run.call_args.kwargs["json_schema"]
+
+
 def test_round_decisions_are_recorded_in_ledger(tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
     role_call, _seen = _one_round(tmp_path)

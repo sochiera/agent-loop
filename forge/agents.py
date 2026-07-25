@@ -265,7 +265,8 @@ def extract_json(text: str) -> dict | None:
 
 
 def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
-                      stdin_text: str | None = None) -> str:
+                      stdin_text: str | None = None,
+                      env: dict[str, str] | None = None) -> str:
     """Uruchom komendę; przy limicie backoff i ponów; zwróć (stdout+stderr)."""
     phase = _phase_from_log(log_path)
     delay = cfg.backoff_start_s
@@ -277,7 +278,7 @@ def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
         try:
             proc = subprocess.run(
                 argv, cwd=cwd, input=stdin_text, text=True,
-                capture_output=True, timeout=cfg.agent_timeout_s,
+                capture_output=True, timeout=cfg.agent_timeout_s, env=env,
             )
         except subprocess.TimeoutExpired as e:
             log(f"  agent[{phase}] TIMEOUT po {cfg.agent_timeout_s}s")
@@ -391,7 +392,8 @@ def _trim_aggregated_output(value) -> None:
 
 def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str,
                *, model: str | None = None, effort: str | None = None,
-               mcp_config: str = "", usage_dir: str = "") -> str:
+               mcp_config: str = "", usage_dir: str = "", thin: bool = False,
+               system_prompt: str = "") -> str:
     """Claude Code headless. Zwraca końcowy tekst odpowiedzi (pole .result).
 
     model/effort None → wartości planisty (zgodność wsteczna). Puste → Claude
@@ -401,6 +403,8 @@ def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str,
     model = cfg.planner_model if model is None else model
     effort = (cfg.planner_effort if effort is None else effort) or "medium"
     argv = [cfg.claude_bin, "-p", prompt]
+    if thin:
+        argv += ["--system-prompt", system_prompt, "--tools", ""]
     if model:
         argv += ["--model", model]
     if mcp_config:
@@ -564,45 +568,109 @@ def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
 
 
 def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str,
-                 *, model: str, effort: str, usage_dir: str = "") -> str:
+                 *, model: str, effort: str, usage_dir: str = "",
+                 thin: bool = False, system_prompt: str = "",
+                 json_schema: str = "") -> str:
     """Uruchom dowolny agent CLI wg szablonu (adapters.GenericSpec).
 
     Obce CLI nie mają wspólnego formatu liczników, więc zapisujemy sam fakt
     wywołania — inaczej domyślny mistrz (opencode) nie istniałby w raporcie."""
     out_file = _prepare_last_msg_file(project_dir, cfg) if spec.uses_output_file else None
-    subs = {"prompt": prompt, "model": model or "", "effort": effort or "",
-            "project": project_dir, "output": out_file or ""}
+    subs = {
+        "prompt": prompt, "system": system_prompt, "schema": json_schema,
+        "model": model or "", "effort": effort or "",
+        "project": project_dir, "output": out_file or "",
+    }
     argv = adapters.expand_template(spec.template, subs)
     if not argv:
         raise AgentError(f"Pusty szablon komendy dla agenta '{spec.name}'.")
-    stream = _run_with_backoff(argv, project_dir, cfg, log_path)
+    process_env = None
+    if thin and spec.name == "opencode":
+        process_env = os.environ.copy()
+        process_env["OPENCODE_CONFIG_CONTENT"] = json.dumps({
+            "agent": {
+                "forge-thin": {
+                    "description": "Forge tool-free advisory role",
+                    "mode": "primary",
+                    "prompt": system_prompt,
+                    "tools": False,
+                },
+            },
+        }, ensure_ascii=False)
+    if process_env is None:
+        stream = _run_with_backoff(argv, project_dir, cfg, log_path)
+    else:
+        stream = _run_with_backoff(
+            argv, project_dir, cfg, log_path, env=process_env)
     _log_call_without_tokens(usage_dir or project_dir, cfg, log_path,
                              spec.name, model, effort)
-    return _read_last_msg(out_file) if out_file else stream
+    if out_file:
+        return _read_last_msg(out_file)
+    if thin and spec.name == "opencode":
+        return _extract_opencode_text(stream)
+    return stream
+
+
+def _extract_opencode_text(stream: str) -> str:
+    """Złóż tekst odpowiedzi z surowych zdarzeń ``--format json``."""
+    chunks: list[str] = []
+    for line in stream.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        part = event.get("part") if isinstance(event, dict) else None
+        if isinstance(part, dict) and part.get("type", "text") == "text":
+            if isinstance(part.get("text"), str):
+                chunks.append(part["text"])
+        elif (isinstance(event, dict) and event.get("type") == "text"
+              and isinstance(event.get("text"), str)):
+            chunks.append(event["text"])
+    return "".join(chunks) or stream
+
+
+def _complete_prompt(system_prompt: str, prompt: str) -> str:
+    return f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
 
 
 def run_agent(name: str, prompt: str, cfg: Config, project_dir: str, log_path: str,
               *, model: str = "", effort: str = "", mcp_config: str = "",
-              usage_dir: str = "") -> str:
+              usage_dir: str = "", thin: bool = False,
+              system_prompt: str = "", json_schema: str = "") -> str:
     """Jedno-strzałowe wywołanie dowolnego agenta CLI (any-CLI dyspozytor).
 
     mcp_config wspiera tylko claude (inni agenci konfigurują MCP po swojemu,
     np. codex w ~/.codex/config.toml) — dla nich jest ignorowany. usage_dir
     kieruje telemetrię poza katalog roboczy (rola pracująca w sandboxie)."""
     name = adapters.canonical_agent(name)
+    thin_adapter = adapters.thin_spec(name) if thin else None
+    if thin_adapter is not None and name in adapters.BUILTIN_AGENTS:
+        return _run_generic(
+            thin_adapter, prompt, cfg, project_dir, log_path,
+            model=model, effort=effort, usage_dir=usage_dir, thin=True,
+            system_prompt=system_prompt, json_schema=json_schema)
     if name == "claude":
         return run_claude(prompt, cfg, project_dir, log_path, model=model,
-                          effort=effort, mcp_config=mcp_config, usage_dir=usage_dir)
+                          effort=effort, mcp_config=mcp_config, usage_dir=usage_dir,
+                          thin=thin, system_prompt=system_prompt)
     if name == "codex":
-        return run_codex(prompt, cfg, project_dir, log_path, model=model,
+        return run_codex(_complete_prompt(system_prompt, prompt) if thin else prompt,
+                         cfg, project_dir, log_path, model=model,
                          effort=effort, usage_dir=usage_dir)
-    spec = adapters.generic_spec(name)
+    spec = thin_adapter or adapters.generic_spec(name)
     if spec is None:
         raise AgentError(
             f"Nieznany agent '{name}'. Wbudowane: claude, codex. Dla innego CLI "
             f"ustaw {adapters.env_key(name)} z szablonem komendy.")
-    return _run_generic(spec, prompt, cfg, project_dir, log_path,
-                        model=model, effort=effort, usage_dir=usage_dir)
+    effective_prompt = (
+        prompt if thin_adapter is not None
+        else _complete_prompt(system_prompt, prompt) if thin else prompt
+    )
+    return _run_generic(
+        spec, effective_prompt, cfg, project_dir, log_path,
+        model=model, effort=effort, usage_dir=usage_dir,
+        thin=thin_adapter is not None, system_prompt=system_prompt,
+        json_schema=json_schema)
 
 
 def run_agent_session(name: str, prompt: str, cfg: Config, project_dir: str,
