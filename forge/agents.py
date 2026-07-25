@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
 
 from . import adapters
 from .config import Config, RATE_LIMIT_PATTERNS
@@ -27,6 +28,48 @@ class LimitExhausted(RuntimeError):
 
 class AgentError(RuntimeError):
     """Agent zawiódł z powodu innego niż limit (np. crash, timeout)."""
+
+
+def _isolated_agent_env(name: str) -> dict[str, str]:
+    """Środowisko CLI bez globalnych plików instrukcji użytkownika."""
+    env = os.environ.copy()
+    name = adapters.canonical_agent(name)
+    home = Path(env.get("HOME", str(Path.home())))
+    config_root = Path(env.get(
+        "XDG_CONFIG_HOME", str(home / ".config"))) / "forge"
+    if name == "codex":
+        target = config_root / "codex"
+        _prepare_isolated_home(
+            target,
+            ((home / ".codex" / "auth.json", "auth.json"),
+             (home / ".codex" / "config.toml", "config.toml")),
+        )
+        env["CODEX_HOME"] = str(target)
+    elif name == "claude":
+        target = config_root / "claude"
+        _prepare_isolated_home(
+            target,
+            ((home / ".claude" / ".credentials.json", ".credentials.json"),),
+        )
+        env["CLAUDE_CONFIG_DIR"] = str(target)
+    return env
+
+
+def _prepare_isolated_home(
+        target: Path, links: tuple[tuple[Path, str], ...]) -> None:
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        target.chmod(0o700)
+    except OSError:
+        pass
+    for source, name in links:
+        destination = target / name
+        if not source.exists() or destination.exists() or destination.is_symlink():
+            continue
+        try:
+            destination.symlink_to(source)
+        except FileExistsError:
+            pass
 
 
 def _ts() -> str:
@@ -414,7 +457,9 @@ def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str,
         "--output-format", "json",
         "--dangerously-skip-permissions",  # pełna autonomia — edytuje pliki bez pytań
     ]
-    raw = _run_with_backoff(argv, project_dir, cfg, log_path)
+    raw = _run_with_backoff(
+        argv, project_dir, cfg, log_path,
+        env=_isolated_agent_env("claude"))
     # --output-format json → obiekt z polem "result".
     try:
         obj = json.loads(raw)
@@ -527,7 +572,9 @@ def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
     a = _codex_agent(cfg, model, effort)
     last_msg = _prepare_last_msg_file(project_dir, cfg)
     argv = _codex_argv(a, cfg, project_dir, last_msg, prompt)
-    _run_with_backoff(argv, project_dir, cfg, log_path)
+    _run_with_backoff(
+        argv, project_dir, cfg, log_path,
+        env=_isolated_agent_env("codex"))
     _log_call_without_tokens(usage_dir or project_dir, cfg, log_path,
                              "codex", a.model, a.effort)
     return _read_last_msg(last_msg)
@@ -546,7 +593,9 @@ def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
     last_msg = _prepare_last_msg_file(project_dir, cfg)
     argv = _codex_argv(a, cfg, project_dir, last_msg, prompt,
                        json_stream=True, resume_id=session_id)
-    stream = _run_with_backoff(argv, project_dir, cfg, log_path)
+    stream = _run_with_backoff(
+        argv, project_dir, cfg, log_path,
+        env=_isolated_agent_env("codex"))
     sid = session_id or extract_session_id(stream)
     cumulative = extract_codex_usage(stream)
     if cumulative and sid:

@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from forge.agents import (
     _append_log,
+    _isolated_agent_env,
     run_agent,
     run_claude,
     run_codex,
@@ -169,6 +170,54 @@ def test_thin_opencode_injects_tool_free_agent_and_extracts_text_event(
     assert agent["prompt"] == "stable rules"
     assert "--pure" in captured["argv"]
     assert result == '{"tester":"","coder":"","planner":""}'
+
+
+def test_isolated_cli_homes_link_auth_but_not_global_instructions(
+        tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    config = tmp_path / "config"
+    codex_source = home / ".codex"
+    claude_source = home / ".claude"
+    codex_source.mkdir(parents=True)
+    claude_source.mkdir()
+    (codex_source / "auth.json").write_text("auth", encoding="utf-8")
+    (codex_source / "config.toml").write_text("model='x'", encoding="utf-8")
+    (codex_source / "AGENTS.md").write_text("private", encoding="utf-8")
+    (claude_source / ".credentials.json").write_text(
+        "credentials", encoding="utf-8")
+    (claude_source / "CLAUDE.md").write_text("private", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
+
+    codex_env = _isolated_agent_env("codex")
+    claude_env = _isolated_agent_env("claude")
+
+    codex_home = Path(codex_env["CODEX_HOME"])
+    claude_home = Path(claude_env["CLAUDE_CONFIG_DIR"])
+    assert codex_home == config / "forge" / "codex"
+    assert claude_home == config / "forge" / "claude"
+    assert (codex_home / "auth.json").is_symlink()
+    assert (codex_home / "config.toml").is_symlink()
+    assert (claude_home / ".credentials.json").is_symlink()
+    assert not (codex_home / "AGENTS.md").exists()
+    assert not (claude_home / "CLAUDE.md").exists()
+
+
+def test_builtin_agents_receive_isolated_environment(tmp_path: Path) -> None:
+    claude_raw = '{"result":"ok"}'
+    with patch("forge.agents._isolated_agent_env",
+               side_effect=lambda name: {f"{name.upper()}_ISOLATED": "1"}), \
+         patch("forge.agents._run_with_backoff",
+               return_value=claude_raw) as claude_run:
+        run_claude("prompt", Config(), str(tmp_path), str(tmp_path / "c.log"))
+    assert claude_run.call_args.kwargs["env"] == {"CLAUDE_ISOLATED": "1"}
+
+    with patch("forge.agents._isolated_agent_env",
+               side_effect=lambda name: {f"{name.upper()}_ISOLATED": "1"}), \
+         patch("forge.agents._run_with_backoff",
+               return_value="") as codex_run:
+        run_codex("prompt", Config(), str(tmp_path), str(tmp_path / "x.log"))
+    assert codex_run.call_args.kwargs["env"] == {"CODEX_ISOLATED": "1"}
 
 
 if __name__ == "__main__":
