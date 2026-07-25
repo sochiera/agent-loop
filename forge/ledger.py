@@ -56,3 +56,15 @@ def tail(project: str, limit: int = KEEP_LINES, runtime_dir: str = ".forge") -> 
     except Exception:  # noqa: BLE001 — uszkodzony dziennik nie może nic zatrzymać
         return ""
     return "\n".join(lines[-limit:])
+
+
+def tail_for_task(project: str, task_id: str, limit: int = 8,
+                  runtime_dir: str = ".forge") -> str:
+    """Ostatnie wpisy dotyczące dokładnie jednego zadania."""
+    prefix = f"{task_id} "
+    lines = tail(project, KEEP_LINES, runtime_dir).splitlines()
+    matching = [
+        line for line in lines
+        if line.partition("] ")[2].startswith(prefix)
+    ]
+    return "\n".join(matching[-limit:])

@@ -23,6 +23,7 @@ class State:
     coder_session: str = ""
     tester_decision: dict = field(default_factory=dict)
     tester_handoff: str = ""
+    coder_summary: str = ""
     tester_record: str = ""
     coder_record: str = ""
     review_notes: list[str] = field(default_factory=list)

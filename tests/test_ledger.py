@@ -46,6 +46,26 @@ def test_tail_limit_returns_only_last_entries(tmp_path: Path) -> None:
     assert lines[-1].endswith("wpis 9")
 
 
+def test_tail_for_task_filters_before_applying_limit(tmp_path: Path) -> None:
+    for index in range(10):
+        ledger.append(str(tmp_path), f"task-001 r{index} tester→red")
+        ledger.append(str(tmp_path), f"task-002 r{index} koder→green")
+
+    lines = ledger.tail_for_task(str(tmp_path), "task-001", limit=5).splitlines()
+
+    assert len(lines) == 5
+    assert all("task-001" in line for line in lines)
+    assert lines[-1].endswith("task-001 r9 tester→red")
+
+
+def test_tail_for_task_does_not_match_longer_task_id(tmp_path: Path) -> None:
+    ledger.append(str(tmp_path), "task-001 start")
+    ledger.append(str(tmp_path), "task-0010 start")
+
+    assert "task-0010" not in ledger.tail_for_task(
+        str(tmp_path), "task-001", limit=8)
+
+
 def test_missing_ledger_reads_as_empty(tmp_path: Path) -> None:
     assert ledger.tail(str(tmp_path)) == ""
 

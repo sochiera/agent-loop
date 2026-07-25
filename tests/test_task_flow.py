@@ -122,6 +122,43 @@ def test_review_changes_start_a_new_tdd_cycle_then_commit(tmp_path: Path) -> Non
     assert _git(tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "feat: Zmiana wartości"
 
 
+def test_tester_receives_task_scoped_context_in_every_prompt(tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+    orchestrate.ledger.append(str(tmp_path), "task-999 sekret innego zadania")
+    orchestrate.ledger.append(str(tmp_path), "task-001 wcześniejszy wpis")
+    tester_answers = iter((
+        '{"status":"red","reason":"brakuje VALUE=1"}',
+        '{"status":"review"}',
+    ))
+    tester_prompts: list[str] = []
+
+    def role_call(_cfg, project, _state, role, prompt, _log):
+        if role == "tester":
+            tester_prompts.append(prompt)
+            answer = next(tester_answers)
+            if '"red"' in answer:
+                path = Path(project, "tests", "test_app.py")
+                path.write_text(
+                    path.read_text(encoding="utf-8")
+                    + "\ndef test_new_value():\n    assert VALUE == 1\n",
+                    encoding="utf-8")
+            return answer
+        Path(project, "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        return '{"status":"green","summary":"ustawiono VALUE na 1"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}'):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    confirmation = tester_prompts[-1]
+    assert "brakuje VALUE=1" in confirmation
+    assert "ustawiono VALUE na 1" in confirmation
+    assert "app.py" in confirmation and "tests/test_app.py" in confirmation
+    assert "task-001 wcześniejszy wpis" in tester_prompts[0]
+    assert "sekret innego zadania" not in tester_prompts[0]
+
+
 def test_review_proceeds_without_automatic_boundary(tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
     with patch("forge.orchestrate._call_role", return_value='{"status":"review"}'), \

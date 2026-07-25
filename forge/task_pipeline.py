@@ -112,6 +112,7 @@ def run_tdd_loop(*, state, max_rounds: int, run_tester: Callable[[str], PhaseRes
         result = run_coder(decision)
         state.tdd_round += 1
         if result.status != "green":
+            state.coder_summary = ""
             if state.tdd_round >= max_rounds:
                 return f"round_limit: zadanie wymaga podziału (limit {max_rounds})"
             handoff = result.data.get(
@@ -126,6 +127,7 @@ def run_tdd_loop(*, state, max_rounds: int, run_tester: Callable[[str], PhaseRes
         handoff = str(result.data.get("summary", "")).strip()
         if not handoff:
             handoff = "Koder zgłosił green bez podsumowania; oceń zastany diff."
+        state.coder_summary = handoff
         state.tester_handoff = handoff
         checkpoint("tester")
     raise AssertionError("pętla TDD kończy się wyłącznie przez return")

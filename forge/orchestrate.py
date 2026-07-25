@@ -28,7 +28,7 @@ Zwróć teraz wyłącznie jeden poprawny obiekt JSON w formacie podanym wyżej.
 _TASK_STATE_FIELDS = (
     "current_task", "task_phase", "tdd_round",
     "tester_session", "coder_session", "tester_decision", "tester_handoff",
-    "tester_record", "coder_record", "review_notes", "corrections_done",
+    "coder_summary", "tester_record", "coder_record", "review_notes", "corrections_done",
     "corrections_tree_hash", "task_start_tag", "coder_tree_hash",
 )
 
@@ -425,6 +425,10 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             ensure_notes(new_round=True)
             return run_turn("tester", prompts.tester_task_prompt(
                 task["file"], state.test_cmd, handoff=handoff,
+                previous_decision=state.tester_decision,
+                coder_summary=state.coder_summary,
+                changed_files=_changed(project, state.task_start_tag),
+                task_ledger=ledger.tail_for_task(project, task["id"], limit=8),
                 resume=bool(state.tester_session)), parse_tester_decision)
 
         def run_coder(decision):

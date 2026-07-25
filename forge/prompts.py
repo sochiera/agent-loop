@@ -3,7 +3,7 @@ from __future__ import annotations
 
 
 def bootstrap_prompt(brief: str) -> str:
-    return f"""ROLA: bootstrap. Przeczytaj brief:\n{brief}\nUtwórz minimalny projekt, docs/DESIGN.md, docs/ARCHITECTURE.md, BACKLOG.md oraz działający test. Ustal profil końcowej weryfikacji: targets z smoke/ci/hardware i odpowiadające komendy. Nie commituj. Zwróć tylko JSON {{"kind":"app|game","test_cmd":"...","build_cmd":"","verify":{{"targets":["smoke"],"smoke_cmd":"...","flash_cmd":"","target_cmd":"","ci_status_cmd":"","ci_logs_cmd":""}}}}."""
+    return f"""ROLA: bootstrap. Przeczytaj brief:\n{brief}\nUtwórz minimalny projekt, docs/DESIGN.md, docs/ARCHITECTURE.md, BACKLOG.md oraz działający test. Utwórz też AGENTS.md i CLAUDE.md z krótką informacją: „.forge/ to runtime orkiestratora — plik twojego zadania i cały potrzebny kontekst dostajesz w promptcie, więc nie ma tam nic, czego potrzebujesz”. To wyjaśnienie, nie zakaz. Ustal profil końcowej weryfikacji: targets z smoke/ci/hardware i odpowiadające komendy. Nie commituj. Zwróć tylko JSON {{"kind":"app|game","test_cmd":"...","build_cmd":"","verify":{{"targets":["smoke"],"smoke_cmd":"...","flash_cmd":"","target_cmd":"","ci_status_cmd":"","ci_logs_cmd":""}}}}."""
 
 
 def bootstrap_architecture_review_prompt(brief_path: str, test_cmd: str) -> str:
@@ -16,8 +16,27 @@ def plan_batch_prompt(batch_size: int, start_index: int, kind: str = "app", *, v
     return f"""ROLA: planista projektu typu {kind}. Przeczytaj DESIGN, ARCHITECTURE i BACKLOG.{feedback}{failures} Przygotuj maksymalnie {batch_size} małych zadań od {start_index:03d}; zapisz każde w .forge/tasks/task-NNN.md. Format zadania: Cel, Kryteria akceptacji, Publiczny kontrakt, Ścieżki testów, Ścieżki kodu, Test ukierunkowany, Trudność, Poza zakresem. Nie commituj. JSON: {{"no_more_tasks":false,"tasks":[{{"id":"task-{start_index:03d}","title":"...","file":".forge/tasks/task-{start_index:03d}.md","criteria":[],"test_globs":[],"code_globs":[],"targeted_test_cmd":"","difficulty":"standard"}}]}}."""
 
 
-def tester_task_prompt(task_file: str, test_cmd: str, *, handoff: str = "", resume: bool = False) -> str:
-    return f"""ROLA: TESTER. {'Kontynuujesz własną sesję.' if resume else 'Początek prywatnej sesji.'} Przeczytaj {task_file}, handoff, aktualny diff, właściwe testy i minimum kodu. Oceń zmiany pozostawione przez kodera albo reviewera: możesz je zachować, poprawić albo przywrócić, jeśli kontrakt wymaga czegoś innego. Uwagi review rozpoczynają nowy cykl TDD pod twoją kontrolą. Wybierz dokładnie red (minimalny czerwony test, uruchom `{test_cmd}`), code (wyłącznie istniejący test lub krok bez zachowania), review albo blocked. Jeśli kolejne cykle review wracają bez postępu i Mistrz wskaże pętlę, zwróć blocked z konkretnym powodem. Nie pisz kodu produkcyjnego i nie commituj. W `reason` przekaż koderowi konkretną ocenę i następny krok. Handoff od kodera/reviewera/Mistrza: {handoff or '(brak)'}. JSON: {{"status":"red|code|review|blocked","command":"...","test_files":[],"reason":"..."}}."""
+def tester_task_prompt(
+        task_file: str, test_cmd: str, *, handoff: str = "",
+        previous_decision: dict | None = None, coder_summary: str = "",
+        changed_files: list[str] | None = None, task_ledger: str = "",
+        resume: bool = False) -> str:
+    previous = previous_decision or {}
+    previous_text = (
+        f"{previous.get('status', '(brak)')} — "
+        f"{previous.get('reason', '(brak powodu)')}"
+    )
+    changed_text = ", ".join(changed_files or []) or "(brak)"
+    return f"""ROLA: TESTER. {'Kontynuujesz własną sesję.' if resume else 'Początek prywatnej sesji.'} Przeczytaj {task_file}, handoff, aktualny diff, właściwe testy i minimum kodu.
+
+KONTEKST BIEŻĄCEGO ZADANIA:
+- poprzednia decyzja testera i reason: {previous_text}
+- summary kodera: {coder_summary or '(brak)'}
+- pliki zmienione od startu zadania: {changed_text}
+- ostatnie wpisy dziennika tego zadania:
+{task_ledger or '(brak)'}
+
+Oceń zmiany pozostawione przez kodera albo reviewera: możesz je zachować, poprawić albo przywrócić, jeśli kontrakt wymaga czegoś innego. Uwagi review rozpoczynają nowy cykl TDD pod twoją kontrolą. Wybierz dokładnie red (minimalny czerwony test, uruchom `{test_cmd}`), code (wyłącznie istniejący test lub krok bez zachowania), review albo blocked. Jeśli kolejne cykle review wracają bez postępu i Mistrz wskaże pętlę, zwróć blocked z konkretnym powodem. Nie pisz kodu produkcyjnego i nie commituj. W `reason` przekaż koderowi konkretną ocenę i następny krok. Handoff od kodera/reviewera/Mistrza: {handoff or '(brak)'}. JSON: {{"status":"red|code|review|blocked","command":"...","test_files":[],"reason":"..."}}."""
 
 
 def coder_task_prompt(task_file: str, test_cmd: str, *, decision: dict, resume: bool = False) -> str:
