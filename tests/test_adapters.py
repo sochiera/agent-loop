@@ -165,7 +165,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
 
     def test_agents_in_use_reflects_mode(self) -> None:
         cfg = Config(planner_agent="claude", tester_agent="codex", coder_agent="grok",
-                     reviewer_agent="", verifier_agent="")
+                     reviewer_agent="", verifier_agent="", master_agent="claude")
         self.assertEqual(set(cfg.agents_in_use()), {"claude", "codex", "grok"})
 
     def test_gpt_alias_uses_codex_matrix(self) -> None:
@@ -182,7 +182,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         # planner=gpt i tester=codex to jedna binarka — preflight nie może jej
         # liczyć dwa razy (ani dublować komunikatu o braku).
         cfg = Config(planner_agent="gpt", tester_agent="codex", coder_agent="codex",
-                     reviewer_agent="", verifier_agent="")
+                     reviewer_agent="", verifier_agent="", master_agent="gpt")
         canon = [adapters.canonical_agent(a) for a in cfg.agents_in_use()]
         self.assertEqual(len(canon), len(set(canon)))
         self.assertEqual(set(canon), {"codex"})

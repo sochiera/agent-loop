@@ -28,6 +28,11 @@ ROLE_MODEL_LEVELS: dict[str, dict[str, str]] = {
     "coder": {"simple": "economy", "standard": "efficient", "complex": "balanced"},
     "reviewer": {"simple": "efficient", "standard": "balanced", "complex": "strong"},
     "verifier": {"simple": "economy", "standard": "efficient", "complex": "balanced"},
+    # Mistrz czyta kilkadziesiąt krótkich linii dziennika i nigdy nie czyta
+    # kodu — to rozpoznawanie wzorca, nie rozumowanie o implementacji. Wołany
+    # co rundę, więc musi być tani, inaczej odtworzyłby problem kosztowy,
+    # który ma pomagać wykrywać.
+    "master": {d: "efficient" for d in TASK_DIFFICULTIES},
 }
 
 # Użytkownik wybiera narzędzie/agenta dla roli. Konkretny model i effort są
@@ -138,9 +143,9 @@ class Config:
     codex_effort: str = os.environ.get("FORGE_CODEX_EFFORT", "medium")
 
     # Ile zadań planista produkuje jednym wywołaniem (koszt stały planisty ÷ batch).
-    batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "10"))
+    batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "4"))
     # Mały bezpiecznik: większe zadanie ma zostać ponownie rozplanowane.
-    max_tdd_rounds: int = int(os.environ.get("FORGE_MAX_TDD_ROUNDS", "20"))
+    max_tdd_rounds: int = int(os.environ.get("FORGE_MAX_TDD_ROUNDS", "10"))
     # Agent CLI każdej roli nowego modelu. "claude"/"codex" mają wbudowaną
     # obsługę; dowolna inna nazwa → agent generyczny z FORGE_AGENT_<NAME>_CMD
     # (patrz adapters.py). Domyślnie tester i koder to opencode (NeuralWatt).
@@ -173,6 +178,12 @@ class Config:
     flash_retries: int = int(os.environ.get("FORGE_FLASH_RETRIES", "1"))
     # Plik konfiguracji MCP doklejany do claude TYLKO w roli weryfikatora.
     verifier_mcp_config: str = os.environ.get("FORGE_VERIFIER_MCP_CONFIG", "")
+
+    # Mistrz kuźni — nadzorca procesu. Doradczy: jedyny jego efekt to krótka
+    # nota doklejana do promptu roli, więc jego awaria nie może nic zatrzymać.
+    master_agent: str = os.environ.get("FORGE_MASTER_AGENT", "opencode")
+    master_model: str = os.environ.get("FORGE_MASTER_MODEL", "")
+    master_effort: str = os.environ.get("FORGE_MASTER_EFFORT", "")
 
     # Recenzent zadania: pusty agent = agent testera, ale ZAWSZE świeży
     # kontekst (bez sesji i dziennika) — autor nie recenzuje własnej pracy.
@@ -220,6 +231,7 @@ class Config:
             "bootstrap": (self.planner_agent, self.planner_model, self.planner_effort),
             "tester": (self.tester_agent, self.tester_model, self.tester_effort),
             "coder": (self.coder_agent, self.coder_model, self.coder_effort),
+            "master": (self.master_agent, self.master_model, self.master_effort),
         }
         if name == "verifier":
             configured[name] = (
@@ -279,6 +291,7 @@ class Config:
         więc preflight nie sprawdza jej dwa razy (i nie dubluje komunikatu o
         braku). Zachowujemy pierwszą napotkaną nazwę wyświetlaną (dla logów)."""
         names = [self.planner_agent, self.tester_agent, self.coder_agent,
+                 self.master_agent,
                  self.role("verifier")[0], self.role("reviewer")[0]]
         seen: dict[str, str] = {}
         for name in names:
@@ -303,12 +316,20 @@ class Config:
     git_push: bool = os.environ.get("FORGE_GIT_PUSH", "1") != "0"
     git_remote: str = os.environ.get("FORGE_GIT_REMOTE", "origin")
 
-    # Backoff przy limitach (sekundy): rośnie geometrycznie do sufitu.
-    backoff_start_s: int = 60
-    backoff_max_s: int = 3600
-    backoff_factor: float = 2.0
+    # Backoff przy limitach (sekundy): rośnie geometrycznie do sufitu. Sufit to
+    # 24h — miesięczny "spend limit" traktujemy jak zwykły limit czasowy: nie
+    # ma sensu odpytywać częściej niż raz dziennie, gdy i tak nie zniknie
+    # wcześniej (reset limitu albo ręczne podniesienie przez użytkownika).
+    backoff_start_s: int = int(os.environ.get("FORGE_BACKOFF_START_S", "60"))
+    backoff_max_s: int = int(os.environ.get("FORGE_BACKOFF_MAX_S", str(24 * 3600)))
+    backoff_factor: float = float(os.environ.get("FORGE_BACKOFF_FACTOR", "2.0"))
+    # Budżet ŁĄCZNEGO czekania na limit. backoff_max_s ogranicza pojedyncze
+    # oczekiwanie — bez tego pułapu 20 ponowień z podwajaniem daje ok. 10 dni
+    # martwego biegu. Po wyczerpaniu budżetu zatrzymujemy się z checkpointem.
+    backoff_total_s: int = int(os.environ.get("FORGE_BACKOFF_TOTAL_S", str(24 * 3600)))
     # Ile razy ponawiać jedną fazę przy limicie zanim uznamy limit za wyczerpany.
-    max_limit_retries: int = 6
+    # Twardym ogranicznikiem jest zwykle backoff_total_s; to drugi bezpiecznik.
+    max_limit_retries: int = int(os.environ.get("FORGE_MAX_LIMIT_RETRIES", "20"))
 
     # Timeout pojedynczego wywołania agenta (sekundy). Duże, bo TDD bywa długie.
     agent_timeout_s: int = int(os.environ.get("FORGE_AGENT_TIMEOUT", "3600"))

@@ -38,12 +38,12 @@ class GuiSettingsTest(unittest.TestCase):
             self.assertEqual(load_settings(path), {})
 
 
+_ROLES = ("planner", "tester", "coder", "reviewer", "verifier", "master")
+
+
 class GuiLaunchTest(unittest.TestCase):
     def test_launch_uses_argv_and_role_environment(self) -> None:
-        roles = {
-            role: {"agent": "codex"}
-            for role in ("planner", "tester", "coder", "reviewer", "verifier")
-        }
+        roles = {role: {"agent": "codex"} for role in _ROLES}
 
         command, env = build_launch("brief.md", "project", roles)
 
@@ -53,11 +53,16 @@ class GuiLaunchTest(unittest.TestCase):
         self.assertNotIn("FORGE_CODER_MODEL", env)
         self.assertNotIn("FORGE_REVIEWER_EFFORT", env)
 
+    def test_master_is_configurable_from_gui(self) -> None:
+        roles = {role: {"agent": "codex"} for role in _ROLES}
+        roles["master"]["agent"] = "claude"
+
+        _command, env = build_launch("brief.md", "project", roles)
+
+        self.assertEqual(env["FORGE_MASTER_AGENT"], "claude")
+
     def test_invalid_multiline_value_is_rejected(self) -> None:
-        roles = {
-            role: {"agent": "codex"}
-            for role in ("planner", "tester", "coder", "reviewer", "verifier")
-        }
+        roles = {role: {"agent": "codex"} for role in _ROLES}
         roles["tester"]["agent"] = "bad\nvalue"
 
         with self.assertRaisesRegex(ValueError, "tester.agent"):

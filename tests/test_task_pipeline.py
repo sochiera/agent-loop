@@ -139,3 +139,21 @@ def test_fingerprint_fallback_uses_test_conventions_not_substrings(
 
     (tmp_path / "test_feature.py").write_text("assert False\n", encoding="utf-8")
     assert fingerprint_tests(str(tmp_path), []) != before
+
+
+def test_review_notes_are_normalised_to_strings() -> None:
+    """Recenzent bywa niekarny w kształcie 'notes'; reszta pipeline'u je łączy
+    i zapisuje, więc nie-string nie może wybuchać po akceptacji zadania."""
+    result = parse_review_decision('{"verdict":"approve","notes":[1,{"a":2},"ok"]}')
+
+    assert result.status == "approve"
+    assert result.data["notes"] == ["1", "{'a': 2}", "ok"]
+    assert "; ".join(result.data["notes"])
+
+
+def test_review_without_notes_gets_empty_list() -> None:
+    assert parse_review_decision('{"verdict":"approve"}').data["notes"] == []
+
+
+def test_review_with_scalar_notes_does_not_explode() -> None:
+    assert parse_review_decision('{"verdict":"changes","notes":"popraw"}').data["notes"] == ["popraw"]

@@ -54,7 +54,21 @@ def parse_review_decision(text: str) -> PhaseResult:
     verdict = data.get("verdict")
     if verdict not in REVIEW_VERDICTS:
         raise InvalidDecision(f"niedozwolony werdykt review: {verdict!r}")
+    # Reszta pipeline'u łączy notes i zapisuje je do stanu, promptu poprawek
+    # i dziennika. Nie-string wybuchłby dopiero PO zaakceptowaniu zadania,
+    # więc kształt normalizujemy tu — w jedynym miejscu, przez które przechodzą.
+    data["notes"] = _as_strings(data.get("notes"))
     return PhaseResult(verdict, data)
+
+
+def _as_strings(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [item if isinstance(item, str) else str(item) for item in value]
+    return [str(value)]
 
 
 def test_fingerprint(project: str, globs: list[str]) -> str:

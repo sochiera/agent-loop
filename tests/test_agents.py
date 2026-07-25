@@ -31,7 +31,8 @@ class AgentArgumentsTest(unittest.TestCase):
 
         self.assertEqual(result, "planned")
         run.assert_called_once_with("prompt", cfg, "/tmp", "/tmp/log",
-                                    model="gpt-5.6-sol", effort="high")
+                                    model="gpt-5.6-sol", effort="high",
+                                    usage_dir="")
 
     @patch("forge.agents._run_with_backoff", return_value="")
     def test_codex_receives_selected_model_and_effort(self, run: Mock) -> None:

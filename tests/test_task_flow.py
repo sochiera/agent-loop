@@ -70,6 +70,7 @@ def test_full_happy_path_reaches_commit(tmp_path: Path) -> None:
         return '{"status":"green","refactor":"done"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate._run_boundary", return_value=(True, ["pytest: rc=0"])), \
          patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}') as reviewer:
         assert orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
@@ -114,6 +115,7 @@ def test_review_changes_are_fixed_by_coder_then_committed(tmp_path: Path) -> Non
 def test_red_boundary_returns_control_to_tester(tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
     with patch("forge.orchestrate._call_role", return_value='{"status":"review"}'), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate._run_boundary", return_value=(False, ["pytest: rc=1"])), \
          patch("forge.orchestrate.run_agent") as reviewer:
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)

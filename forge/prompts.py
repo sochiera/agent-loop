@@ -35,5 +35,31 @@ def corrections_prompt(task_file: str, notes: list[str], test_cmd: str, *,
     return f"""ROLA: KODER — jedna tura poprawek. Własna sesja: {resume}. Przeczytaj {task_file}, aktualny `git diff {start_tag or 'HEAD'}` i zmienione pliki {changed or []}; uwagi: {notes}. Możesz zmieniać testy i kod. Dla zmiany zachowania: test red → code green → refactor. Uruchom test ukierunkowany `{targeted}`, potem pełną suitę `{test_cmd}`. Nie commituj. JSON: {{"status":"green","summary":"...","refactor":"done|not_needed"}}."""
 
 
+def master_prompt(ledger_tail: str) -> str:
+    """Mistrz kuźni: pilnuje PROCESU, nie kodu. Widzi wyłącznie dziennik."""
+    return f"""ROLA: MISTRZ kuźni — nadzorca procesu. Nie czytasz repo, nie uruchamiasz testów, nie zmieniasz plików. Widzisz tylko dziennik zdarzeń poniżej i sterujesz zespołem wyłącznie krótką notatką doklejaną do promptu roli.
+
+Zasady procesu, których pilnujesz:
+- tester pisze minimalny czerwony test i nie pisze kodu produkcyjnego;
+- koder zazielenia test; jeśli odsyła test jako błędny (test_changes_needed), musi wskazać konkretną linię i konkretną poprawkę;
+- runda ma posuwać zadanie do przodu: powtórzenie tej samej decyzji z `pliki=bez_zmian` to pętla, nie postęp (samo powtórzenie statusu przy `pliki=zmienione` bywa normalne);
+- planista tnie zadania tak, by mieściły się w budżecie rund; seria zadań ginących na round_limit oznacza, że tnie za grubo.
+
+DZIENNIK (najstarsze u góry):
+{ledger_tail or '(pusty)'}
+
+Jeśli proces idzie normalnie, zwróć puste stringi — to odpowiedź domyślna i oczekiwana. Odezwij się tylko, gdy widzisz pętlę albo złamaną zasadę: nazwij konkretne zachowanie z dziennika i powiedz wprost, co ma zostać zrobione inaczej. Nie zmieniaj kryteriów zadania i nie sugeruj rozwiązania merytorycznego — sterujesz procesem.
+
+JSON: {{"tester":"","coder":"","planner":""}}."""
+
+
+def master_note_suffix(note: str) -> str:
+    """Nota mistrza doklejana do promptu roli; pusta nota nie zmienia promptu."""
+    if not note.strip():
+        return ""
+    return ("\n\nUWAGA MISTRZA (wskazówka procesowa, nie zmienia kryteriów "
+            f"zadania): {note.strip()}")
+
+
 def verify_goal_prompt(cycle: int, evidence: dict, cycle_dir: str, **_ignored) -> str:
     return f"""ROLA: weryfikator celu. Cykl {cycle}; dowody: {evidence}; logi: {cycle_dir}. Oceń MVP. JSON: {{"verdict":"complete","notes":[]}} albo {{"verdict":"changes","notes":["..."]}}."""

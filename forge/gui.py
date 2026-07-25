@@ -41,6 +41,7 @@ ROLE_DEFS = (
     ("coder", "Koder", "Implementuje rozwiązanie i zazielenia testy"),
     ("reviewer", "Recenzent", "Sprawdza ukończone zadanie w świeżym kontekście"),
     ("verifier", "Weryfikator", "Ocenia, czy cały cel został osiągnięty"),
+    ("master", "Mistrz", "Pilnuje procesu i wykrywa pętle; tylko doradza"),
 )
 LEVEL_LABELS = {
     "economy": "economy", "efficient": "efficient", "balanced": "balanced",

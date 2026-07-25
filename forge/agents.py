@@ -38,6 +38,12 @@ def log(msg: str) -> None:
     print(f"[{_ts()}] {msg}", flush=True)
 
 
+def _format_duration(seconds: float) -> str:
+    total = int(seconds)
+    hours, rest = divmod(total, 3600)
+    return f"{hours}h{rest // 60:02d}m" if hours else f"{rest // 60}m{rest % 60:02d}s"
+
+
 def _looks_like_limit(text: str) -> bool:
     return bool(_LIMIT_RE.search(text or ""))
 
@@ -263,6 +269,7 @@ def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
     """Uruchom komendę; przy limicie backoff i ponów; zwróć (stdout+stderr)."""
     phase = _phase_from_log(log_path)
     delay = cfg.backoff_start_s
+    waited = 0
     last_output = ""
     for attempt in range(cfg.max_limit_retries + 1):
         started = time.monotonic()
@@ -292,11 +299,23 @@ def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
                 raise LimitExhausted(
                     f"Limit nadal aktywny po {attempt} ponowieniach — zatrzymuję."
                 )
+            # Budżet dotyczy SUMY oczekiwań, nie pojedynczego snu: bez niego
+            # geometryczny wzrost potrafi ciągnąć martwy bieg wiele dni.
+            delay = min(delay, cfg.backoff_total_s - waited)
+            if delay <= 0:
+                log(f"  agent[{phase}] LIMIT: wyczerpany budżet czekania "
+                    f"({cfg.backoff_total_s}s) — zatrzymuję.")
+                raise LimitExhausted(
+                    f"Limit aktywny po {_format_duration(waited)} oczekiwania "
+                    f"(budżet {_format_duration(cfg.backoff_total_s)}) — zatrzymuję."
+                )
             wake = _dt.datetime.now() + _dt.timedelta(seconds=delay)
             log(f"  agent[{phase}] LIMIT wykryty. Backoff {delay}s "
                 f"(przewidywane wznowienie ~{wake.strftime('%H:%M:%S')}), "
-                f"próba {attempt + 1}/{cfg.max_limit_retries}.")
+                f"próba {attempt + 1}/{cfg.max_limit_retries}, "
+                f"zużyty budżet {_format_duration(waited)}/{_format_duration(cfg.backoff_total_s)}.")
             time.sleep(delay)
+            waited += delay
             delay = min(int(delay * cfg.backoff_factor), cfg.backoff_max_s)
             continue
 
@@ -330,7 +349,7 @@ def _append_log(log_path: str, argv: list[str], output: str, code: int) -> None:
 
 def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str,
                *, model: str | None = None, effort: str | None = None,
-               mcp_config: str = "") -> str:
+               mcp_config: str = "", usage_dir: str = "") -> str:
     """Claude Code headless. Zwraca końcowy tekst odpowiedzi (pole .result).
 
     model/effort None → wartości planisty (zgodność wsteczna). Puste → Claude
@@ -358,10 +377,13 @@ def run_claude(prompt: str, cfg: Config, project_dir: str, log_path: str,
                 raise LimitExhausted("Claude zgłosił błąd limitu w JSON.")
             raise AgentError(f"Claude is_error: {obj.get('result') or obj}")
         if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
-            log_usage(project_dir, cfg, {"agent": "claude",
-                                         "phase": _phase_from_log(log_path),
-                                         "model": model, "effort": effort,
-                                         "usage": obj["usage"]})
+            # usage_dir ≠ project_dir dla ról pracujących w sandboxie (mistrz):
+            # katalog roboczy znika, telemetria musi zostać przy projekcie.
+            log_usage(usage_dir or project_dir, cfg,
+                      {"agent": "claude",
+                       "phase": _phase_from_log(log_path),
+                       "model": model, "effort": effort,
+                       "usage": obj["usage"]})
         return obj.get("result", raw) if isinstance(obj, dict) else raw
     except json.JSONDecodeError:
         return raw  # awaryjnie surowy tekst
@@ -438,13 +460,30 @@ def _read_last_msg(last_msg: str) -> str:
         return ""
 
 
+def _log_call_without_tokens(project_dir: str, cfg: Config, log_path: str,
+                             agent: str, model: str, effort: str) -> None:
+    """Odnotuj samo wywołanie, gdy CLI nie raportuje zużycia tokenów.
+
+    Bez tego rola wołana często (mistrz na opencode/codex-exec) byłaby w
+    raporcie całkowicie niewidoczna — lepiej znać liczbę wywołań niż nic."""
+    log_usage(project_dir, cfg, {"agent": agent, "phase": _phase_from_log(log_path),
+                                 "model": model, "effort": effort,
+                                 "usage_unavailable": True})
+
+
 def run_codex(prompt: str, cfg: Config, project_dir: str, log_path: str,
-              *, model: str | None = None, effort: str | None = None) -> str:
-    """Codex exec (non-interactive). Zwraca ostatnią wiadomość agenta."""
+              *, model: str | None = None, effort: str | None = None,
+              usage_dir: str = "") -> str:
+    """Codex exec (non-interactive). Zwraca ostatnią wiadomość agenta.
+
+    Bez ``--json`` strumień nie niesie liczników, więc zapisujemy sam fakt
+    wywołania (patrz ``run_codex_session`` dla pełnej telemetrii)."""
     a = _codex_agent(cfg, model, effort)
     last_msg = _prepare_last_msg_file(project_dir, cfg)
     argv = _codex_argv(a, cfg, project_dir, last_msg, prompt)
     _run_with_backoff(argv, project_dir, cfg, log_path)
+    _log_call_without_tokens(usage_dir or project_dir, cfg, log_path,
+                             "codex", a.model, a.effort)
     return _read_last_msg(last_msg)
 
 
@@ -483,8 +522,11 @@ def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
 
 
 def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str,
-                 *, model: str, effort: str) -> str:
-    """Uruchom dowolny agent CLI wg szablonu (adapters.GenericSpec)."""
+                 *, model: str, effort: str, usage_dir: str = "") -> str:
+    """Uruchom dowolny agent CLI wg szablonu (adapters.GenericSpec).
+
+    Obce CLI nie mają wspólnego formatu liczników, więc zapisujemy sam fakt
+    wywołania — inaczej domyślny mistrz (opencode) nie istniałby w raporcie."""
     out_file = _prepare_last_msg_file(project_dir, cfg) if spec.uses_output_file else None
     subs = {"prompt": prompt, "model": model or "", "effort": effort or "",
             "project": project_dir, "output": out_file or ""}
@@ -492,28 +534,33 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
     if not argv:
         raise AgentError(f"Pusty szablon komendy dla agenta '{spec.name}'.")
     stream = _run_with_backoff(argv, project_dir, cfg, log_path)
+    _log_call_without_tokens(usage_dir or project_dir, cfg, log_path,
+                             spec.name, model, effort)
     return _read_last_msg(out_file) if out_file else stream
 
 
 def run_agent(name: str, prompt: str, cfg: Config, project_dir: str, log_path: str,
-              *, model: str = "", effort: str = "", mcp_config: str = "") -> str:
+              *, model: str = "", effort: str = "", mcp_config: str = "",
+              usage_dir: str = "") -> str:
     """Jedno-strzałowe wywołanie dowolnego agenta CLI (any-CLI dyspozytor).
 
     mcp_config wspiera tylko claude (inni agenci konfigurują MCP po swojemu,
-    np. codex w ~/.codex/config.toml) — dla nich jest ignorowany."""
+    np. codex w ~/.codex/config.toml) — dla nich jest ignorowany. usage_dir
+    kieruje telemetrię poza katalog roboczy (rola pracująca w sandboxie)."""
     name = adapters.canonical_agent(name)
     if name == "claude":
         return run_claude(prompt, cfg, project_dir, log_path, model=model,
-                          effort=effort, mcp_config=mcp_config)
+                          effort=effort, mcp_config=mcp_config, usage_dir=usage_dir)
     if name == "codex":
-        return run_codex(prompt, cfg, project_dir, log_path, model=model, effort=effort)
+        return run_codex(prompt, cfg, project_dir, log_path, model=model,
+                         effort=effort, usage_dir=usage_dir)
     spec = adapters.generic_spec(name)
     if spec is None:
         raise AgentError(
             f"Nieznany agent '{name}'. Wbudowane: claude, codex. Dla innego CLI "
             f"ustaw {adapters.env_key(name)} z szablonem komendy.")
     return _run_generic(spec, prompt, cfg, project_dir, log_path,
-                        model=model, effort=effort)
+                        model=model, effort=effort, usage_dir=usage_dir)
 
 
 def run_agent_session(name: str, prompt: str, cfg: Config, project_dir: str,

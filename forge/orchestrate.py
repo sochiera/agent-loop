@@ -4,11 +4,14 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 from .agents import (AgentError, LimitExhausted, agent_supports_resume, extract_json,
                      log, run_agent, run_agent_session, run_planner)
 from .config import Config, DEFAULT_TASK_DIFFICULTY, TASK_DIFFICULTIES
+from . import ledger
 from . import prompts
 from . import verify
 from .shellrun import run_shellfree
@@ -144,6 +147,10 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
         cfg.batch_size, start_index, state.project_kind,
         verify_feedback_path=str(feedback) if feedback.exists() else "",
         failure_feedback_path=str(failures) if failures.exists() else "")
+    # Mistrz widzi w dzienniku również historię wsadów — serię zadań ginących
+    # na round_limit potrafi skomentować zanim planista utnie kolejny za grubo.
+    plan_prompt += prompts.master_note_suffix(
+        _master_notes(cfg, project, logf).get("planner", ""))
     data = _decision_with_retry(
         plan_prompt,
         lambda value: run_planner(value, cfg, project, logf("plan")),
@@ -157,8 +164,11 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
         raise AgentError("planista nie utworzył żadnego poprawnego zadania")
     if tasks:
         log(f"Planowanie: utworzono {len(tasks)} zadań: {', '.join(t['id'] for t in tasks)}")
+        ledger.append(project, f"plan: utworzono {len(tasks)} zadań "
+                               f"({tasks[0]['id']}…{tasks[-1]['id']})")
     elif data.get("no_more_tasks"):
         log("Planowanie: planista zgłosił brak dalszych zadań.")
+        ledger.append(project, "plan: planista zgłosił brak dalszych zadań")
     state.task_queue = tasks
     commit_all(project, "docs: plan wsadowy i backlog", cfg)
     return {"no_more_tasks": bool(data.get("no_more_tasks")) and not tasks}
@@ -268,6 +278,40 @@ def _call_role(cfg: Config, project: str, state: State, role: str, prompt: str, 
     return output
 
 
+_MASTER_ROLES = ("tester", "coder", "planner")
+
+
+def _master_notes(cfg: Config, project: str, logf) -> dict[str, str]:
+    """Notatki mistrza per rola — nadzór procesu, nie merytoryki.
+
+    Mistrz jest doradczy Z KONSTRUKCJI, więc każda jego awaria (błąd, limit,
+    śmieciowa odpowiedź) daje brak notatek i pipeline zachowuje się dokładnie
+    tak jak bez niego. Widzi wyłącznie dziennik przekazany w promptcie i
+    pracuje w katalogu tymczasowym — fizycznie nie ma dostępu do repozytorium,
+    więc nie może zmienić drzewa ani wyjść poza swoją rolę.
+    """
+    agent, model, effort = cfg.role("master")
+    # Rola doradcza nie ma prawa przespać godzin backoffu przed realną pracą.
+    advisory = replace(cfg, max_limit_retries=0)
+    prompt = prompts.master_prompt(ledger.tail(project))
+    try:
+        with tempfile.TemporaryDirectory(prefix="forge-master-") as sandbox:
+            # Sandbox jest katalogiem roboczym, ale koszt roli wołanej co rundę
+            # musi trafić do telemetrii projektu, a nie zniknąć razem z nim.
+            raw = run_agent(agent, prompt, advisory, sandbox, logf("master"),
+                            model=model, effort=effort, usage_dir=project)
+        data = extract_json(raw)
+    except Exception:  # noqa: BLE001 — rola doradcza nie ma prawa niczego zatrzymać
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    notes = {role: value.strip() for role, value in data.items()
+             if role in _MASTER_ROLES and isinstance(value, str) and value.strip()}
+    for role, note in notes.items():
+        log(f"  mistrz → {role}: {note}")
+    return notes
+
+
 def _decision_with_retry(prompt: str, invoke, parser):
     """Jedna tania korekta formatu, potem jawny błąd zamiast ukrytej pętli."""
     try:
@@ -292,6 +336,7 @@ def _clear_task_state(state: State) -> None:
 def _fail_task(cfg: Config, project: str, state: State, reason: str) -> None:
     task_id = state.current_task.get("id", "task")
     log(f"Zadanie {task_id} PORZUCONE: {reason}")
+    ledger.append(project, f"{task_id} PORZUCONE: {reason[:200]}")
     artifact = Path(project, cfg.runtime_dir, "failed", task_id)
     artifact.mkdir(parents=True, exist_ok=True)
     artifact.joinpath("reason.txt").write_text(reason + "\n", encoding="utf-8")
@@ -342,31 +387,57 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         state.task_phase = "tester"
         _checkpoint(project, state, "tester")
         log(f"Zadanie {task['id']} — {task['title']} (trudność: {task['difficulty']})")
+        ledger.append(project, f"{task['id']} start: {task['title']} ({task['difficulty']})")
     if state.task_phase in {"", "tester", "coder"}:
-        def run_tester(handoff: str):
-            prompt = prompts.tester_task_prompt(
-                task["file"], state.test_cmd, handoff=handoff,
-                resume=bool(state.tester_session))
-            decision = _decision_with_retry(
-                prompt,
-                lambda value: _call_role(
-                    cfg, project, state, "tester", value, logf("tester")),
-                parse_tester_decision)
-            log(f"  [{task['id']}] runda {state.tdd_round + 1}: tester → {decision.status}"
-                + (f" ({str(decision.data.get('reason', ''))[:200]})" if decision.data.get("reason") else ""))
-            return decision
+        # Mistrz jest wołany raz na rundę; ta sama notatka obsługuje kodera w
+        # tej samej rundzie. Zmienna lokalna wystarcza — po restarcie kolejna
+        # runda i tak zapyta go od nowa.
+        notes: dict[str, str] = {}
+        consulted = False
 
-        def run_coder(decision):
-            prompt = prompts.coder_task_prompt(
-                task["file"], decision.data.get("command") or state.test_cmd,
-                decision=decision.data, resume=bool(state.coder_session))
+        def ensure_notes(new_round: bool) -> None:
+            """Nowa runda pyta mistrza zawsze; wznowienie prosto w koderze
+            pyta, bo inaczej rada dla kodera przepadłaby. Milczenie mistrza
+            (częsty przypadek) nie może kosztować drugiego wywołania."""
+            nonlocal consulted
+            if new_round or not consulted:
+                notes.clear()
+                notes.update(_master_notes(cfg, project, logf))
+                consulted = True
+
+        def run_turn(role: str, prompt: str, parser):
+            """Jedna tura roli: nota mistrza, decyzja, log i wpis do dziennika
+            wraz z informacją, czy tura realnie ruszyła pliki."""
+            prompt += prompts.master_note_suffix(notes.get(role, ""))
+            before = _tree_fingerprint(project)
             result = _decision_with_retry(
                 prompt,
                 lambda value: _call_role(
-                    cfg, project, state, "coder", value, logf("coder")),
-                parse_coder_decision)
-            log(f"  [{task['id']}] runda {state.tdd_round + 1}: koder → {result.status}")
+                    cfg, project, state, role, value, logf(role)),
+                parser)
+            # Sam status nie odróżnia kolejnej legalnej decyzji od pętli —
+            # dopiero brak zmian w plikach czyni z powtórzenia pętlę.
+            changed = "zmienione" if _tree_fingerprint(project) != before else "bez_zmian"
+            reason = str(result.data.get("reason", ""))
+            label = "tester" if role == "tester" else "koder"
+            log(f"  [{task['id']}] runda {state.tdd_round + 1}: {label} → {result.status}"
+                + (f" ({reason[:200]})" if reason else ""))
+            ledger.append(project, f"{task['id']} r{state.tdd_round + 1} "
+                                   f"{label}→{result.status} pliki={changed}: {reason[:160]}")
             return result
+
+        def run_tester(handoff: str):
+            ensure_notes(new_round=True)
+            return run_turn("tester", prompts.tester_task_prompt(
+                task["file"], state.test_cmd, handoff=handoff,
+                resume=bool(state.tester_session)), parse_tester_decision)
+
+        def run_coder(decision):
+            ensure_notes(new_round=False)
+            return run_turn("coder", prompts.coder_task_prompt(
+                task["file"], decision.data.get("command") or state.test_cmd,
+                decision=decision.data, resume=bool(state.coder_session)),
+                parse_coder_decision)
 
         outcome = run_tdd_loop(
             state=state, max_rounds=cfg.max_tdd_rounds,
@@ -404,6 +475,8 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 model=model, effort=effort),
             parse_review_decision)
         log(f"Zadanie {task['id']}: recenzja → {review.status}")
+        ledger.append(project, f"{task['id']} recenzja→{review.status}: "
+                               f"{'; '.join(review.data.get('notes', []))[:160]}")
         if _tree_fingerprint(project) != tree:
             _fail_task(cfg, project, state, "blocked: reviewer zmienił drzewo"); return True
         if review.status == "changes":
@@ -445,6 +518,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
     commit_all(project, f"feat: {task['title']}", cfg)
     git(project, "tag", "-d", state.task_start_tag, check=False)
     log(f"Zadanie {task['id']} UKOŃCZONE i zacommitowane: {task['title']}")
+    ledger.append(project, f"{task['id']} UKOŃCZONE po {state.tdd_round} rundach")
     _clear_task_state(state)
     _checkpoint(project, state, "")
     return True
