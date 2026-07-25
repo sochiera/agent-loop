@@ -119,10 +119,9 @@ def build_task_from_plan(project: str, raw: dict) -> dict:
     if not isinstance(dependencies, (list, tuple)):
         dependencies = [dependencies]
     return {"id": raw.get("id", "task"), "title": raw.get("title", "(bez tytułu)"),
-            "file": raw.get("file", ""), "criteria": raw.get("criteria", []),
-            "test_globs": raw.get("test_globs", []), "code_globs": raw.get("code_globs", []),
+            "file": raw.get("file", ""),
             "targeted_test_cmd": raw.get("targeted_test_cmd", raw.get("test_cmd", "")),
-            "repro_cmd": raw.get("repro_cmd", ""), "difficulty": difficulty,
+            "difficulty": difficulty,
             "depends_on": [str(item) for item in dependencies if str(item)]}
 
 
@@ -477,8 +476,10 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
 
         def run_tester(handoff: str):
             ensure_notes(new_round=True)
+            targeted_test_cmd = (
+                task.get("targeted_test_cmd") or state.test_cmd)
             return run_turn("tester", prompts.tester_task_prompt(
-                task["file"], state.test_cmd, handoff=handoff,
+                task["file"], targeted_test_cmd, handoff=handoff,
                 previous_decision=state.tester_decision,
                 coder_summary=state.coder_summary,
                 changed_files=_changed(project, state.task_start_tag),
@@ -487,8 +488,10 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
 
         def run_coder(decision):
             ensure_notes(new_round=False)
+            targeted_test_cmd = (
+                task.get("targeted_test_cmd") or state.test_cmd)
             return run_turn("coder", prompts.coder_task_prompt(
-                task["file"], decision.data.get("command") or state.test_cmd,
+                task["file"], decision.data.get("command") or targeted_test_cmd,
                 decision=decision.data, resume=bool(state.coder_session)),
                 parse_coder_decision)
 

@@ -81,10 +81,20 @@ def test_failure_keeps_independent_tasks_and_drops_transitive_dependants(
 
 
 def test_plan_task_normalises_dependencies() -> None:
-    task = orchestrate.build_task_from_plan(
-        "/tmp", {"id": "task-003", "depends_on": ["task-001", 2, ""]})
+    task = orchestrate.build_task_from_plan("/tmp", {
+        "id": "task-003",
+        "depends_on": ["task-001", 2, ""],
+        "criteria": ["dead"],
+        "test_globs": ["dead"],
+        "code_globs": ["dead"],
+        "repro_cmd": "dead",
+        "targeted_test_cmd": "pytest tests/test_one.py",
+    })
 
     assert task["depends_on"] == ["task-001", "2"]
+    assert task["targeted_test_cmd"] == "pytest tests/test_one.py"
+    for dead in ("criteria", "test_globs", "code_globs", "repro_cmd"):
+        assert dead not in task
 
 
 def test_fail_task_survives_detached_head(tmp_path: Path) -> None:

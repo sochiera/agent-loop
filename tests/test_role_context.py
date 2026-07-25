@@ -44,3 +44,18 @@ def test_planner_declares_explicit_task_dependencies() -> None:
 
     assert "depends_on" in prompt
     assert "identyfikator" in prompt
+
+
+def test_planner_contract_owns_outcomes_not_test_design() -> None:
+    prompt = prompts.plan_batch_prompt(4, 1)
+
+    assert "Kryteria akceptacji" in prompt
+    assert "Publiczny kontrakt" in prompt
+    assert "Ścieżki testów" not in prompt
+    assert "Test ukierunkowany" not in prompt
+    assert "test_globs" not in prompt
+    assert "code_globs" not in prompt
+    assert '"criteria"' not in prompt
+    assert "zweryfikuj" in prompt
+    assert "uruchomieniem" in prompt
+    assert "wynik" in prompt
