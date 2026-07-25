@@ -71,7 +71,6 @@ def test_full_happy_path_reaches_commit(tmp_path: Path) -> None:
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["pytest: rc=0"])), \
          patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}') as reviewer:
         assert orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -83,47 +82,57 @@ def test_full_happy_path_reaches_commit(tmp_path: Path) -> None:
     assert state.tester_session == state.coder_session == ""
 
 
-def test_review_changes_are_fixed_by_coder_then_committed(tmp_path: Path) -> None:
+def test_review_changes_start_a_new_tdd_cycle_then_commit(tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
-    prompts_seen = []
+    tester_answers = iter((
+        '{"status":"review"}',
+        '{"status":"code","reason":"uwaga review: ustaw wartość 2"}',
+        '{"status":"review"}',
+    ))
+    reviewer_answers = iter((
+        '{"verdict":"changes","notes":["ustaw 2"]}',
+        '{"verdict":"approve"}',
+    ))
+    prompts_seen: dict[str, list[str]] = {"tester": [], "coder": []}
 
     def role_call(_cfg, project, _state, role, prompt, _log):
-        assert role == "tester" or role == "coder"
+        prompts_seen[role].append(prompt)
         if role == "tester":
-            return '{"status":"review"}'
-        prompts_seen.append(prompt)
+            return next(tester_answers)
         Path(project, "app.py").write_text("VALUE = 2\n", encoding="utf-8")
-        Path(project, "tests", "test_app.py").write_text(
-            "from app import VALUE\n\ndef test_value():\n    assert VALUE == 2\n",
-            encoding="utf-8")
-        return '{"status":"green","refactor":"done"}'
+        return '{"status":"green","summary":"ustawiono VALUE=2","refactor":"done"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["pytest: rc=0"])) as boundary, \
-         patch("forge.orchestrate.run_agent", return_value='{"verdict":"changes","notes":["ustaw 2"]}'):
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent", side_effect=reviewer_answers):
+        # Pierwsza recenzja nie uruchamia specjalnej tury kodera.
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+        assert state.task_phase == "tester"
+        assert state.current_task
+        assert prompts_seen["coder"] == []
+        assert "ustaw 2" in state.tester_handoff
+
+        # Tester rozpoczyna nowy cykl, przekazuje poprawkę koderowi i ponownie
+        # kieruje wynik do świeżego reviewera.
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
-    assert boundary.call_count == 2
-    assert len(prompts_seen) == 1
-    assert "git diff forge/task-001-start" in prompts_seen[0]
-    assert "python3 -m pytest -q tests/test_app.py" in prompts_seen[0]
-    assert "pełną suitę `python3 -m pytest -q`" in prompts_seen[0]
-    assert "VALUE == 2" in Path(tmp_path, "tests", "test_app.py").read_text(encoding="utf-8")
+    assert "ustaw 2" in prompts_seen["tester"][1]
+    assert "uwaga review: ustaw wartość 2" in prompts_seen["coder"][0]
+    assert "ustawiono VALUE=2" in prompts_seen["tester"][2]
     assert _git(tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "feat: Zmiana wartości"
 
 
-def test_red_boundary_returns_control_to_tester(tmp_path: Path) -> None:
+def test_review_proceeds_without_automatic_boundary(tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
     with patch("forge.orchestrate._call_role", return_value='{"status":"review"}'), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate._run_boundary", return_value=(False, ["pytest: rc=1"])), \
-         patch("forge.orchestrate.run_agent") as reviewer:
+         patch("forge.orchestrate.run_shellfree") as boundary, \
+         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}') as reviewer:
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
-    reviewer.assert_not_called()
-    assert state.task_phase == "tester"
-    assert "Granica przed review jest czerwona" in state.tester_handoff
-    assert state.tdd_round == 1
+    reviewer.assert_called_once()
+    boundary.assert_not_called()
+    assert state.current_task == {}
 
 
 def test_reviewer_is_fresh_and_never_receives_author_records(tmp_path: Path) -> None:
@@ -138,8 +147,7 @@ def test_reviewer_is_fresh_and_never_receives_author_records(tmp_path: Path) -> 
     state.coder_record = "CODER-RECORD"
     _git(tmp_path, "tag", state.task_start_tag)
 
-    with patch("forge.orchestrate._run_boundary", return_value=(True, ["pytest: rc=0"])), \
-         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}') as reviewer, \
+    with patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}') as reviewer, \
          patch("forge.orchestrate.run_agent_session") as session_call:
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -151,7 +159,7 @@ def test_reviewer_is_fresh_and_never_receives_author_records(tmp_path: Path) -> 
     session_call.assert_not_called()
 
 
-def test_reviewer_tree_change_fails_and_is_rolled_back(tmp_path: Path) -> None:
+def test_reviewer_tree_change_returns_to_tester_without_rollback(tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
 
     def modifying_review(_agent, _prompt, _cfg, project, _log, **_kwargs):
@@ -159,14 +167,16 @@ def test_reviewer_tree_change_fails_and_is_rolled_back(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", return_value='{"status":"review"}'), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["pytest: rc=0"])), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate.run_agent", side_effect=modifying_review):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
-    assert not (tmp_path / "reviewer-change.py").exists()
-    assert state.current_task == {}
-    reason = tmp_path / ".forge" / "failed" / "task-001" / "reason.txt"
-    assert "reviewer zmienił drzewo" in reason.read_text(encoding="utf-8")
+    assert (tmp_path / "reviewer-change.py").read_text(encoding="utf-8") == "bad = True\n"
+    assert state.current_task
+    assert state.task_phase == "tester"
+    assert "reviewer-change.py" in state.tester_handoff
+    assert not (tmp_path / ".forge" / "failed" / "task-001").exists()
+    assert _git(tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "seed"
 
 
 def test_round_limit_routes_to_failure(tmp_path: Path) -> None:
@@ -179,13 +189,14 @@ def test_round_limit_routes_to_failure(tmp_path: Path) -> None:
         return '{"status":"test_changes_needed","reason":"zły test"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate._fail_task") as fail:
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert "round_limit" in fail.call_args.args[-1]
 
 
-def test_restart_after_correction_edits_runs_boundary_without_repeating_coder(
+def test_legacy_corrections_checkpoint_returns_to_tester_without_coder(
         tmp_path: Path) -> None:
     task, state, cfg = _task_repo(tmp_path)
     state.current_task = task
@@ -197,13 +208,14 @@ def test_restart_after_correction_edits_runs_boundary_without_repeating_coder(
     state.corrections_tree_hash = orchestrate._tree_fingerprint(str(tmp_path))
     (tmp_path / "app.py").write_text("VALUE = 3\n", encoding="utf-8")
 
-    with patch("forge.orchestrate._call_role") as coder, \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["pytest: rc=0"])):
+    with patch("forge.orchestrate._call_role") as coder:
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     coder.assert_not_called()
-    assert _git(tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "feat: Zmiana wartości"
-    assert state.current_task == {}
+    assert _git(tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "seed"
+    assert state.current_task
+    assert state.task_phase == "tester"
+    assert "ustaw 3" in state.tester_handoff
 
 
 def test_invalid_decision_gets_exactly_one_format_retry() -> None:

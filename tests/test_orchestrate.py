@@ -4,8 +4,7 @@ import subprocess
 from unittest.mock import patch
 
 from forge.config import Config
-from forge.orchestrate import _run_boundary, build_then_test, run_tests
-from forge.state import State
+from forge.orchestrate import build_then_test, run_tests
 
 
 def test_commands_run_without_shell() -> None:
@@ -39,22 +38,3 @@ def test_kiss_config_has_only_tdd_limit() -> None:
     cfg = Config()
     assert cfg.max_tdd_rounds == 10
     assert not hasattr(cfg, "legacy_mode")
-
-
-def test_review_boundary_runs_build_targeted_full_and_repro_once() -> None:
-    state = State(build_cmd="make", test_cmd="pytest -q")
-    task = {
-        "targeted_test_cmd": "pytest -q tests/test_one.py",
-        "repro_cmd": "python repro.py",
-    }
-    with patch("forge.orchestrate.run_shellfree", return_value=(0, "ok")) as run:
-        green, results = _run_boundary("/tmp", state, task, Config())
-
-    assert green
-    assert [call.args[1] for call in run.call_args_list] == [
-        "make",
-        "pytest -q tests/test_one.py",
-        "pytest -q",
-        "python repro.py",
-    ]
-    assert len(results) == 4

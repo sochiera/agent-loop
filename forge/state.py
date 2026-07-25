@@ -29,7 +29,6 @@ class State:
     corrections_done: bool = False
     corrections_tree_hash: str = ""
     task_start_tag: str = ""
-    coder_test_hash: str = ""
     coder_tree_hash: str = ""
     # Weryfikacja celu pozostaje niezależna od mechaniki zadania.
     verify_targets: list[str] = field(default_factory=list)

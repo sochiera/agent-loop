@@ -67,10 +67,14 @@ def _one_round(tmp_path: Path):
 # --- Prompt mistrza ---------------------------------------------------------
 
 def test_master_prompt_is_process_only_and_carries_ledger() -> None:
-    prompt = prompts.master_prompt("[10:00] task-001 r1 tester→red")
+    prompt = prompts.master_prompt(
+        "[10:00] task-001 r1 koder→green pliki=[tests/test_app.py]")
 
     assert "MISTRZ" in prompt
-    assert "[10:00] task-001 r1 tester→red" in prompt
+    assert "tests/test_app.py" in prompt
+    assert "napisz testerowi" in prompt
+    assert "recenzja→changes" in prompt
+    assert "statusem blocked" in prompt
     # Milczenie jest odpowiedzią domyślną — inaczej mistrz zatruwa każdy prompt.
     assert "pust" in prompt.lower()
     assert '"tester"' in prompt and '"coder"' in prompt and '"planner"' in prompt
@@ -111,7 +115,6 @@ def test_master_notes_reach_tester_and_coder_prompts(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -132,7 +135,6 @@ def test_master_sees_ledger_history(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -145,7 +147,6 @@ def test_round_decisions_are_recorded_in_ledger(tmp_path: Path) -> None:
     role_call, _seen = _one_round(tmp_path)
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}'):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -163,7 +164,6 @@ def test_ledger_records_whether_the_turn_changed_files(tmp_path: Path) -> None:
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}'):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -171,8 +171,8 @@ def test_ledger_records_whether_the_turn_changed_files(tmp_path: Path) -> None:
     coder_line = next(line for line in lines if "koder→green" in line)
     tester_line = next(line for line in lines if "tester→red" in line)
     # Koder i tester realnie edytowali pliki w tej rundzie.
-    assert "pliki=zmienione" in coder_line
-    assert "pliki=zmienione" in tester_line
+    assert "pliki=[app.py]" in coder_line
+    assert "pliki=[tests/test_app.py]" in tester_line
 
 
 def test_ledger_marks_turn_without_file_changes(tmp_path: Path) -> None:
@@ -219,7 +219,6 @@ def test_master_is_consulted_when_resuming_straight_into_coder(tmp_path: Path) -
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -240,7 +239,6 @@ def test_master_is_consulted_once_per_round(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -260,7 +258,6 @@ def test_master_failure_leaves_pipeline_untouched(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -279,7 +276,6 @@ def test_master_limit_does_not_stop_the_run(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -296,7 +292,6 @@ def test_master_garbage_answer_is_ignored(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -315,7 +310,6 @@ def test_master_unexpected_crash_is_swallowed(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -335,7 +329,6 @@ def test_master_never_owns_the_backoff(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -354,7 +347,6 @@ def test_master_cannot_change_the_worktree(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate._run_boundary", return_value=(True, ["ok"])), \
          patch("forge.orchestrate.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 

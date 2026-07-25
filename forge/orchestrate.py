@@ -17,8 +17,7 @@ from . import verify
 from .shellrun import run_shellfree
 from .state import State
 from .task_pipeline import (InvalidDecision, parse_coder_decision, parse_review_decision,
-                            parse_tester_decision, run_tdd_loop,
-                            test_fingerprint)
+                            parse_tester_decision, run_tdd_loop)
 
 _JSON_RETRY = """
 
@@ -30,8 +29,7 @@ _TASK_STATE_FIELDS = (
     "current_task", "task_phase", "tdd_round",
     "tester_session", "coder_session", "tester_decision", "tester_handoff",
     "tester_record", "coder_record", "review_notes", "corrections_done",
-    "corrections_tree_hash", "task_start_tag", "coder_test_hash",
-    "coder_tree_hash",
+    "corrections_tree_hash", "task_start_tag", "coder_tree_hash",
 )
 
 
@@ -92,33 +90,6 @@ def build_then_test(project: str, build_cmd: str, test_cmd: str, timeout: int) -
         if rc != 0:
             return False
     return run_tests(project, test_cmd, timeout)
-
-
-def _tail(output: str, size: int = 1200) -> str:
-    return output[-size:].strip()
-
-
-def _run_boundary(project: str, state: State, task: dict, cfg: Config) -> tuple[bool, list[str]]:
-    commands = []
-    if state.build_cmd:
-        commands.append(state.build_cmd)
-    targeted = task.get("targeted_test_cmd", "").strip()
-    if targeted:
-        commands.append(targeted)
-    if state.test_cmd and state.test_cmd not in commands:
-        commands.append(state.test_cmd)
-    repro = task.get("repro_cmd", "").strip()
-    if repro and repro not in commands:
-        commands.append(repro)
-    if not commands:
-        return False, ["brak komendy testowej"]
-    results = []
-    for command in commands:
-        rc, output = run_shellfree(project, command, cfg.agent_timeout_s)
-        results.append(f"{command}: rc={rc}; {_tail(output)}")
-        if rc != 0:
-            return False, results
-    return True, results
 
 
 def _next_task_index(project: str) -> int:
@@ -244,18 +215,41 @@ def _is_volatile_artifact(name: str) -> bool:
     return base.startswith(".coverage") or base.endswith((".pyc", ".pyo", ".orig"))
 
 
-def _tree_fingerprint(project: str) -> str:
-    """Śledzone i nieignorowane pliki worktree; cache buildów nie ma znaczenia."""
+def _tree_manifest(project: str) -> dict[str, str]:
+    """Hash per plik, aby wznowienia i Mistrz widzieli ten sam stan drzewa."""
     import hashlib
-    root, digest = Path(project), hashlib.sha256()
+    root = Path(project)
+    manifest: dict[str, str] = {}
     names = git(project, "ls-files", "--cached", "--others", "--exclude-standard").stdout.splitlines()
     for name in sorted(set(names)):
         path = root / name
         if not path.is_file() or name.startswith(".forge/") or _is_volatile_artifact(name):
             continue
-        digest.update(str(path.relative_to(root)).encode()); digest.update(b"\0")
-        digest.update(path.read_bytes()); digest.update(b"\0")
+        manifest[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return manifest
+
+
+def _tree_fingerprint(project: str) -> str:
+    """Śledzone i nieignorowane pliki worktree; cache buildów nie ma znaczenia."""
+    import hashlib
+    digest = hashlib.sha256()
+    for name, file_hash in _tree_manifest(project).items():
+        digest.update(name.encode()); digest.update(b"\0")
+        digest.update(file_hash.encode()); digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _turn_changes(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    return sorted(name for name in before.keys() | after.keys()
+                  if before.get(name) != after.get(name))
+
+
+def _describe_turn_changes(paths: list[str], limit: int = 8) -> str:
+    if not paths:
+        return "bez_zmian"
+    visible = ", ".join(paths[:limit])
+    suffix = f", +{len(paths) - limit}" if len(paths) > limit else ""
+    return f"[{visible}{suffix}]"
 
 
 def _checkpoint(project: str, state: State, phase: str) -> None:
@@ -407,17 +401,18 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
 
         def run_turn(role: str, prompt: str, parser):
             """Jedna tura roli: nota mistrza, decyzja, log i wpis do dziennika
-            wraz z informacją, czy tura realnie ruszyła pliki."""
+            wraz z listą plików zmienionych w tej konkretnej turze."""
             prompt += prompts.master_note_suffix(notes.get(role, ""))
-            before = _tree_fingerprint(project)
+            before = _tree_manifest(project)
             result = _decision_with_retry(
                 prompt,
                 lambda value: _call_role(
                     cfg, project, state, role, value, logf(role)),
                 parser)
-            # Sam status nie odróżnia kolejnej legalnej decyzji od pętli —
-            # dopiero brak zmian w plikach czyni z powtórzenia pętlę.
-            changed = "zmienione" if _tree_fingerprint(project) != before else "bez_zmian"
+            # Nazwy plików pozwalają Mistrzowi zauważyć np. zmianę testu przez
+            # kodera i poprosić testera o ocenę bez mechanicznego blokowania.
+            changed = _describe_turn_changes(
+                _turn_changes(before, _tree_manifest(project)))
             reason = str(result.data.get("reason", ""))
             label = "tester" if role == "tester" else "koder"
             log(f"  [{task['id']}] runda {state.tdd_round + 1}: {label} → {result.status}"
@@ -444,29 +439,19 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             run_tester=run_tester,
             run_coder=run_coder,
             checkpoint=lambda phase: _checkpoint(project, state, phase),
-            fingerprint=lambda: test_fingerprint(project, task.get("test_globs", [])),
             worktree_fingerprint=lambda: _tree_fingerprint(project),
         )
         if outcome != "review":
             _fail_task(cfg, project, state, outcome)
             return True
-        log(f"Zadanie {task['id']}: pętla TDD zielona, sprawdzam granicę przed review.")
+        log(f"Zadanie {task['id']}: pętla TDD zakończona, przekazuję do review.")
         _checkpoint(project, state, "review")
     if state.task_phase == "review":
-        green, results = _run_boundary(project, state, task, cfg)
-        log(f"Zadanie {task['id']}: granica testowa przed review — {'ZIELONA' if green else 'CZERWONA'}")
-        if not green:
-            state.tester_handoff = "Granica przed review jest czerwona: " + " | ".join(results)
-            state.tdd_round += 1
-            if state.tdd_round >= cfg.max_tdd_rounds:
-                _fail_task(cfg, project, state, f"round_limit: zadanie wymaga podziału (limit {cfg.max_tdd_rounds})"); return True
-            _checkpoint(project, state, "tester")
-            return True
-        tree = _tree_fingerprint(project)
+        before_review = _tree_manifest(project)
         reviewer, model, effort = cfg.role("reviewer", task["difficulty"])
         review_prompt = prompts.review_task_prompt_kiss(
             task["file"], start_tag=state.task_start_tag,
-            changed=_changed(project, state.task_start_tag), test_results=results)
+            changed=_changed(project, state.task_start_tag))
         log(f"Zadanie {task['id']}: recenzja (świeży kontekst)…")
         review = _decision_with_retry(
             review_prompt,
@@ -475,44 +460,43 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 model=model, effort=effort),
             parse_review_decision)
         log(f"Zadanie {task['id']}: recenzja → {review.status}")
-        ledger.append(project, f"{task['id']} recenzja→{review.status}: "
+        review_changes = _describe_turn_changes(
+            _turn_changes(before_review, _tree_manifest(project)))
+        ledger.append(project, f"{task['id']} recenzja→{review.status} "
+                               f"pliki={review_changes}: "
                                f"{'; '.join(review.data.get('notes', []))[:160]}")
-        if _tree_fingerprint(project) != tree:
-            _fail_task(cfg, project, state, "blocked: reviewer zmienił drzewo"); return True
+        review_notes = list(review.data.get("notes", []))
         if review.status == "changes":
-            state.review_notes = list(review.data.get("notes", []))
-            state.corrections_tree_hash = _tree_fingerprint(project)
-            _checkpoint(project, state, "corrections")
-        else:
-            _checkpoint(project, state, "commit")
-    if state.task_phase == "corrections":
-        if not state.corrections_done:
-            if not state.corrections_tree_hash:
-                state.corrections_tree_hash = _tree_fingerprint(project)
-                _checkpoint(project, state, "corrections")
-            if state.corrections_tree_hash == _tree_fingerprint(project):
-                log(f"Zadanie {task['id']}: poprawki po recenzji — {'; '.join(state.review_notes)[:300]}")
-                correction_prompt = prompts.corrections_prompt(
-                    task["file"], state.review_notes, state.test_cmd,
-                    targeted_test_cmd=task.get("targeted_test_cmd", ""),
-                    start_tag=state.task_start_tag,
-                    changed=_changed(project, state.task_start_tag),
-                    resume=bool(state.coder_session))
-                correction = _decision_with_retry(
-                    correction_prompt,
-                    lambda value: _call_role(
-                        cfg, project, state, "coder", value, logf("corrections")),
-                    parse_coder_decision)
-                log(f"Zadanie {task['id']}: poprawki → {correction.status}")
-                if correction.status != "green":
-                    _fail_task(cfg, project, state, "poprawki review nie zostały wykonane"); return True
-            state.corrections_done = True
-            state.corrections_tree_hash = ""
-            _checkpoint(project, state, "corrections")
-        green, _ = _run_boundary(project, state, task, cfg)
-        if not green:
-            _fail_task(cfg, project, state, "czerwone testy po poprawkach review"); return True
+            state.review_notes = review_notes
+            state.tester_handoff = (
+                "Reviewer nie zaakceptował zadania. Rozpocznij nowy cykl TDD "
+                f"i oceń uwagi: {'; '.join(review_notes) or '(brak konkretów)'}.")
+            if review_changes != "bez_zmian":
+                state.tester_handoff += (
+                    " Reviewer zmienił też pliki "
+                    f"{review_changes}; oceń te zmiany, zachowaj, popraw albo przywróć.")
+            _checkpoint(project, state, "tester")
+            return True
+        if review_changes != "bez_zmian":
+            # Reviewer ma pozostać read-only, lecz przypadkowy zapis nie jest
+            # powodem do porzucenia całego zadania. Tester ocenia pozostawiony diff.
+            state.tester_handoff = (
+                "Reviewer zaakceptował wynik, ale mimo roli read-only zmienił pliki "
+                f"{review_changes}. Oceń pozostawiony diff; zachowaj, popraw albo "
+                "przywróć te zmiany, a następnie wybierz dalszy krok.")
+            _checkpoint(project, state, "tester")
+            return True
         _checkpoint(project, state, "commit")
+    if state.task_phase == "corrections":
+        # Zgodność ze starymi checkpointami. Osobna, jednorazowa tura kodera
+        # została usunięta: każda uwaga review wraca teraz przez testera.
+        state.tester_handoff = (
+            "Wznowiono stary checkpoint poprawek po review. Rozpocznij nowy cykl "
+            f"TDD i oceń uwagi: {'; '.join(state.review_notes) or '(brak konkretów)'}.")
+        state.corrections_done = False
+        state.corrections_tree_hash = ""
+        _checkpoint(project, state, "tester")
+        return True
     if state.task_phase != "commit":
         return True
     commit_all(project, f"feat: {task['title']}", cfg)

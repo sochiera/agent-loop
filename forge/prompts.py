@@ -17,22 +17,15 @@ def plan_batch_prompt(batch_size: int, start_index: int, kind: str = "app", *, v
 
 
 def tester_task_prompt(task_file: str, test_cmd: str, *, handoff: str = "", resume: bool = False) -> str:
-    return f"""ROLA: TESTER. {'Kontynuujesz własną sesję.' if resume else 'Początek prywatnej sesji.'} Przeczytaj {task_file}, właściwe testy i minimum kodu. Wybierz dokładnie red (minimalny czerwony test, uruchom `{test_cmd}`), code (wyłącznie istniejący test lub krok bez zachowania), review albo blocked. Nie pisz kodu produkcyjnego i nie commituj. Handoff: {handoff or '(brak)'}. JSON: {{"status":"red|code|review|blocked","command":"...","test_files":[],"reason":"..."}}."""
+    return f"""ROLA: TESTER. {'Kontynuujesz własną sesję.' if resume else 'Początek prywatnej sesji.'} Przeczytaj {task_file}, handoff, aktualny diff, właściwe testy i minimum kodu. Oceń zmiany pozostawione przez kodera albo reviewera: możesz je zachować, poprawić albo przywrócić, jeśli kontrakt wymaga czegoś innego. Uwagi review rozpoczynają nowy cykl TDD pod twoją kontrolą. Wybierz dokładnie red (minimalny czerwony test, uruchom `{test_cmd}`), code (wyłącznie istniejący test lub krok bez zachowania), review albo blocked. Jeśli kolejne cykle review wracają bez postępu i Mistrz wskaże pętlę, zwróć blocked z konkretnym powodem. Nie pisz kodu produkcyjnego i nie commituj. W `reason` przekaż koderowi konkretną ocenę i następny krok. Handoff od kodera/reviewera/Mistrza: {handoff or '(brak)'}. JSON: {{"status":"red|code|review|blocked","command":"...","test_files":[],"reason":"..."}}."""
 
 
 def coder_task_prompt(task_file: str, test_cmd: str, *, decision: dict, resume: bool = False) -> str:
-    return f"""ROLA: KODER. {'Kontynuujesz własną sesję.' if resume else 'Początek prywatnej sesji.'} Przeczytaj {task_file} i testy. Decyzja testera: {decision.get('status')} — {decision.get('reason', '')}. Najpierw oceń test; jeśli jest błędny, nie zmieniaj go i zwróć test_changes_needed. W przeciwnym razie: code green, `{test_cmd}`, mały refaktor, ponów test. W tej pętli nie zmieniaj testów ani nie commituj. JSON: {{"status":"green","summary":"...","refactor":"done|not_needed"}} albo {{"status":"test_changes_needed","reason":"..."}}."""
+    return f"""ROLA: KODER. {'Kontynuujesz własną sesję.' if resume else 'Początek prywatnej sesji.'} Przeczytaj {task_file}, decyzję testera i testy. Decyzja testera: {decision.get('status')} — {decision.get('reason', '')}. Najpierw oceń test; jeśli jest błędny, nie dopasowuj go do implementacji — zwróć test_changes_needed z konkretną uwagą dla testera. Jeśli nie możesz bezpiecznie wykonać uwag review albo potrzebujesz decyzji testera, zwróć tester_input_needed z konkretnym powodem; nie udawaj green. W przeciwnym razie: code green, `{test_cmd}`, mały refaktor, ponów test. W normalnej pętli nie zmieniaj testów ani nie commituj. W `summary` przekaż testerowi, co zmieniłaś, jakie testy uruchomiłaś i wszystko, co powinien ponownie ocenić. JSON: {{"status":"green","summary":"...","refactor":"done|not_needed"}} albo {{"status":"test_changes_needed|tester_input_needed","reason":"..."}}."""
 
 
-def review_task_prompt_kiss(task_file: str, *, start_tag: str, changed: list[str], test_results: list[str]) -> str:
-    return f"""ROLA: świeży, read-only reviewer. Przeczytaj {task_file}, `git diff {start_tag}`, zmienione pliki {changed} oraz wyniki testów {test_results}. Oceń cały kontrakt i testy. Nie zmieniaj drzewa. JSON: {{"verdict":"approve","notes":[]}} albo {{"verdict":"changes","notes":["konkretna poprawka"]}}."""
-
-
-def corrections_prompt(task_file: str, notes: list[str], test_cmd: str, *,
-                       targeted_test_cmd: str = "", start_tag: str = "",
-                       changed: list[str] | None = None, resume: bool = False) -> str:
-    targeted = targeted_test_cmd or test_cmd
-    return f"""ROLA: KODER — jedna tura poprawek. Własna sesja: {resume}. Przeczytaj {task_file}, aktualny `git diff {start_tag or 'HEAD'}` i zmienione pliki {changed or []}; uwagi: {notes}. Możesz zmieniać testy i kod. Dla zmiany zachowania: test red → code green → refactor. Uruchom test ukierunkowany `{targeted}`, potem pełną suitę `{test_cmd}`. Nie commituj. JSON: {{"status":"green","summary":"...","refactor":"done|not_needed"}}."""
+def review_task_prompt_kiss(task_file: str, *, start_tag: str, changed: list[str]) -> str:
+    return f"""ROLA: świeży, read-only reviewer. Przeczytaj {task_file}, `git diff {start_tag}` oraz zmienione pliki {changed}. Oceń cały kontrakt, implementację i testy. Nie zmieniaj drzewa. JSON: {{"verdict":"approve","notes":[]}} albo {{"verdict":"changes","notes":["konkretna poprawka"]}}."""
 
 
 def master_prompt(ledger_tail: str) -> str:
@@ -41,8 +34,11 @@ def master_prompt(ledger_tail: str) -> str:
 
 Zasady procesu, których pilnujesz:
 - tester pisze minimalny czerwony test i nie pisze kodu produkcyjnego;
-- koder zazielenia test; jeśli odsyła test jako błędny (test_changes_needed), musi wskazać konkretną linię i konkretną poprawkę;
-- runda ma posuwać zadanie do przodu: powtórzenie tej samej decyzji z `pliki=bez_zmian` to pętla, nie postęp (samo powtórzenie statusu przy `pliki=zmienione` bywa normalne);
+- koder zazielenia test; jeśli odsyła test jako błędny (`test_changes_needed`) albo potrzebuje decyzji testera (`tester_input_needed`), musi podać konkretny powód i następny krok;
+- wpis `pliki=[...]` pokazuje dokładne ścieżki zmienione w danej turze; jeśli koder zmienił test, nie blokuj zadania, tylko napisz testerowi, by świadomie ocenił tę zmianę i w razie potrzeby poprawił lub przywrócił test;
+- tester przekazuje uwagi koderowi przez `reason`, a koder testerowi przez `summary`; pilnuj, by odsyłali sobie konkretne informacje zamiast powtarzać status;
+- runda ma posuwać zadanie do przodu: powtórzenie tej samej decyzji z `pliki=bez_zmian` to pętla, nie postęp (samo powtórzenie statusu przy zmienionych plikach bywa normalne);
+- `recenzja→changes` zawsze rozpoczyna nowy cykl od testera; gdy kilka kolejnych recenzji wraca bez postępu albo z tym samym problemem, napisz testerowi wprost, by zakończył pętlę statusem blocked i podał konkretny powód;
 - planista tnie zadania tak, by mieściły się w budżecie rund; seria zadań ginących na round_limit oznacza, że tnie za grubo.
 
 DZIENNIK (najstarsze u góry):

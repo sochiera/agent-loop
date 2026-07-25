@@ -98,8 +98,8 @@ def test_commit_restart_does_not_enter_tdd_loop(tmp_path: Path) -> None:
     (tmp_path / "task.md").write_text("task", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True); subprocess.run(["git", "commit", "-qm", "seed"], cwd=tmp_path, check=True)
     subprocess.run(["git", "tag", "forge/task-start"], cwd=tmp_path, check=True)
-    state = State(current_task={"id": "task", "title": "Task", "file": "task.md", "difficulty": "simple"}, task_phase="commit", task_start_tag="forge/task-start", tester_decision={"status": "review"}, tester_handoff="old", coder_test_hash="hash")
+    state = State(current_task={"id": "task", "title": "Task", "file": "task.md", "difficulty": "simple"}, task_phase="commit", task_start_tag="forge/task-start", tester_decision={"status": "review"}, tester_handoff="old")
     with patch("forge.orchestrate.run_tdd_loop", side_effect=AssertionError("TDD must not run")), patch("forge.orchestrate.commit_all"):
         assert orchestrate.run_task(Config(git_push=False), str(tmp_path), state, lambda _: "log")
     assert state.current_task == {}
-    assert state.tester_decision == {} and state.tester_handoff == "" and state.coder_test_hash == ""
+    assert state.tester_decision == {} and state.tester_handoff == ""
