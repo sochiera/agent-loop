@@ -39,6 +39,14 @@ def test_bootstrap_creates_informational_project_instructions() -> None:
     assert "kontekst dostajesz w promptcie" in prompt
 
 
+def test_bootstrap_creates_indexed_documentation_layout() -> None:
+    prompt = prompts.bootstrap_prompt("brief")
+
+    assert "docs/ARCHITECTURE/00-INDEX.md" in prompt
+    assert "docs/DESIGN/00-INDEX.md" in prompt
+    assert "docs/DECISIONS/" in prompt
+
+
 def test_planner_declares_explicit_task_dependencies() -> None:
     prompt = prompts.plan_batch_prompt(4, 1)
 
@@ -71,3 +79,21 @@ def test_confirmation_prompt_only_checks_suite_and_untested_criteria() -> None:
     assert "czy pozostały nieprzetestowane kryteria akceptacji" in prompt
     assert "Nie oceniaj jakości implementacji" in prompt
     assert "świeżego reviewera" in prompt
+
+
+def test_planner_reads_small_indexes_and_archive_only_on_demand() -> None:
+    prompt = prompts.plan_batch_prompt(4, 1)
+
+    assert "docs/ARCHITECTURE/00-INDEX.md" in prompt
+    assert "docs/DESIGN/00-INDEX.md" in prompt
+    assert "BACKLOG-ARCHIVE.md" in prompt
+    assert "tylko do wglądu na żądanie" in prompt
+
+
+def test_coder_updates_documentation_through_indexes() -> None:
+    prompt = prompts.coder_task_prompt(
+        "task.md", "pytest", decision={"status": "red", "reason": "missing"})
+
+    assert "docs/ARCHITECTURE/00-INDEX.md" in prompt
+    assert "właściwego pliku wskazanego przez indeks" in prompt
+    assert "nowy plik" in prompt and "wpisem w indeksie" in prompt

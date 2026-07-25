@@ -699,6 +699,7 @@ def _prune_transcript_logs(log_dir: Path, current_iteration: int) -> None:
 
 _RUNTIME_KEEP_ITEMS = 20
 _DOC_SIZE_LIMIT = 20_000
+_DOC_INDEX_SIZE_LIMIT = 2_000
 
 
 def _housekeeping(cfg: Config, project: str) -> None:
@@ -747,17 +748,27 @@ def _flag_oversized_docs(project: str) -> None:
             size = path.stat().st_size
         except OSError:
             continue
-        if size > _DOC_SIZE_LIMIT:
-            oversized.append((path.relative_to(project).as_posix(), size))
+        is_index = path.name == "00-INDEX.md"
+        limit = _DOC_INDEX_SIZE_LIMIT if is_index else _DOC_SIZE_LIMIT
+        if size > limit:
+            oversized.append((
+                path.relative_to(project).as_posix(), size, is_index))
     if not oversized:
         return
     backlog = Path(project, "BACKLOG.md")
     existing = backlog.read_text(encoding="utf-8") if backlog.exists() else ""
-    additions = [
-        f"- Dług dokumentacji: `{name}` ma {size // 1000} KB "
-        "— zaplanuj podział pliku.\n"
-        for name, size in oversized if f"`{name}`" not in existing
-    ]
+    additions = []
+    for name, size, is_index in oversized:
+        if f"`{name}`" in existing:
+            continue
+        if is_index:
+            additions.append(
+                f"- Dług dokumentacji: indeks `{name}` ma {size // 1000} KB "
+                "i przekroczył limit 2 KB — skróć mapę obszarów.\n")
+        else:
+            additions.append(
+                f"- Dług dokumentacji: `{name}` ma {size // 1000} KB "
+                "— zaplanuj podział pliku.\n")
     if additions:
         with backlog.open("a", encoding="utf-8") as target:
             target.writelines(additions)

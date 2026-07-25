@@ -160,3 +160,16 @@ def test_housekeeping_runs_before_planner(tmp_path) -> None:
             lambda phase: phase)
 
     assert events == ["housekeeping", "planner"]
+
+
+def test_housekeeping_flags_oversized_documentation_index(tmp_path) -> None:
+    index = tmp_path / "docs" / "ARCHITECTURE" / "00-INDEX.md"
+    index.parent.mkdir(parents=True)
+    index.write_text("x" * 2_001, encoding="utf-8")
+
+    _housekeeping(Config(), str(tmp_path))
+
+    backlog = (tmp_path / "BACKLOG.md").read_text(encoding="utf-8")
+    assert "docs/ARCHITECTURE/00-INDEX.md" in backlog
+    assert "indeks" in backlog
+    assert "2 KB" in backlog
