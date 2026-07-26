@@ -264,7 +264,9 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         for agent, role, difficulty, expected in (
             ("grok", "coder", "complex", ("grok-4.5", "medium")),
             ("opencode", "reviewer", "complex",
-             ("neuralwatt/glm-5.2-flex", "high")),
+             ("neuralwatt/glm-5.2-short-flex", "medium")),
+            ("opencode", "coder", "simple",
+             ("neuralwatt/qwen3.6-35b-fast", "")),
         ):
             cfg = Config(**{f"{role}_agent": agent})
             _, model, effort = cfg.role(role, difficulty)
@@ -277,7 +279,11 @@ class ConfigRoleResolutionTest(unittest.TestCase):
             )
             self.assertEqual((model, effort), expected)
             self.assertIn(model, argv)
-            self.assertIn(effort, argv)
+            if effort:
+                self.assertIn(effort, argv)
+            else:
+                # Model bez wsparcia dla --variant nie może dostać wiszącej flagi.
+                self.assertNotIn("--variant", argv)
 
 
 class RunGenericAgentTest(unittest.TestCase):
