@@ -6,7 +6,11 @@ import json
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pytest
+
+from forge import agents
 from forge.agents import (
+    AgentError,
     _aggregated_output_chars,
     _append_log,
     _isolated_agent_env,
@@ -148,12 +152,15 @@ def test_thin_codex_falls_back_to_normal_call_with_complete_prompt(
     assert "journal" in prompt
 
 
-def test_thin_opencode_injects_tool_free_agent_and_extracts_text_event(
-        tmp_path: Path) -> None:
-    stream = json.dumps({
-        "type": "text",
-        "part": {"text": '{"tester":"","coder":"","planner":""}'},
-    })
+def _run_thin_opencode(tmp_path: Path, monkeypatch, stream: str) -> tuple:
+    """Tryb cienki opencode z podstawioną konfiguracją użytkownika."""
+    config_home = tmp_path / "xdg"
+    (config_home / "opencode").mkdir(parents=True)
+    (config_home / "opencode" / "opencode.json").write_text(
+        json.dumps({"provider": {"neuralwatt": {"npm": "@ai-sdk/openai"}}}),
+        encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     captured = {}
 
     def backoff(argv, cwd, cfg, log_path, stdin_text=None, env=None):
@@ -166,13 +173,51 @@ def test_thin_opencode_injects_tool_free_agent_and_extracts_text_event(
             "opencode", "journal", Config(), str(tmp_path),
             str(tmp_path / "log"), thin=True, system_prompt="stable rules",
             json_schema="{}")
+    return captured, result
+
+
+def test_thin_opencode_injects_tool_free_agent_and_extracts_text_event(
+        tmp_path: Path, monkeypatch) -> None:
+    stream = json.dumps({
+        "type": "text",
+        "part": {"text": '{"tester":"","coder":"","planner":""}'},
+    })
+    captured, result = _run_thin_opencode(tmp_path, monkeypatch, stream)
 
     inline = json.loads(captured["env"]["OPENCODE_CONFIG_CONTENT"])
     agent = inline["agent"]["forge-thin"]
-    assert agent["tools"] is False
+    # Schemat agenta oczekuje mapy nazwa→bool, nie samego ``false``.
+    assert agent["tools"] and all(
+        value is False for value in agent["tools"].values())
     assert agent["prompt"] == "stable rules"
     assert "--pure" in captured["argv"]
     assert result == '{"tester":"","coder":"","planner":""}'
+
+
+def test_thin_opencode_keeps_user_provider_config(
+        tmp_path: Path, monkeypatch) -> None:
+    """Podstawienie treści konfiguracji nie może skasować bloku ``provider`` —
+    bez niego ``-m neuralwatt/...`` nie rozwiąże się na dostawcę."""
+    captured, _ = _run_thin_opencode(
+        tmp_path, monkeypatch,
+        json.dumps({"type": "text", "part": {"text": "{}"}}))
+
+    inline = json.loads(captured["env"]["OPENCODE_CONFIG_CONTENT"])
+    assert inline["provider"] == {"neuralwatt": {"npm": "@ai-sdk/openai"}}
+    assert "forge-thin" in inline["agent"]
+
+
+def test_thin_opencode_deduplicates_streamed_part_updates(
+        tmp_path: Path, monkeypatch) -> None:
+    """Strumień emituje tę samą część w miarę jak rośnie; sklejenie wszystkich
+    wystąpień dałoby wielokrotnie powtórzoną odpowiedź."""
+    growing = ['{"tester":', '{"tester":"",', '{"tester":"","coder":""}']
+    stream = "\n".join(
+        json.dumps({"part": {"id": "prt_1", "type": "text", "text": text}})
+        for text in growing)
+    _, result = _run_thin_opencode(tmp_path, monkeypatch, stream)
+
+    assert result == '{"tester":"","coder":""}'
 
 
 def test_isolated_cli_homes_link_auth_but_not_global_instructions(
@@ -253,3 +298,75 @@ def test_large_tool_output_is_reported_to_project_ledger(
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_failed_codex_resume_falls_back_to_a_new_session(tmp_path: Path) -> None:
+    """Przeniesienie CODEX_HOME (izolacja instrukcji) unieważnia zapisane id
+    wątków. Nieudany resume nie może zatrzymywać całej pętli."""
+    calls: list[list[str]] = []
+
+    def backoff(argv, cwd, cfg, log_path, stdin_text=None, env=None,
+                ledger_project=""):
+        calls.append(argv)
+        if "resume" in argv:
+            raise AgentError("agent zwrócił kod 1. Ogon:\nsession not found")
+        return json.dumps({"type": "thread.started", "thread_id": "new-id"})
+
+    with patch("forge.agents._run_with_backoff", side_effect=backoff):
+        _out, sid = agents.run_codex_session(
+            "prompt", Config(), str(tmp_path), str(tmp_path / "log"),
+            session_id="stale-id")
+
+    assert len(calls) == 2
+    assert "resume" in calls[0] and "stale-id" in calls[0]
+    assert "resume" not in calls[1]
+    assert sid == "new-id"
+
+
+def test_failed_first_codex_session_still_raises(tmp_path: Path) -> None:
+    with patch("forge.agents._run_with_backoff",
+               side_effect=AgentError("crash")):
+        with pytest.raises(AgentError):
+            agents.run_codex_session(
+                "prompt", Config(), str(tmp_path), str(tmp_path / "log"))
+
+
+def test_claude_thin_template_never_bypasses_native_handling(
+        tmp_path: Path, monkeypatch) -> None:
+    """Ścieżka generyczna gubi wykrywanie limitów, `is_error` i telemetrię
+    zużycia, a claude ma natywny tryb cienki — więc natywny musi wygrać."""
+    monkeypatch.setenv("FORGE_AGENT_CLAUDE_THIN_CMD", "custom-claude {prompt}")
+
+    with patch("forge.agents.run_claude", return_value="{}") as native, \
+         patch("forge.agents._run_generic") as generic:
+        run_agent("claude", "journal", Config(), str(tmp_path),
+                  str(tmp_path / "log"), thin=True, system_prompt="rules")
+
+    native.assert_called_once()
+    assert native.call_args.kwargs["thin"] is True
+    assert native.call_args.kwargs["system_prompt"] == "rules"
+    generic.assert_not_called()
+
+
+def test_codex_sandbox_defaults_to_workspace_but_keeps_network(
+        tmp_path: Path) -> None:
+    """Zawężamy zasięg PLIKÓW (żeby `find ..` nie schodził do sąsiednich
+    repozytoriów), ale nie odcinamy sieci — to psułoby buildy."""
+    with patch("forge.agents._run_with_backoff", return_value="") as run:
+        run_codex("prompt", Config(), str(tmp_path), str(tmp_path / "log"))
+
+    argv = run.call_args.args[0]
+    assert argv[argv.index("-s") + 1] == "workspace-write"
+    assert "sandbox_workspace_write.network_access=true" in argv
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+
+
+def test_full_access_sandbox_stays_available_as_an_opt_in(
+        tmp_path: Path) -> None:
+    cfg = Config(codex_sandbox="danger-full-access")
+    with patch("forge.agents._run_with_backoff", return_value="") as run:
+        run_codex("prompt", cfg, str(tmp_path), str(tmp_path / "log"))
+
+    argv = run.call_args.args[0]
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    assert "-s" not in argv

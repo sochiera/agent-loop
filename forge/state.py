@@ -26,6 +26,7 @@ class State:
     tester_handoff: str = ""
     coder_summary: str = ""
     no_change_rounds: int = 0
+    suite_regression: bool = False
     round_changed: bool = False
     tester_record: str = ""
     coder_record: str = ""

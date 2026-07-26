@@ -217,6 +217,32 @@ def test_full_suite_failure_after_review_returns_to_tester_without_commit(
         tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "seed"
 
 
+def test_tester_works_on_full_suite_after_gate_regression(
+        tmp_path: Path) -> None:
+    """Regresję wykrytą pełnym pakietem trzeba naprawiać pełnym pakietem —
+    test ukierunkowany z definicji jej nie odtworzy."""
+    task, state, cfg = _task_repo(tmp_path)
+    prompts_seen: list[str] = []
+
+    def role_call(_cfg, _project, _state, role, prompt, _log):
+        prompts_seen.append(prompt)
+        return '{"status":"review"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent",
+               return_value='{"verdict":"approve"}'), \
+         patch("forge.orchestrate.build_then_test_result",
+               return_value=(False, "FAIL integration_test")):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+        assert state.suite_regression
+        prompts_seen.clear()
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert state.test_cmd in prompts_seen[0]
+    assert task["targeted_test_cmd"] not in prompts_seen[0]
+
+
 def test_tdd_uses_targeted_command_but_commit_gate_uses_full_suite(
         tmp_path: Path) -> None:
     task, state, cfg = _task_repo(tmp_path)

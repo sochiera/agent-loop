@@ -29,7 +29,7 @@ Zwróć teraz wyłącznie jeden poprawny obiekt JSON w formacie podanym wyżej.
 _TASK_STATE_FIELDS = (
     "current_task", "task_phase", "tdd_round",
     "tester_session", "coder_session", "tester_decision", "tester_handoff",
-    "coder_summary", "no_change_rounds", "round_changed",
+    "coder_summary", "no_change_rounds", "round_changed", "suite_regression",
     "tester_record", "coder_record", "review_notes", "corrections_done",
     "corrections_tree_hash", "task_start_tag", "coder_tree_hash",
 )
@@ -438,6 +438,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         state.tester_handoff = str(task.get("batch_handoff", "")).strip()
         state.no_change_rounds = 0
         state.round_changed = False
+        state.suite_regression = False
         _checkpoint(project, state, "tester")
         log(f"Zadanie {task['id']} — {task['title']} (trudność: {task['difficulty']})")
         ledger.append(project, f"{task['id']} start: {task['title']} ({task['difficulty']})")
@@ -488,8 +489,10 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             state.round_changed = False
             confirmation = bool(
                 state.coder_summary and handoff == state.coder_summary)
+            # Regresja wykryta bramką dotyczy PEŁNEGO pakietu — testu
+            # ukierunkowanego nie da się na niej odtworzyć.
             test_cmd = (
-                state.test_cmd if confirmation
+                state.test_cmd if confirmation or state.suite_regression
                 else task.get("targeted_test_cmd") or state.test_cmd
             )
             return run_turn("tester", prompts.tester_task_prompt(
@@ -582,9 +585,11 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
     suite_green, suite_output = build_then_test_result(
         project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
     if not suite_green:
+        state.suite_regression = True
         state.tester_handoff = (
             "Deterministyczna bramka przed commitem wykazała, że pełny pakiet "
-            "jest czerwony po tym zadaniu. Oceń ogon wyniku, napraw albo zwróć "
+            f"jest czerwony po tym zadaniu. Pracuj na `{state.test_cmd}`, nie "
+            "na teście ukierunkowanym. Oceń ogon wyniku, napraw albo zwróć "
             f"`blocked` z konkretnym powodem:\n{suite_output[-2000:]}"
         )
         _checkpoint(project, state, "tester")

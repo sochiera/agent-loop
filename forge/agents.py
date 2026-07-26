@@ -565,6 +565,11 @@ def _codex_argv(a, cfg: Config, project_dir: str, last_msg: str, prompt: str,
         common += ["--dangerously-bypass-approvals-and-sandbox"]
     else:
         common += ["-s", cfg.codex_sandbox]
+        if cfg.codex_sandbox == "workspace-write":
+            # Zawężamy ZASIĘG PLIKÓW, nie możliwości agenta: bez tej linii
+            # workspace-write odcina też sieć i psuje buildy pobierające
+            # zależności. Celem jest brak wyjścia do sąsiednich repozytoriów.
+            common += ["-c", "sandbox_workspace_write.network_access=true"]
 
     if resume_id:
         argv += common + ["-C", project_dir, "exec", "resume"]
@@ -633,9 +638,22 @@ def run_codex_session(prompt: str, cfg: Config, project_dir: str, log_path: str,
     last_msg = _prepare_last_msg_file(project_dir, cfg)
     argv = _codex_argv(a, cfg, project_dir, last_msg, prompt,
                        json_stream=True, resume_id=session_id)
-    stream = _run_with_backoff(
-        argv, project_dir, cfg, log_path,
-        env=_isolated_agent_env("codex"))
+    env = _isolated_agent_env("codex")
+    try:
+        stream = _run_with_backoff(argv, project_dir, cfg, log_path, env=env)
+    except AgentError:
+        if not session_id:
+            raise
+        # Wątek może zniknąć: czyszczenie po stronie CLI albo przeniesienie
+        # CODEX_HOME (izolacja instrukcji) unieważnia stare id. Utrata historii
+        # jest tańsza niż zatrzymanie pętli — prompt roli niesie handoff.
+        log(f"  agent[{_phase_from_log(log_path)}] resume nieudany "
+            f"(sesja {session_id}) — startuję nową sesję")
+        session_id = None
+        last_msg = _prepare_last_msg_file(project_dir, cfg)
+        argv = _codex_argv(a, cfg, project_dir, last_msg, prompt,
+                           json_stream=True, resume_id=None)
+        stream = _run_with_backoff(argv, project_dir, cfg, log_path, env=env)
     sid = session_id or extract_session_id(stream)
     cumulative = extract_codex_usage(stream)
     if cumulative and sid:
@@ -673,19 +691,9 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
     argv = adapters.expand_template(spec.template, subs)
     if not argv:
         raise AgentError(f"Pusty szablon komendy dla agenta '{spec.name}'.")
-    process_env = None
-    if thin and spec.name == "opencode":
-        process_env = os.environ.copy()
-        process_env["OPENCODE_CONFIG_CONTENT"] = json.dumps({
-            "agent": {
-                "forge-thin": {
-                    "description": "Forge tool-free advisory role",
-                    "mode": "primary",
-                    "prompt": system_prompt,
-                    "tools": False,
-                },
-            },
-        }, ensure_ascii=False)
+    process_env = (
+        _opencode_thin_env(system_prompt)
+        if thin and spec.name == "opencode" else None)
     kwargs = {}
     if process_env is not None:
         kwargs["env"] = process_env
@@ -702,22 +710,79 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
     return stream
 
 
+# Narzędzia opencode wyłączane w roli doradczej. Schemat agenta oczekuje mapy
+# nazwa→bool; samo ``false`` nie jest poprawną wartością pola ``tools``.
+_OPENCODE_TOOLS = (
+    "bash", "edit", "write", "read", "grep", "glob", "list", "patch",
+    "todowrite", "todoread", "webfetch", "task",
+)
+
+
+def _opencode_user_config() -> dict:
+    """Konfiguracja użytkownika, którą tryb cienki ROZSZERZA, nie zastępuje.
+
+    ``OPENCODE_CONFIG_CONTENT`` podstawia całą konfigurację, więc wysłanie
+    samej definicji agenta skasowałoby blok ``provider`` — a to on mapuje
+    ``-m <provider>/<model>`` na realnego dostawcę."""
+    candidates = []
+    explicit = os.environ.get("OPENCODE_CONFIG", "").strip()
+    if explicit:
+        candidates.append(explicit)
+    config_home = (os.environ.get("XDG_CONFIG_HOME")
+                   or os.path.join(os.path.expanduser("~"), ".config"))
+    candidates.append(os.path.join(config_home, "opencode", "opencode.json"))
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def _opencode_thin_env(system_prompt: str) -> dict[str, str]:
+    config = _opencode_user_config()
+    agents = dict(config.get("agent") or {})
+    agents["forge-thin"] = {
+        "description": "Forge tool-free advisory role",
+        "mode": "primary",
+        "prompt": system_prompt,
+        "tools": {name: False for name in _OPENCODE_TOOLS},
+    }
+    config["agent"] = agents
+    env = os.environ.copy()
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, ensure_ascii=False)
+    return env
+
+
 def _extract_opencode_text(stream: str) -> str:
-    """Złóż tekst odpowiedzi z surowych zdarzeń ``--format json``."""
-    chunks: list[str] = []
+    """Złóż tekst odpowiedzi z surowych zdarzeń ``--format json``.
+
+    Strumień emituje TĘ SAMĄ część wielokrotnie, w miarę jak rośnie, więc
+    sklejenie wszystkich wystąpień dałoby tekst powtórzony kilkadziesiąt razy.
+    Trzymamy ostatnią wersję każdej części w kolejności pierwszego wystąpienia;
+    część bez identyfikatora trafia do wspólnego kubełka (wygrywa ostatnia)."""
+    parts: dict[str, str] = {}
     for line in stream.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        part = event.get("part") if isinstance(event, dict) else None
-        if isinstance(part, dict) and part.get("type", "text") == "text":
-            if isinstance(part.get("text"), str):
-                chunks.append(part["text"])
-        elif (isinstance(event, dict) and event.get("type") == "text"
-              and isinstance(event.get("text"), str)):
-            chunks.append(event["text"])
-    return "".join(chunks) or stream
+        if not isinstance(event, dict):
+            continue
+        inner = event.get("part")
+        part = inner if isinstance(inner, dict) else event
+        # Typ bywa na części albo na obejmującym ją zdarzeniu — sprawdzamy oba,
+        # żeby nie brać za tekst bloków `reasoning`, `tool` czy `step-start`.
+        if (part.get("type") or event.get("type")) != "text":
+            continue
+        text = part.get("text")
+        if not isinstance(text, str):
+            continue
+        parts[str(part.get("id") or event.get("id") or "")] = text
+    return "".join(parts.values()) or stream
 
 
 def _complete_prompt(system_prompt: str, prompt: str) -> str:
@@ -735,16 +800,21 @@ def run_agent(name: str, prompt: str, cfg: Config, project_dir: str, log_path: s
     kieruje telemetrię poza katalog roboczy (rola pracująca w sandboxie)."""
     name = adapters.canonical_agent(name)
     thin_adapter = adapters.thin_spec(name) if thin else None
-    if thin_adapter is not None and name in adapters.BUILTIN_AGENTS:
-        return _run_generic(
-            thin_adapter, prompt, cfg, project_dir, log_path,
-            model=model, effort=effort, usage_dir=usage_dir, thin=True,
-            system_prompt=system_prompt, json_schema=json_schema)
     if name == "claude":
+        # Natywny tryb cienki (--system-prompt/--tools "") wygrywa z szablonem:
+        # ścieżka generyczna gubi wykrywanie limitów, `is_error` i telemetrię
+        # zużycia, a claude potrafi zrobić dokładnie to samo bez tych strat.
         return run_claude(prompt, cfg, project_dir, log_path, model=model,
                           effort=effort, mcp_config=mcp_config, usage_dir=usage_dir,
                           thin=thin, system_prompt=system_prompt)
     if name == "codex":
+        # Codex nie ma flag trybu cienkiego, więc własny szablon operatora jest
+        # tu jedyną drogą do oszczędności — i dlatego ma pierwszeństwo.
+        if thin_adapter is not None:
+            return _run_generic(
+                thin_adapter, prompt, cfg, project_dir, log_path,
+                model=model, effort=effort, usage_dir=usage_dir, thin=True,
+                system_prompt=system_prompt, json_schema=json_schema)
         return run_codex(_complete_prompt(system_prompt, prompt) if thin else prompt,
                          cfg, project_dir, log_path, model=model,
                          effort=effort, usage_dir=usage_dir)
