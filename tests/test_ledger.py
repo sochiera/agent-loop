@@ -81,6 +81,44 @@ def test_compact_tail_for_master_limits_lines_and_width(tmp_path: Path) -> None:
     assert "task-029" in lines[-1]
 
 
+def test_compact_tail_keeps_file_list_and_cuts_the_reason(tmp_path: Path) -> None:
+    """Lista plików to jedyny sygnał postępu, jaki mistrz ma — powód jest
+    dla niego dodatkiem, więc to powód ma ustąpić przy cięciu."""
+    ledger.append(
+        str(tmp_path),
+        "task-001 r3 koder→green pliki=[app/core.py, app/model.py, "
+        "tests/test_core.py]: " + "powód " * 40,
+    )
+
+    line = ledger.compact_tail(str(tmp_path)).splitlines()[0]
+
+    assert "tests/test_core.py]" in line
+    assert len(line) < 200
+
+
+def test_round_limit_tasks_are_visible_beyond_the_master_window(
+        tmp_path: Path) -> None:
+    """Zadanie idące na limit rund zajmuje więcej linii niż całe okno mistrza,
+    więc bez osobnego licznika reguła o zbyt grubych zadaniach jest martwa."""
+    for task in ("task-001", "task-002"):
+        for round_no in range(1, 11):
+            ledger.append(str(tmp_path), f"{task} r{round_no} tester→red pliki=bez_zmian: x")
+            ledger.append(str(tmp_path), f"{task} r{round_no} koder→green pliki=[a.py]: x")
+        ledger.append(
+            str(tmp_path),
+            f"{task} PORZUCONE: round_limit: zadanie wymaga podziału (limit 10)")
+
+    assert "task-001" not in ledger.compact_tail(str(tmp_path))
+    assert ledger.round_limit_tasks(str(tmp_path)) == ["task-001", "task-002"]
+
+
+def test_round_limit_tasks_ignores_other_failures(tmp_path: Path) -> None:
+    ledger.append(str(tmp_path), "task-001 PORZUCONE: tester zwrócił blocked")
+    ledger.append(str(tmp_path), "task-002 UKOŃCZONE po 3 rundach")
+
+    assert ledger.round_limit_tasks(str(tmp_path)) == []
+
+
 def test_missing_ledger_reads_as_empty(tmp_path: Path) -> None:
     assert ledger.tail(str(tmp_path)) == ""
 

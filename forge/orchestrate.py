@@ -308,7 +308,8 @@ def _master_notes(cfg: Config, project: str, logf) -> dict[str, str]:
     agent, model, effort = cfg.role("master")
     # Rola doradcza nie ma prawa przespać godzin backoffu przed realną pracą.
     advisory = replace(cfg, max_limit_retries=0)
-    prompt = prompts.master_ledger_prompt(ledger.compact_tail(project))
+    prompt = prompts.master_ledger_prompt(
+        ledger.compact_tail(project), ledger.round_limit_tasks(project))
     try:
         with tempfile.TemporaryDirectory(prefix="forge-master-") as sandbox:
             # Sandbox jest katalogiem roboczym, ale koszt roli wołanej co rundę

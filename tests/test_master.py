@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -66,18 +67,92 @@ def _one_round(tmp_path: Path):
 
 # --- Prompt mistrza ---------------------------------------------------------
 
+def _flat(text: str) -> str:
+    """Prompt jest zawijany dla czytelności — asercje mają pilnować treści,
+    nie miejsca łamania linii."""
+    return " ".join(text.split())
+
+
 def test_master_prompt_is_process_only_and_carries_ledger() -> None:
-    prompt = prompts.master_prompt(
-        "[10:00] task-001 r1 koder→green pliki=[tests/test_app.py]")
+    prompt = _flat(prompts.master_prompt(
+        "[10:00] task-001 r1 koder→green pliki=[tests/test_app.py]"))
 
     assert "MISTRZ" in prompt
     assert "tests/test_app.py" in prompt
-    assert "napisz testerowi" in prompt
-    assert "recenzja→changes" in prompt
-    assert "statusem blocked" in prompt
+    assert "poproś testera o świadomą ocenę" in prompt
+    assert "`recenzja→changes`" in prompt
+    assert "nie sugeruj rozwiązań technicznych" in prompt
     # Milczenie jest odpowiedzią domyślną — inaczej mistrz zatruwa każdy prompt.
     assert "pust" in prompt.lower()
     assert '"tester"' in prompt and '"coder"' in prompt and '"planner"' in prompt
+
+
+def test_master_knows_process_and_legal_code_status() -> None:
+    prompt = _flat(prompts.master_system_prompt())
+
+    assert "`red` i `code` przekazują pracę koderowi" in prompt
+    assert "`code` jest legalne" in prompt
+    assert "`recenzja→changes`" in prompt
+    assert "`recenzja→approve`" in prompt
+    assert "pełnej bramki testów" in prompt
+
+
+def test_master_only_intervenes_on_observable_process_patterns() -> None:
+    prompt = _flat(prompts.master_system_prompt())
+
+    assert "co najmniej dwie kolejne tury" in prompt
+    assert "zmianę pliku testowego przez kodera" in prompt
+    assert "kolejne `recenzja→changes` bez zmian" in prompt
+    assert "co najmniej dwa zadania na liście `round_limit`" in prompt
+    assert "nie oceniaj poprawności implementacji" in prompt
+    assert "kompletności `reason`/`summary`" in prompt
+    assert "UKOŃCZONE" in prompt and "PORZUCONE" in prompt
+    assert "Nie uzupełniaj brakujących informacji domysłami" in prompt
+
+
+def test_every_intervention_rule_says_what_to_ask_for() -> None:
+    """Reguła bez zaleconego działania zmusza mistrza do improwizacji —
+    a improwizacja to dokładnie ta merytoryka, której ma nie uprawiać."""
+    block = prompts.master_system_prompt().partition(
+        "Interweniuj tylko")[2].partition("\n\n")[0]
+    rules = [_flat(rule) for rule in block.split("\n- ")[1:]]
+
+    assert len(rules) == 4
+    for rule in rules:
+        assert "—" in rule, f"reguła bez zalecenia: {rule}"
+
+
+def test_round_limit_rule_survives_the_ban_on_finished_tasks() -> None:
+    """`round_limit` kończy zadanie jako PORZUCONE, więc bez wyjątku wprost
+    obie reguły promptu wskazują przeciwnie."""
+    assert "obowiązuje mimo `PORZUCONE`" in _flat(
+        prompts.master_system_prompt())
+
+
+def test_master_prompt_uses_vocabulary_the_ledger_actually_writes(
+        tmp_path: Path) -> None:
+    """Prompt każe dopasowywać wzorce dosłownie, więc jego słownik musi
+    pochodzić z dziennika, a nie z tłumaczenia nazw ról (`recenzja` ≠ `review`).
+    """
+    _task, state, cfg = _task_repo(tmp_path)
+    role_call, _seen = _one_round(tmp_path)
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}'):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    def labels(text: str) -> set[str]:
+        return set(re.findall(r"(\w+)→", text))
+
+    written = labels(ledger.tail(str(tmp_path)))
+    prompt = prompts.master_system_prompt()
+
+    assert {"tester", "koder", "recenzja"} <= written
+    assert written >= labels(prompt), (
+        f"prompt mówi o zdarzeniach, których dziennik nie zapisuje: "
+        f"{labels(prompt) - written}")
+    assert all(label in prompt for label in written)
 
 
 def test_empty_note_adds_nothing_to_prompt() -> None:
@@ -152,10 +227,27 @@ def test_master_receives_compact_ledger_view(tmp_path: Path) -> None:
 
     prompt = run.call_args.args[1]
     journal = prompt.split("DZIENNIK (najstarsze u góry):\n", 1)[1]
-    journal = journal.split("\n\nJeśli proces", 1)[0]
     lines = journal.splitlines()
     assert len(lines) == 20
     assert all(len(line) <= 120 for line in lines)
+
+
+def test_master_receives_round_limit_failures_it_cannot_see_in_the_window(
+        tmp_path: Path) -> None:
+    """Reguła o zbyt grubych zadaniach potrzebuje dwóch porażek, a te nigdy
+    nie mieszczą się razem w oknie dziennika."""
+    ledger.append(str(tmp_path), "task-001 PORZUCONE: round_limit: limit 10")
+    for index in range(25):
+        ledger.append(str(tmp_path), f"task-002 r{index} tester→red pliki=bez_zmian: x")
+    ledger.append(str(tmp_path), "task-002 PORZUCONE: round_limit: limit 10")
+
+    with patch("forge.orchestrate.run_agent", return_value="{}") as run:
+        orchestrate._master_notes(
+            Config(), str(tmp_path), lambda phase: str(tmp_path / f"{phase}.log"))
+
+    prompt = run.call_args.args[1]
+    assert "task-001" not in prompt.split("DZIENNIK", 1)[1]
+    assert "round_limit (cała pamięć dziennika): task-001, task-002" in prompt
 
 
 def test_master_declares_thin_advisory_role(tmp_path: Path) -> None:

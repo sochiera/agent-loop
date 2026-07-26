@@ -56,30 +56,63 @@ def review_task_prompt_kiss(task_file: str, *, start_tag: str, changed: list[str
     return f"""ROLA: świeży, read-only reviewer. Przeczytaj {task_file}, `git diff {start_tag}` oraz zmienione pliki {changed}. Oceń cały kontrakt, implementację i testy. Nie zmieniaj drzewa. JSON: {{"verdict":"approve","notes":[]}} albo {{"verdict":"changes","notes":["konkretna poprawka"]}}."""
 
 
-def master_prompt(ledger_tail: str) -> str:
+def master_prompt(ledger_tail: str, round_limit_tasks: list[str] | None = None) -> str:
     """Mistrz kuźni: pilnuje PROCESU, nie kodu. Widzi wyłącznie dziennik."""
-    return master_system_prompt() + "\n\n" + master_ledger_prompt(ledger_tail)
+    return (master_system_prompt() + "\n\n"
+            + master_ledger_prompt(ledger_tail, round_limit_tasks))
 
 
 def master_system_prompt() -> str:
-    return """ROLA: MISTRZ kuźni — nadzorca procesu. Nie czytasz repo, nie uruchamiasz testów, nie zmieniasz plików. Sterujesz zespołem wyłącznie krótką notatką doklejaną do promptu roli.
+    return """ROLA: MISTRZ — doradczy obserwator procesu Forge.
 
-Zasady procesu, których pilnujesz:
-- tester pisze minimalny czerwony test i nie pisze kodu produkcyjnego;
-- koder zazielenia test; jeśli odsyła test jako błędny (`test_changes_needed`) albo potrzebuje decyzji testera (`tester_input_needed`), musi podać konkretny powód i następny krok;
-- wpis `pliki=[...]` pokazuje dokładne ścieżki zmienione w danej turze; jeśli koder zmienił test, nie blokuj zadania, tylko napisz testerowi, by świadomie ocenił tę zmianę i w razie potrzeby poprawił lub przywrócił test;
-- tester przekazuje uwagi koderowi przez `reason`, a koder testerowi przez `summary`; pilnuj, by odsyłali sobie konkretne informacje zamiast powtarzać status;
-- runda ma posuwać zadanie do przodu: powtórzenie tej samej decyzji z `pliki=bez_zmian` to pętla, nie postęp (samo powtórzenie statusu przy zmienionych plikach bywa normalne);
-- `recenzja→changes` zawsze rozpoczyna nowy cykl od testera; gdy kilka kolejnych recenzji wraca bez postępu albo z tym samym problemem, napisz testerowi wprost, by zakończył pętlę statusem blocked i podał konkretny powód;
-- planista tnie zadania tak, by mieściły się w budżecie rund; seria zadań ginących na round_limit oznacza, że tnie za grubo.
+Forge prowadzi zadanie przez małą pętlę:
+1. tester wybiera `red`, `code`, `review` albo `blocked`;
+2. `red` i `code` przekazują pracę koderowi;
+3. koder zwraca `green` albo odsyła sprawę testerowi;
+4. po `green` tester potwierdza wynik i kieruje zadanie do review albo
+   rozpoczyna następny cykl;
+5. `recenzja→changes` rozpoczyna kolejny cykl od testera;
+6. `recenzja→approve` prowadzi do pełnej bramki testów i commita; regresja
+   bramki albo pliki ruszone przez reviewera wracają do testera.
 
-Jeśli proces idzie normalnie, zwróć puste stringi — to odpowiedź domyślna i oczekiwana. Odezwij się tylko, gdy widzisz pętlę albo złamaną zasadę: nazwij konkretne zachowanie z dziennika i powiedz wprost, co ma zostać zrobione inaczej. Nie zmieniaj kryteriów zadania i nie sugeruj rozwiązania merytorycznego — sterujesz procesem.
+`code` jest legalne — oznacza, że nie potrzeba nowej czerwonej bramki.
+`pliki=bez_zmian` nie jest samo w sobie błędem. Jego powtarzanie razem z tą
+samą decyzją może oznaczać pętlę.
+
+Jesteś wyłącznie doradcą. Możesz dodać krótką uwagę do promptu testera,
+kodera albo planisty. Nie sterujesz stanem, nie zmieniasz kryteriów zadania
+i nie decydujesz o jego ukończeniu.
+
+Dostajesz wyłącznie skompaktowany dziennik zdarzeń oraz listę zadań padłych
+na `round_limit`. Nie czytaj repo, nie uruchamiaj narzędzi i nie oceniaj
+poprawności implementacji, testów, wyboru `red`/`code` ani kompletności
+`reason`/`summary`.
+
+Interweniuj tylko, gdy dane bezpośrednio pokazują:
+- co najmniej dwie kolejne tury tej samej roli z tą samą decyzją i
+  `pliki=bez_zmian` — zacytuj powtarzany wpis i poproś tę rolę o zmianę
+  podejścia albo o `blocked` z konkretnym powodem;
+- zmianę pliku testowego przez kodera — poproś testera o świadomą ocenę;
+- kolejne `recenzja→changes` bez zmian w plikach — poproś testera, by przerwał
+  pętlę: wdrożył uwagi recenzji albo zwrócił `blocked` z konkretnym powodem;
+- co najmniej dwa zadania na liście `round_limit` — poproś planistę o mniejsze
+  zadania. Ta uwaga dotyczy planisty, więc obowiązuje mimo `PORZUCONE`.
+
+Poza nią nie wydawaj wskazówek dotyczących zadania, które późniejszy wpis
+oznacza jako `UKOŃCZONE` albo `PORZUCONE`. Nie uzupełniaj brakujących
+informacji domysłami i nie sugeruj rozwiązań technicznych. Gdy nie ma
+jednoznacznego problemu, zwróć puste stringi.
 
 JSON: {"tester":"","coder":"","planner":""}."""
 
 
-def master_ledger_prompt(ledger_tail: str) -> str:
-    return f"""ROLA: MISTRZ. Przeanalizuj wyłącznie poniższy dziennik procesu.
+def master_ledger_prompt(ledger_tail: str, round_limit_tasks: list[str] | None = None) -> str:
+    # Zadania na round_limit liczone są z całej pamięci dziennika: dwa takie
+    # zadania nigdy nie zmieszczą się razem w oknie widzianym przez mistrza.
+    failures = ", ".join(round_limit_tasks or []) or "(brak)"
+    return f"""ROLA: MISTRZ. Przeanalizuj wyłącznie poniższe dane procesu.
+
+ZADANIA PADŁE NA round_limit (cała pamięć dziennika): {failures}
 
 DZIENNIK (najstarsze u góry):
 {ledger_tail or '(pusty)'}

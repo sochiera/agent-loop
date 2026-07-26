@@ -16,6 +16,7 @@ KEEP_LINES = 80
 MAX_ENTRY = 300
 MASTER_LINES = 20
 MASTER_WIDTH = 120
+MASTER_FILES = 160
 _FILE = "ledger.md"
 
 
@@ -72,7 +73,37 @@ def tail_for_task(project: str, task_id: str, limit: int = 8,
     return "\n".join(matching[-limit:])
 
 
+def _compact_line(line: str, width: int = MASTER_WIDTH) -> str:
+    """Przytnij POWÓD, nie listę plików.
+
+    Mistrz wykrywa wzorce po ``pliki=…`` (np. zmianę testu przez kodera),
+    a ta lista stoi w linii przed powodem — cięcie na sztywnej szerokości
+    gubiło właśnie ją, gdy tura ruszyła kilka plików naraz.
+    """
+    head, marker, rest = line.partition("pliki=")
+    if not marker:
+        return line[:width]
+    files, colon, reason = rest.partition(": ")
+    kept = f"{head}{marker}{files[:MASTER_FILES]}{colon}"
+    return kept + reason[:max(0, width - len(kept))]
+
+
 def compact_tail(project: str, runtime_dir: str = ".forge") -> str:
     """Mały widok dziennika dla często wywoływanej roli mistrza."""
     lines = tail(project, MASTER_LINES, runtime_dir).splitlines()
-    return "\n".join(line[:MASTER_WIDTH] for line in lines)
+    return "\n".join(_compact_line(line) for line in lines)
+
+
+def round_limit_tasks(project: str, runtime_dir: str = ".forge") -> list[str]:
+    """Zadania porzucone przez ``round_limit`` w CAŁEJ pamięci dziennika.
+
+    Jedno zadanie idące na limit rund zajmuje więcej linii niż całe okno
+    mistrza, więc wzorzec „planista tnie za grubo" jest z ``compact_tail``
+    strukturalnie niewidoczny — trzeba mu go policzyć osobno.
+    """
+    found: list[str] = []
+    for line in tail(project, KEEP_LINES, runtime_dir).splitlines():
+        task_id, _, rest = line.partition("] ")[2].partition(" ")
+        if rest.startswith("PORZUCONE: round_limit") and task_id not in found:
+            found.append(task_id)
+    return found

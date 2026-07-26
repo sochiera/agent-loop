@@ -146,3 +146,7 @@ zignorować, jeśli uzasadni lepsze rozwiązanie w `ARCHITECTURE.md`.
 
 ---------------
 Nowa zmiana: w agent-loop zostało dodane review dla kroku bootstrap oraz podział na trudność zadań przy planowaniu. Warto uwzględnić.
+
+
+---------------
+Nowa zmiana: w agent-loop dużo bugów i usprawnień zostało zaimplementowanych. Uwzględnij to. Warto chyba posprzątać repo gry też.
