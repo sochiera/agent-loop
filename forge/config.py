@@ -295,11 +295,11 @@ class Config:
     codex_bin: str = os.environ.get("FORGE_CODEX_BIN", "codex")
 
     # Tryb sandboxa Codeksa: read-only | workspace-write | danger-full-access.
-    # Domyślnie KATALOG PROJEKTU: `find .. -name AGENTS.md` potrafił zejść do
-    # sąsiednich repozytoriów użytkownika i wciągnąć ich zawartość do kontekstu.
-    # Rozszerz przez FORGE_CODEX_SANDBOX=danger-full-access, gdy agent naprawdę
-    # potrzebuje całego systemu plików (np. diagnoza instalacji narzędzia).
-    codex_sandbox: str = os.environ.get("FORGE_CODEX_SANDBOX", "workspace-write")
+    # Domyślnie pełny dostęp: buildy i testy potrafią legalnie pisać poza
+    # katalogiem projektu (np. Godot do XDG_DATA_HOME). Zawęź jawnie przez
+    # FORGE_CODEX_SANDBOX=workspace-write albo read-only.
+    codex_sandbox: str = os.environ.get(
+        "FORGE_CODEX_SANDBOX", "danger-full-access")
 
     # --- Push do zdalnego repo gry -----------------------------------------
     # Po każdym udanym commicie orkiestrator pcha bieżący branch do remote.

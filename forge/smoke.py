@@ -123,8 +123,9 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     cfg = Config()
-    # Smoke nie potrzebuje pełnego dostępu — zapis ograniczony do katalogu temp.
-    cfg.codex_sandbox = os.environ.get("FORGE_SMOKE_SANDBOX", "workspace-write")
+    # Domyślnie sprawdzamy ten sam posture co normalny przebieg Forge.
+    cfg.codex_sandbox = os.environ.get(
+        "FORGE_SMOKE_SANDBOX", "danger-full-access")
     cfg.codex_effort = os.environ.get("FORGE_SMOKE_EFFORT", "minimal")
     cfg.agent_timeout_s = int(os.environ.get("FORGE_SMOKE_TIMEOUT", "300"))
     cfg.max_limit_retries = 1

@@ -348,25 +348,23 @@ def test_claude_thin_template_never_bypasses_native_handling(
     generic.assert_not_called()
 
 
-def test_codex_sandbox_defaults_to_workspace_but_keeps_network(
+def test_codex_sandbox_defaults_to_full_access(
         tmp_path: Path) -> None:
-    """Zawężamy zasięg PLIKÓW (żeby `find ..` nie schodził do sąsiednich
-    repozytoriów), ale nie odcinamy sieci — to psułoby buildy."""
     with patch("forge.agents._run_with_backoff", return_value="") as run:
         run_codex("prompt", Config(), str(tmp_path), str(tmp_path / "log"))
+
+    argv = run.call_args.args[0]
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    assert "-s" not in argv
+
+
+def test_workspace_sandbox_stays_available_as_an_opt_in_and_keeps_network(
+        tmp_path: Path) -> None:
+    cfg = Config(codex_sandbox="workspace-write")
+    with patch("forge.agents._run_with_backoff", return_value="") as run:
+        run_codex("prompt", cfg, str(tmp_path), str(tmp_path / "log"))
 
     argv = run.call_args.args[0]
     assert argv[argv.index("-s") + 1] == "workspace-write"
     assert "sandbox_workspace_write.network_access=true" in argv
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv
-
-
-def test_full_access_sandbox_stays_available_as_an_opt_in(
-        tmp_path: Path) -> None:
-    cfg = Config(codex_sandbox="danger-full-access")
-    with patch("forge.agents._run_with_backoff", return_value="") as run:
-        run_codex("prompt", cfg, str(tmp_path), str(tmp_path / "log"))
-
-    argv = run.call_args.args[0]
-    assert "--dangerously-bypass-approvals-and-sandbox" in argv
-    assert "-s" not in argv
