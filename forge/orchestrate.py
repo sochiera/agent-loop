@@ -730,6 +730,25 @@ _RUNTIME_KEEP_ITEMS = 20
 _DOC_SIZE_LIMIT = 20_000
 _DOC_INDEX_SIZE_LIMIT = 2_000
 
+# Pliki instrukcji czytane samoczynnie przez agentów CLI (codex → AGENTS.md,
+# claude → CLAUDE.md). Zasiewamy je deterministycznie, bo projekty
+# zbootstrapowane przed tą zasadą ich nie mają, a bez tej notki tester i koder
+# greppują runtime orkiestratora w poszukiwaniu kontekstu, który i tak dostają
+# w promptcie — jedna taka tura potrafi wciągnąć megabajt cudzych transkryptów.
+_AGENT_NOTE_FILES = ("AGENTS.md", "CLAUDE.md")
+
+
+def _agent_instruction_note(runtime_dir: str) -> str:
+    return f"""# Notatka dla agentów
+
+`{runtime_dir}/` to runtime orkiestratora Forge. Plik twojego zadania i cały
+potrzebny kontekst dostajesz w promptcie, więc nie ma tam nic, czego
+potrzebujesz. Dotyczy to zwłaszcza `{runtime_dir}/tasks/archive/` (zamknięte
+zadania) — czytanie tego zapycha kontekst i nic nie wnosi.
+
+To wyjaśnienie, nie zakaz.
+"""
+
 
 def _housekeeping(cfg: Config, project: str) -> None:
     """Deterministyczne sprzątanie przed planowaniem, bez udziału agenta."""
@@ -747,6 +766,28 @@ def _housekeeping(cfg: Config, project: str) -> None:
                 suffix += 1
             target = archive / f"{source.stem}-{suffix}{source.suffix}"
         source.replace(target)
+
+    # Archiwum zadań rośnie w nieskończoność, a agenci listują `.forge`.
+    # Kolejność NUMERYCZNA, nie leksykograficzna: przy przejściu task-999 →
+    # task-1000 sortowanie po nazwie skasowałoby najnowsze zadanie, a
+    # `_next_task_index` liczy `max(ids)` — numery zaczęłyby się powtarzać.
+    def _archive_order(path: Path) -> tuple[int, str]:
+        match = re.match(r"task-(\d+)", path.stem)
+        return (int(match.group(1)) if match else 0, path.name)
+
+    archived = sorted(archive.glob("task-*.md"), key=_archive_order)
+    for stale in archived[:-_RUNTIME_KEEP_ITEMS]:
+        stale.unlink(missing_ok=True)
+
+    # Transkrypty żyją poza drzewem projektu; katalog sprzed tej migracji
+    # zostawał w repo i był realnym magnesem na megabajtowe grepy agentów.
+    shutil.rmtree(runtime / "logs", ignore_errors=True)
+
+    for name in _AGENT_NOTE_FILES:
+        note = Path(project, name)
+        if not note.exists():  # nigdy nie nadpisujemy cudzej treści
+            note.write_text(
+                _agent_instruction_note(cfg.runtime_dir), encoding="utf-8")
 
     failed = runtime / "failed"
     artifacts = sorted(
@@ -788,15 +829,21 @@ def _flag_oversized_docs(project: str) -> None:
     existing = backlog.read_text(encoding="utf-8") if backlog.exists() else ""
     additions = []
     for name, size, is_index in oversized:
-        if f"`{name}`" in existing:
+        # Deduplikacja po PEŁNYM markerze wpisu, nie po samej ścieżce: backlog
+        # wspomina pliki dokumentacji w zwykłej prozie („Szczegóły w `docs/…`"),
+        # więc luźniejszy warunek uznawał dług za już zgłoszony i bramka nigdy
+        # nie dopisała ani jednej linii.
+        marker = (f"Dług dokumentacji: indeks `{name}`" if is_index
+                  else f"Dług dokumentacji: `{name}`")
+        if marker in existing:
             continue
         if is_index:
             additions.append(
-                f"- Dług dokumentacji: indeks `{name}` ma {size // 1000} KB "
+                f"- {marker} ma {size // 1000} KB "
                 "i przekroczył limit 2 KB — skróć mapę obszarów.\n")
         else:
             additions.append(
-                f"- Dług dokumentacji: `{name}` ma {size // 1000} KB "
+                f"- {marker} ma {size // 1000} KB "
                 "— zaplanuj podział pliku.\n")
     if additions:
         with backlog.open("a", encoding="utf-8") as target:
@@ -875,6 +922,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Forge zatrzymany bezpiecznie: {exc}. Checkpoint zapisano w {path}.",
               file=__import__("sys").stderr, flush=True)
         return 3 if isinstance(exc, LimitExhausted) else 1
+    except KeyboardInterrupt:
+        # GUI obiecuje „stan zostanie zapisany" i wysyła SIGINT — bez tej
+        # gałęzi obietnica kończyła się tracebackiem zamiast checkpointu.
+        state.save(str(path))
+        print(f"Forge przerwany. Checkpoint zapisano w {path}.",
+              file=__import__("sys").stderr, flush=True)
+        return 130
     log("Forge: pętla zakończona (brak dalszej pracy lub limit iteracji).")
     return 0
 

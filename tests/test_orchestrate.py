@@ -137,6 +137,17 @@ def test_housekeeping_archives_tasks_prunes_runtime_and_flags_large_docs(
     assert "20" in backlog
 
 
+def test_interrupt_saves_checkpoint_instead_of_raising(tmp_path) -> None:
+    state_path = tmp_path / ".forge" / "STATE.json"
+    State(bootstrapped=True, iteration=7).save(str(state_path))
+
+    with patch("forge.orchestrate.one_iteration", side_effect=KeyboardInterrupt):
+        code = orchestrate.main(["--project", str(tmp_path), "--max-iters", "1"])
+
+    assert code == 130
+    assert State.load(str(state_path)).bootstrapped is True
+
+
 def test_housekeeping_runs_before_planner(tmp_path) -> None:
     events: list[str] = []
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
@@ -160,6 +171,77 @@ def test_housekeeping_runs_before_planner(tmp_path) -> None:
             lambda phase: phase)
 
     assert events == ["housekeeping", "planner"]
+
+
+def test_housekeeping_prunes_task_archive_and_stale_runtime_logs(
+        tmp_path) -> None:
+    project = tmp_path / "project"
+    runtime = project / ".forge"
+    tasks = runtime / "tasks"
+    archive = tasks / "archive"
+    archive.mkdir(parents=True)
+    for index in range(1, 26):
+        (archive / f"task-{index:03d}.md").write_text("old", encoding="utf-8")
+    (tasks / "task-026.md").write_text("current", encoding="utf-8")
+    stale_logs = runtime / "logs"
+    stale_logs.mkdir()
+    (stale_logs / "task-0001-c01-test.log").write_text("{}", encoding="utf-8")
+
+    _housekeeping(Config(), str(project))
+
+    archived = sorted(path.name for path in archive.glob("task-*.md"))
+    assert len(archived) == 20
+    assert archived[0] == "task-007.md"      # najstarsze skasowane
+    assert archived[-1] == "task-026.md"     # bieżące zadanie zachowane
+    assert not stale_logs.exists()
+
+
+def test_task_archive_pruning_never_lowers_next_index(tmp_path) -> None:
+    """Przejście przez tysiąc: sort po nazwie skasowałby task-1000."""
+    archive = tmp_path / ".forge" / "tasks" / "archive"
+    archive.mkdir(parents=True)
+    for index in list(range(980, 1000)) + [1000]:
+        (archive / f"task-{index}.md").write_text("done", encoding="utf-8")
+
+    _housekeeping(Config(), str(tmp_path))
+
+    assert (archive / "task-1000.md").exists()
+    assert not (archive / "task-980.md").exists()
+    assert _next_task_index(str(tmp_path)) == 1001
+
+
+def test_housekeeping_seeds_agent_instruction_files_without_overwriting(
+        tmp_path) -> None:
+    (tmp_path / "AGENTS.md").write_text("własna treść", encoding="utf-8")
+
+    _housekeeping(Config(), str(tmp_path))
+
+    assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == "własna treść"
+    seeded = (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+    assert ".forge/" in seeded
+    assert "wyjaśnienie, nie zakaz" in seeded
+
+
+def test_housekeeping_flags_oversized_doc_mentioned_in_backlog_prose(
+        tmp_path) -> None:
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "ARCHITECTURE.md").write_text("x" * 116_000, encoding="utf-8")
+    # Planista rutynowo cytuje ścieżki dokumentacji w opisach zadań — to nie
+    # jest zgłoszony dług i nie może wyciszać bramki.
+    (tmp_path / "BACKLOG.md").write_text(
+        "- [ ] K76 Coś tam. Szczegóły w `docs/ARCHITECTURE.md`.\n",
+        encoding="utf-8")
+
+    _housekeeping(Config(), str(tmp_path))
+
+    backlog = (tmp_path / "BACKLOG.md").read_text(encoding="utf-8")
+    assert "Dług dokumentacji: `docs/ARCHITECTURE.md` ma 116 KB" in backlog
+
+    _housekeeping(Config(), str(tmp_path))  # drugi przebieg nie duplikuje
+
+    assert (tmp_path / "BACKLOG.md").read_text(
+        encoding="utf-8").count("Dług dokumentacji") == 1
 
 
 def test_housekeeping_flags_oversized_documentation_index(tmp_path) -> None:
