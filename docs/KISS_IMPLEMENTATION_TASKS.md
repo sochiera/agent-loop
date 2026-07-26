@@ -305,8 +305,8 @@ Pokryć:
 
 ### CODE GREEN
 
-- Rozszerzyć format taska o `targeted_test_cmd`.
-- Dla starszego zadania bez tego pola użyć pustej wartości.
+- Komendę celowanej bramki wybiera tester na podstawie kryteriów zadania
+  i aktualnego ryzyka.
 - Po `status=review` wykonać granicę testową na niezmienionym drzewie.
 - Zapisać wynik tylko jako krótki kod, nazwę komendy i ograniczony ogon logu.
 - Nie zapisywać „zieleni” jako wiecznie ważnego booleana. Po restarcie lub
@@ -475,7 +475,7 @@ Pokryć end-to-end z atrapami agentów:
 
 - Przełączyć `one_iteration()` na nowy `run_task()`.
 - Zachować `phase_plan_batch()` i `phase_verify_goal()`.
-- Uaktualnić format taska planisty o `targeted_test_cmd`.
+- Pozostawić wybór komendy celowanej bramki testerowi.
 - Nie dodawać trybu wyboru starego pipeline'u.
 
 ### REFACTOR

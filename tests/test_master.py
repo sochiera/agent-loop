@@ -36,7 +36,6 @@ def _task_repo(tmp_path: Path) -> tuple[dict, State, Config]:
         "file": "task.md",
         "difficulty": "simple",
         "test_globs": ["tests/test_*.py"],
-        "targeted_test_cmd": "python3 -m pytest -q tests/test_app.py",
     }
     state = State(bootstrapped=True, test_cmd="python3 -m pytest -q",
                   task_queue=[task])
@@ -45,7 +44,9 @@ def _task_repo(tmp_path: Path) -> tuple[dict, State, Config]:
 
 def _one_round(tmp_path: Path):
     """Tester → koder → tester(review): jedna pełna runda TDD."""
-    tester_answers = iter(('{"status":"red"}', '{"status":"review"}'))
+    tester_answers = iter((
+        '{"status":"red","command":"python3 -m pytest -q tests/test_app.py"}',
+        '{"status":"review"}'))
     seen: dict[str, str] = {}
 
     def role_call(_cfg, project, _state, role, prompt, _log):
@@ -299,7 +300,8 @@ def test_ledger_marks_turn_without_file_changes(tmp_path: Path) -> None:
     def role_call(_cfg, _project, _state, role, _prompt, _log):
         # Nikt nic nie zmienia — dokładnie kształt pętli z task-381.
         if role == "tester":
-            return '{"status":"red"}'
+            return ('{"status":"red",'
+                    '"command":"python3 -m pytest -q tests/test_app.py"}')
         return '{"status":"test_changes_needed","reason":"zmień test"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
@@ -316,8 +318,8 @@ def test_two_complete_rounds_without_changes_warn_next_tester(
         tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
     tester_answers = iter((
-        '{"status":"red"}',
-        '{"status":"red"}',
+        '{"status":"red","command":"python3 -m pytest -q tests/test_app.py"}',
+        '{"status":"red","command":"python3 -m pytest -q tests/test_app.py"}',
         '{"status":"blocked","reason":"brak bezpiecznej drogi"}',
     ))
     tester_prompts: list[str] = []
@@ -346,7 +348,7 @@ def test_file_change_resets_no_change_round_counter(tmp_path: Path) -> None:
     _git(tmp_path, "tag", state.task_start_tag)
     state.no_change_rounds = 2
     tester_answers = iter((
-        '{"status":"red"}',
+        '{"status":"red","command":"python3 -m pytest -q tests/test_app.py"}',
         '{"status":"blocked","reason":"done"}',
     ))
 

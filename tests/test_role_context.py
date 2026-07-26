@@ -64,21 +64,62 @@ def test_planner_contract_owns_outcomes_not_test_design() -> None:
     assert "test_globs" not in prompt
     assert "code_globs" not in prompt
     assert '"criteria"' not in prompt
+    assert "najwęższy wiarygodny dobór należy do testera" in prompt
+    assert "prywatnych helperów" in prompt
+    assert "unikalnego ryzyka na granicy systemów" in prompt
     assert "zweryfikuj" in prompt
     assert "uruchomieniem" in prompt
     assert "wynik" in prompt
 
 
-def test_confirmation_prompt_only_checks_suite_and_untested_criteria() -> None:
+def test_confirmation_prompt_checks_targeted_gate_criteria_and_test_quality() -> None:
     prompt = prompts.tester_task_prompt(
         "task.md", "pytest -q", confirmation=True,
+        suggested_test_cmd="pytest -q tests/test_app.py",
         coder_summary="implemented")
 
     assert "TURA POTWIERDZAJĄCA" in prompt
-    assert "czy pakiet jest zielony" in prompt
-    assert "czy pozostały nieprzetestowane kryteria akceptacji" in prompt
+    assert "pytest -q tests/test_app.py" in prompt
+    assert "czy jest zielona" in prompt
+    assert "pozostały nieprzetestowane kryteria akceptacji" in prompt
+    assert "mały refaktor bez osłabiania pokrycia" in prompt
+    assert "należy do Forge przed commitem" in prompt
     assert "Nie oceniaj jakości implementacji" in prompt
     assert "świeżego reviewera" in prompt
+
+
+def test_confirmation_wins_over_sticky_regression_from_legacy_checkpoint() -> None:
+    prompt = prompts.tester_task_prompt(
+        "task.md", "pytest -q", confirmation=True, suite_regression=True,
+        coder_summary="naprawiono regresję")
+
+    assert "TURA POTWIERDZAJĄCA" in prompt
+    assert "PEŁNA BRAMKA wykryła regresję" not in prompt
+
+
+def test_tester_owns_targeted_command_and_test_refactor() -> None:
+    prompt = prompts.tester_task_prompt("task.md", "pytest -q")
+
+    assert "Samodzielnie wybierz" in prompt
+    assert "najwęższą wiarygodną komendę" in prompt
+    assert "fallbackiem, nie domyślną komendą" in prompt
+    assert "realistyczny defekt" in prompt
+    assert "change-detectorów" in prompt
+    assert "refaktorować testy i ich wspólną infrastrukturę" in prompt
+
+
+def test_reviewer_prompt_is_plain_code_review() -> None:
+    prompt = prompts.review_task_prompt_kiss(
+        "task.md", start_tag="forge/task-start", changed=["app.py"])
+
+    for expected in (
+        "błędów zachowania", "SOLID/KISS", "design smells", "duplikacji",
+        "nazw, które nie opisują", "testy sprawdzają wartościowe zachowanie",
+        "Nie streszczaj diffu",
+    ):
+        assert expected in prompt
+    assert "macierz" not in prompt
+    assert "Zwróć wyłącznie JSON" in prompt
 
 
 def test_planner_reads_small_indexes_and_archive_only_on_demand() -> None:
@@ -97,6 +138,9 @@ def test_coder_updates_documentation_through_indexes() -> None:
     assert "docs/ARCHITECTURE/00-INDEX.md" in prompt
     assert "właściwego pliku wskazanego przez indeks" in prompt
     assert "nowy plik" in prompt and "wpisem w indeksie" in prompt
+    assert "bramkę testera" in prompt
+    assert "pełną suitę przed commitem uruchamia Forge" in prompt
+    assert "tautologiczny" in prompt
 
 
 def test_every_fifth_batch_requires_one_technical_debt_task() -> None:

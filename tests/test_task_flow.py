@@ -38,7 +38,6 @@ def _task_repo(tmp_path: Path) -> tuple[dict, State, Config]:
         "file": "task.md",
         "difficulty": "simple",
         "test_globs": ["tests/test_*.py"],
-        "targeted_test_cmd": "python3 -m pytest -q tests/test_app.py",
     }
     state = State(
         bootstrapped=True,
@@ -86,7 +85,8 @@ def test_review_changes_start_a_new_tdd_cycle_then_commit(tmp_path: Path) -> Non
     _task, state, cfg = _task_repo(tmp_path)
     tester_answers = iter((
         '{"status":"review"}',
-        '{"status":"code","reason":"uwaga review: ustaw wartość 2"}',
+        '{"status":"code","command":"python3 -m pytest -q tests/test_app.py",'
+        '"reason":"uwaga review: ustaw wartość 2"}',
         '{"status":"review"}',
     ))
     reviewer_answers = iter((
@@ -127,7 +127,8 @@ def test_tester_receives_task_scoped_context_in_every_prompt(tmp_path: Path) -> 
     orchestrate.ledger.append(str(tmp_path), "task-999 sekret innego zadania")
     orchestrate.ledger.append(str(tmp_path), "task-001 wcześniejszy wpis")
     tester_answers = iter((
-        '{"status":"red","reason":"brakuje VALUE=1"}',
+        '{"status":"red","command":"python3 -m pytest -q tests/test_app.py",'
+        '"reason":"brakuje VALUE=1"}',
         '{"status":"review"}',
     ))
     tester_prompts: list[str] = []
@@ -219,33 +220,45 @@ def test_full_suite_failure_after_review_returns_to_tester_without_commit(
 
 def test_tester_works_on_full_suite_after_gate_regression(
         tmp_path: Path) -> None:
-    """Regresję wykrytą pełnym pakietem trzeba naprawiać pełnym pakietem —
-    test ukierunkowany z definicji jej nie odtworzy."""
-    task, state, cfg = _task_repo(tmp_path)
-    prompts_seen: list[str] = []
+    """Sygnał regresji wymusza jedną turę, nie połyka potwierdzenia po green."""
+    _task, state, cfg = _task_repo(tmp_path)
+    tester_answers = iter((
+        '{"status":"review"}',
+        '{"status":"code","command":"python3 -m pytest -q",'
+        '"reason":"odtworzona regresja"}',
+        '{"status":"review"}',
+    ))
+    tester_prompts: list[str] = []
 
     def role_call(_cfg, _project, _state, role, prompt, _log):
-        prompts_seen.append(prompt)
-        return '{"status":"review"}'
+        if role == "tester":
+            tester_prompts.append(prompt)
+            return next(tester_answers)
+        return '{"status":"green","summary":"regresja naprawiona"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate.run_agent",
                return_value='{"verdict":"approve"}'), \
          patch("forge.orchestrate.build_then_test_result",
-               return_value=(False, "FAIL integration_test")):
+               side_effect=((False, "FAIL integration_test"), (True, "ok"))):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
         assert state.suite_regression
-        prompts_seen.clear()
+        tester_prompts.clear()
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
-    assert state.test_cmd in prompts_seen[0]
-    assert task["targeted_test_cmd"] not in prompts_seen[0]
+    assert len(tester_prompts) == 2
+    assert state.test_cmd in tester_prompts[0]
+    assert "PEŁNA BRAMKA wykryła regresję" in tester_prompts[0]
+    assert "tej komendy nie zawężaj" in tester_prompts[0]
+    assert "TURA POTWIERDZAJĄCA" in tester_prompts[1]
+    assert "PEŁNA BRAMKA wykryła regresję" not in tester_prompts[1]
+    assert not state.suite_regression
 
 
-def test_tdd_uses_targeted_command_but_commit_gate_uses_full_suite(
+def test_tester_chooses_command_and_commit_gate_uses_full_suite(
         tmp_path: Path) -> None:
-    task, state, cfg = _task_repo(tmp_path)
+    _task, state, cfg = _task_repo(tmp_path)
     prompts_seen: list[str] = []
 
     def role_call(_cfg, _project, _state, role, prompt, _log):
@@ -262,18 +275,22 @@ def test_tdd_uses_targeted_command_but_commit_gate_uses_full_suite(
                return_value=(True, "ok")) as gate:
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
-    assert task["targeted_test_cmd"] in prompts_seen[0]
+    assert state.test_cmd in prompts_seen[0]
+    assert "fallbackiem, nie domyślną komendą" in prompts_seen[0]
     gate.assert_called_once_with(
         str(tmp_path), state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
 
 
-def test_confirmation_turn_is_narrow_and_uses_full_suite(tmp_path: Path) -> None:
-    task, state, cfg = _task_repo(tmp_path)
+def test_confirmation_reuses_tester_command_without_requiring_full_suite(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
     tester_answers = iter((
-        '{"status":"red","reason":"VALUE ma być 1"}',
+        '{"status":"red","command":"python3 -m pytest -q tests/test_app.py",'
+        '"reason":"VALUE ma być 1"}',
         '{"status":"review"}',
     ))
     tester_prompts: list[str] = []
+    coder_prompts: list[str] = []
 
     def role_call(_cfg, project, _state, role, prompt, _log):
         if role == "tester":
@@ -286,6 +303,7 @@ def test_confirmation_turn_is_narrow_and_uses_full_suite(tmp_path: Path) -> None
                     + "\ndef test_new_value():\n    assert VALUE == 1\n",
                     encoding="utf-8")
             return answer
+        coder_prompts.append(prompt)
         Path(project, "app.py").write_text("VALUE = 1\n", encoding="utf-8")
         return '{"status":"green","summary":"VALUE ustawione na 1"}'
 
@@ -297,11 +315,43 @@ def test_confirmation_turn_is_narrow_and_uses_full_suite(tmp_path: Path) -> None
                return_value=(True, "ok")):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
-    assert task["targeted_test_cmd"] in tester_prompts[0]
+    command = "python3 -m pytest -q tests/test_app.py"
     assert "TURA POTWIERDZAJĄCA" not in tester_prompts[0]
     assert "TURA POTWIERDZAJĄCA" in tester_prompts[1]
-    assert f"uruchom `{state.test_cmd}`" in tester_prompts[1]
+    assert command in coder_prompts[0]
+    assert f"ostatniej bramki testera `{command}`" in tester_prompts[1]
+    assert "należy do Forge przed commitem" in tester_prompts[1]
+    assert f"uruchom `{state.test_cmd}`" not in tester_prompts[1]
     assert "Nie oceniaj jakości implementacji" in tester_prompts[1]
+
+
+def test_legacy_coder_checkpoint_without_command_falls_back_to_full_suite(
+        tmp_path: Path) -> None:
+    task, state, cfg = _task_repo(tmp_path)
+    state.current_task = task
+    state.task_queue = []
+    state.task_phase = "coder"
+    state.task_start_tag = "forge/task-001-start"
+    state.tester_decision = {"status": "code", "reason": "stary checkpoint"}
+    _git(tmp_path, "tag", state.task_start_tag)
+    coder_prompts: list[str] = []
+
+    def role_call(_cfg, _project, _state, role, prompt, _log):
+        if role == "coder":
+            coder_prompts.append(prompt)
+            return '{"status":"green","summary":"bez zmian"}'
+        return '{"status":"review"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent",
+               return_value='{"verdict":"approve"}'), \
+         patch("forge.orchestrate.build_then_test_result",
+               return_value=(True, "ok")):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert len(coder_prompts) == 1
+    assert f"bramkę testera `{state.test_cmd}`" in coder_prompts[0]
 
 
 def test_nonblocking_reviewer_notes_are_added_to_backlog(
@@ -387,7 +437,8 @@ def test_round_limit_routes_to_failure(tmp_path: Path) -> None:
 
     def role_call(_cfg, _project, _state, role, _prompt, _log):
         if role == "tester":
-            return '{"status":"red"}'
+            return ('{"status":"red",'
+                    '"command":"python3 -m pytest -q tests/test_app.py"}')
         return '{"status":"test_changes_needed","reason":"zły test"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
@@ -432,6 +483,27 @@ def test_invalid_decision_gets_exactly_one_format_retry() -> None:
     assert result.status == "review"
     assert prompts[0] == "base"
     assert "wyłącznie jeden poprawny obiekt JSON" in prompts[1]
+    assert "Powód odrzucenia: agent nie zwrócił poprawnego JSON-a" in prompts[1]
+
+
+def test_invalid_tester_decision_retry_explains_missing_command() -> None:
+    answers = iter((
+        '{"status":"red"}',
+        '{"status":"red","command":"pytest tests/test_app.py"}',
+    ))
+    prompts = []
+
+    result = orchestrate._decision_with_retry(
+        "base",
+        lambda prompt: prompts.append(prompt) or next(answers),
+        orchestrate.parse_tester_decision)
+
+    assert result.status == "red"
+    assert result.data["command"] == "pytest tests/test_app.py"
+    assert (
+        "Powód odrzucenia: decyzja testera 'red' wymaga niepustego `command`"
+        in prompts[1]
+    )
 
 
 def test_second_invalid_decision_stops() -> None:

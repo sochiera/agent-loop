@@ -8,10 +8,17 @@ from forge.task_pipeline import (InvalidDecision, parse_coder_decision, parse_re
 
 
 def test_decision_contracts_are_small_and_strict() -> None:
-    assert parse_tester_decision('{"status":"red","reason":"x"}').status == "red"
+    result = parse_tester_decision(
+        '{"status":"red","command":" pytest tests/test_x.py ","reason":"x"}')
+    assert result.status == "red"
+    assert result.data["command"] == "pytest tests/test_x.py"
     assert parse_coder_decision('{"status":"green"}').status == "green"
     assert parse_review_decision('{"verdict":"approve"}').status == "approve"
     with pytest.raises(InvalidDecision): parse_tester_decision('not json')
+    with pytest.raises(InvalidDecision):
+        parse_tester_decision('{"status":"red"}')
+    with pytest.raises(InvalidDecision):
+        parse_tester_decision('{"status":"code","command":"  "}')
     with pytest.raises(InvalidDecision): parse_coder_decision('{"status":"retry"}')
 
 
@@ -22,7 +29,9 @@ def test_red_green_returns_to_same_tester() -> None:
     handoffs = []
     def run_tester(handoff):
         value = next(tester); seen.append(value); handoffs.append(handoff)
-        return parse_tester_decision('{"status":"' + value + '"}')
+        command = ',"command":"pytest tests/test_x.py"' if value == "red" else ""
+        return parse_tester_decision(
+            '{"status":"' + value + '"' + command + '}')
     outcome = run_tdd_loop(state=state, max_rounds=4, run_tester=run_tester,
         run_coder=lambda _: parse_coder_decision(
             '{"status":"green","summary":"kod i testy zielone"}'),
@@ -39,7 +48,9 @@ def test_code_decision_does_not_require_a_new_test() -> None:
     result = run_tdd_loop(
         state=state, max_rounds=4,
         run_tester=lambda _: parse_tester_decision(
-            '{"status":"' + next(tester) + '"}'),
+            '{"status":"' + (status := next(tester)) + '"'
+            + (',"command":"pytest tests/test_x.py"' if status == "code" else "")
+            + '}'),
         run_coder=lambda decision: (
             coder_decisions.append(decision.status)
             or parse_coder_decision('{"status":"green"}')
@@ -57,8 +68,10 @@ def test_coder_can_return_test_feedback_to_same_tester() -> None:
 
     def run_tester(handoff):
         handoffs.append(handoff)
+        status = next(tester)
+        command = ',"command":"pytest tests/test_x.py"' if status == "red" else ""
         return parse_tester_decision(
-            '{"status":"' + next(tester) + '"}')
+            '{"status":"' + status + '"' + command + '}')
 
     result = run_tdd_loop(
         state=state, max_rounds=4,
@@ -83,8 +96,10 @@ def test_coder_can_request_tester_decision_after_review_feedback() -> None:
     def run_tester(handoff):
         handoffs.append(handoff)
         status = next(tester)
+        command = ',"command":"pytest tests/test_x.py"' if status == "code" else ""
         return parse_tester_decision(
-            '{"status":"' + status + '","reason":"tester zdecydował"}')
+            '{"status":"' + status + '"'
+            + command + ',"reason":"tester zdecydował"}')
 
     result = run_tdd_loop(
         state=state, max_rounds=4,
@@ -109,7 +124,9 @@ def test_coder_changes_are_evaluated_by_tester_without_file_guard() -> None:
     result = run_tdd_loop(
         state=state, max_rounds=4,
         run_tester=lambda _: parse_tester_decision(
-            '{"status":"' + next(tester) + '"}'),
+            '{"status":"' + (status := next(tester)) + '"'
+            + (',"command":"pytest tests/test_x.py"' if status == "red" else "")
+            + '}'),
         run_coder=lambda decision: (
             coder_calls.append(decision.status)
             or parse_coder_decision('{"status":"green"}')

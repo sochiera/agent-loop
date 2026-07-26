@@ -88,11 +88,9 @@ def test_plan_task_normalises_dependencies() -> None:
         "test_globs": ["dead"],
         "code_globs": ["dead"],
         "repro_cmd": "dead",
-        "targeted_test_cmd": "pytest tests/test_one.py",
     })
 
     assert task["depends_on"] == ["task-001", "2"]
-    assert task["targeted_test_cmd"] == "pytest tests/test_one.py"
     for dead in ("criteria", "test_globs", "code_globs", "repro_cmd"):
         assert dead not in task
 

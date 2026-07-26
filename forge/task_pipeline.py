@@ -35,6 +35,12 @@ def parse_tester_decision(text: str) -> PhaseResult:
     status = data.get("status")
     if status not in TESTER_STATUSES:
         raise InvalidDecision(f"niedozwolona decyzja testera: {status!r}")
+    if status in {"red", "code"}:
+        command = data.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise InvalidDecision(
+                f"decyzja testera {status!r} wymaga niepustego `command`")
+        data["command"] = command.strip()
     return PhaseResult(status, data)
 
 

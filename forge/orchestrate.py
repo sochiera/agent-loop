@@ -121,7 +121,6 @@ def build_task_from_plan(project: str, raw: dict) -> dict:
         dependencies = [dependencies]
     return {"id": raw.get("id", "task"), "title": raw.get("title", "(bez tytułu)"),
             "file": raw.get("file", ""),
-            "targeted_test_cmd": raw.get("targeted_test_cmd", raw.get("test_cmd", "")),
             "difficulty": difficulty,
             "depends_on": [str(item) for item in dependencies if str(item)]}
 
@@ -335,8 +334,12 @@ def _decision_with_retry(prompt: str, invoke, parser):
     """Jedna tania korekta formatu, potem jawny błąd zamiast ukrytej pętli."""
     try:
         return parser(invoke(prompt))
-    except InvalidDecision:
-        return parser(invoke(prompt + _JSON_RETRY))
+    except InvalidDecision as exc:
+        reason = str(exc)[:500]
+        retry_prompt = (
+            prompt + _JSON_RETRY + f"\nPowód odrzucenia: {reason}\n"
+        )
+        return parser(invoke(retry_prompt))
 
 
 def _parse_json_object(text: str) -> dict:
@@ -490,27 +493,35 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             state.round_changed = False
             confirmation = bool(
                 state.coder_summary and handoff == state.coder_summary)
-            # Regresja wykryta bramką dotyczy PEŁNEGO pakietu — testu
-            # ukierunkowanego nie da się na niej odtworzyć.
-            test_cmd = (
-                state.test_cmd if confirmation or state.suite_regression
-                else task.get("targeted_test_cmd") or state.test_cmd
-            )
-            return run_turn("tester", prompts.tester_task_prompt(
-                task["file"], test_cmd, handoff=handoff,
+            suggested_test_cmd = str(
+                state.tester_decision.get("command", "")).strip()
+            using_suite_regression = state.suite_regression
+            result = run_turn("tester", prompts.tester_task_prompt(
+                task["file"], state.test_cmd,
+                suggested_test_cmd=suggested_test_cmd,
+                handoff=handoff,
                 previous_decision=state.tester_decision,
                 coder_summary=state.coder_summary,
                 changed_files=_changed(project, state.task_start_tag),
                 task_ledger=ledger.tail_for_task(project, task["id"], limit=8),
                 resume=bool(state.tester_session),
-                confirmation=confirmation), parse_tester_decision)
+                confirmation=confirmation,
+                suite_regression=using_suite_regression),
+                parse_tester_decision)
+            # To jednorazowy sygnał kierujący najbliższą turę testera na pełną
+            # bramkę. Czyścimy go dopiero po poprawnie sparsowanej odpowiedzi:
+            # checkpoint sprzed tury nadal umożliwia bezpieczne wznowienie.
+            if using_suite_regression:
+                state.suite_regression = False
+            return result
 
         def run_coder(decision):
             ensure_notes(new_round=False)
-            targeted_test_cmd = (
-                task.get("targeted_test_cmd") or state.test_cmd)
+            # Nowe decyzje red/code zawsze mają command. Fallback obsługuje
+            # wyłącznie wznowienie starego checkpointu fazy coder.
+            test_cmd = str(decision.data.get("command", "")).strip() or state.test_cmd
             result = run_turn("coder", prompts.coder_task_prompt(
-                task["file"], decision.data.get("command") or targeted_test_cmd,
+                task["file"], test_cmd,
                 decision=decision.data, resume=bool(state.coder_session)),
                 parse_coder_decision)
             state.no_change_rounds = (

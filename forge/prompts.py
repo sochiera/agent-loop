@@ -14,27 +14,41 @@ def plan_batch_prompt(batch_size: int, start_index: int, kind: str = "app", *, v
     feedback = f" Przeczytaj świeży feedback weryfikacji celu: {verify_feedback_path}; najpierw zaplanuj jego naprawę." if verify_feedback_path else ""
     failures = f" Przeczytaj porażki wcześniejszych zadań: {failure_feedback_path}; rozbij je lub wybierz inną drogę." if failure_feedback_path else ""
     debt = " Wymóg: jedno zadanie w tym wsadzie ma być zadaniem długu technicznego z testami regresji." if require_debt else ""
-    return f"""ROLA: planista projektu typu {kind}. Najpierw przeczytaj małe indeksy docs/DESIGN/00-INDEX.md i docs/ARCHITECTURE/00-INDEX.md, potem tylko wskazane w nich pliki potrzebne do bieżącego planu oraz BACKLOG.md. BACKLOG-ARCHIVE.md jest tylko do wglądu na żądanie — nie czytaj go domyślnie.{feedback}{failures}{debt} Przygotuj maksymalnie {batch_size} małych zadań od {start_index:03d}; zapisz każde w .forge/tasks/task-NNN.md. Format zadania: Cel, Kryteria akceptacji, Publiczny kontrakt, Trudność, Poza zakresem. Opisz co ma być obserwowalnie prawdą, ale wybór przypadków, asercji i plików testowych zostaw testerowi. Jeśli kryterium zależy od zachowania konkretnej wersji narzędzia lub silnika, zweryfikuj je uruchomieniem i zapisz wynik w zadaniu. Dla każdego zadania podaj `depends_on` jako listę identyfikatorów wcześniejszych zadań, od których naprawdę zależy. Nie commituj. JSON: {{"no_more_tasks":false,"tasks":[{{"id":"task-{start_index:03d}","title":"...","file":".forge/tasks/task-{start_index:03d}.md","targeted_test_cmd":"","depends_on":[],"difficulty":"standard"}}]}}."""
+    return f"""ROLA: planista projektu typu {kind}. Najpierw przeczytaj małe indeksy docs/DESIGN/00-INDEX.md i docs/ARCHITECTURE/00-INDEX.md, potem tylko wskazane w nich pliki potrzebne do bieżącego planu oraz BACKLOG.md. BACKLOG-ARCHIVE.md jest tylko do wglądu na żądanie — nie czytaj go domyślnie.{feedback}{failures}{debt} Przygotuj maksymalnie {batch_size} małych zadań od {start_index:03d}; zapisz każde w .forge/tasks/task-NNN.md. Format zadania: Cel, Kryteria akceptacji, Publiczny kontrakt, Trudność, Poza zakresem. Kryteria opisują zachowanie użytkownika albo rzeczywisty publiczny kontrakt. Nie kontraktuj nazw prywatnych helperów, położenia i kolejności elementów, liczby połączeń ani innej struktury wewnętrznej, chyba że świadomie stanowi ona publiczny interfejs. Nie narzucaj plików, przypadków, asercji, liczby testów ani komend — ich najwęższy wiarygodny dobór należy do testera. Wymagaj E2E tylko dla unikalnego ryzyka na granicy systemów, nie mechanicznie dla każdej podobnej funkcji. Jeśli kryterium zależy od zachowania konkretnej wersji narzędzia lub silnika, zweryfikuj je uruchomieniem i zapisz wynik w zadaniu. Dla każdego zadania podaj `depends_on` jako listę identyfikatorów wcześniejszych zadań, od których naprawdę zależy. Nie commituj. JSON: {{"no_more_tasks":false,"tasks":[{{"id":"task-{start_index:03d}","title":"...","file":".forge/tasks/task-{start_index:03d}.md","depends_on":[],"difficulty":"standard"}}]}}."""
 
 
 def tester_task_prompt(
-        task_file: str, test_cmd: str, *, handoff: str = "",
-        previous_decision: dict | None = None, coder_summary: str = "",
-        changed_files: list[str] | None = None, task_ledger: str = "",
-        resume: bool = False, confirmation: bool = False) -> str:
+        task_file: str, full_test_cmd: str, *, suggested_test_cmd: str = "",
+        handoff: str = "", previous_decision: dict | None = None,
+        coder_summary: str = "", changed_files: list[str] | None = None,
+        task_ledger: str = "", resume: bool = False,
+        confirmation: bool = False, suite_regression: bool = False) -> str:
     previous = previous_decision or {}
     previous_text = (
         f"{previous.get('status', '(brak)')} — "
         f"{previous.get('reason', '(brak powodu)')}"
     )
     changed_text = ", ".join(changed_files or []) or "(brak)"
+    # Confirmation ma pierwszeństwo dla zgodności ze checkpointem zapisanym
+    # przez starszą wersję, w której suite_regression pozostawało przyklejone
+    # również po udanej turze naprawczej testera i green kodera.
     if confirmation:
-        instructions = f"""TURA POTWIERDZAJĄCA po green kodera. Odpowiedz wyłącznie na dwa pytania:
-1. uruchom `{test_cmd}` i odpowiedz, czy pakiet jest zielony;
-2. czy pozostały nieprzetestowane kryteria akceptacji.
-Nie oceniaj jakości implementacji — to zadanie świeżego reviewera. Jeśli obie odpowiedzi są korzystne, wybierz review; w przeciwnym razie wybierz red, code albo blocked i podaj konkretny powód."""
+        suggested = (
+            f"Zacznij od ostatniej bramki testera `{suggested_test_cmd}`."
+            if suggested_test_cmd else
+            "Wybierz najwęższą wiarygodną komendę dla zmienionego zachowania."
+        )
+        instructions = f"""TURA POTWIERDZAJĄCA po green kodera. {suggested}
+1. uruchom celowaną bramkę i odpowiedz, czy jest zielona;
+2. sprawdź, czy pozostały nieprzetestowane kryteria akceptacji;
+3. przejrzyj dotknięte testy i wykonaj potrzebny mały refaktor bez osłabiania pokrycia.
+Pełna bramka `{full_test_cmd}` należy do Forge przed commitem; nie uruchamiaj jej tutaj bez konkretnej potrzeby. Nie oceniaj jakości implementacji — to zadanie świeżego reviewera. Jeśli wynik i pokrycie są dobre, wybierz review; w przeciwnym razie wybierz red, code albo blocked i podaj konkretny powód. Dla red/code zwróć faktycznie używaną komendę w `command`."""
+    elif suite_regression:
+        instructions = f"""PEŁNA BRAMKA wykryła regresję. Odtwórz ją komendą `{full_test_cmd}`; tej komendy nie zawężaj. Oceń zastane zmiany i wybierz red, code, review albo blocked. Dla red/code zwróć tę komendę w `command`."""
     else:
-        instructions = f"""Oceń zmiany pozostawione przez kodera albo reviewera: możesz je zachować, poprawić albo przywrócić, jeśli kontrakt wymaga czegoś innego. Uwagi review rozpoczynają nowy cykl TDD pod twoją kontrolą. Wybierz dokładnie red (minimalny czerwony test, uruchom `{test_cmd}`), code (wyłącznie istniejący test lub krok bez zachowania), review albo blocked. Zanim zwrócisz red, potwierdź, że test kolekcjonuje się i pada na asercji kontraktu, a nie na błędzie składni/importu/nazwy. Błąd kolekcji w teście, który sama napisałaś, napraw natychmiast — to nie jest czerwona bramka. Jeśli kolejne cykle review wracają bez postępu i Mistrz wskaże pętlę, zwróć blocked z konkretnym powodem."""
+        instructions = f"""Oceń zmiany pozostawione przez kodera albo reviewera: możesz je zachować, poprawić albo przywrócić, jeśli kontrakt wymaga czegoś innego. Uwagi review rozpoczynają nowy cykl TDD pod twoją kontrolą. Wybierz dokładnie red (minimalny czerwony test), code (wyłącznie istniejący test lub krok bez zachowania), review albo blocked.
+Przed dodaniem testu nazwij realistyczny defekt, którego nie wykrywają istniejące testy. Preferuj rozszerzenie lub parametryzację istniejącej bramki. Nie dodawaj change-detectorów sprawdzających prywatną strukturę i nie buduj oracle tą samą logiką co zachowanie testowane, chyba że struktura jest publicznym kontraktem albo test świadomie sprawdza wyłącznie adapter.
+Samodzielnie wybierz i uruchom najwęższą wiarygodną komendę. Pełna bramka projektu to `{full_test_cmd}` i jest fallbackiem, nie domyślną komendą tej tury. Dla red/code zwróć faktycznie używaną komendę w `command`. Zanim zwrócisz red, potwierdź, że test kolekcjonuje się i pada na asercji kontraktu, a nie na błędzie składni/importu/nazwy. Błąd kolekcji w teście, który sama napisałaś, napraw natychmiast — to nie jest czerwona bramka. Po green odpowiadasz też za mały refaktor dotkniętych testów: usuwaj duplikacje i bezwartościowe change-detectory bez osłabiania pokrycia. Jeśli kolejne cykle review wracają bez postępu i Mistrz wskaże pętlę, zwróć blocked z konkretnym powodem."""
     return f"""ROLA: TESTER. {'Kontynuujesz własną sesję.' if resume else 'Początek prywatnej sesji.'} Przeczytaj {task_file}, handoff, aktualny diff, właściwe testy i minimum kodu.
 
 KONTEKST BIEŻĄCEGO ZADANIA:
@@ -45,15 +59,15 @@ KONTEKST BIEŻĄCEGO ZADANIA:
 {task_ledger or '(brak)'}
 
 {instructions}
-Nie pisz kodu produkcyjnego i nie commituj. W `reason` przekaż koderowi konkretną ocenę i następny krok. BIEŻĄCY HANDOFF SKIEROWANY DO CIEBIE: {handoff or '(brak)'}. JSON: {{"status":"red|code|review|blocked","command":"...","test_files":[],"reason":"..."}}."""
+Nie pisz kodu produkcyjnego i nie commituj. Wolno ci refaktorować testy i ich wspólną infrastrukturę. W `reason` przekaż koderowi konkretną ocenę i następny krok. BIEŻĄCY HANDOFF SKIEROWANY DO CIEBIE: {handoff or '(brak)'}. JSON: {{"status":"red|code|review|blocked","command":"...","test_files":[],"reason":"..."}}."""
 
 
 def coder_task_prompt(task_file: str, test_cmd: str, *, decision: dict, resume: bool = False) -> str:
-    return f"""ROLA: KODER. {'Kontynuujesz własną sesję.' if resume else 'Początek prywatnej sesji.'} Przeczytaj {task_file}, decyzję testera i testy. Decyzja testera: {decision.get('status')} — {decision.get('reason', '')}. Najpierw oceń test; jeśli jest błędny, nie dopasowuj go do implementacji — zwróć test_changes_needed z konkretną uwagą dla testera. Jeśli nie możesz bezpiecznie wykonać uwag review albo potrzebujesz decyzji testera, zwróć tester_input_needed z konkretnym powodem; nie udawaj green. W przeciwnym razie: code green, `{test_cmd}`, mały refaktor, ponów test. Dokumentację dopisuj do właściwego pliku wskazanego przez indeks docs/ARCHITECTURE/00-INDEX.md lub docs/DESIGN/00-INDEX.md; nowy plik twórz tylko razem z wpisem w indeksie. W normalnej pętli nie zmieniaj testów ani nie commituj. W `summary` przekaż testerowi, co zmieniłaś, jakie testy uruchomiłaś i wszystko, co powinien ponownie ocenić. JSON: {{"status":"green","summary":"...","refactor":"done|not_needed"}} albo {{"status":"test_changes_needed|tester_input_needed","reason":"..."}}."""
+    return f"""ROLA: KODER. {'Kontynuujesz własną sesję.' if resume else 'Początek prywatnej sesji.'} Przeczytaj {task_file}, decyzję testera i testy. Decyzja testera: {decision.get('status')} — {decision.get('reason', '')}. Najpierw oceń test; jeśli jest tautologiczny, kruchy albo sprawdza implementację zamiast kontraktu, nie dopasowuj do niego kodu — zwróć test_changes_needed z konkretną uwagą dla testera. Jeśli nie możesz bezpiecznie wykonać uwag review albo potrzebujesz decyzji testera, zwróć tester_input_needed z konkretnym powodem; nie udawaj green. W przeciwnym razie: code green, uruchom bramkę testera `{test_cmd}`, zrób mały refaktor kodu produkcyjnego i ponów tę bramkę. Możesz uruchomić dodatkowe wąskie testy dotkniętych komponentów; pełną suitę przed commitem uruchamia Forge. Dokumentację dopisuj do właściwego pliku wskazanego przez indeks docs/ARCHITECTURE/00-INDEX.md lub docs/DESIGN/00-INDEX.md; nowy plik twórz tylko razem z wpisem w indeksie. W normalnej pętli nie zmieniaj testów ani nie commituj. W `summary` przekaż testerowi, co zmieniłaś, jakie testy uruchomiłaś i wszystko, co powinien ponownie ocenić. JSON: {{"status":"green","summary":"...","refactor":"done|not_needed"}} albo {{"status":"test_changes_needed|tester_input_needed","reason":"..."}}."""
 
 
 def review_task_prompt_kiss(task_file: str, *, start_tag: str, changed: list[str]) -> str:
-    return f"""ROLA: świeży, read-only reviewer. Przeczytaj {task_file}, `git diff {start_tag}` oraz zmienione pliki {changed}. Oceń cały kontrakt, implementację i testy. Nie zmieniaj drzewa. JSON: {{"verdict":"approve","notes":[]}} albo {{"verdict":"changes","notes":["konkretna poprawka"]}}."""
+    return f"""ROLA: świeży, read-only reviewer. Przeczytaj {task_file}, `git diff {start_tag}` oraz zmienione pliki {changed}. Zrób normalne, rzeczowe code review. Szukaj błędów zachowania i przypadków brzegowych, naruszeń kontraktu, zbyt silnego sprzężenia, naruszeń SOLID/KISS, design smells, zbędnej złożoności, duplikacji oraz nazw, które nie opisują faktycznego działania. Oceń też, czy testy sprawdzają wartościowe zachowanie zamiast powtarzać implementację lub wykrywać każdą zmianę prywatnej struktury. Nie streszczaj diffu i nie zakładaj, że zielone albo dobrze nazwane testy dowodzą poprawności. Nie wymyślaj problemów stylistycznych ani pracy poza zakresem. Możesz uruchomić wąski test dla konkretnego podejrzenia, ale pełna suita należy do Forge. Nie zmieniaj drzewa. Problem wymagający poprawy oznacza `changes`; drobny dług może być `approve` z notatką. Zwróć wyłącznie JSON: {{"verdict":"approve","notes":[]}} albo {{"verdict":"changes","notes":["konkretny problem"]}}."""
 
 
 def master_prompt(ledger_tail: str, round_limit_tasks: list[str] | None = None) -> str:
