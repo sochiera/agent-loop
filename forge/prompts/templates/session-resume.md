@@ -1,0 +1,1 @@
+Kontynuujesz własną sesję.

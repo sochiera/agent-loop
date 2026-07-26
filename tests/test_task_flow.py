@@ -81,7 +81,8 @@ def test_full_happy_path_reaches_commit(tmp_path: Path) -> None:
     assert state.tester_session == state.coder_session == ""
 
 
-def test_review_changes_start_a_new_tdd_cycle_then_commit(tmp_path: Path) -> None:
+def test_review_request_changes_starts_a_new_tdd_cycle_then_commit(
+        tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
     tester_answers = iter((
         '{"status":"review"}',
@@ -90,7 +91,7 @@ def test_review_changes_start_a_new_tdd_cycle_then_commit(tmp_path: Path) -> Non
         '{"status":"review"}',
     ))
     reviewer_answers = iter((
-        '{"verdict":"changes","notes":["ustaw 2"]}',
+        '{"verdict":"request_changes","notes":["ustaw 2"]}',
         '{"verdict":"approve"}',
     ))
     prompts_seen: dict[str, list[str]] = {"tester": [], "coder": []}
@@ -354,26 +355,149 @@ def test_legacy_coder_checkpoint_without_command_falls_back_to_full_suite(
     assert f"bramkę testera `{state.test_cmd}`" in coder_prompts[0]
 
 
-def test_nonblocking_reviewer_notes_are_added_to_backlog(
+def test_review_suggestions_can_be_rejected_and_finalized_without_rereview(
         tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
+    tester_answers = iter((
+        '{"status":"review"}',
+        '{"status":"finalize",'
+        '"reason":"sugestia odrzucona: obecna nazwa opisuje kontrakt"}',
+    ))
+    tester_prompts: list[str] = []
 
-    with patch("forge.orchestrate._call_role",
-               return_value='{"status":"review"}'), \
+    def role_call(_cfg, _project, _state, role, prompt, _log):
+        assert role == "tester"
+        tester_prompts.append(prompt)
+        return next(tester_answers)
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate.run_agent", return_value=(
-             '{"verdict":"approve","notes":'
-             '["nazwa helpera jest nieprecyzyjna"]}')), \
+             '{"verdict":"suggestions","notes":'
+             '["rozważ krótszą nazwę helpera"]}')) as reviewer, \
          patch("forge.orchestrate.build_then_test_result",
                return_value=(True, "ok")):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+        assert state.task_phase == "tester"
+        assert state.review_suggestions_pending
+        assert state.current_task
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
-    backlog = (tmp_path / "BACKLOG.md").read_text(encoding="utf-8")
-    assert "task-001" in backlog
-    assert "nazwa helpera jest nieprecyzyjna" in backlog
+    assert reviewer.call_count == 1
+    assert "rozważ krótszą nazwę helpera" in tester_prompts[1]
+    assert "finalize" in tester_prompts[1]
+    assert not state.review_suggestions_pending
+    assert state.current_task == {}
+    assert not (tmp_path / "BACKLOG.md").exists()
 
 
-def test_blocking_reviewer_notes_do_not_enter_backlog_before_fix(
+def test_interrupt_after_finalize_resumes_at_commit(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+    tester_answers = iter((
+        '{"status":"review"}',
+        '{"status":"finalize","reason":"sugestia świadomie odrzucona"}',
+    ))
+    real_append = orchestrate.ledger.append
+
+    def interrupt_finalize(project: str, line: str) -> None:
+        if "sugestie→finalize" in line:
+            raise KeyboardInterrupt
+        real_append(project, line)
+
+    with patch(
+            "forge.orchestrate._call_role",
+            side_effect=lambda *_args: next(tester_answers)), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent", return_value=(
+             '{"verdict":"suggestions","notes":["rozważ krótszą nazwę"]}'
+         )):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+        with patch(
+                "forge.orchestrate.ledger.append",
+                side_effect=interrupt_finalize):
+            with pytest.raises(KeyboardInterrupt):
+                orchestrate.run_task(
+                    cfg, str(tmp_path), state, lambda phase: phase)
+
+    saved = State.load(str(tmp_path / ".forge" / "STATE.json"))
+    assert state.task_phase == saved.task_phase == "commit"
+    assert not saved.review_suggestions_pending
+    assert saved.review_notes == []
+
+    with patch(
+            "forge.orchestrate.build_then_test_result",
+            return_value=(True, "ok")):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert state.current_task == {}
+
+
+def test_review_suggestions_can_be_applied_by_coder_without_rereview(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+    tester_answers = iter((
+        '{"status":"review"}',
+        '{"status":"code","command":"python3 -m pytest -q tests/test_app.py",'
+        '"reason":"stosuję sugestię: uprość VALUE do 1"}',
+        '{"status":"finalize",'
+        '"reason":"sugestia zastosowana; celowana bramka zielona"}',
+    ))
+    coder_prompts: list[str] = []
+
+    def role_call(_cfg, project, _state, role, prompt, _log):
+        if role == "tester":
+            return next(tester_answers)
+        coder_prompts.append(prompt)
+        Path(project, "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        return '{"status":"green","summary":"ustawiono VALUE=1"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent", return_value=(
+             '{"verdict":"suggestions","notes":["uprość VALUE do 1"]}'
+         )) as reviewer, \
+         patch("forge.orchestrate.build_then_test_result",
+               return_value=(True, "ok")):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert reviewer.call_count == 1
+    assert len(coder_prompts) == 1
+    assert "stosuję sugestię" in coder_prompts[0]
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert state.current_task == {}
+
+
+def test_tester_can_escalate_suggestions_to_a_second_review(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+    tester_answers = iter((
+        '{"status":"review"}',
+        '{"status":"review","reason":"zmiana wykracza poza sugestię"}',
+    ))
+    reviewer_answers = iter((
+        '{"verdict":"suggestions","notes":["rozważ zmianę granicy modułu"]}',
+        '{"verdict":"approve","notes":[]}',
+    ))
+
+    with patch(
+            "forge.orchestrate._call_role",
+            side_effect=lambda *_args: next(tester_answers)), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch(
+             "forge.orchestrate.run_agent",
+             side_effect=reviewer_answers) as reviewer, \
+         patch("forge.orchestrate.build_then_test_result",
+               return_value=(True, "ok")):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert reviewer.call_count == 2
+    assert state.current_task == {}
+
+
+def test_request_changes_notes_do_not_enter_backlog_before_fix(
         tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)
 
@@ -381,9 +505,11 @@ def test_blocking_reviewer_notes_do_not_enter_backlog_before_fix(
                return_value='{"status":"review"}'), \
          patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate.run_agent", return_value=(
-             '{"verdict":"changes","notes":["napraw kontrakt"]}')):
+             '{"verdict":"request_changes","notes":["napraw kontrakt"]}')):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
+    assert state.task_phase == "tester"
+    assert "napraw kontrakt" in state.tester_handoff
     assert not (tmp_path / "BACKLOG.md").exists()
 
 
@@ -504,6 +630,31 @@ def test_invalid_tester_decision_retry_explains_missing_command() -> None:
         "Powód odrzucenia: decyzja testera 'red' wymaga niepustego `command`"
         in prompts[1]
     )
+
+
+def test_finalize_outside_suggestions_gets_format_retry(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+    answers = iter((
+        '{"status":"finalize","reason":"za wcześnie"}',
+        '{"status":"review"}',
+    ))
+    tester_prompts: list[str] = []
+
+    def role_call(_cfg, _project, _state, role, prompt, _log):
+        assert role == "tester"
+        tester_prompts.append(prompt)
+        return next(answers)
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent",
+               return_value='{"verdict":"approve"}'):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert len(tester_prompts) == 2
+    assert "`finalize` jest dozwolone tylko po werdykcie suggestions" \
+        in tester_prompts[1]
 
 
 def test_second_invalid_decision_stops() -> None:

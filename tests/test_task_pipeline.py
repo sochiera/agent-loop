@@ -14,12 +14,26 @@ def test_decision_contracts_are_small_and_strict() -> None:
     assert result.data["command"] == "pytest tests/test_x.py"
     assert parse_coder_decision('{"status":"green"}').status == "green"
     assert parse_review_decision('{"verdict":"approve"}').status == "approve"
+    assert parse_review_decision(
+        '{"verdict":"suggestions","notes":["uprość nazwę"]}'
+    ).status == "suggestions"
+    assert parse_review_decision(
+        '{"verdict":"request_changes","notes":["napraw kontrakt"]}'
+    ).status == "request_changes"
     with pytest.raises(InvalidDecision): parse_tester_decision('not json')
     with pytest.raises(InvalidDecision):
         parse_tester_decision('{"status":"red"}')
     with pytest.raises(InvalidDecision):
         parse_tester_decision('{"status":"code","command":"  "}')
     with pytest.raises(InvalidDecision): parse_coder_decision('{"status":"retry"}')
+    with pytest.raises(InvalidDecision):
+        parse_review_decision('{"verdict":"approve","notes":["popraw"]}')
+    with pytest.raises(InvalidDecision):
+        parse_review_decision('{"verdict":"suggestions","notes":[]}')
+    with pytest.raises(InvalidDecision):
+        parse_review_decision('{"verdict":"suggestions","notes":["  "]}')
+    with pytest.raises(InvalidDecision):
+        parse_review_decision('{"verdict":"request_changes"}')
 
 
 def test_red_green_returns_to_same_tester() -> None:
@@ -171,9 +185,10 @@ def test_restart_after_coder_edits_returns_to_tester_without_repeating_coder() -
 def test_review_notes_are_normalised_to_strings() -> None:
     """Recenzent bywa niekarny w kształcie 'notes'; reszta pipeline'u je łączy
     i zapisuje, więc nie-string nie może wybuchać po akceptacji zadania."""
-    result = parse_review_decision('{"verdict":"approve","notes":[1,{"a":2},"ok"]}')
+    result = parse_review_decision(
+        '{"verdict":"suggestions","notes":[1,{"a":2},"ok"]}')
 
-    assert result.status == "approve"
+    assert result.status == "suggestions"
     assert result.data["notes"] == ["1", "{'a': 2}", "ok"]
     assert "; ".join(result.data["notes"])
 
@@ -183,4 +198,23 @@ def test_review_without_notes_gets_empty_list() -> None:
 
 
 def test_review_with_scalar_notes_does_not_explode() -> None:
-    assert parse_review_decision('{"verdict":"changes","notes":"popraw"}').data["notes"] == ["popraw"]
+    result = parse_review_decision(
+        '{"verdict":"request_changes","notes":"popraw"}')
+    assert result.data["notes"] == ["popraw"]
+
+
+def test_finalize_requires_reason_and_ends_tdd_loop() -> None:
+    with pytest.raises(InvalidDecision):
+        parse_tester_decision('{"status":"finalize"}')
+
+    state = SimpleNamespace(task_phase="", tdd_round=0, tester_decision={})
+    result = run_tdd_loop(
+        state=state,
+        max_rounds=4,
+        run_tester=lambda _: parse_tester_decision(
+            '{"status":"finalize","reason":"sugestia odrzucona: szkodzi KISS"}'),
+        run_coder=lambda _: pytest.fail("coder should not run"),
+        checkpoint=lambda _: None,
+    )
+
+    assert result == "finalize"

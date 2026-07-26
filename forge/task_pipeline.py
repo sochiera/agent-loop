@@ -12,9 +12,9 @@ class InvalidDecision(ValueError):
 
 
 TASK_PHASES = ("tester", "coder", "review", "corrections", "commit")
-TESTER_STATUSES = ("red", "code", "review", "blocked")
+TESTER_STATUSES = ("red", "code", "review", "finalize", "blocked")
 CODER_STATUSES = ("green", "test_changes_needed", "tester_input_needed")
-REVIEW_VERDICTS = ("approve", "changes")
+REVIEW_VERDICTS = ("approve", "suggestions", "request_changes")
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,12 @@ def parse_tester_decision(text: str) -> PhaseResult:
             raise InvalidDecision(
                 f"decyzja testera {status!r} wymaga niepustego `command`")
         data["command"] = command.strip()
+    if status == "finalize":
+        reason = data.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise InvalidDecision(
+                "decyzja testera 'finalize' wymaga niepustego `reason`")
+        data["reason"] = reason.strip()
     return PhaseResult(status, data)
 
 
@@ -57,10 +63,13 @@ def parse_review_decision(text: str) -> PhaseResult:
     verdict = data.get("verdict")
     if verdict not in REVIEW_VERDICTS:
         raise InvalidDecision(f"niedozwolony werdykt review: {verdict!r}")
-    # Reszta pipeline'u łączy notes i zapisuje je do stanu, handoffu testera
-    # oraz dziennika. Nie-string wybuchłby dopiero PO zaakceptowaniu zadania,
-    # więc kształt normalizujemy tu — w jedynym miejscu, przez które przechodzą.
-    data["notes"] = _as_strings(data.get("notes"))
+    notes = _as_strings(data.get("notes"))
+    data["notes"] = notes
+    if verdict == "approve" and notes:
+        raise InvalidDecision("werdykt 'approve' wymaga pustego `notes`")
+    if verdict in {"suggestions", "request_changes"} and not notes:
+        raise InvalidDecision(
+            f"werdykt {verdict!r} wymaga co najmniej jednej notatki")
     return PhaseResult(verdict, data)
 
 
@@ -68,10 +77,15 @@ def _as_strings(value) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return [value] if value.strip() else []
-    if isinstance(value, (list, tuple)):
-        return [item if isinstance(item, str) else str(item) for item in value]
-    return [str(value)]
+        value = [value]
+    elif not isinstance(value, (list, tuple)):
+        value = [value]
+    notes = []
+    for item in value:
+        text = item if isinstance(item, str) else str(item)
+        if text.strip():
+            notes.append(text.strip())
+    return notes
 
 
 def _coder_request_handoff(status: str, reason: str) -> str:
@@ -99,8 +113,8 @@ def run_tdd_loop(*, state, max_rounds: int, run_tester: Callable[[str], PhaseRes
             state.tester_handoff = ""
             if decision.status == "blocked":
                 return f"blocked: {decision.data.get('reason', 'tester nie podał powodu')}"
-            if decision.status == "review":
-                return "review"
+            if decision.status in {"review", "finalize"}:
+                return decision.status
             if state.tdd_round >= max_rounds:
                 return f"round_limit: zadanie wymaga podziału (limit {max_rounds})"
             state.task_phase = "coder"

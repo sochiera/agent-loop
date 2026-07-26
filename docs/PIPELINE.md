@@ -1,12 +1,19 @@
 # Forge KISS pipeline
 
-Jedno zadanie przechodzi przez pętlę `tester ↔ coder`, następnie `review`. Werdykt `changes` wraca do testera i rozpoczyna nowy cykl TDD; dopiero `approve` prowadzi do `commit`.
+Jedno zadanie przechodzi przez pętlę `tester ↔ coder`, następnie `review`.
+Reviewer zwraca `approve`, `suggestions` albo `request_changes`.
+`request_changes` wraca do testera i rozpoczyna nowy cykl TDD zakończony
+świeżym review. `suggestions` wraca do jednorazowej oceny testera i może
+zakończyć się `finalize` bez drugiego review. `approve` prowadzi bezpośrednio
+do `commit`.
 
 Tester decyduje o dalszym kroku: `red`, `code`, `review` albo `blocked`. Po
 `red` lub `code` koder odpowiada `green`, `test_changes_needed` albo
 `tester_input_needed`. Oba niezielone wyniki wraz z powodem wracają do tej
 samej sesji testera. Limit `max_tdd_rounds` wynosi domyślnie 10 i oznacza
-potrzebę podziału zadania.
+potrzebę podziału zadania. Wyłącznie po `suggestions` tester może też zwrócić
+`finalize` z niepustym uzasadnieniem rozliczającym sugestie jako zastosowane
+albo odrzucone.
 
 Planista opisuje zachowanie i publiczny kontrakt, ale nie wybiera testów ani
 komend. Tester sam wybiera najwęższą wiarygodną bramkę i zwraca jej komendę w
@@ -27,10 +34,18 @@ Po decyzji `review` świeży, read-only reviewer wykonuje zwykłe code review:
 szuka błędów, przypadków brzegowych, naruszeń kontraktu i SOLID/KISS, design
 smells, zbędnej złożoności, duplikacji, mylących nazw oraz testów bez wartości.
 Nie zastępuje pełnej bramki, ale może uruchomić wąski test dla konkretnego
-podejrzenia. Przy `changes` uwagi wracają do zachowanej sesji testera, która
+podejrzenia. `approve` wymaga pustej listy uwag. `suggestions` jest dozwolone
+tylko wtedy, gdy diff można bezpiecznie commitować bez zastosowania uwag.
+Tester ocenia każdą sugestię, może sam poprawić testy albo przekazać
+zaakceptowaną zmianę koderowi, a następnie wybiera `finalize`. Jeśli poprawki
+wyjdą poza mały zakres, zmienią publiczne zachowanie albo wzbudzą wątpliwości,
+tester wybiera `review`, świadomie ponosząc koszt nowej recenzji.
+
+Przy `request_changes` uwagi wracają do zachowanej sesji testera, która
 rozpoczyna nowy cykl TDD. Jeśli reviewer mimo roli read-only zapisze pliki,
 Forge nie porzuca ani nie cofa zadania: podaje testerowi dokładne ścieżki do
-oceny. Dopiero `approve` bez zapisów przechodzi do pełnej bramki i commitu.
+oceny i wymaga zwykłej ścieżki review. `approve`, a także poprawne `finalize`,
+przechodzą do pełnej bramki i commitu.
 Sesje są czyszczone po udanym commicie albo zakończeniu zadania przez testera
 jako `blocked`.
 
@@ -44,9 +59,10 @@ rolę. Mistrz uruchamia się na początku każdej rundy i może na tej podstawie
 poprosić testera o ocenę testu zmienionego przez kodera. `reason` testera
 trafia do promptu kodera, a `summary` kodera wraca jako handoff do następnej
 tury testera. Werdykty review i zapisane przez reviewera ścieżki również
-trafiają do ledgera. Gdy kolejne cykle review nie robią postępu, Mistrz poleca
-testerowi zwrócić `blocked` z konkretnym powodem; wtedy standardowa obsługa
-porażki zapisuje artefakt, przywraca tag startowy i oddaje sterowanie planiście.
+trafiają do ledgera. Gdy kolejne cykle `request_changes` nie robią postępu,
+Mistrz poleca testerowi zwrócić `blocked` z konkretnym powodem; wtedy
+standardowa obsługa porażki zapisuje artefakt, przywraca tag startowy i oddaje
+sterowanie planiście.
 
 Niepoprawna decyzja JSON dostaje dokładnie jedną prośbę o korektę samego
 formatu. Druga niepoprawna odpowiedź zatrzymuje przebieg z zapisanym

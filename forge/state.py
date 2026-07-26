@@ -31,6 +31,7 @@ class State:
     tester_record: str = ""
     coder_record: str = ""
     review_notes: list[str] = field(default_factory=list)
+    review_suggestions_pending: bool = False
     corrections_done: bool = False
     corrections_tree_hash: str = ""
     task_start_tag: str = ""

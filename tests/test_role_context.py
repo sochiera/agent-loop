@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from forge import prompts
 
 
@@ -120,6 +122,44 @@ def test_reviewer_prompt_is_plain_code_review() -> None:
         assert expected in prompt
     assert "macierz" not in prompt
     assert "Zwróć wyłącznie JSON" in prompt
+    assert '"verdict":"approve"' in prompt
+    assert '"verdict":"suggestions"' in prompt
+    assert '"verdict":"request_changes"' in prompt
+    assert "można bezpiecznie zacommitować" in prompt
+
+
+def test_suggestions_prompt_can_finalize_or_escalate() -> None:
+    prompt = prompts.tester_task_prompt(
+        "task.md",
+        "pytest -q",
+        handoff="uprość helper",
+        review_suggestions=True,
+        review_notes=["usuń duplikację", "skróć nazwę"],
+    )
+
+    assert "zaakceptował bieżący diff z sugestiami" in prompt.lower()
+    assert "zastosuj" in prompt and "odrzuć" in prompt
+    assert "usuń duplikację; skróć nazwę" in prompt
+    assert "finalize" in prompt
+    assert "bez ponownego review" in prompt
+    assert "świadoma eskalacja" in prompt
+
+
+def test_agent_prompt_bodies_live_in_separate_files() -> None:
+    template_dir = (
+        Path(prompts.__file__).parent / "templates"
+    )
+
+    expected = {
+        "bootstrap.md",
+        "planner.md",
+        "tester.md",
+        "coder.md",
+        "reviewer.md",
+        "master-system.md",
+        "verify-goal.md",
+    }
+    assert expected <= {path.name for path in template_dir.iterdir()}
 
 
 def test_planner_reads_small_indexes_and_archive_only_on_demand() -> None:

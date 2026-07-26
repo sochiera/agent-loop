@@ -81,7 +81,7 @@ def test_master_prompt_is_process_only_and_carries_ledger() -> None:
     assert "MISTRZ" in prompt
     assert "tests/test_app.py" in prompt
     assert "poproś testera o świadomą ocenę" in prompt
-    assert "`recenzja→changes`" in prompt
+    assert "`recenzja→request_changes`" in prompt
     assert "nie sugeruj rozwiązań technicznych" in prompt
     # Milczenie jest odpowiedzią domyślną — inaczej mistrz zatruwa każdy prompt.
     assert "pust" in prompt.lower()
@@ -93,7 +93,8 @@ def test_master_knows_process_and_legal_code_status() -> None:
 
     assert "`red` i `code` przekazują pracę koderowi" in prompt
     assert "`code` jest legalne" in prompt
-    assert "`recenzja→changes`" in prompt
+    assert "`recenzja→request_changes`" in prompt
+    assert "`recenzja→suggestions`" in prompt
     assert "`recenzja→approve`" in prompt
     assert "pełnej bramki testów" in prompt
 
@@ -103,7 +104,7 @@ def test_master_only_intervenes_on_observable_process_patterns() -> None:
 
     assert "co najmniej dwie kolejne tury" in prompt
     assert "zmianę pliku testowego przez kodera" in prompt
-    assert "kolejne `recenzja→changes` bez zmian" in prompt
+    assert "kolejne `recenzja→request_changes` bez zmian" in prompt
     assert "co najmniej dwa zadania na liście `round_limit`" in prompt
     assert "nie oceniaj poprawności implementacji" in prompt
     assert "kompletności `reason`/`summary`" in prompt

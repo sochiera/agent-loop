@@ -30,8 +30,9 @@ _TASK_STATE_FIELDS = (
     "current_task", "task_phase", "tdd_round",
     "tester_session", "coder_session", "tester_decision", "tester_handoff",
     "coder_summary", "no_change_rounds", "round_changed", "suite_regression",
-    "tester_record", "coder_record", "review_notes", "corrections_done",
-    "corrections_tree_hash", "task_start_tag", "coder_tree_hash",
+    "tester_record", "coder_record", "review_notes",
+    "review_suggestions_pending", "corrections_done", "corrections_tree_hash",
+    "task_start_tag", "coder_tree_hash",
 )
 
 
@@ -443,6 +444,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         state.no_change_rounds = 0
         state.round_changed = False
         state.suite_regression = False
+        state.review_suggestions_pending = False
         _checkpoint(project, state, "tester")
         log(f"Zadanie {task['id']} — {task['title']} (trudność: {task['difficulty']})")
         ledger.append(project, f"{task['id']} start: {task['title']} ({task['difficulty']})")
@@ -496,6 +498,16 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             suggested_test_cmd = str(
                 state.tester_decision.get("command", "")).strip()
             using_suite_regression = state.suite_regression
+
+            def parse_for_current_review_cycle(text: str):
+                parsed = parse_tester_decision(text)
+                if (parsed.status == "finalize"
+                        and not state.review_suggestions_pending):
+                    raise InvalidDecision(
+                        "`finalize` jest dozwolone tylko po werdykcie "
+                        "suggestions")
+                return parsed
+
             result = run_turn("tester", prompts.tester_task_prompt(
                 task["file"], state.test_cmd,
                 suggested_test_cmd=suggested_test_cmd,
@@ -506,8 +518,10 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 task_ledger=ledger.tail_for_task(project, task["id"], limit=8),
                 resume=bool(state.tester_session),
                 confirmation=confirmation,
-                suite_regression=using_suite_regression),
-                parse_tester_decision)
+                suite_regression=using_suite_regression,
+                review_suggestions=state.review_suggestions_pending,
+                review_notes=state.review_notes),
+                parse_for_current_review_cycle)
             # To jednorazowy sygnał kierujący najbliższą turę testera na pełną
             # bramkę. Czyścimy go dopiero po poprawnie sparsowanej odpowiedzi:
             # checkpoint sprzed tury nadal umożliwia bezpieczne wznowienie.
@@ -535,11 +549,38 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             checkpoint=lambda phase: _checkpoint(project, state, phase),
             worktree_fingerprint=lambda: _tree_fingerprint(project),
         )
-        if outcome != "review":
+        if outcome == "finalize":
+            # Najpierw ustaw następną legalną fazę. Jeśli SIGINT nadejdzie
+            # podczas logowania poniżej, handler zapisze już wznawialny commit,
+            # a nie fazę testera pozbawioną informacji o sugestiach.
+            state.task_phase = "commit"
+            state.review_suggestions_pending = False
+            state.review_notes = []
+            _checkpoint(project, state, "commit")
+            log(
+                f"Zadanie {task['id']}: sugestie rozliczone, "
+                "pomijam ponowne review."
+            )
+            ledger.append(
+                project,
+                f"{task['id']} sugestie→finalize: "
+                f"{state.tester_decision.get('reason', '')[:160]}",
+            )
+        elif outcome != "review":
             _fail_task(cfg, project, state, outcome)
             return True
-        log(f"Zadanie {task['id']}: pętla TDD zakończona, przekazuję do review.")
-        _checkpoint(project, state, "review")
+        else:
+            # `review` w cyklu sugestii jest świadomą eskalacją. Kolejny
+            # reviewer widzi cały finalny diff; sugestie przestają być
+            # przepustką do commita bez recenzji.
+            state.task_phase = "review"
+            state.review_suggestions_pending = False
+            state.review_notes = []
+            _checkpoint(project, state, "review")
+            log(
+                f"Zadanie {task['id']}: pętla TDD zakończona, "
+                "przekazuję do review."
+            )
     if state.task_phase == "review":
         before_review = _tree_manifest(project)
         reviewer, model, effort = cfg.role("reviewer", task["difficulty"])
@@ -560,10 +601,11 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                                f"pliki={review_changes}: "
                                f"{'; '.join(review.data.get('notes', []))[:160]}")
         review_notes = list(review.data.get("notes", []))
-        if review.status == "changes":
+        if review.status == "request_changes":
+            state.review_suggestions_pending = False
             state.review_notes = review_notes
             state.tester_handoff = (
-                "Reviewer nie zaakceptował zadania. Rozpocznij nowy cykl TDD "
+                "Reviewer zażądał poprawek. Rozpocznij nowy cykl TDD "
                 f"i oceń uwagi: {'; '.join(review_notes) or '(brak konkretów)'}.")
             if review_changes != "bez_zmian":
                 state.tester_handoff += (
@@ -575,12 +617,24 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             # Reviewer ma pozostać read-only, lecz przypadkowy zapis nie jest
             # powodem do porzucenia całego zadania. Tester ocenia pozostawiony diff.
             state.tester_handoff = (
-                "Reviewer zaakceptował wynik, ale mimo roli read-only zmienił pliki "
+                "Reviewer mimo roli read-only zmienił pliki "
                 f"{review_changes}. Oceń pozostawiony diff; zachowaj, popraw albo "
                 "przywróć te zmiany, a następnie wybierz dalszy krok.")
+            state.review_suggestions_pending = False
             _checkpoint(project, state, "tester")
             return True
-        _append_review_backlog(project, task, review_notes)
+        if review.status == "suggestions":
+            state.review_notes = review_notes
+            state.review_suggestions_pending = True
+            state.tester_handoff = (
+                "Reviewer zaakceptował bieżący diff z opcjonalnymi sugestiami. "
+                "Oceń każdą, zastosuj albo odrzuć z powodem: "
+                f"{'; '.join(review_notes)}."
+            )
+            _checkpoint(project, state, "tester")
+            return True
+        state.review_notes = []
+        state.review_suggestions_pending = False
         _checkpoint(project, state, "commit")
     if state.task_phase == "corrections":
         # Zgodność ze starymi checkpointami. Osobna, jednorazowa tura kodera
@@ -590,6 +644,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             f"TDD i oceń uwagi: {'; '.join(state.review_notes) or '(brak konkretów)'}.")
         state.corrections_done = False
         state.corrections_tree_hash = ""
+        state.review_suggestions_pending = False
         _checkpoint(project, state, "tester")
         return True
     if state.task_phase != "commit":
@@ -613,26 +668,6 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
     _clear_task_state(state)
     _checkpoint(project, state, "")
     return True
-
-
-def _append_review_backlog(
-        project: str, task: dict, notes: list[str]) -> None:
-    """Zachowaj nieblokujące uwagi zaakceptowanej recenzji."""
-    if not notes:
-        return
-    backlog = Path(project, "BACKLOG.md")
-    existing = backlog.read_text(encoding="utf-8") if backlog.exists() else ""
-    additions = []
-    for note in notes:
-        clean = " ".join(str(note).split())
-        if clean and clean not in existing:
-            additions.append(
-                f"- Dług po review {task.get('id', 'task')} "
-                f"({task.get('title', 'bez tytułu')}): {clean}\n")
-    if additions:
-        with backlog.open("a", encoding="utf-8") as target:
-            target.writelines(additions)
-
 
 def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
     """Końcowa weryfikacja celu zostaje poza pipeline'em pojedynczego zadania."""
