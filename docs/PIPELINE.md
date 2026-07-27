@@ -84,6 +84,13 @@ Planista czyta `docs/PROJECT.md`, a nie brief: zmiany intencji docierają do
 niego przez ten plik i backlog. Nie rozwija zakresu samodzielnie — gdy backlog
 jest pusty, zwraca `no_more_tasks` i oddaje decyzję przeglądowi kierunku.
 
+Identyfikator zadania to dokładnie `task-NNN` i jest to kontrakt, nie
+konwencja: Forge wylicza z tego formatu numer następnego wsadu oraz kolejność
+archiwum. Zadanie o innym identyfikatorze jest odrzucane z wpisem w logu i
+ledgerze, a nie renumerowane — zgadnięty numer mógłby wskazać istniejący plik
+cudzego zadania. Odrzucenie wszystkich zadań wsadu kończy fazę jawnym błędem
+i checkpointem.
+
 Planista opisuje zachowanie i publiczny kontrakt, ale nie wybiera testów ani
 komend. Tester sam wybiera najwęższą wiarygodną bramkę i zwraca jej komendę w
 decyzji `red` albo `code`; Forge przekazuje tę samą komendę koderowi. Koder może
@@ -118,6 +125,11 @@ przechodzą do pełnej bramki i commitu.
 Sesje są czyszczone po udanym commicie albo zakończeniu zadania przez testera
 jako `blocked`.
 
+Bramka przed commitem i zapis reviewera raportują się w logu i w ledgerze.
+Czerwona bramka po `finalize` cofała zadanie do testera bez żadnego śladu:
+z zewnątrz wyglądało to jak zwis albo pętla, a Mistrz — który widzi wyłącznie
+ledger — dostawał w tym miejscu niewyjaśnioną lukę.
+
 Checkpoint opisuje następną czynność. Przed wywołaniem kodera Forge zapamiętuje
 odcisk całego drzewa wyłącznie po to, by po restarcie nie powtarzać częściowo
 wykonanej tury. Zastane zmiany wracają do oceny testera; żaden plik testowy
@@ -125,7 +137,13 @@ nie jest mechanicznie chroniony przed edycją kodera.
 
 Każdy wpis rundy w ledgerze zawiera dokładne ścieżki zmienione przez daną
 rolę. Mistrz uruchamia się na początku każdej rundy i może na tej podstawie
-poprosić testera o ocenę testu zmienionego przez kodera. `reason` testera
+poprosić testera o ocenę testu zmienionego przez kodera. Razem z ledgerem
+dostaje pozycję pętli: id aktywnego zadania i rolę, która zaraz ruszy. Bez tego
+brak wpisu tury jeszcze niewykonanej czytał jako urwany cykl. Uwagi dla testera
+i kodera są dodatkowo filtrowane deterministycznie — nazwanie w nich innego
+zadania niż aktywne odrzuca uwagę, bo okno ledgera obejmuje kilka zamkniętych
+zadań wstecz. Reguła `round_limit` dotyczy planisty i filtra nie podlega.
+`reason` testera
 trafia do promptu kodera, a `summary` kodera wraca jako handoff do następnej
 tury testera. Werdykty review i zapisane przez reviewera ścieżki również
 trafiają do ledgera. Gdy kolejne cykle `request_changes` nie robią postępu,

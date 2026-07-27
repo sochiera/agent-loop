@@ -253,6 +253,83 @@ def test_master_receives_round_limit_failures_it_cannot_see_in_the_window(
     assert "round_limit (cała pamięć dziennika): task-001, task-002" in prompt
 
 
+def test_master_learns_where_the_loop_stands(tmp_path: Path) -> None:
+    """Mistrz jest pytany PRZED turą, więc dziennik zawsze kończy się na turze
+    poprzedniej. Bez tej informacji brak wpisu tury, która dopiero ma ruszyć,
+    czytał jako urwany cykl — i produkował fałszywy alarm w każdej rundzie."""
+    with patch("forge.orchestrate.run_agent", return_value="{}") as run:
+        orchestrate._master_notes(
+            Config(), str(tmp_path), lambda phase: str(tmp_path / f"{phase}.log"),
+            task_id="task-466", next_role="tester")
+
+    prompt = _flat(run.call_args.args[1])
+    assert "aktywne zadanie to task-466" in prompt
+    assert "zaraz ruszy tura roli `tester`" in prompt
+    assert "nie jest urwanym cyklem" in prompt
+
+
+def test_master_prompt_names_the_red_gate_entry_the_ledger_writes() -> None:
+    """Wpis bramki jest nowym zdarzeniem w dzienniku; nieopisany w promptcie
+    byłby dla mistrza kolejną luką do wypełnienia domysłem."""
+    assert "bramka przed commitem CZERWONA" in _flat(
+        prompts.master_system_prompt())
+
+
+def test_master_note_about_another_task_is_dropped() -> None:
+    notes = {"tester": "task-464 r2: powtórzony pliki=bez_zmian",
+             "coder": "podaj konkretną linię"}
+
+    kept = orchestrate._scoped_master_notes(notes, "task-465")
+
+    assert kept == {"coder": "podaj konkretną linię"}
+
+
+def test_path_segment_is_not_mistaken_for_a_task_id() -> None:
+    """Uwaga mistrza cytuje wpisy `pliki=[…]`, więc ścieżka zawierająca
+    `task-NNN` nie może udawać wzmianki o obcym zadaniu."""
+    notes = {"tester": "koder zmienił tests/task-002.py — oceń tę zmianę"}
+
+    assert orchestrate._scoped_master_notes(notes, "task-001") == notes
+
+
+def test_task_id_at_end_of_sentence_still_counts_as_a_mention() -> None:
+    notes = {"coder": "zmień podejście w zadaniu task-464."}
+
+    assert orchestrate._scoped_master_notes(notes, "task-465") == {}
+
+
+def test_planner_note_may_name_other_tasks() -> None:
+    """Reguła `round_limit` z definicji mówi o cudzych, porzuconych zadaniach —
+    ta sama bramka nie może jej uciszyć."""
+    notes = {"planner": "task-001 i task-002 padły na round_limit; tnij drobniej"}
+
+    assert orchestrate._scoped_master_notes(notes, "task-003") == notes
+
+
+def test_notes_for_absent_roles_are_dropped_during_planning() -> None:
+    notes = {"tester": "nie powtarzaj testu", "planner": "tnij drobniej"}
+
+    assert orchestrate._scoped_master_notes(notes, "") == {
+        "planner": "tnij drobniej"}
+
+
+def test_stale_master_note_never_reaches_the_role_prompt(tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+    role_call, seen = _one_round(tmp_path)
+
+    def agent_call(_agent, prompt, _cfg, _project, _log, **_kwargs):
+        if "MISTRZ" in prompt:
+            return '{"tester":"task-999 r2: zmień podejście","coder":""}'
+        return '{"verdict":"approve"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert "task-999" not in seen["tester"]
+    assert "UWAGA MISTRZA" not in seen["tester"]
+
+
 def test_master_declares_thin_advisory_role(tmp_path: Path) -> None:
     with patch("forge.orchestrate.run_agent", return_value="{}") as run:
         orchestrate._master_notes(

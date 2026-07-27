@@ -212,12 +212,15 @@ def review_task_prompt_kiss(
 
 def master_prompt(
         ledger_tail: str,
-        round_limit_tasks: list[str] | None = None) -> str:
+        round_limit_tasks: list[str] | None = None,
+        task_id: str = "",
+        next_role: str = "") -> str:
     """Mistrz kuźni: pilnuje procesu, nie kodu. Widzi wyłącznie dziennik."""
     return (
         master_system_prompt()
         + "\n\n"
-        + master_ledger_prompt(ledger_tail, round_limit_tasks)
+        + master_ledger_prompt(ledger_tail, round_limit_tasks,
+                               task_id=task_id, next_role=next_role)
     )
 
 
@@ -225,12 +228,28 @@ def master_system_prompt() -> str:
     return read_template("master-system.md")
 
 
+def master_position(task_id: str = "", next_role: str = "") -> str:
+    """Gdzie stoi pętla w chwili pytania — inaczej mistrz zgaduje.
+
+    Mistrz jest wołany PRZED turą, więc ostatnim wpisem dziennika jest zawsze
+    poprzednia tura. Bez tej informacji brak wpisu tury, która dopiero ma
+    ruszyć, wygląda jak urwany cykl i produkuje fałszywe alarmy.
+    """
+    if not task_id:
+        return read_template("master-position-planning.md")
+    return render("master-position.md", TASK_ID=task_id,
+                  NEXT_ROLE=next_role or "tester")
+
+
 def master_ledger_prompt(
         ledger_tail: str,
-        round_limit_tasks: list[str] | None = None) -> str:
+        round_limit_tasks: list[str] | None = None,
+        task_id: str = "",
+        next_role: str = "") -> str:
     failures = ", ".join(round_limit_tasks or []) or "(brak)"
     return render(
         "master-ledger.md",
+        POSITION=master_position(task_id, next_role),
         FAILURES=failures,
         LEDGER_TAIL=ledger_tail or "(pusty)",
     )

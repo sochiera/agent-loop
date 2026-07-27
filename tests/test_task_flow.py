@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from forge import orchestrate
+from forge import ledger, orchestrate
 from forge.config import Config
 from forge.state import State
 from forge.task_pipeline import InvalidDecision
@@ -217,6 +217,54 @@ def test_full_suite_failure_after_review_returns_to_tester_without_commit(
     assert "napraw albo zwróć `blocked`" in state.tester_handoff
     assert _git(
         tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "seed"
+
+
+def test_red_commit_gate_announces_itself_in_log_and_ledger(
+        tmp_path: Path) -> None:
+    """Cicha bramka wyglądała jak zwis: po `finalize` zadanie wracało do
+    testera bez śladu w logu, a mistrz — który widzi wyłącznie dziennik —
+    dostawał niewyjaśnioną lukę i wypełniał ją domysłem o urwanym cyklu."""
+    _task, state, cfg = _task_repo(tmp_path)
+    lines: list[str] = []
+
+    with patch("forge.orchestrate._call_role",
+               return_value='{"status":"review"}'), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.log", side_effect=lines.append), \
+         patch("forge.orchestrate.run_agent",
+               return_value='{"verdict":"approve"}'), \
+         patch("forge.orchestrate.build_then_test_result",
+               return_value=(False, "FAIL integration_test\ntrace tail")):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    announced = [line for line in lines if "bramka przed commitem" in line]
+    assert any("pełny pakiet" in line for line in announced), lines
+    assert any("CZERWONA" in line for line in announced), lines
+    journal = ledger.tail(str(tmp_path))
+    assert "bramka przed commitem CZERWONA" in journal
+    assert "FAIL integration_test" in journal
+
+
+def test_reviewer_write_announces_itself_in_log_and_ledger(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+    lines: list[str] = []
+
+    def modifying_review(_agent, _prompt, _cfg, project, _log, **_kwargs):
+        Path(project, "reviewer-change.py").write_text(
+            "bad = True\n", encoding="utf-8")
+        return '{"verdict":"approve"}'
+
+    with patch("forge.orchestrate._call_role",
+               return_value='{"status":"review"}'), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.log", side_effect=lines.append), \
+         patch("forge.orchestrate.run_agent", side_effect=modifying_review):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert any("read-only" in line and "reviewer-change.py" in line
+               for line in lines), lines
+    assert "reviewer-change.py" in ledger.tail(str(tmp_path))
 
 
 def test_tester_works_on_full_suite_after_gate_regression(

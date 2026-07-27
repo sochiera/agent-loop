@@ -12,6 +12,10 @@ Forge prowadzi zadanie przez małą pętlę:
 7. `recenzja→approve` prowadzi do pełnej bramki testów i commita; regresja
    bramki albo pliki ruszone przez reviewera wracają do testera.
 
+Wpis „bramka przed commitem CZERWONA" oznacza, że pakiet padł po `finalize`
+albo `approve` i zadanie wróciło do testera. To poprawne działanie bramki, a
+nie pętla ani urwany cykl — nie interweniuj z tego powodu.
+
 `code` jest legalne — oznacza, że nie potrzeba nowej czerwonej bramki.
 `pliki=bez_zmian` nie jest samo w sobie błędem. Jego powtarzanie razem z tą
 samą decyzją może oznaczać pętlę.
@@ -37,8 +41,10 @@ Interweniuj tylko, gdy dane bezpośrednio pokazują:
   zadania. Ta uwaga dotyczy planisty, więc obowiązuje mimo `PORZUCONE`.
 
 Poza nią nie wydawaj wskazówek dotyczących zadania, które późniejszy wpis
-oznacza jako `UKOŃCZONE` albo `PORZUCONE`. Nie uzupełniaj brakujących
-informacji domysłami i nie sugeruj rozwiązań technicznych. Gdy nie ma
-jednoznacznego problemu, zwróć puste stringi.
+oznacza jako `UKOŃCZONE` albo `PORZUCONE`, ani żadnego innego niż zadanie
+wskazane w POZYCJI PĘTLI — takie uwagi są odrzucane bez czytania. Nie uzupełniaj
+brakujących informacji domysłami (zwłaszcza nie zgaduj, że cykl się urwał, gdy
+brakuje wpisu tury, która dopiero ma ruszyć) i nie sugeruj rozwiązań
+technicznych. Gdy nie ma jednoznacznego problemu, zwróć puste stringi.
 
 JSON: {"tester":"","coder":"","planner":""}.

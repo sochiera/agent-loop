@@ -114,6 +114,19 @@ def _next_task_index(project: str) -> int:
     return max(ids, default=0) + 1
 
 
+# Kanoniczny identyfikator zadania. Nie jest to konwencja kosmetyczna: z tego
+# formatu `_next_task_index` i porządkowanie archiwum wyliczają numer następnego
+# wsadu, więc identyfikator poza nim nie zostałby policzony i kolejny wsad
+# nadpisałby pliki zadań. `_TASK_ID_MENTION` musi opisywać tę samą gramatykę —
+# stąd jeden wzorzec, a nie dwa, które mogłyby się rozjechać.
+_TASK_ID_BODY = r"task-\d+"
+_TASK_ID = re.compile(_TASK_ID_BODY)
+
+
+def valid_task_id(task_id: str) -> bool:
+    return bool(_TASK_ID.fullmatch(task_id))
+
+
 def build_task_from_plan(project: str, raw: dict) -> dict:
     difficulty = raw.get("difficulty", DEFAULT_TASK_DIFFICULTY)
     if difficulty not in TASK_DIFFICULTIES:
@@ -121,7 +134,7 @@ def build_task_from_plan(project: str, raw: dict) -> dict:
     dependencies = raw.get("depends_on", [])
     if not isinstance(dependencies, (list, tuple)):
         dependencies = [dependencies]
-    return {"id": raw.get("id", "task"), "title": raw.get("title", "(bez tytułu)"),
+    return {"id": str(raw.get("id", "")), "title": raw.get("title", "(bez tytułu)"),
             "file": raw.get("file", ""),
             "difficulty": difficulty,
             "depends_on": [str(item) for item in dependencies if str(item)]}
@@ -152,6 +165,15 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     tasks = []
     for raw in data.get("tasks", []):
         task = build_task_from_plan(project, raw)
+        if not valid_task_id(task["id"]):
+            # Odrzucamy zamiast renumerować: zgadnięty numer mógłby wskazać
+            # cudzy, istniejący plik zadania. Gdy nie zostanie żadne zadanie,
+            # faza kończy się jawnym błędem i checkpointem.
+            log(f"Planowanie: pomijam zadanie o identyfikatorze {task['id']!r} "
+                "— wymagany format task-NNN.")
+            ledger.append(project, "plan: pominięto zadanie o niepoprawnym "
+                                   f"identyfikatorze {task['id']!r}")
+            continue
         if task["file"] and Path(project, task["file"]).is_file():
             tasks.append(task)
     if not tasks and not data.get("no_more_tasks"):
@@ -553,9 +575,50 @@ def _call_role(cfg: Config, project: str, state: State, role: str, prompt: str, 
 
 
 _MASTER_ROLES = ("tester", "coder", "planner")
+# Wzmianka o zadaniu, a nie segment ścieżki: uwaga mistrza cytuje wpisy z
+# `pliki=[…]`, więc `tests/task-002.py` w poprawnej uwadze o task-001 nie może
+# udawać obcego identyfikatora. Kropki na końcu NIE wykluczamy — zdanie
+# „dotyczy task-465." jest częstsze niż plik o takiej nazwie, a przeoczona
+# wzmianka jest gorsza od nadmiarowo odrzuconej uwagi (patrz niżej).
+_TASK_ID_MENTION = re.compile(r"(?<![\w/])" + _TASK_ID_BODY)
 
 
-def _master_notes(cfg: Config, project: str, logf) -> dict[str, str]:
+def _scoped_master_notes(notes: dict[str, str], task_id: str) -> dict[str, str]:
+    """Uwagi dla testera i kodera muszą dotyczyć AKTYWNEGO zadania.
+
+    Mistrz widzi okno dziennika obejmujące kilka zadań wstecz i regularnie
+    adresuje radę o zadaniu już zamkniętym do roli pracującej nad następnym.
+    Prompt tego zabrania, ale zakaz w promptcie nie jest gwarancją — ta bramka
+    jest. Uwaga dla planisty przechodzi: jego reguła `round_limit` z definicji
+    mówi o cudzych, porzuconych zadaniach.
+
+    Heurystyka wzmianki jest świadomie asymetryczna. Mistrz jest doradczy, więc
+    nadmiarowo odrzucona uwaga kosztuje tyle, ile jego milczenie — czyli
+    zachowanie bazowe — i dodatkowo trafia do logu. Przeoczona wzmianka wpuszcza
+    do promptu radę o zamkniętym zadaniu, czyli dokładnie ten defekt, przed
+    którym ta bramka broni.
+    """
+    kept: dict[str, str] = {}
+    for role, note in notes.items():
+        if role == "planner":
+            kept[role] = note
+            continue
+        if not task_id:
+            log(f"  mistrz: odrzucono uwagę dla {role} — żadne zadanie nie "
+                "jest aktywne.")
+            continue
+        foreign = sorted({found for found in _TASK_ID_MENTION.findall(note)
+                          if found != task_id})
+        if foreign:
+            log(f"  mistrz: odrzucono uwagę dla {role} — dotyczy "
+                f"{', '.join(foreign)}, a aktywne jest {task_id}.")
+            continue
+        kept[role] = note
+    return kept
+
+
+def _master_notes(cfg: Config, project: str, logf, *, task_id: str = "",
+                  next_role: str = "") -> dict[str, str]:
     """Notatki mistrza per rola — nadzór procesu, nie merytoryki.
 
     Mistrz jest doradczy Z KONSTRUKCJI, więc każda jego awaria (błąd, limit,
@@ -563,12 +626,16 @@ def _master_notes(cfg: Config, project: str, logf) -> dict[str, str]:
     tak jak bez niego. Widzi wyłącznie dziennik przekazany w promptcie i
     pracuje w katalogu tymczasowym — fizycznie nie ma dostępu do repozytorium,
     więc nie może zmienić drzewa ani wyjść poza swoją rolę.
+
+    ``task_id`` i ``next_role`` mówią mu, gdzie stoi pętla: bez tego brak wpisu
+    tury, która dopiero ma ruszyć, wyglądał jak urwany cykl.
     """
     agent, model, effort = cfg.role("master")
     # Rola doradcza nie ma prawa przespać godzin backoffu przed realną pracą.
     advisory = replace(cfg, max_limit_retries=0)
     prompt = prompts.master_ledger_prompt(
-        ledger.compact_tail(project), ledger.round_limit_tasks(project))
+        ledger.compact_tail(project), ledger.round_limit_tasks(project),
+        task_id=task_id, next_role=next_role)
     try:
         with tempfile.TemporaryDirectory(prefix="forge-master-") as sandbox:
             # Sandbox jest katalogiem roboczym, ale koszt roli wołanej co rundę
@@ -583,8 +650,10 @@ def _master_notes(cfg: Config, project: str, logf) -> dict[str, str]:
         return {}
     if not isinstance(data, dict):
         return {}
-    notes = {role: value.strip() for role, value in data.items()
-             if role in _MASTER_ROLES and isinstance(value, str) and value.strip()}
+    notes = _scoped_master_notes(
+        {role: value.strip() for role, value in data.items()
+         if role in _MASTER_ROLES and isinstance(value, str) and value.strip()},
+        task_id)
     for role, note in notes.items():
         log(f"  mistrz → {role}: {note}")
     return notes
@@ -741,14 +810,16 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         notes: dict[str, str] = {}
         consulted = False
 
-        def ensure_notes(new_round: bool) -> None:
+        def ensure_notes(new_round: bool, next_role: str) -> None:
             """Nowa runda pyta mistrza zawsze; wznowienie prosto w koderze
             pyta, bo inaczej rada dla kodera przepadłaby. Milczenie mistrza
             (częsty przypadek) nie może kosztować drugiego wywołania."""
             nonlocal consulted
             if new_round or not consulted:
                 notes.clear()
-                notes.update(_master_notes(cfg, project, logf))
+                notes.update(_master_notes(
+                    cfg, project, logf,
+                    task_id=str(task.get("id", "")), next_role=next_role))
                 consulted = True
 
         def run_turn(role: str, prompt: str, parser):
@@ -777,7 +848,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             return result
 
         def run_tester(handoff: str):
-            ensure_notes(new_round=True)
+            ensure_notes(new_round=True, next_role="tester")
             state.round_changed = False
             confirmation = bool(
                 state.coder_summary and handoff == state.coder_summary)
@@ -816,7 +887,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             return result
 
         def run_coder(decision):
-            ensure_notes(new_round=False)
+            ensure_notes(new_round=False, next_role="coder")
             # Nowe decyzje red/code zawsze mają command. Fallback obsługuje
             # wyłącznie wznowienie starego checkpointu fazy coder.
             test_cmd = str(decision.data.get("command", "")).strip() or state.test_cmd
@@ -907,6 +978,10 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 f"{review_changes}. Oceń pozostawiony diff; zachowaj, popraw albo "
                 "przywróć te zmiany, a następnie wybierz dalszy krok.")
             state.review_suggestions_pending = False
+            log(f"Zadanie {task['id']}: reviewer mimo roli read-only zmienił pliki "
+                f"{review_changes} — wracam do testera po ocenę tego diffu.")
+            ledger.append(project, f"{task['id']} review-zapis {review_changes}: "
+                                   "powrót do testera po ocenę diffu recenzenta")
             _checkpoint(project, state, "tester")
             return True
         if review.status == "suggestions":
@@ -935,10 +1010,21 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         return True
     if state.task_phase != "commit":
         return True
+    log(f"Zadanie {task['id']}: bramka przed commitem — pełny pakiet "
+        f"`{state.test_cmd}`…")
     suite_green, suite_output = build_then_test_result(
         project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s)
     if not suite_green:
         state.suite_regression = True
+        # Cisza w tym miejscu wyglądała jak zwis albo pętla: zadanie wracało do
+        # testera bez śladu w logu. Mistrz też widzi tylko dziennik, więc bez
+        # wpisu dostawał niewyjaśnioną lukę między `finalize` i kolejną turą.
+        log(f"Zadanie {task['id']}: bramka przed commitem CZERWONA — "
+            "wracam do testera z pełnym pakietem zamiast commitować.")
+        # Bez strzałki: `pliki=`/`rola→decyzja` to słownik wzorców mistrza i
+        # nowy pseudo-label tylko by go rozmywał.
+        ledger.append(project, f"{task['id']} bramka przed commitem CZERWONA, "
+                               f"powrót do testera; ogon: {suite_output[-160:]}")
         state.tester_handoff = (
             "Deterministyczna bramka przed commitem wykazała, że pełny pakiet "
             f"jest czerwony po tym zadaniu. Pracuj na `{state.test_cmd}`, nie "

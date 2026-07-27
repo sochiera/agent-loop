@@ -18,7 +18,10 @@ zwróć `no_more_tasks`, gdy nie ma z czego planować — wtedy przegląd kierun
 wskaże następny przyrost. Nie wymyślaj pracy na zapas.
 
 Przygotuj maksymalnie {{BATCH_SIZE}} małych zadań od task-{{START_INDEX}};
-zapisz każde w .forge/tasks/task-NNN.md. Format zadania: Cel, Kryteria akceptacji,
+zapisz każde w .forge/tasks/task-NNN.md. Identyfikator musi mieć dokładnie
+format `task-NNN` (litera w numerze, prefiks albo sufiks powodują odrzucenie
+zadania) — Forge wylicza z niego numer następnego wsadu. Wariant zadania zapisz
+w tytule, nie w identyfikatorze. Format zadania: Cel, Kryteria akceptacji,
 Publiczny kontrakt, Trudność, Poza zakresem. Kryteria opisują
 zachowanie użytkownika albo rzeczywisty publiczny kontrakt.
 

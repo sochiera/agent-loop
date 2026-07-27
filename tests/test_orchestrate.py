@@ -3,7 +3,10 @@ from __future__ import annotations
 import subprocess
 from unittest.mock import patch
 
+import pytest
+
 from forge import orchestrate
+from forge.agents import AgentError
 from forge.config import Config
 from forge.orchestrate import (
     _housekeeping,
@@ -171,6 +174,57 @@ def test_housekeeping_runs_before_planner(tmp_path) -> None:
             lambda phase: phase)
 
     assert events == ["housekeeping", "planner"]
+
+
+def test_task_with_non_canonical_id_is_rejected_not_renumbered(tmp_path) -> None:
+    """`_next_task_index` liczy numer następnego wsadu z formatu `task-NNN`.
+    Identyfikator poza tym formatem nie zostałby policzony, więc kolejny wsad
+    nadpisałby cudze pliki zadań — zgadywanie numeru byłoby gorsze niż odmowa.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.test"],
+                   cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Forge Tests"],
+                   cwd=tmp_path, check=True)
+    tasks = tmp_path / ".forge" / "tasks"
+    tasks.mkdir(parents=True)
+    for name in ("task-001.md", "task-alpha.md"):
+        (tasks / name).write_text("Cel: cokolwiek\n", encoding="utf-8")
+    plan = (
+        '{"tasks":['
+        '{"id":"task-alpha","title":"Wariant","file":".forge/tasks/task-alpha.md"},'
+        '{"id":"task-001","title":"Poprawne","file":".forge/tasks/task-001.md"}'
+        ']}'
+    )
+    state = State(bootstrapped=True)
+
+    with patch("forge.orchestrate._housekeeping"), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_planner", return_value=plan):
+        orchestrate.phase_plan_batch(
+            Config(git_push=False), str(tmp_path), state, lambda phase: phase)
+
+    assert [task["id"] for task in state.task_queue] == ["task-001"]
+
+
+def test_all_tasks_rejected_stops_the_batch_explicitly(tmp_path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.test"],
+                   cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Forge Tests"],
+                   cwd=tmp_path, check=True)
+    tasks = tmp_path / ".forge" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "G82.md").write_text("Cel: cokolwiek\n", encoding="utf-8")
+    plan = '{"tasks":[{"id":"G82.1a","title":"X","file":".forge/tasks/G82.md"}]}'
+
+    with patch("forge.orchestrate._housekeeping"), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_planner", return_value=plan), \
+         pytest.raises(AgentError, match="żadnego poprawnego zadania"):
+        orchestrate.phase_plan_batch(
+            Config(git_push=False), str(tmp_path), State(bootstrapped=True),
+            lambda phase: phase)
 
 
 def test_housekeeping_prunes_task_archive_and_stale_runtime_logs(
