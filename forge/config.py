@@ -35,11 +35,11 @@ ROLE_MODEL_LEVELS: dict[str, dict[str, str]] = {
     "verifier": {"simple": "economy", "standard": "efficient", "complex": "balanced"},
     # Mistrz czyta kilkadziesiąt krótkich linii dziennika i nigdy nie czyta
     # kodu — to rozpoznawanie wzorca, nie rozumowanie o implementacji. Wołany
-    # co rundę, więc musi być tani, inaczej odtworzyłby problem kosztowy,
-    # który ma pomagać wykrywać. Dno drabinki mu wystarcza: jako jedyna rola
-    # pracuje bez narzędzi i bez pętli agentowej (tryb cienki w agents.py),
-    # więc model nie musi tu nic planować ani czytać drzewa.
-    "master": {d: "economy" for d in TASK_DIFFICULTIES},
+    # co rundę, więc dla prostych i standardowych zadań dostaje efficient,
+    # a tylko dla trudnych balanced. Jako jedyna rola pracuje bez narzędzi
+    # i bez pętli agentowej (tryb cienki w agents.py), więc nie musi planować
+    # ani czytać drzewa.
+    "master": {"simple": "efficient", "standard": "efficient", "complex": "balanced"},
 }
 
 # Użytkownik wybiera narzędzie/agenta dla roli. Konkretny model i effort są

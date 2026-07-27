@@ -173,11 +173,13 @@ def test_note_is_labelled_as_advisory() -> None:
 
 # --- Routing roli -----------------------------------------------------------
 
-def test_master_runs_at_cheapest_level() -> None:
-    """Wołany co rundę, więc siedzi na dnie drabinki modeli."""
+def test_master_routing_scales_with_task_difficulty() -> None:
+    """Master jest tani dla prostych zadań i silniejszy dla trudnych."""
     cfg = Config()
 
-    assert cfg.model_level("master") == "economy"
+    assert cfg.model_level("master", "simple") == "efficient"
+    assert cfg.model_level("master", "standard") == "efficient"
+    assert cfg.model_level("master", "complex") == "balanced"
     assert cfg.role("master")[0]
 
 
