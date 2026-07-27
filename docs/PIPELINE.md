@@ -43,7 +43,15 @@ Rola dostaje powód uruchomienia, diff briefu (tylko gdy się zmienił), listę
 commitów od poprzedniego przeglądu i listę niezaczętych zadań; `docs/PROJECT.md`
 i `BACKLOG.md` czyta sama. Wolno jej zapisać wyłącznie te dwa pliki — każdą inną
 zmianę Forge wykrywa manifestem drzewa i cofa, zanim cokolwiek trafi do commita.
-Pełny bootstrap nie jest powtarzany, bo jest nieidempotentny.
+Bramka kotwiczy się na SHA sprzed fazy, nie na bieżącym HEAD: własny commit roli
+albo recenzenta jest wycofywany (`reset --mixed`), więc nie da się przemycić
+zmiany poza zakresem ani pokazać recenzentowi pustego diffu. Pełny bootstrap nie
+jest powtarzany, bo jest nieidempotentny.
+
+Diff briefu nigdy nie jest po cichu obcinany — po udanym przeglądzie snapshotem
+staje się cały nowy brief, więc nieprzeczytany ogon zmian zniknąłby bez śladu.
+Zbyt duży diff zastępuje pełna treść briefu, a brief niemieszczący się w
+promptcie zatrzymuje przegląd z prośbą o podział dokumentu.
 
 Kierunek jest recenzowany, bo błąd na tym poziomie propaguje się na wszystkie
 kolejne zadania. Świeży, read-only recenzent (`bootstrap_reviewer`, najsilniejszy
@@ -64,10 +72,13 @@ decyzją albo zadaniem w backlogu. Projekt zbootstrapowany przed tym mechanizmem
 nie ma snapshotu i przechodzi jednorazową synchronizację początkową.
 
 Pusty backlog nie kończy projektu. `no_more_tasks` bez potwierdzonego
-`goal_reached` prosi o przegląd kierunku; dopiero jego zgoda przepuszcza do
-końcowej weryfikacji celu. Bezpiecznikiem są dwa jałowe wsady z rzędu — wtedy
-weryfikacja rusza mimo wszystko, żeby para planista↔przegląd nie kręciła się w
-kółko na najsilniejszym modelu.
+`goal_reached` prosi o przegląd kierunku; dopiero jego zgoda kończy pracę.
+Zaakceptowany `goal_reached` przechodzi PROSTO do końcowej weryfikacji celu —
+bez kolejnego wsadu planisty i bez dokańczania starej kolejki. Czerwona
+weryfikacja kasuje tę zgodę, bo dowód mówi, że celu nie osiągnięto.
+Bezpiecznikiem są dwa jałowe wsady z rzędu — wtedy weryfikacja rusza mimo
+wszystko, żeby para planista↔przegląd nie kręciła się w kółko na najsilniejszym
+modelu.
 
 Planista czyta `docs/PROJECT.md`, a nie brief: zmiany intencji docierają do
 niego przez ten plik i backlog. Nie rozwija zakresu samodzielnie — gdy backlog

@@ -170,9 +170,11 @@ def test_review_records_its_own_cadence_and_requeues_planning(
     assert "task-007: Stary plan" in note
 
 
-def test_reached_goal_is_remembered_for_the_planner_gate(
+def test_reached_goal_goes_straight_to_final_verification(
         tmp_path: Path) -> None:
+    """Nawet przy replan=false stara kolejka nie może przeżyć osiągniętego celu."""
     project, state, cfg = _steered_repo(tmp_path)
+    state.task_queue = [{"id": "task-007", "title": "Stary plan"}]
 
     _run_steering(project, state, cfg,
                   answers=('{"summary":"gotowe","replan":false,'
@@ -180,6 +182,61 @@ def test_reached_goal_is_remembered_for_the_planner_gate(
 
     assert state.goal_confirmed is True
     assert state.task_queue == []
+    assert state.task_phase == "verify_goal"
+
+    with patch("forge.orchestrate.phase_plan_batch") as plan, \
+         patch("forge.orchestrate.phase_verify_goal",
+               return_value=False) as verify:
+        orchestrate.one_iteration(cfg, str(project), state)
+
+    verify.assert_called_once()
+    plan.assert_not_called()
+
+
+def test_red_verification_forgets_the_confirmed_goal(tmp_path: Path) -> None:
+    project, state, cfg = _steered_repo(tmp_path)
+    state.goal_confirmed = True
+    state.verify_targets = ["smoke"]
+    state.smoke_cmd = "false"
+
+    with patch("forge.verify.collect_evidence",
+               return_value={"smoke": {"rc": 1}}):
+        assert orchestrate.phase_verify_goal(
+            cfg, str(project), state, lambda phase: phase) is True
+
+    assert state.goal_confirmed is False
+
+
+def test_string_booleans_are_refused_instead_of_ending_the_project() -> None:
+    with pytest.raises(InvalidDecision, match="goal_reached"):
+        orchestrate._parse_steering_decision(
+            '{"summary":"x","goal_reached":"false"}')
+    with pytest.raises(InvalidDecision, match="replan"):
+        orchestrate._parse_steering_decision(
+            '{"summary":"x","replan":"false"}')
+    with pytest.raises(InvalidDecision, match="changes"):
+        orchestrate._parse_steering_decision(
+            '{"summary":"x","changes":"jedna zmiana"}')
+    with pytest.raises(InvalidDecision, match="summary"):
+        orchestrate._parse_steering_decision('{"replan":true}')
+
+
+def test_valid_verdict_keeps_its_defaults(tmp_path: Path) -> None:
+    data = orchestrate._parse_steering_decision('{"summary":" x "}')
+
+    assert data == {"summary": "x", "replan": True, "goal_reached": False,
+                    "changes": []}
+
+
+def test_typed_verdict_error_gets_one_cheap_correction(
+        tmp_path: Path) -> None:
+    project, state, cfg = _steered_repo(tmp_path)
+
+    _run_steering(project, state, cfg,
+                  answers=('{"summary":"x","goal_reached":"true"}', STEERED))
+
+    assert state.goal_confirmed is False
+    assert state.task_phase == ""
 
 
 def test_cadence_review_does_not_resend_the_unchanged_brief(
@@ -279,6 +336,93 @@ def test_review_reverts_writes_outside_its_scope(tmp_path: Path) -> None:
     assert not Path(project, "hack.py").exists()
     assert Path(project, "BACKLOG.md").read_text(
         encoding="utf-8") == "- [ ] tryb sieciowy\n"
+
+
+def test_own_commit_does_not_smuggle_changes_past_the_scope_gate(
+        tmp_path: Path) -> None:
+    """Cofanie musi kotwiczyć się na SHA sprzed fazy, nie na ruchomym HEAD."""
+    project, state, cfg = _steered_repo(tmp_path)
+    base = _git(project, "rev-parse", "HEAD").stdout.strip()
+
+    def write(project_dir: Path) -> None:
+        _write_in_scope(project_dir)
+        (project_dir / "app.py").write_text("VALUE = 99\n", encoding="utf-8")
+        _git(project_dir, "add", "-A")
+        _git(project_dir, "commit", "-qm", "przemycam kod")
+
+    _run_steering(project, state, cfg, write=write)
+
+    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
+    history = _git(project, "log", f"{base}..HEAD", "-p").stdout
+    assert "VALUE = 99" not in history
+    assert "tryb sieciowy" in Path(project, "BACKLOG.md").read_text(
+        encoding="utf-8")
+
+
+def test_review_prompt_diffs_against_the_state_before_the_phase(
+        tmp_path: Path) -> None:
+    project, state, cfg = _steered_repo(tmp_path)
+    base = _git(project, "rev-parse", "HEAD").stdout.strip()
+
+    seen = _run_steering(project, state, cfg)
+
+    review = [p for p in seen if "recenzent przeglądu kierunku" in p][0]
+    assert base in review
+
+
+def test_failure_after_a_reviewer_write_still_leaves_a_clean_tree(
+        tmp_path: Path) -> None:
+    project, state, cfg = _steered_repo(tmp_path)
+
+    def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
+        if "recenzent przeglądu kierunku" in prompt:
+            (Path(project_dir) / "app.py").write_text(
+                "HACK = 1\n", encoding="utf-8")
+            return APPROVE
+        _write_in_scope(Path(project_dir))
+        return STEERED
+
+    with patch("forge.orchestrate.run_agent", side_effect=agent), \
+         pytest.raises(orchestrate.AgentError):
+        orchestrate.phase_diff_bootstrap(
+            cfg, str(project), state, lambda phase: phase, "cadence")
+
+    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
+    assert not orchestrate.has_changes(str(project))
+
+
+def test_reviewer_commit_is_caught_even_with_an_untouched_tree(
+        tmp_path: Path) -> None:
+    project, state, cfg = _steered_repo(tmp_path)
+
+    def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
+        if "recenzent przeglądu kierunku" in prompt:
+            _git(Path(project_dir), "add", "-A")
+            _git(Path(project_dir), "commit", "-qm", "recenzent commituje")
+            return APPROVE
+        _write_in_scope(Path(project_dir))
+        return STEERED
+
+    with patch("forge.orchestrate.run_agent", side_effect=agent), \
+         pytest.raises(orchestrate.AgentError, match="zmienił historię"):
+        orchestrate.phase_diff_bootstrap(
+            cfg, str(project), state, lambda phase: phase, "cadence")
+
+    assert not orchestrate.has_changes(str(project))
+    assert Path(project, "BACKLOG.md").read_text(
+        encoding="utf-8") == "- [ ] stary wpis\n"
+
+
+def test_unreadable_brief_never_overwrites_the_snapshot(
+        tmp_path: Path) -> None:
+    project, state, cfg = _steered_repo(tmp_path)
+    Path(cfg.brief_path).unlink()
+
+    _run_steering(project, state, cfg, trigger="cadence")
+
+    assert Path(project, brief.SNAPSHOT_PATH).read_text(
+        encoding="utf-8") == "Cel: gra.\n"
+    assert state.brief_digest == brief.digest("Cel: gra.\n")
 
 
 def test_unparsable_verdict_keeps_the_previous_brief_as_reference(
@@ -536,8 +680,33 @@ def test_large_brief_snapshot_is_not_documentation_debt(tmp_path: Path) -> None:
         encoding="utf-8")
 
 
-def test_diff_of_a_rewritten_brief_stays_bounded() -> None:
-    text = brief.diff("stary\n" * 5000, "nowy\n" * 5000, limit=500)
+def test_oversized_diff_falls_back_to_the_whole_brief() -> None:
+    """Obcięty diff gubiłby wymagania na zawsze: snapshot zapisuje cały brief."""
+    new = "nowy\n" * 200 + "OSTATNIE WYMAGANIE\n"
 
-    assert len(text) < 700
-    assert "obcięto" in text
+    text = brief.diff("stary\n" * 200, new, limit=100)
+
+    assert "OSTATNIE WYMAGANIE" in text
+    assert "PEŁNA bieżąca treść briefu" in text
+    assert "obcięto" not in text
+
+
+def test_brief_too_large_to_sync_stops_instead_of_guessing() -> None:
+    with pytest.raises(brief.TooLargeToSync, match="Podziel brief"):
+        brief.diff("stary\n" * 5000, "nowy\n" * 5000, limit=500, full_limit=1000)
+
+
+def test_unsyncable_brief_stops_the_run_without_touching_the_snapshot(
+        tmp_path: Path) -> None:
+    project, state, cfg = _steered_repo(tmp_path)
+    _change_brief(cfg, "nowy\n" * 5000)
+    cfg_limits = {"limit": 10, "full_limit": 100}
+
+    with patch("forge.brief.DIFF_LIMIT", cfg_limits["limit"]), \
+         patch("forge.brief.FULL_LIMIT", cfg_limits["full_limit"]), \
+         pytest.raises(orchestrate.AgentError, match="zbyt duży"):
+        _run_steering(project, state, cfg, trigger="brief")
+
+    assert state.brief_digest == brief.digest("Cel: gra.\n")
+    assert Path(project, brief.SNAPSHOT_PATH).read_text(
+        encoding="utf-8") == "Cel: gra.\n"
