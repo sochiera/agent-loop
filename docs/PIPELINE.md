@@ -35,8 +35,8 @@ zajdzie którykolwiek warunek:
 
 - **zmiana briefu** (skrót różny od snapshotu) — najmocniejsze wejście, wygrywa
   z pozostałymi powodami;
-- **kadencja** — minęły `FORGE_STEERING_BATCHES` (domyślnie 3) wsady planisty
-  od ostatniego przeglądu;
+- **kadencja** — minęły `FORGE_STEERING_BATCHES` (domyślnie 2) wsady planisty
+  od ostatniego przeglądu, czyli co 2×`FORGE_BATCH_SIZE` = 12 zadań;
 - **wyczerpany backlog** — planista zgłosił `no_more_tasks`.
 
 Rola dostaje powód uruchomienia, diff briefu (tylko gdy się zmienił), listę

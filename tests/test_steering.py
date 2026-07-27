@@ -91,22 +91,23 @@ def test_settled_project_does_not_ask_for_a_review(tmp_path: Path) -> None:
 def test_cadence_triggers_review_after_configured_batches(
         tmp_path: Path) -> None:
     project, state, cfg = _steered_repo(tmp_path)
-    state.plan_batches = 2
+    state.plan_batches = cfg.steering_batches - 1
 
     assert orchestrate._steering_trigger(cfg, str(project), state) == ""
 
-    state.plan_batches = 3
+    state.plan_batches = cfg.steering_batches
 
     assert orchestrate._steering_trigger(cfg, str(project), state) == "cadence"
 
 
 def test_cadence_counts_from_the_last_review(tmp_path: Path) -> None:
     project, state, cfg = _steered_repo(tmp_path)
-    state.plan_batches, state.steered_at_batch = 5, 3
+    state.steered_at_batch = 3
+    state.plan_batches = state.steered_at_batch + cfg.steering_batches - 1
 
     assert orchestrate._steering_trigger(cfg, str(project), state) == ""
 
-    state.plan_batches = 6
+    state.plan_batches += 1
 
     assert orchestrate._steering_trigger(cfg, str(project), state) == "cadence"
 

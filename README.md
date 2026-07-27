@@ -33,7 +33,7 @@ zadanie jako `blocked`.
 Zakres projektu nie jest ustalany z góry. Bootstrap buduje szkielet i backlog
 tylko dla najcieńszego demo, a całą wizję zapisuje w `docs/PROJECT.md` (plus
 kopię briefu w `docs/BRIEF-SNAPSHOT.md`). Dalej zakres rozwija przegląd kierunku
-`diff-bootstrap`: rusza co trzy wsady planisty, po zmianie briefu albo gdy
+`diff-bootstrap`: rusza co dwa wsady planisty (czyli co 12 zadań), po zmianie briefu albo gdy
 backlog się wyczerpie, i aktualizuje wyłącznie `BACKLOG.md` oraz
 `docs/PROJECT.md` — każdą zmianę poza tym zakresem Forge cofa. Kierunek ocenia
 świeży recenzent na najsilniejszym modelu; cztery odrzucenia zatrzymują przebieg

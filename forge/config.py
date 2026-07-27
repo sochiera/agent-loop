@@ -163,11 +163,25 @@ class Config:
     codex_effort: str = os.environ.get("FORGE_CODEX_EFFORT", "medium")
 
     # Ile zadań planista produkuje jednym wywołaniem (koszt stały planisty ÷ batch).
-    batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "4"))
+    #
+    # Wywołanie planisty ma duży koszt STAŁY: czyta repo od zera (~900 tys.
+    # tokenów wejścia na wywołanie, niezależnie od rozmiaru wsadu) i dopiero
+    # potem myśli. W pomiarach na .forge/usage.jsonl 64% jego rachunku to samo
+    # to czytanie, a 36% właściwe rozumowanie. Większy wsad amortyzuje tę stałą
+    # bez dotykania modelu ani effortu — czyli bez osłabiania planowania, w
+    # którym błąd kumuluje się na cały projekt.
+    #
+    # Górna granica jest jakościowa, nie kosztowa: dalsze zadania wsadu planuje
+    # się na coraz starszym stanie repo. Stąd 6, nie 8.
+    batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "6"))
     # Co ile wsadów planisty przegląd kierunku ocenia, dokąd idzie projekt.
     # Backlog jest z założenia krótki, więc to ten przegląd, a nie bootstrap,
     # odpowiada za rozwój zakresu projektu w czasie.
-    steering_batches: int = int(os.environ.get("FORGE_STEERING_BATCHES", "3"))
+    #
+    # Liczy WSADY, nie zadania, więc idzie w parze z batch_size: 2×6 trzyma
+    # kadencję na 12 zadaniach, czyli tam, gdzie było przy 3×4. Podniesienie
+    # wsadu bez zejścia tutaj kupiłoby oszczędność opóźnieniem korekty kursu.
+    steering_batches: int = int(os.environ.get("FORGE_STEERING_BATCHES", "2"))
     # Budżet recenzji bootstrapu i przeglądu kierunku. Wyczerpanie oznacza, że
     # rozbieżności nie da się rozstrzygnąć bez decyzji użytkownika.
     max_bootstrap_reviews: int = int(
