@@ -17,10 +17,23 @@ def bootstrap_architecture_review_prompt(
     )
 
 
+def diff_bootstrap_prompt(
+        brief_diff: str, *, initial: bool = False,
+        queued_tasks: list[str] | None = None) -> str:
+    """Synchronizacja zmiany briefu: sam diff, nie dwa pełne dokumenty."""
+    return render(
+        "diff-bootstrap.md",
+        INITIAL=read_template("diff-bootstrap-initial.md") if initial else "",
+        DIFF=brief_diff,
+        QUEUED="; ".join(queued_tasks or []) or "(brak)",
+    )
+
+
 def plan_batch_prompt(
         batch_size: int, start_index: int, kind: str = "app", *,
         verify_feedback_path: str = "", failure_feedback_path: str = "",
-        require_debt: bool = False, **_ignored) -> str:
+        brief_change_path: str = "", require_debt: bool = False,
+        **_ignored) -> str:
     feedback = (
         render(
             "planner-verification-feedback.md",
@@ -39,9 +52,17 @@ def plan_batch_prompt(
         read_template("planner-debt-requirement.md")
         if require_debt else ""
     )
+    brief_change = (
+        render(
+            "planner-brief-change.md",
+            BRIEF_CHANGE_PATH=brief_change_path,
+        )
+        if brief_change_path else ""
+    )
     return render(
         "planner.md",
         KIND=kind,
+        BRIEF_CHANGE=brief_change,
         FEEDBACK=feedback,
         FAILURES=failures,
         DEBT=debt,

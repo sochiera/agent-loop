@@ -1,7 +1,8 @@
 # Bootstrap i synchronizacja zmian briefu — propozycja
 
-Status: opis problemu i kierunku. Ten dokument nie oznacza, że mechanizm
-diff-bootstrapu został już zaimplementowany.
+Status: ZAIMPLEMENTOWANE. Ten dokument opisuje problem i kierunek; przebieg
+wykonawczy mechanizmu opisuje [PIPELINE.md](PIPELINE.md), a decyzje z ostatniej
+sekcji zostały rozstrzygnięte i wdrożone.
 
 ## Problem obecnego bootstrapu
 
@@ -109,16 +110,24 @@ zadań pilnych na jej początek jest bezpieczniejsze niż jej zastąpienie.
 ## Otwarte decyzje przed implementacją
 
 1. Czy opisy projektu mają być jednym `docs/PROJECT.md`, czy małym katalogiem
-   z indeksem?
+   z indeksem? -> może być 1
 2. Jak długo przechowywać snapshoty briefu i czy mają być częścią repozytorium,
-   czy wyłącznie `.forge/`?
-3. Czy każdy diff-bootstrap wymaga osobnego read-only review?
+   czy wyłącznie `.forge/`? -> może być w repo 
+3. Czy każdy diff-bootstrap wymaga osobnego read-only review? -> raczej nie, ale to powinien robić najsilniejszy model.
 4. Jak dokładnie przeplanowywać niezaczęte zadania, których założenia zmienił
-   brief?
+   brief? -> planista powinien to ogarnąć
 5. Czy zmiana samych sugestii lub klimatu ma uruchamiać planowanie od razu,
-   czy tylko aktualizować kontekst następnego zwykłego wsadu?
+   czy tylko aktualizować kontekst następnego zwykłego wsadu? -> IMHO po zmianie prompta powinien być bootstrap-diff i potem od razu planista
 
-## Poza zakresem tej zmiany
+## Stan wdrożenia
 
-Ten dokument nie implementuje wykrywania zmian briefu, nowych pól stanu,
-diff-bootstrapu, migracji istniejących projektów ani priorytetyzacji kolejki.
+- Snapshot briefu: `docs/BRIEF-SNAPSHOT.md` w repozytorium projektu; skrót w
+  `State.brief_digest`.
+- Kontekst planistki: jeden `docs/PROJECT.md`, tworzony przez bootstrap i
+  aktualizowany przez diff-bootstrap.
+- Diff-bootstrap: `forge.orchestrate.phase_brief_sync`, rola `diff_bootstrap` na
+  poziomie `max`, bez osobnego review; zakres zapisu wymuszany deterministycznie.
+- Migracja: projekt bez snapshotu przechodzi jednorazową synchronizację
+  początkową zamiast ponownego bootstrapu.
+- Kolejka: `replan` w werdykcie decyduje, czy niezaczęte zadania wracają do
+  planisty razem z notatką o zmianie briefu.

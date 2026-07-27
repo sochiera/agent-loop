@@ -15,6 +15,36 @@ potrzebę podziału zadania. Wyłącznie po `suggestions` tester może też zwr�
 `finalize` z niepustym uzasadnieniem rozliczającym sugestie jako zastosowane
 albo odrzucone.
 
+## Bootstrap i synchronizacja briefu
+
+Bootstrap czyta cały brief raz i materializuje trwały kontekst projektu w
+`docs/PROJECT.md`: opis i odbiorcę, ogólny cel z kryterium sukcesu, ograniczenia
+i priorytety, klimat oraz sugestie autora, z jawnym rozróżnieniem wymagań,
+preferencji i pomysłów opcjonalnych. Po zaakceptowanej recenzji architektury
+Forge zapisuje kopię briefu w `docs/BRIEF-SNAPSHOT.md` i jego skrót w stanie.
+
+Zmiana głównego briefu nie uruchamia ponownie bootstrapu, bo ten jest
+nieidempotentny. Na granicy między zadaniami — przed planowaniem i przed
+weryfikacją celu, nigdy w trakcie aktywnego zadania — Forge porównuje brief ze
+snapshotem i przy różnicy uruchamia `diff-bootstrap`. Rola dostaje sam diff
+briefu, listę niezaczętych zadań i czyta `docs/PROJECT.md` oraz `BACKLOG.md`.
+Wolno jej zapisać wyłącznie te dwa pliki; każdą inną zmianę Forge wykrywa
+manifestem drzewa i cofa, zanim cokolwiek trafi do commita. Osobnego review nie
+ma — dlatego rola pracuje na najsilniejszym modelu.
+
+Nowy snapshot i skrót zapisujemy dopiero po poprawnym werdykcie i walidacji
+zakresu, więc awaria zostawia poprzednią wersję jako punkt odniesienia i
+operację można bezpiecznie wznowić. Werdykt niesie `replan`: przy `true`
+niezaczęta kolejka wraca do planisty razem z jednorazową notatką
+`.forge/brief-change.md` (podsumowanie, przeniesione zmiany, wycofane zadania),
+którą konsumuje najbliższy wsad. Ukończonego kodu nikt nie cofa automatycznie —
+usunięte wymaganie staje się jawną decyzją albo zadaniem w backlogu. Projekt
+zbootstrapowany przed tym mechanizmem nie ma snapshotu i przechodzi jednorazową
+synchronizację początkową.
+
+Planista czyta odtąd `docs/PROJECT.md`, a nie brief: zmiany intencji docierają
+do niego przez ten plik i backlog.
+
 Planista opisuje zachowanie i publiczny kontrakt, ale nie wybiera testów ani
 komend. Tester sam wybiera najwęższą wiarygodną bramkę i zwraca jej komendę w
 decyzji `red` albo `code`; Forge przekazuje tę samą komendę koderowi. Koder może

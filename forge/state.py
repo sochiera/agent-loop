@@ -11,6 +11,9 @@ from .task_pipeline import TASK_PHASES
 @dataclass
 class State:
     bootstrapped: bool = False
+    # Skrót briefu zaakceptowany przez ostatni bootstrap albo diff-bootstrap.
+    # Pusty przy projekcie sprzed tego mechanizmu → pierwsza synchronizacja.
+    brief_digest: str = ""
     iteration: int = 0
     plan_batches: int = 0
     test_cmd: str = ""

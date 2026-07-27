@@ -22,6 +22,9 @@ MODEL_LEVELS = ("economy", "efficient", "balanced", "strong", "max")
 # Trudność opisuje zakres zadania, a poziom modelu politykę routingu providera.
 ROLE_MODEL_LEVELS: dict[str, dict[str, str]] = {
     "bootstrap": {d: "max" for d in TASK_DIFFICULTIES},
+    # Synchronizacja briefu nie ma osobnego review, więc rozstrzyga ją
+    # najsilniejszy model — myli się raz, a skutek niesie cały dalszy plan.
+    "diff_bootstrap": {d: "max" for d in TASK_DIFFICULTIES},
     "planner": {d: "strong" for d in TASK_DIFFICULTIES},
     "planner_escalation": {d: "max" for d in TASK_DIFFICULTIES},
     "tester": {"simple": "efficient", "standard": "balanced", "complex": "balanced"},
@@ -244,6 +247,7 @@ class Config:
             "planner_escalation": (self.planner_agent, self.planner_model, self.planner_effort),
             # Bootstrap używa agenta planisty, lecz ma własną politykę poziomu.
             "bootstrap": (self.planner_agent, self.planner_model, self.planner_effort),
+            "diff_bootstrap": (self.planner_agent, self.planner_model, self.planner_effort),
             "tester": (self.tester_agent, self.tester_model, self.tester_effort),
             "coder": (self.coder_agent, self.coder_model, self.coder_effort),
             "master": (self.master_agent, self.master_model, self.master_effort),
@@ -268,7 +272,8 @@ class Config:
         agent, configured_model, configured_effort = configured[name]
         # Jawne ustawienie planisty jest intencją operatora; routing trudności
         # dotyczy wykonawców pojedynczego zadania.
-        if name in {"planner", "planner_escalation", "bootstrap"} and configured_model:
+        if (name in {"planner", "planner_escalation", "bootstrap", "diff_bootstrap"}
+                and configured_model):
             return (agent, *self._role_model_effort(agent, configured_model, configured_effort))
         canonical = adapters.canonical_agent(agent)
         level = self.model_level(name, difficulty)

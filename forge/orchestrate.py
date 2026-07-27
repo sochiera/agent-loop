@@ -12,6 +12,7 @@ from pathlib import Path
 from .agents import (AgentError, LimitExhausted, agent_supports_resume, extract_json,
                      log, run_agent, run_agent_session, run_planner)
 from .config import Config, DEFAULT_TASK_DIFFICULTY, TASK_DIFFICULTIES
+from . import brief
 from . import ledger
 from . import prompts
 from . import verify
@@ -130,6 +131,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     _housekeeping(cfg, project)
     feedback = Path(project, cfg.runtime_dir, "verification", "latest-feedback.md")
     failures = Path(project, cfg.runtime_dir, "failures.md")
+    brief_change = _brief_change_path(cfg, project)
     start_index = _next_task_index(project)
     next_batch = state.plan_batches + 1
     log(f"Planowanie: proszę planistę o maks. {cfg.batch_size} zadań od task-{start_index:03d}…")
@@ -137,6 +139,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
         cfg.batch_size, start_index, state.project_kind,
         verify_feedback_path=str(feedback) if feedback.exists() else "",
         failure_feedback_path=str(failures) if failures.exists() else "",
+        brief_change_path=str(brief_change) if brief_change.exists() else "",
         require_debt=next_batch % 5 == 0)
     # Mistrz widzi w dzienniku również historię wsadów — serię zadań ginących
     # na round_limit potrafi skomentować zanim planista utnie kolejny za grubo.
@@ -162,14 +165,17 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
         log("Planowanie: planista zgłosił brak dalszych zadań.")
         ledger.append(project, "plan: planista zgłosił brak dalszych zadań")
     state.task_queue = tasks
+    # Zmiana briefu jest jednorazowym wejściem do planowania. Gdyby została,
+    # każdy kolejny wsad płaciłby za czytanie tej samej, już rozliczonej notatki.
+    brief_change.unlink(missing_ok=True)
     commit_all(project, "docs: plan wsadowy i backlog", cfg)
     return {"no_more_tasks": bool(data.get("no_more_tasks")) and not tasks}
 
 
 def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     log("Bootstrap: analiza briefu i budowa szkieletu projektu…")
-    brief = Path(cfg.brief_path).read_text(encoding="utf-8")
-    bootstrap = prompts.bootstrap_prompt(brief)
+    brief_text = Path(cfg.brief_path).read_text(encoding="utf-8")
+    bootstrap = prompts.bootstrap_prompt(brief_text)
     data = _decision_with_retry(
         bootstrap,
         lambda value: run_planner(
@@ -177,6 +183,10 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
         _parse_json_object)
     if not data.get("test_cmd"):
         raise AgentError("bootstrap nie zwrócił poprawnego JSON-a")
+    if not Path(project, brief.PROJECT_DOC_PATH).is_file():
+        # Bez tego pliku planista straciłby kierunek projektu razem z briefem,
+        # a diff-bootstrap nie miałby czego aktualizować.
+        raise AgentError(f"bootstrap nie utworzył {brief.PROJECT_DOC_PATH}")
     state.test_cmd = data["test_cmd"]
     state.build_cmd = data.get("build_cmd", "")
     state.project_kind = data.get("kind", "app")
@@ -204,8 +214,114 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     if verdict.status != "approve":
         raise AgentError("recenzja architektury bootstrapu wymaga zmian")
     state.bootstrapped = True
+    # Snapshot i skrót zapisujemy dopiero po zaakceptowanej recenzji: awaria
+    # wcześniej ma zostawić brief jako niezsynchronizowany, nie jako rozliczony.
+    brief.write_snapshot(project, brief_text)
+    state.brief_digest = brief.digest(brief_text)
     log("Bootstrap: recenzja zaakceptowana, commituję.")
     commit_all(project, "chore: bootstrap projektu", cfg)
+
+
+def _brief_change_path(cfg: Config, project: str) -> Path:
+    return Path(project, cfg.runtime_dir, "brief-change.md")
+
+
+def _brief_needs_sync(cfg: Config, project: str, state: State) -> bool:
+    """Czy trzeba uruchomić diff-bootstrap na najbliższej bezpiecznej granicy."""
+    return brief.changed(project, state.brief_digest, brief.read(cfg.brief_path))
+
+
+def _revert_out_of_scope(project: str, paths: list[str]) -> list[str]:
+    """Cofnij zmiany poza zakresem synchronizacji briefu.
+
+    Zakres jest sprawdzany deterministycznie, a nie tylko opisany w promptcie:
+    rola pracuje bez osobnego review, więc jej jedynym ogranicznikiem jest ta
+    bramka. Cofnięcie zamiast porzucenia całej operacji jest bezpieczne, bo
+    dozwolone pliki to wyłącznie backlog i opis projektu — pozostają spójne bez
+    zmian, których nie wolno było wykonać.
+    """
+    if not paths:
+        return []
+    untracked = set(_untracked(project))
+    tracked = [name for name in paths if name not in untracked]
+    if tracked:
+        git(project, "checkout", "HEAD", "--", *tracked, check=False)
+    for name in paths:
+        if name in untracked:
+            Path(project, name).unlink(missing_ok=True)
+    return paths
+
+
+def _write_brief_change_note(cfg: Config, project: str, data: dict,
+                             dropped: list[dict]) -> None:
+    """Jednorazowa notatka dla planisty; konsumuje ją najbliższy wsad."""
+    lines = ["# Zmiana briefu — kontekst planowania", "",
+             str(data.get("summary", "")).strip() or "(bez podsumowania)", ""]
+    changes = [str(item).strip() for item in data.get("changes", []) if str(item).strip()]
+    if changes:
+        lines.append("Zmiany przeniesione do backlogu i docs/PROJECT.md:")
+        lines += [f"- {item}" for item in changes]
+        lines.append("")
+    if dropped:
+        lines.append("Zadania wycofane z kolejki do ponownego zaplanowania "
+                     "(ich założenia mógł zmienić brief):")
+        lines += [f"- {task.get('id', '?')}: {task.get('title', '')}"
+                  for task in dropped]
+        lines.append("")
+    path = _brief_change_path(cfg, project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def phase_brief_sync(cfg: Config, project: str, state: State, logf) -> None:
+    """Diff-bootstrap: przenieś zmianę briefu do backlogu i opisu projektu.
+
+    Pełny bootstrap jest nieidempotentny, więc zmiana briefu nie może go
+    uruchamiać ponownie. Ta faza ma węższy zakres zapisu i nie dotyka kodu,
+    testów ani architektury będącej wynikiem zrealizowanych zadań.
+    """
+    current = brief.read(cfg.brief_path)
+    previous = brief.snapshot(project)
+    initial = not previous
+    log("Diff-bootstrap: brief zmieniony — synchronizuję backlog i opis projektu"
+        + (" (pierwsza synchronizacja: brak snapshotu)" if initial else "") + "…")
+    agent, model, effort = cfg.role("diff_bootstrap")
+    before = _tree_manifest(project)
+    sync_prompt = prompts.diff_bootstrap_prompt(
+        brief.diff(previous, current), initial=initial,
+        queued_tasks=[f"{task.get('id', '?')}: {task.get('title', '')}"
+                      for task in state.task_queue])
+    data = _decision_with_retry(
+        sync_prompt,
+        lambda value: run_agent(
+            agent, value, cfg, project, logf("diff-bootstrap"),
+            model=model, effort=effort),
+        _parse_json_object)
+    changed_paths = _turn_changes(before, _tree_manifest(project))
+    reverted = _revert_out_of_scope(project, brief.out_of_scope(changed_paths))
+    if reverted:
+        log("Diff-bootstrap: cofnięto zmiany poza zakresem: "
+            + _describe_turn_changes(reverted))
+        ledger.append(project, "diff-bootstrap: cofnięto zmiany poza zakresem "
+                               + _describe_turn_changes(reverted))
+    replan = data.get("replan", True) is not False
+    dropped = state.task_queue if replan else []
+    _write_brief_change_note(cfg, project, data, dropped)
+    if replan:
+        # Kolejka mogła zakładać nieaktualny brief. Zadania nie znikają po
+        # cichu: ich tytuły wracają do planisty w notatce o zmianie briefu, więc
+        # to on rozstrzyga, co przeplanować, a co porzucić.
+        state.task_queue = []
+        state.task_phase = ""
+    # Dopiero teraz brief jest rozliczony — wcześniejsza awaria zostawia
+    # poprzednią wersję jako punkt odniesienia i pozwala wznowić operację.
+    brief.write_snapshot(project, current)
+    state.brief_digest = brief.digest(current)
+    summary = str(data.get("summary", "")).strip()
+    log(f"Diff-bootstrap: gotowe (replan={replan}). {summary[:200]}")
+    ledger.append(project, f"diff-bootstrap: replan={replan}, "
+                           f"wycofano {len(dropped)} zadań z kolejki: {summary[:160]}")
+    commit_all(project, "docs: synchronizacja briefu", cfg)
 
 
 def _write_current_task(project: str, task: dict) -> None:
@@ -729,6 +845,14 @@ def one_iteration(cfg: Config, project: str, state: State) -> bool:
         if git(project, "rev-parse", "--verify", "HEAD", check=False).returncode == 0:
             _require_clean(project, "bootstrapem")
         phase_bootstrap(cfg, project, state, logf); state.save(str(Path(project, cfg.runtime_dir, "STATE.json"))); return True
+    # Granica między zadaniami jest jedynym bezpiecznym momentem na zmianę
+    # wymagań: aktywne zadanie ma dokończyć swój cykl na założeniach, z którymi
+    # ruszyło. Weryfikacja starego celu po zmianie briefu byłaby stratą, więc
+    # synchronizacja wyprzedza także ją.
+    if not state.current_task and _brief_needs_sync(cfg, project, state):
+        _require_clean(project, "synchronizacją briefu")
+        phase_brief_sync(cfg, project, state, logf)
+        return True
     if state.task_phase == "verify_goal":
         return phase_verify_goal(cfg, project, state, logf)
     if not state.current_task and not state.task_queue:
@@ -860,6 +984,10 @@ def _flag_oversized_docs(project: str) -> None:
     oversized = []
     docs = Path(project, "docs")
     for path in docs.rglob("*.md") if docs.is_dir() else []:
+        # Snapshot briefu jest wierną kopią cudzego dokumentu i bazą diffu —
+        # jego rozmiar nie jest długiem dokumentacji do podziału.
+        if path.relative_to(project).as_posix() == brief.SNAPSHOT_PATH:
+            continue
         try:
             size = path.stat().st_size
         except OSError:
