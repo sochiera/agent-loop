@@ -200,13 +200,13 @@ class ConfigRoleResolutionTest(unittest.TestCase):
                      tester_model="", coder_model="",
                      codex_model="gpt-x", codex_effort="high")
         self.assertEqual(cfg.role("tester", "simple"),
-                         ("codex", "gpt-5.6-terra", "low"))
+                         ("codex", "gpt-5.6-luna", "high"))
         self.assertEqual(cfg.role("tester", "complex"),
-                         ("codex", "gpt-5.6-terra", "medium"))
+                         ("codex", "gpt-5.6-sol", "low"))
         self.assertEqual(cfg.role("coder", "simple"),
-                         ("codex", "gpt-5.6-luna", "low"))
+                         ("codex", "gpt-5.6-luna", "medium"))
         self.assertEqual(cfg.role("coder", "standard"),
-                         ("codex", "gpt-5.6-terra", "low"))
+                         ("codex", "gpt-5.6-luna", "high"))
 
     def test_task_complexity_and_model_level_are_separate(self) -> None:
         cfg = Config(tester_agent="codex")
@@ -242,13 +242,13 @@ class ConfigRoleResolutionTest(unittest.TestCase):
 
     def test_gpt_alias_uses_codex_matrix(self) -> None:
         cfg = Config(tester_agent="gpt", tester_model="", codex_model="gpt-x", codex_effort="high")
-        self.assertEqual(cfg.role("tester"), ("gpt", "gpt-5.6-terra", "medium"))
+        self.assertEqual(cfg.role("tester"), ("gpt", "gpt-5.6-sol", "low"))
 
     def test_reviewer_alias_uses_reviewer_matrix(self) -> None:
         cfg = Config(tester_agent="codex", tester_model="custom-m", tester_effort="high",
                      reviewer_agent="gpt", reviewer_model="",
                      codex_model="fallback-m", codex_effort="low")
-        self.assertEqual(cfg.role("reviewer"), ("gpt", "gpt-5.6-terra", "medium"))
+        self.assertEqual(cfg.role("reviewer"), ("gpt", "gpt-5.6-sol", "low"))
 
     def test_agents_in_use_dedups_aliases(self) -> None:
         # planner=gpt i tester=codex to jedna binarka — preflight nie może jej

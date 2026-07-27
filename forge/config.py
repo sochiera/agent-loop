@@ -48,9 +48,9 @@ ROLE_MODEL_LEVELS: dict[str, dict[str, str]] = {
 # konfiguracji. Poziom modelu wynika osobno z roli i trudności zadania.
 MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
     "codex": {
-        "economy": ("gpt-5.6-luna", "low"),
-        "efficient": ("gpt-5.6-terra", "low"),
-        "balanced": ("gpt-5.6-terra", "medium"),
+        "economy": ("gpt-5.6-luna", "medium"),
+        "efficient": ("gpt-5.6-luna", "high"),
+        "balanced": ("gpt-5.6-sol", "low"),
         "strong": ("gpt-5.6-sol", "medium"),
         "max": ("gpt-5.6-sol", "high"),
     },
