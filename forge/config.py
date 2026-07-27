@@ -22,9 +22,11 @@ MODEL_LEVELS = ("economy", "efficient", "balanced", "strong", "max")
 # Trudność opisuje zakres zadania, a poziom modelu politykę routingu providera.
 ROLE_MODEL_LEVELS: dict[str, dict[str, str]] = {
     "bootstrap": {d: "max" for d in TASK_DIFFICULTIES},
-    # Synchronizacja briefu nie ma osobnego review, więc rozstrzyga ją
-    # najsilniejszy model — myli się raz, a skutek niesie cały dalszy plan.
+    # Przegląd kierunku rozstrzyga, dokąd idzie projekt — myli się raz, a skutek
+    # niesie cały dalszy plan. Jego recenzent ma tę samą wagę: to ostatnia
+    # bramka przed propagacją błędnego kierunku na wszystkie kolejne zadania.
     "diff_bootstrap": {d: "max" for d in TASK_DIFFICULTIES},
+    "bootstrap_reviewer": {d: "max" for d in TASK_DIFFICULTIES},
     "planner": {d: "strong" for d in TASK_DIFFICULTIES},
     "planner_escalation": {d: "max" for d in TASK_DIFFICULTIES},
     "tester": {"simple": "efficient", "standard": "balanced", "complex": "balanced"},
@@ -162,6 +164,14 @@ class Config:
 
     # Ile zadań planista produkuje jednym wywołaniem (koszt stały planisty ÷ batch).
     batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "4"))
+    # Co ile wsadów planisty przegląd kierunku ocenia, dokąd idzie projekt.
+    # Backlog jest z założenia krótki, więc to ten przegląd, a nie bootstrap,
+    # odpowiada za rozwój zakresu projektu w czasie.
+    steering_batches: int = int(os.environ.get("FORGE_STEERING_BATCHES", "3"))
+    # Budżet recenzji bootstrapu i przeglądu kierunku. Wyczerpanie oznacza, że
+    # rozbieżności nie da się rozstrzygnąć bez decyzji użytkownika.
+    max_bootstrap_reviews: int = int(
+        os.environ.get("FORGE_MAX_BOOTSTRAP_REVIEWS", "4"))
     # Mały bezpiecznik: większe zadanie ma zostać ponownie rozplanowane.
     max_tdd_rounds: int = int(os.environ.get("FORGE_MAX_TDD_ROUNDS", "10"))
     # Agent CLI każdej roli nowego modelu. "claude"/"codex" mają wbudowaną
@@ -248,6 +258,7 @@ class Config:
             # Bootstrap używa agenta planisty, lecz ma własną politykę poziomu.
             "bootstrap": (self.planner_agent, self.planner_model, self.planner_effort),
             "diff_bootstrap": (self.planner_agent, self.planner_model, self.planner_effort),
+            "bootstrap_reviewer": (self.planner_agent, self.planner_model, self.planner_effort),
             "tester": (self.tester_agent, self.tester_model, self.tester_effort),
             "coder": (self.coder_agent, self.coder_model, self.coder_effort),
             "master": (self.master_agent, self.master_model, self.master_effort),
@@ -272,7 +283,8 @@ class Config:
         agent, configured_model, configured_effort = configured[name]
         # Jawne ustawienie planisty jest intencją operatora; routing trudności
         # dotyczy wykonawców pojedynczego zadania.
-        if (name in {"planner", "planner_escalation", "bootstrap", "diff_bootstrap"}
+        if (name in {"planner", "planner_escalation", "bootstrap",
+                     "diff_bootstrap", "bootstrap_reviewer"}
                 and configured_model):
             return (agent, *self._role_model_effort(agent, configured_model, configured_effort))
         canonical = adapters.canonical_agent(agent)

@@ -15,35 +15,63 @@ potrzebę podziału zadania. Wyłącznie po `suggestions` tester może też zwr�
 `finalize` z niepustym uzasadnieniem rozliczającym sugestie jako zastosowane
 albo odrzucone.
 
-## Bootstrap i synchronizacja briefu
+## Bootstrap i przegląd kierunku
 
-Bootstrap czyta cały brief raz i materializuje trwały kontekst projektu w
-`docs/PROJECT.md`: opis i odbiorcę, ogólny cel z kryterium sukcesu, ograniczenia
-i priorytety, klimat oraz sugestie autora, z jawnym rozróżnieniem wymagań,
-preferencji i pomysłów opcjonalnych. Po zaakceptowanej recenzji architektury
-Forge zapisuje kopię briefu w `docs/BRIEF-SNAPSHOT.md` i jego skrót w stanie.
+Projekt prowadzimy zwinnie: zakres nie jest ustalany z góry, tylko rośnie w
+kolejnych przeglądach kierunku.
 
-Zmiana głównego briefu nie uruchamia ponownie bootstrapu, bo ten jest
-nieidempotentny. Na granicy między zadaniami — przed planowaniem i przed
-weryfikacją celu, nigdy w trakcie aktywnego zadania — Forge porównuje brief ze
-snapshotem i przy różnicy uruchamia `diff-bootstrap`. Rola dostaje sam diff
-briefu, listę niezaczętych zadań i czyta `docs/PROJECT.md` oraz `BACKLOG.md`.
-Wolno jej zapisać wyłącznie te dwa pliki; każdą inną zmianę Forge wykrywa
-manifestem drzewa i cofa, zanim cokolwiek trafi do commita. Osobnego review nie
-ma — dlatego rola pracuje na najsilniejszym modelu.
+Bootstrap czyta cały brief raz i buduje szkielet z **najcieńszym pionowym
+plasterkiem** w `BACKLOG.md` — maksymalnie trzema wpisami prowadzącymi do
+uruchamialnego demo, nawet niepełnego. Cała reszta wizji trafia do
+`docs/PROJECT.md`: opis i odbiorca, cel docelowy z kryterium sukcesu,
+ograniczenia i priorytety, klimat, sugestie autora, kolejne prawdopodobne etapy
+i rzeczy świadomie odłożone, z jawnym rozróżnieniem wymagań, preferencji i
+pomysłów opcjonalnych. Po zaakceptowanej recenzji Forge zapisuje kopię briefu w
+`docs/BRIEF-SNAPSHOT.md` i jego skrót w stanie.
 
-Nowy snapshot i skrót zapisujemy dopiero po poprawnym werdykcie i walidacji
-zakresu, więc awaria zostawia poprzednią wersję jako punkt odniesienia i
-operację można bezpiecznie wznowić. Werdykt niesie `replan`: przy `true`
-niezaczęta kolejka wraca do planisty razem z jednorazową notatką
-`.forge/brief-change.md` (podsumowanie, przeniesione zmiany, wycofane zadania),
-którą konsumuje najbliższy wsad. Ukończonego kodu nikt nie cofa automatycznie —
-usunięte wymaganie staje się jawną decyzją albo zadaniem w backlogu. Projekt
-zbootstrapowany przed tym mechanizmem nie ma snapshotu i przechodzi jednorazową
-synchronizację początkową.
+Przegląd kierunku (`diff-bootstrap`) rusza na granicy między zadaniami — przed
+planowaniem i przed weryfikacją celu, nigdy w trakcie aktywnego zadania — gdy
+zajdzie którykolwiek warunek:
 
-Planista czyta odtąd `docs/PROJECT.md`, a nie brief: zmiany intencji docierają
-do niego przez ten plik i backlog.
+- **zmiana briefu** (skrót różny od snapshotu) — najmocniejsze wejście, wygrywa
+  z pozostałymi powodami;
+- **kadencja** — minęły `FORGE_STEERING_BATCHES` (domyślnie 3) wsady planisty
+  od ostatniego przeglądu;
+- **wyczerpany backlog** — planista zgłosił `no_more_tasks`.
+
+Rola dostaje powód uruchomienia, diff briefu (tylko gdy się zmienił), listę
+commitów od poprzedniego przeglądu i listę niezaczętych zadań; `docs/PROJECT.md`
+i `BACKLOG.md` czyta sama. Wolno jej zapisać wyłącznie te dwa pliki — każdą inną
+zmianę Forge wykrywa manifestem drzewa i cofa, zanim cokolwiek trafi do commita.
+Pełny bootstrap nie jest powtarzany, bo jest nieidempotentny.
+
+Kierunek jest recenzowany, bo błąd na tym poziomie propaguje się na wszystkie
+kolejne zadania. Świeży, read-only recenzent (`bootstrap_reviewer`, najsilniejszy
+model) ocenia kierunek, nie styl: czy zmiana wynika ze stanu projektu, czy krok
+jest najcieńszym sensownym przyrostem, czy nic nie zniknęło po cichu i czy
+`goal_reached` jest uczciwe. `request_changes` wraca do roli przeglądu z uwagami;
+budżet to `FORGE_MAX_BOOTSTRAP_REVIEWS` (domyślnie 4) recenzji. Wyczerpanie
+budżetu cofa zmiany i zatrzymuje przebieg z checkpointem — dalej potrzebna jest
+decyzja użytkownika. Ta sama pętla obowiązuje recenzję architektury bootstrapu.
+
+Nowy snapshot, skrót i kadencję zapisujemy dopiero po zaakceptowanym werdykcie,
+więc awaria zostawia poprzedni punkt odniesienia i operację można wznowić.
+Werdykt niesie `replan` — przy `true` niezaczęta kolejka wraca do planisty razem
+z jednorazową notatką `.forge/steering.md` (podsumowanie, przeniesione zmiany,
+wycofane zadania), którą konsumuje najbliższy wsad — oraz `goal_reached`.
+Ukończonego kodu nikt nie cofa automatycznie: usunięte wymaganie staje się jawną
+decyzją albo zadaniem w backlogu. Projekt zbootstrapowany przed tym mechanizmem
+nie ma snapshotu i przechodzi jednorazową synchronizację początkową.
+
+Pusty backlog nie kończy projektu. `no_more_tasks` bez potwierdzonego
+`goal_reached` prosi o przegląd kierunku; dopiero jego zgoda przepuszcza do
+końcowej weryfikacji celu. Bezpiecznikiem są dwa jałowe wsady z rzędu — wtedy
+weryfikacja rusza mimo wszystko, żeby para planista↔przegląd nie kręciła się w
+kółko na najsilniejszym modelu.
+
+Planista czyta `docs/PROJECT.md`, a nie brief: zmiany intencji docierają do
+niego przez ten plik i backlog. Nie rozwija zakresu samodzielnie — gdy backlog
+jest pusty, zwraca `no_more_tasks` i oddaje decyzję przeglądowi kierunku.
 
 Planista opisuje zachowanie i publiczny kontrakt, ale nie wybiera testów ani
 komend. Tester sam wybiera najwęższą wiarygodną bramkę i zwraca jej komendę w

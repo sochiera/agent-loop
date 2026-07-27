@@ -4,8 +4,18 @@ from __future__ import annotations
 from .render import read_template, render
 
 
-def bootstrap_prompt(brief: str) -> str:
-    return render("bootstrap.md", BRIEF=brief)
+def _corrections(name: str, review_notes: list[str] | None) -> str:
+    """Uwagi recenzenta doklejane do kolejnej próby; brak uwag nic nie zmienia."""
+    notes = "; ".join(note for note in (review_notes or []) if str(note).strip())
+    return render(name, NOTES=notes) if notes else ""
+
+
+def bootstrap_prompt(brief: str, *, review_notes: list[str] | None = None) -> str:
+    return render(
+        "bootstrap.md",
+        BRIEF=brief,
+        CORRECTIONS=_corrections("bootstrap-corrections.md", review_notes),
+    )
 
 
 def bootstrap_architecture_review_prompt(
@@ -17,22 +27,54 @@ def bootstrap_architecture_review_prompt(
     )
 
 
+STEERING_TRIGGERS = ("cadence", "brief", "backlog")
+
+
+def _steering_trigger(trigger: str, batches: int) -> str:
+    if trigger == "cadence":
+        return render("diff-bootstrap-trigger-cadence.md", BATCHES=batches)
+    if trigger not in STEERING_TRIGGERS:
+        raise ValueError(f"nieznany powód przeglądu kierunku: {trigger!r}")
+    return read_template(f"diff-bootstrap-trigger-{trigger}.md")
+
+
 def diff_bootstrap_prompt(
-        brief_diff: str, *, initial: bool = False,
-        queued_tasks: list[str] | None = None) -> str:
-    """Synchronizacja zmiany briefu: sam diff, nie dwa pełne dokumenty."""
+        brief_diff: str = "", *, trigger: str = "cadence", batches: int = 0,
+        initial: bool = False, queued_tasks: list[str] | None = None,
+        recent: str = "", review_notes: list[str] | None = None) -> str:
+    """Przegląd kierunku: sam diff briefu i lista commitów, nie pełne dokumenty.
+
+    Rola sama czyta docs/PROJECT.md i BACKLOG.md, więc prompt niesie wyłącznie
+    to, czego nie ma na dysku: powód uruchomienia, zmianę briefu i to, co
+    powstało od poprzedniego przeglądu.
+    """
     return render(
         "diff-bootstrap.md",
+        TRIGGER=_steering_trigger(trigger, batches),
         INITIAL=read_template("diff-bootstrap-initial.md") if initial else "",
-        DIFF=brief_diff,
+        BRIEF_CHANGE=(
+            brief_diff or read_template("diff-bootstrap-brief-unchanged.md")),
+        RECENT=recent or "(brak nowych commitów)",
         QUEUED="; ".join(queued_tasks or []) or "(brak)",
+        CORRECTIONS=_corrections(
+            "diff-bootstrap-corrections.md", review_notes),
+    )
+
+
+def diff_bootstrap_review_prompt(
+        base: str, *, summary: str = "", goal_reached: bool = False) -> str:
+    return render(
+        "diff-bootstrap-review.md",
+        BASE=base,
+        SUMMARY=summary or "(brak)",
+        GOAL_REACHED="tak" if goal_reached else "nie",
     )
 
 
 def plan_batch_prompt(
         batch_size: int, start_index: int, kind: str = "app", *,
         verify_feedback_path: str = "", failure_feedback_path: str = "",
-        brief_change_path: str = "", require_debt: bool = False,
+        steering_path: str = "", require_debt: bool = False,
         **_ignored) -> str:
     feedback = (
         render(
@@ -52,17 +94,14 @@ def plan_batch_prompt(
         read_template("planner-debt-requirement.md")
         if require_debt else ""
     )
-    brief_change = (
-        render(
-            "planner-brief-change.md",
-            BRIEF_CHANGE_PATH=brief_change_path,
-        )
-        if brief_change_path else ""
+    steering = (
+        render("planner-steering.md", STEERING_PATH=steering_path)
+        if steering_path else ""
     )
     return render(
         "planner.md",
         KIND=kind,
-        BRIEF_CHANGE=brief_change,
+        STEERING=steering,
         FEEDBACK=feedback,
         FAILURES=failures,
         DEBT=debt,

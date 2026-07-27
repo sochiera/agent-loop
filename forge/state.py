@@ -16,6 +16,16 @@ class State:
     brief_digest: str = ""
     iteration: int = 0
     plan_batches: int = 0
+    # --- Zwinne sterowanie kierunkiem (diff-bootstrap) ----------------------
+    # Kadencja przeglądu: numer wsadu i commit ostatniego przeglądu kierunku.
+    steered_at_batch: int = 0
+    steered_at_sha: str = ""
+    # Wyczerpany backlog prosi o przegląd, zamiast kończyć projekt.
+    steering_due: bool = False
+    # Dopiero przegląd kierunku orzeka, że cel briefu jest osiągnięty.
+    goal_confirmed: bool = False
+    # Bezpiecznik przed jałową parą planista↔przegląd na najsilniejszym modelu.
+    empty_plans: int = 0
     test_cmd: str = ""
     build_cmd: str = ""
     project_kind: str = "app"

@@ -114,6 +114,8 @@ zadań pilnych na jej początek jest bezpieczniejsze niż jej zastąpienie.
 2. Jak długo przechowywać snapshoty briefu i czy mają być częścią repozytorium,
    czy wyłącznie `.forge/`? -> może być w repo 
 3. Czy każdy diff-bootstrap wymaga osobnego read-only review? -> raczej nie, ale to powinien robić najsilniejszy model.
+   DECYZJA ZMIENIONA: tak, wymaga — osobna rola recenzenta, własny prompt,
+   najsilniejszy model, budżet 4 recenzji, potem stop i decyzja użytkownika.
 4. Jak dokładnie przeplanowywać niezaczęte zadania, których założenia zmienił
    brief? -> planista powinien to ogarnąć
 5. Czy zmiana samych sugestii lub klimatu ma uruchamiać planowanie od razu,
@@ -121,13 +123,26 @@ zadań pilnych na jej początek jest bezpieczniejsze niż jej zastąpienie.
 
 ## Stan wdrożenia
 
+Mechanizm wyszedł poza pierwotny zakres tej propozycji: diff-bootstrap nie jest
+już wyłącznie reakcją na zmianę briefu, tylko regularnym przeglądem kierunku
+prowadzącym projekt zwinnie. Pełny opis przebiegu: [PIPELINE.md](PIPELINE.md).
+
+- Bootstrap: backlog wyłącznie dla najcieńszego demo (maks. 3 wpisy), wizja w
+  `docs/PROJECT.md`. Zakres rozwijają dopiero przeglądy kierunku.
 - Snapshot briefu: `docs/BRIEF-SNAPSHOT.md` w repozytorium projektu; skrót w
   `State.brief_digest`.
 - Kontekst planistki: jeden `docs/PROJECT.md`, tworzony przez bootstrap i
-  aktualizowany przez diff-bootstrap.
-- Diff-bootstrap: `forge.orchestrate.phase_brief_sync`, rola `diff_bootstrap` na
-  poziomie `max`, bez osobnego review; zakres zapisu wymuszany deterministycznie.
+  aktualizowany przez przegląd kierunku.
+- Przegląd kierunku: `forge.orchestrate.phase_diff_bootstrap`, rola
+  `diff_bootstrap` na poziomie `max`. Wyzwalacze: zmiana briefu, kadencja
+  (`FORGE_STEERING_BATCHES`, domyślnie 3 wsady planisty) i wyczerpany backlog.
+  Zakres zapisu (`BACKLOG.md`, `docs/PROJECT.md`) wymuszany deterministycznie.
+- Recenzja kierunku: rola `bootstrap_reviewer` na poziomie `max`, świeży
+  read-only kontekst, budżet `FORGE_MAX_BOOTSTRAP_REVIEWS` (4). Ta sama pętla
+  poprawek obowiązuje recenzję architektury bootstrapu.
+- Koniec projektu: `no_more_tasks` prosi o przegląd kierunku; do końcowej
+  weryfikacji przepuszcza dopiero `goal_reached` albo dwa jałowe wsady z rzędu.
 - Migracja: projekt bez snapshotu przechodzi jednorazową synchronizację
   początkową zamiast ponownego bootstrapu.
 - Kolejka: `replan` w werdykcie decyduje, czy niezaczęte zadania wracają do
-  planisty razem z notatką o zmianie briefu.
+  planisty razem z notatką `.forge/steering.md`.

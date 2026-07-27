@@ -30,12 +30,14 @@ ich wdrożenie rozszerzyło zakres lub ujawniło ryzyko. Mistrz obserwuje ledger
 i przy powtarzającej się bez postępu pętli review poleca testerowi zakończyć
 zadanie jako `blocked`.
 
-Bootstrap czyta brief raz i zapisuje trwały kontekst projektu w
-`docs/PROJECT.md` oraz kopię briefu w `docs/BRIEF-SNAPSHOT.md`. Późniejsza
-zmiana briefu nie powtarza bootstrapu: na granicy między zadaniami rusza
-`diff-bootstrap`, który aktualizuje wyłącznie `BACKLOG.md` i `docs/PROJECT.md`,
-a każdą zmianę poza tym zakresem Forge cofa. Szczegóły w
-[docs/PIPELINE.md](docs/PIPELINE.md).
+Zakres projektu nie jest ustalany z góry. Bootstrap buduje szkielet i backlog
+tylko dla najcieńszego demo, a całą wizję zapisuje w `docs/PROJECT.md` (plus
+kopię briefu w `docs/BRIEF-SNAPSHOT.md`). Dalej zakres rozwija przegląd kierunku
+`diff-bootstrap`: rusza co trzy wsady planisty, po zmianie briefu albo gdy
+backlog się wyczerpie, i aktualizuje wyłącznie `BACKLOG.md` oraz
+`docs/PROJECT.md` — każdą zmianę poza tym zakresem Forge cofa. Kierunek ocenia
+świeży recenzent na najsilniejszym modelu; cztery odrzucenia zatrzymują przebieg
+z checkpointem. Szczegóły w [docs/PIPELINE.md](docs/PIPELINE.md).
 
 Teksty promptów ról znajdują się osobno w `forge/prompts/templates/`; kod
 pakietu `forge.prompts` tylko wybiera wariant i podstawia kontekst.

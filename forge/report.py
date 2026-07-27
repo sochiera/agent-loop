@@ -21,6 +21,7 @@ import sys
 # Kolejność ma znaczenie: pierwszy pasujący wzorzec wygrywa.
 _PHASE_GROUPS: list[tuple[str, str]] = [
     (r"^bootstrap", "bootstrap"),
+    (r"^diff-bootstrap-review", "diff-bootstrap-review"),
     (r"^diff-bootstrap", "diff-bootstrap"),
     (r"^plan", "plan"),
     (r"^tester", "tester"),

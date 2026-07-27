@@ -131,7 +131,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     _housekeeping(cfg, project)
     feedback = Path(project, cfg.runtime_dir, "verification", "latest-feedback.md")
     failures = Path(project, cfg.runtime_dir, "failures.md")
-    brief_change = _brief_change_path(cfg, project)
+    steering = _steering_path(cfg, project)
     start_index = _next_task_index(project)
     next_batch = state.plan_batches + 1
     log(f"Planowanie: proszę planistę o maks. {cfg.batch_size} zadań od task-{start_index:03d}…")
@@ -139,7 +139,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
         cfg.batch_size, start_index, state.project_kind,
         verify_feedback_path=str(feedback) if feedback.exists() else "",
         failure_feedback_path=str(failures) if failures.exists() else "",
-        brief_change_path=str(brief_change) if brief_change.exists() else "",
+        steering_path=str(steering) if steering.exists() else "",
         require_debt=next_batch % 5 == 0)
     # Mistrz widzi w dzienniku również historię wsadów — serię zadań ginących
     # na round_limit potrafi skomentować zanim planista utnie kolejny za grubo.
@@ -161,32 +161,90 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
         log(f"Planowanie: utworzono {len(tasks)} zadań: {', '.join(t['id'] for t in tasks)}")
         ledger.append(project, f"plan: utworzono {len(tasks)} zadań "
                                f"({tasks[0]['id']}…{tasks[-1]['id']})")
+        state.empty_plans = 0
     elif data.get("no_more_tasks"):
         log("Planowanie: planista zgłosił brak dalszych zadań.")
         ledger.append(project, "plan: planista zgłosił brak dalszych zadań")
+        state.empty_plans += 1
     state.task_queue = tasks
-    # Zmiana briefu jest jednorazowym wejściem do planowania. Gdyby została,
-    # każdy kolejny wsad płaciłby za czytanie tej samej, już rozliczonej notatki.
-    brief_change.unlink(missing_ok=True)
+    # Notatka przeglądu kierunku jest jednorazowym wejściem do planowania. Gdyby
+    # została, każdy kolejny wsad płaciłby za czytanie już rozliczonej treści.
+    steering.unlink(missing_ok=True)
     commit_all(project, "docs: plan wsadowy i backlog", cfg)
     return {"no_more_tasks": bool(data.get("no_more_tasks")) and not tasks}
+
+
+def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
+                        attempt, review_prompt, log_phase: str) -> dict:
+    """Buduj i recenzuj, aż recenzent zaakceptuje albo skończy się budżet.
+
+    Bootstrap i przegląd kierunku wyznaczają kierunek całej dalszej pracy, więc
+    błąd propaguje się na każde kolejne zadanie. Jedna recenzja bez prawa do
+    poprawki marnowałaby całą pracę przy pierwszej drobnej uwadze, a nieskończona
+    pętla paliłaby najsilniejszy model. ``max_bootstrap_reviews`` godzi oba
+    ryzyka: po wyczerpaniu budżetu decyzja należy do użytkownika.
+
+    ``attempt(notes)`` wykonuje (kolejne) podejście i zwraca jego JSON;
+    ``review_prompt(data)`` buduje prompt recenzji dla tego wyniku.
+    """
+    reviewer, model, effort = cfg.role("bootstrap_reviewer")
+    notes: list[str] = []
+    for round_number in range(1, cfg.max_bootstrap_reviews + 1):
+        data = attempt(notes)
+        tree = _tree_fingerprint(project)
+        log(f"{label}: recenzja {round_number}/{cfg.max_bootstrap_reviews} "
+            "(świeży, read-only recenzent)…")
+        verdict = _decision_with_retry(
+            review_prompt(data),
+            lambda value: run_agent(
+                reviewer, value, cfg, project, logf(log_phase),
+                model=model, effort=effort),
+            parse_review_decision)
+        if _tree_fingerprint(project) != tree:
+            raise AgentError(f"recenzent ({label}) zmienił drzewo")
+        notes = [str(note) for note in verdict.data.get("notes", [])]
+        ledger.append(project, f"{label} recenzja {round_number}"
+                               f"→{verdict.status}: {'; '.join(notes)[:160]}")
+        if verdict.status == "approve":
+            log(f"{label}: recenzja zaakceptowana.")
+            return data
+        log(f"{label}: recenzja wymaga zmian: {'; '.join(notes)[:300]}")
+    raise AgentError(
+        f"{label}: recenzent odrzucił wynik {cfg.max_bootstrap_reviews} razy "
+        f"({'; '.join(notes)[:300]}). Potrzebna decyzja użytkownika.")
 
 
 def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     log("Bootstrap: analiza briefu i budowa szkieletu projektu…")
     brief_text = Path(cfg.brief_path).read_text(encoding="utf-8")
-    bootstrap = prompts.bootstrap_prompt(brief_text)
-    data = _decision_with_retry(
-        bootstrap,
-        lambda value: run_planner(
-            value, cfg, project, logf("bootstrap"), role="bootstrap"),
-        _parse_json_object)
-    if not data.get("test_cmd"):
-        raise AgentError("bootstrap nie zwrócił poprawnego JSON-a")
-    if not Path(project, brief.PROJECT_DOC_PATH).is_file():
-        # Bez tego pliku planista straciłby kierunek projektu razem z briefem,
-        # a diff-bootstrap nie miałby czego aktualizować.
-        raise AgentError(f"bootstrap nie utworzył {brief.PROJECT_DOC_PATH}")
+
+    def attempt(notes: list[str]) -> dict:
+        if notes:
+            log("Bootstrap: poprawiam szkielet po uwagach recenzenta…")
+        data = _decision_with_retry(
+            prompts.bootstrap_prompt(brief_text, review_notes=notes),
+            lambda value: run_planner(
+                value, cfg, project, logf("bootstrap"), role="bootstrap"),
+            _parse_json_object)
+        if not data.get("test_cmd"):
+            raise AgentError("bootstrap nie zwrócił poprawnego JSON-a")
+        if not Path(project, brief.PROJECT_DOC_PATH).is_file():
+            # Bez tego pliku planista straciłby kierunek projektu razem z
+            # briefem, a przegląd kierunku nie miałby czego aktualizować.
+            raise AgentError(f"bootstrap nie utworzył {brief.PROJECT_DOC_PATH}")
+        log(f"Bootstrap: test_cmd={data['test_cmd']!r} "
+            f"build_cmd={data.get('build_cmd', '')!r} kind={data.get('kind', 'app')!r}")
+        if not build_then_test(project, data.get("build_cmd", ""),
+                               data["test_cmd"], cfg.agent_timeout_s):
+            raise AgentError("testy bootstrapu nie przeszły")
+        log("Bootstrap: testy początkowe zielone.")
+        return data
+
+    data = _reviewed_bootstrap(
+        cfg, project, logf, label="Bootstrap", attempt=attempt,
+        review_prompt=lambda result: prompts.bootstrap_architecture_review_prompt(
+            cfg.brief_path, result["test_cmd"]),
+        log_phase="bootstrap-review")
     state.test_cmd = data["test_cmd"]
     state.build_cmd = data.get("build_cmd", "")
     state.project_kind = data.get("kind", "app")
@@ -194,25 +252,6 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     state.verify_targets = list(profile.get("targets") or [])
     for key in ("smoke_cmd", "flash_cmd", "target_cmd", "ci_status_cmd", "ci_logs_cmd"):
         setattr(state, key, str(profile.get(key, "")))
-    log(f"Bootstrap: test_cmd={state.test_cmd!r} build_cmd={state.build_cmd!r} kind={state.project_kind!r}")
-    if not build_then_test(project, state.build_cmd, state.test_cmd, cfg.agent_timeout_s):
-        raise AgentError("testy bootstrapu nie przeszły")
-    log("Bootstrap: testy początkowe zielone.")
-    reviewer, model, effort = cfg.role("reviewer", "complex")
-    tree = _tree_fingerprint(project)
-    review_prompt = prompts.bootstrap_architecture_review_prompt(
-        cfg.brief_path, state.test_cmd)
-    log("Bootstrap: recenzja architektury (świeży, read-only recenzent)…")
-    verdict = _decision_with_retry(
-        review_prompt,
-        lambda value: run_agent(
-            reviewer, value, cfg, project, logf("bootstrap-review"),
-            model=model, effort=effort),
-        parse_review_decision)
-    if _tree_fingerprint(project) != tree:
-        raise AgentError("reviewer architektury bootstrapu zmienił drzewo")
-    if verdict.status != "approve":
-        raise AgentError("recenzja architektury bootstrapu wymaga zmian")
     state.bootstrapped = True
     # Snapshot i skrót zapisujemy dopiero po zaakceptowanej recenzji: awaria
     # wcześniej ma zostawić brief jako niezsynchronizowany, nie jako rozliczony.
@@ -220,25 +259,46 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     state.brief_digest = brief.digest(brief_text)
     log("Bootstrap: recenzja zaakceptowana, commituję.")
     commit_all(project, "chore: bootstrap projektu", cfg)
+    # Pierwszy przegląd kierunku ma zobaczyć wyłącznie pracę wykonaną PO
+    # bootstrapie, a nie sam commit szkieletu.
+    state.steered_at_sha = git(project, "rev-parse", "HEAD", check=False).stdout.strip()
 
 
-def _brief_change_path(cfg: Config, project: str) -> Path:
-    return Path(project, cfg.runtime_dir, "brief-change.md")
+def _steering_path(cfg: Config, project: str) -> Path:
+    return Path(project, cfg.runtime_dir, "steering.md")
 
 
-def _brief_needs_sync(cfg: Config, project: str, state: State) -> bool:
-    """Czy trzeba uruchomić diff-bootstrap na najbliższej bezpiecznej granicy."""
-    return brief.changed(project, state.brief_digest, brief.read(cfg.brief_path))
+def _steering_trigger(cfg: Config, project: str, state: State) -> str:
+    """Powód uruchomienia przeglądu kierunku albo pusty string.
+
+    Zmiana briefu wygrywa z kadencją: to najmocniejsze wejście, jakie przegląd
+    może dostać, i chcemy je zobaczyć w promptcie nawet wtedy, gdy licznik
+    wsadów akurat też dojrzał.
+    """
+    if brief.changed(project, state.brief_digest, brief.read(cfg.brief_path)):
+        return "brief"
+    if state.steering_due:
+        return "backlog"
+    if state.plan_batches - state.steered_at_batch >= cfg.steering_batches:
+        return "cadence"
+    return ""
+
+
+def _recent_commits(project: str, since_sha: str, limit: int = 30) -> str:
+    """Co powstało od ostatniego przeglądu — tanie wejście zamiast czytania kodu."""
+    span = f"{since_sha}..HEAD" if since_sha else f"-{limit}"
+    result = git(project, "log", "--oneline", f"--max-count={limit}", span,
+                 check=False)
+    return result.stdout.strip()
 
 
 def _revert_out_of_scope(project: str, paths: list[str]) -> list[str]:
-    """Cofnij zmiany poza zakresem synchronizacji briefu.
+    """Cofnij zmiany poza zakresem przeglądu kierunku.
 
-    Zakres jest sprawdzany deterministycznie, a nie tylko opisany w promptcie:
-    rola pracuje bez osobnego review, więc jej jedynym ogranicznikiem jest ta
-    bramka. Cofnięcie zamiast porzucenia całej operacji jest bezpieczne, bo
-    dozwolone pliki to wyłącznie backlog i opis projektu — pozostają spójne bez
-    zmian, których nie wolno było wykonać.
+    Zakres jest sprawdzany deterministycznie, a nie tylko opisany w promptcie.
+    Cofnięcie zamiast porzucenia całej operacji jest bezpieczne, bo dozwolone
+    pliki to wyłącznie backlog i opis projektu — pozostają spójne bez zmian,
+    których nie wolno było wykonać.
     """
     if not paths:
         return []
@@ -252,10 +312,10 @@ def _revert_out_of_scope(project: str, paths: list[str]) -> list[str]:
     return paths
 
 
-def _write_brief_change_note(cfg: Config, project: str, data: dict,
-                             dropped: list[dict]) -> None:
+def _write_steering_note(cfg: Config, project: str, data: dict,
+                         dropped: list[dict]) -> None:
     """Jednorazowa notatka dla planisty; konsumuje ją najbliższy wsad."""
-    lines = ["# Zmiana briefu — kontekst planowania", "",
+    lines = ["# Przegląd kierunku — kontekst planowania", "",
              str(data.get("summary", "")).strip() or "(bez podsumowania)", ""]
     changes = [str(item).strip() for item in data.get("changes", []) if str(item).strip()]
     if changes:
@@ -264,64 +324,95 @@ def _write_brief_change_note(cfg: Config, project: str, data: dict,
         lines.append("")
     if dropped:
         lines.append("Zadania wycofane z kolejki do ponownego zaplanowania "
-                     "(ich założenia mógł zmienić brief):")
+                     "(ich założenia zmienił przegląd kierunku):")
         lines += [f"- {task.get('id', '?')}: {task.get('title', '')}"
                   for task in dropped]
         lines.append("")
-    path = _brief_change_path(cfg, project)
+    path = _steering_path(cfg, project)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def phase_brief_sync(cfg: Config, project: str, state: State, logf) -> None:
-    """Diff-bootstrap: przenieś zmianę briefu do backlogu i opisu projektu.
+def phase_diff_bootstrap(cfg: Config, project: str, state: State, logf,
+                         trigger: str = "cadence") -> None:
+    """Przegląd kierunku: gdzie jest projekt i jaki jest następny przyrost.
 
-    Pełny bootstrap jest nieidempotentny, więc zmiana briefu nie może go
-    uruchamiać ponownie. Ta faza ma węższy zakres zapisu i nie dotyka kodu,
-    testów ani architektury będącej wynikiem zrealizowanych zadań.
+    Pełny bootstrap jest nieidempotentny, więc ani zmiana briefu, ani upływ
+    kolejnych wsadów nie mogą go powtórzyć. Ta faza ma węższy zakres zapisu
+    (backlog i opis projektu) i nie dotyka kodu, testów ani architektury
+    będącej wynikiem zrealizowanych zadań.
     """
     current = brief.read(cfg.brief_path)
     previous = brief.snapshot(project)
     initial = not previous
-    log("Diff-bootstrap: brief zmieniony — synchronizuję backlog i opis projektu"
-        + (" (pierwsza synchronizacja: brak snapshotu)" if initial else "") + "…")
+    log(f"Diff-bootstrap: przegląd kierunku (powód: {trigger})"
+        + (" — pierwszy przegląd, brak snapshotu briefu" if initial else "") + "…")
     agent, model, effort = cfg.role("diff_bootstrap")
     before = _tree_manifest(project)
-    sync_prompt = prompts.diff_bootstrap_prompt(
-        brief.diff(previous, current), initial=initial,
-        queued_tasks=[f"{task.get('id', '?')}: {task.get('title', '')}"
-                      for task in state.task_queue])
-    data = _decision_with_retry(
-        sync_prompt,
-        lambda value: run_agent(
-            agent, value, cfg, project, logf("diff-bootstrap"),
-            model=model, effort=effort),
-        _parse_json_object)
-    changed_paths = _turn_changes(before, _tree_manifest(project))
-    reverted = _revert_out_of_scope(project, brief.out_of_scope(changed_paths))
-    if reverted:
-        log("Diff-bootstrap: cofnięto zmiany poza zakresem: "
-            + _describe_turn_changes(reverted))
-        ledger.append(project, "diff-bootstrap: cofnięto zmiany poza zakresem "
-                               + _describe_turn_changes(reverted))
+    queued = [f"{task.get('id', '?')}: {task.get('title', '')}"
+              for task in state.task_queue]
+    recent = _recent_commits(project, state.steered_at_sha)
+
+    def attempt(notes: list[str]) -> dict:
+        if notes:
+            log("Diff-bootstrap: poprawiam przegląd po uwagach recenzenta…")
+        result = _decision_with_retry(
+            prompts.diff_bootstrap_prompt(
+                brief.diff(previous, current) if trigger == "brief" else "",
+                trigger=trigger, batches=cfg.steering_batches, initial=initial,
+                queued_tasks=queued, recent=recent, review_notes=notes),
+            lambda value: run_agent(
+                agent, value, cfg, project, logf("diff-bootstrap"),
+                model=model, effort=effort),
+            _parse_json_object)
+        # Zakres pilnujemy po KAŻDEJ próbie, także tej poprawkowej: recenzent
+        # ma oceniać kierunek, a nie sprzątać po zapisie poza uprawnieniami.
+        reverted = _revert_out_of_scope(
+            project, brief.out_of_scope(_turn_changes(before, _tree_manifest(project))))
+        if reverted:
+            log("Diff-bootstrap: cofnięto zmiany poza zakresem: "
+                + _describe_turn_changes(reverted))
+            ledger.append(project, "diff-bootstrap: cofnięto zmiany poza zakresem "
+                                   + _describe_turn_changes(reverted))
+        return result
+
+    try:
+        data = _reviewed_bootstrap(
+            cfg, project, logf, label="Diff-bootstrap", attempt=attempt,
+            review_prompt=lambda result: prompts.diff_bootstrap_review_prompt(
+                "HEAD", summary=str(result.get("summary", "")),
+                goal_reached=bool(result.get("goal_reached"))),
+            log_phase="diff-bootstrap-review")
+    except Exception:  # noqa: BLE001 — awaria zawsze zostawia czyste drzewo
+        # Niezaakceptowany kierunek nie ma prawa zostać w drzewie: następne
+        # wznowienie zaczyna od stanu sprzed przeglądu, brief pozostaje
+        # nierozliczony, a kolejna iteracja nie wywraca się na brudnym drzewie.
+        _revert_out_of_scope(project, sorted(brief.SYNC_WRITABLE))
+        raise
     replan = data.get("replan", True) is not False
     dropped = state.task_queue if replan else []
-    _write_brief_change_note(cfg, project, data, dropped)
+    _write_steering_note(cfg, project, data, dropped)
     if replan:
-        # Kolejka mogła zakładać nieaktualny brief. Zadania nie znikają po
-        # cichu: ich tytuły wracają do planisty w notatce o zmianie briefu, więc
-        # to on rozstrzyga, co przeplanować, a co porzucić.
+        # Kolejka mogła zakładać nieaktualny kierunek. Zadania nie znikają po
+        # cichu: ich tytuły wracają do planisty w notatce przeglądu, więc to on
+        # rozstrzyga, co przeplanować, a co porzucić.
         state.task_queue = []
         state.task_phase = ""
-    # Dopiero teraz brief jest rozliczony — wcześniejsza awaria zostawia
-    # poprzednią wersję jako punkt odniesienia i pozwala wznowić operację.
+    # Dopiero teraz brief i kadencja są rozliczone — wcześniejsza awaria
+    # zostawia poprzedni punkt odniesienia i pozwala wznowić operację.
     brief.write_snapshot(project, current)
     state.brief_digest = brief.digest(current)
+    state.steered_at_batch = state.plan_batches
+    state.steering_due = False
+    state.goal_confirmed = bool(data.get("goal_reached"))
     summary = str(data.get("summary", "")).strip()
-    log(f"Diff-bootstrap: gotowe (replan={replan}). {summary[:200]}")
-    ledger.append(project, f"diff-bootstrap: replan={replan}, "
-                           f"wycofano {len(dropped)} zadań z kolejki: {summary[:160]}")
-    commit_all(project, "docs: synchronizacja briefu", cfg)
+    log(f"Diff-bootstrap: gotowe (replan={replan}, "
+        f"goal_reached={state.goal_confirmed}). {summary[:200]}")
+    ledger.append(project, f"diff-bootstrap ({trigger}): replan={replan} "
+                           f"goal_reached={state.goal_confirmed}, wycofano "
+                           f"{len(dropped)} zadań: {summary[:160]}")
+    commit_all(project, "docs: przegląd kierunku projektu", cfg)
+    state.steered_at_sha = git(project, "rev-parse", "HEAD", check=False).stdout.strip()
 
 
 def _write_current_task(project: str, task: dict) -> None:
@@ -846,12 +937,13 @@ def one_iteration(cfg: Config, project: str, state: State) -> bool:
             _require_clean(project, "bootstrapem")
         phase_bootstrap(cfg, project, state, logf); state.save(str(Path(project, cfg.runtime_dir, "STATE.json"))); return True
     # Granica między zadaniami jest jedynym bezpiecznym momentem na zmianę
-    # wymagań: aktywne zadanie ma dokończyć swój cykl na założeniach, z którymi
-    # ruszyło. Weryfikacja starego celu po zmianie briefu byłaby stratą, więc
-    # synchronizacja wyprzedza także ją.
-    if not state.current_task and _brief_needs_sync(cfg, project, state):
-        _require_clean(project, "synchronizacją briefu")
-        phase_brief_sync(cfg, project, state, logf)
+    # kierunku: aktywne zadanie ma dokończyć swój cykl na założeniach, z którymi
+    # ruszyło. Weryfikacja starego celu po zmianie kierunku byłaby stratą, więc
+    # przegląd wyprzedza także ją.
+    trigger = "" if state.current_task else _steering_trigger(cfg, project, state)
+    if trigger:
+        _require_clean(project, "przeglądem kierunku")
+        phase_diff_bootstrap(cfg, project, state, logf, trigger)
         return True
     if state.task_phase == "verify_goal":
         return phase_verify_goal(cfg, project, state, logf)
@@ -859,7 +951,15 @@ def one_iteration(cfg: Config, project: str, state: State) -> bool:
         _require_clean(project, "planowaniem")
         planned = phase_plan_batch(cfg, project, state, logf)
         if planned["no_more_tasks"]:
-            return phase_verify_goal(cfg, project, state, logf)
+            # Pusty backlog nie kończy projektu: zakres rozwija przegląd
+            # kierunku, więc dopiero jego werdykt `goal_reached` przepuszcza do
+            # końcowej weryfikacji. Bezpiecznik na dwa jałowe wsady z rzędu
+            # chroni przed pętlą planista↔przegląd na najsilniejszym modelu.
+            if state.goal_confirmed or state.empty_plans >= 2:
+                return phase_verify_goal(cfg, project, state, logf)
+            log("Planowanie: backlog wyczerpany — proszę o przegląd kierunku.")
+            state.steering_due = True
+            return True
     state.iteration += 1
     return run_task(cfg, project, state, logf)
 

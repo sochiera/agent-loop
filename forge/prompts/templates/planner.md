@@ -7,10 +7,15 @@ bieżącego planu oraz BACKLOG.md. BACKLOG-ARCHIVE.md jest tylko do wglądu na �
 — nie czytaj go domyślnie. Głównego briefu ani docs/BRIEF-SNAPSHOT.md nie
 czytaj: jego zmiany docierają do ciebie przez docs/PROJECT.md i BACKLOG.md.
 
-{{BRIEF_CHANGE}}
+{{STEERING}}
 {{FEEDBACK}}
 {{FAILURES}}
 {{DEBT}}
+
+Backlog jest celowo krótki: projekt prowadzimy zwinnie, a jego zakres rozwija
+osobny przegląd kierunku, nie ty. Planuj to, co realnie stoi w backlogu, i
+zwróć `no_more_tasks`, gdy nie ma z czego planować — wtedy przegląd kierunku
+wskaże następny przyrost. Nie wymyślaj pracy na zapas.
 
 Przygotuj maksymalnie {{BATCH_SIZE}} małych zadań od task-{{START_INDEX}};
 zapisz każde w .forge/tasks/task-NNN.md. Format zadania: Cel, Kryteria akceptacji,
