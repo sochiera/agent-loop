@@ -30,6 +30,32 @@ def test_non_resumable_role_receives_only_its_private_record(tmp_path: Path) -> 
     assert state.tester_record.endswith("new tester action")
 
 
+def test_record_is_cut_on_turn_boundaries_never_mid_json_block() -> None:
+    """Cięcie bajtowe wstrzykiwało roli urwany blok ```json dokładnie tam, gdzie
+    jej kontrakt każe zwrócić jeden poprawny obiekt JSON."""
+    turn = 'analiza\n```json\n{"status": "red"}\n```'
+    record = orchestrate._append_record(orchestrate._append_record("", turn), turn)
+    assert record.count("```") % 2 == 0
+
+    oversized = "x" * (orchestrate._RECORD_BUDGET + 500) + '\n```json\n{"status": "red"'
+    cut = orchestrate._append_record("", oversized)
+    assert cut.startswith("[…"), "ucięcie musi być jawne dla roli"
+    assert cut.count("```") % 2 == 0, "otwarty blok połknąłby resztę promptu"
+
+
+def test_record_keeps_only_the_newest_turns() -> None:
+    record = ""
+    for i in range(4):
+        record = orchestrate._append_record(record, f"runda {i}")
+    assert "runda 0" not in record and record.endswith("runda 3")
+
+
+def test_session_mode_reflects_where_continuity_actually_comes_from() -> None:
+    assert orchestrate._session_mode(State(), "tester") == "new"
+    assert orchestrate._session_mode(State(tester_record="x"), "tester") == "record"
+    assert orchestrate._session_mode(State(tester_session="s"), "tester") == "session"
+
+
 def test_failure_creates_ref_artifact_and_removes_new_file(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)

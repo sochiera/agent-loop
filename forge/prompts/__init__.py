@@ -110,11 +110,23 @@ def plan_batch_prompt(
     )
 
 
+_SESSION_TEMPLATES = {
+    "session": "session-resume.md",   # agent wznawiający (codex)
+    "record": "session-record.md",    # agent bezsesyjny z własnym rekordem
+}
+
+
+def _session_block(mode: str) -> str:
+    """Zdanie o ciągłości roli. Musi zgadzać się z tym, co rola dostaje w promptcie:
+    obietnica „kontynuujesz sesję" przy pustej sesji to kłamstwo o jej historii."""
+    return read_template(_SESSION_TEMPLATES.get(mode, "session-new.md"))
+
+
 def tester_task_prompt(
         task_file: str, full_test_cmd: str, *, suggested_test_cmd: str = "",
         handoff: str = "", previous_decision: dict | None = None,
         coder_summary: str = "", changed_files: list[str] | None = None,
-        task_ledger: str = "", resume: bool = False,
+        task_ledger: str = "", session_mode: str = "new",
         confirmation: bool = False, suite_regression: bool = False,
         review_suggestions: bool = False,
         review_notes: list[str] | None = None) -> str:
@@ -169,8 +181,7 @@ def tester_task_prompt(
     )
     return render(
         "tester.md",
-        SESSION=read_template(
-            "session-resume.md" if resume else "session-new.md"),
+        SESSION=_session_block(session_mode),
         TASK_FILE=task_file,
         PREVIOUS_TEXT=previous_text,
         CODER_SUMMARY=coder_summary or "(brak)",
@@ -188,11 +199,10 @@ def tester_task_prompt(
 
 def coder_task_prompt(
         task_file: str, test_cmd: str, *, decision: dict,
-        resume: bool = False) -> str:
+        session_mode: str = "new") -> str:
     return render(
         "coder.md",
-        SESSION=read_template(
-            "session-resume.md" if resume else "session-new.md"),
+        SESSION=_session_block(session_mode),
         TASK_FILE=task_file,
         DECISION_STATUS=decision.get("status"),
         DECISION_REASON=decision.get("reason", ""),

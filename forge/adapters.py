@@ -15,10 +15,18 @@ Placeholdery szablonu: {prompt} {system} {schema} {model} {effort} {project}
   (np. {model} przy nieustawionym modelu), jest pomijany — nie zostawiamy pustych
   argumentów.
 
-Generyczny agent NIE wznawia sesji (nie znamy formatu jego wyjścia, więc nie
-przechwycimy id sesji). Ciągłość kontekstu per zadanie zapewnia mu dziennik
-zadania — orchestrate dokleja go do promptu (patrz _session_call). To ten sam
-mechanizm, którego claude/generic używają zamiast resume.
+Poza codeksem NIE wznawiamy sesji — i jest to decyzja wydajnościowa, nie brak.
+Technicznie dałoby się: claude i grok mają `--resume`, a oba przyjmują też
+`--session-id`, więc id sesji można NADAĆ przed startem, nie wyłuskiwać z
+wyjścia. Nie robimy tego, bo pomiary na .forge/usage.jsonl (832 tury claude,
+lipiec 2026) mówią, że to by podrożyło:
+- tura bezsesyjna i tak ma ~92% wejścia z cache — jedno `claude -p` to kilkanaście
+  wewnętrznych wywołań API i tylko pierwsze go nie trafia,
+- wznowienie nie zmniejsza kontekstu, tylko pozwala mu narastać: u codeksa, przy
+  tej samej skuteczności cache, tury wznowione mają 2,8× większe wejście od
+  nowych (w pojedynczych fazach nawet 7×).
+Ciągłość kontekstu per zadanie zapewnia agentowi bezsesyjnemu dziennik zadania
+i prywatny rekord roli — orchestrate dokleja je do promptu (patrz _call_role).
 
 KONTRAKT generycznego agenta (nie wykryjemy tego za Ciebie — CLI bywają różne):
 - przy PORAŻCE wyjdź kodem != 0 (wtedy orkiestrator zgłosi błąd/backoff);
@@ -38,7 +46,8 @@ _TOKEN_RE = re.compile(r"\{(\w+)\}")
 
 # Agenci z wbudowaną, przetestowaną obsługą (flagi + parsowanie wyjścia).
 BUILTIN_AGENTS = ("claude", "codex")
-# Tylko codex wznawia sesje (codex exec resume). Reszta jedzie na dzienniku.
+# Tylko codex wznawia sesje (codex exec resume). Reszta jedzie na dzienniku —
+# świadomie, patrz docstring modułu. To nie jest luka do „naprawienia".
 RESUMABLE_AGENTS = ("codex",)
 
 _PLACEHOLDERS = (

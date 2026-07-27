@@ -559,18 +559,58 @@ def _checkpoint(project: str, state: State, phase: str) -> None:
     state.save(str(Path(project, ".forge", "STATE.json")))
 
 
+# Prywatny zapis roli bezsesyjnej — jej jedyna ciągłość między turami.
+#
+# Cięty po CAŁYCH turach, nie po bajtach. Cięcie bajtowe wstrzykiwało roli urwany
+# blok ```json dokładnie tam, gdzie jej kontrakt każe zwrócić jeden poprawny
+# obiekt JSON — najgorsze możliwe miejsce na obcięcie w połowie.
+#
+# Budżet jest jeden, bo zapis i wstrzyknięcie to teraz ta sama treść. Wcześniej
+# STATE.json trzymał 8000 znaków, a do promptu szło ostatnie 4000: połowa zapisu
+# nie była czytana nigdy.
+_RECORD_SEPARATOR = "\n\n=== poprzednia tura ===\n"
+_RECORD_TURNS = 2
+_RECORD_BUDGET = 4000
+
+
+def _balance_fences(text: str) -> str:
+    """Domknij niesparowany ```. Otwarty blok połyka resztę promptu."""
+    return text + "\n```" if text.count("```") % 2 else text
+
+
+def _append_record(record: str, output: str) -> str:
+    """Dopisz turę i przytnij zapis do ostatnich _RECORD_TURNS w budżecie."""
+    turns = [t for t in record.split(_RECORD_SEPARATOR) if t.strip()]
+    turns = (turns + [output.strip()])[-_RECORD_TURNS:]
+    while len(turns) > 1 and len(_RECORD_SEPARATOR.join(turns)) > _RECORD_BUDGET:
+        turns.pop(0)
+    joined = _RECORD_SEPARATOR.join(turns)
+    if len(joined) > _RECORD_BUDGET:
+        # Pojedyncza tura ponad budżet: zostaje ogon, bo tam stoi decyzja roli.
+        joined = "[…początek tury ucięty…]\n" + _balance_fences(joined[-_RECORD_BUDGET:])
+    return joined
+
+
+def _session_mode(state: State, role: str) -> str:
+    """Skąd rola ma ciągłość: z własnej sesji, z dziennika-rekordu, znikąd."""
+    suffix = "tester" if role == "tester" else "coder"
+    if getattr(state, f"{suffix}_session"):
+        return "session"
+    return "record" if getattr(state, f"{suffix}_record") else "new"
+
+
 def _call_role(cfg: Config, project: str, state: State, role: str, prompt: str, log: str) -> str:
     agent, model, effort = cfg.role(role, state.current_task.get("difficulty", DEFAULT_TASK_DIFFICULTY))
     attr = "tester_session" if role == "tester" else "coder_session"
     previous = getattr(state, attr)
     record_attr = "tester_record" if role == "tester" else "coder_record"
     if not agent_supports_resume(agent) and getattr(state, record_attr):
-        prompt += "\n\nPrywatny, ograniczony zapis poprzednich działań tej samej roli:\n" + getattr(state, record_attr)[-4000:]
+        prompt += "\n\nPrywatny, ograniczony zapis poprzednich działań tej samej roli:\n" + getattr(state, record_attr)
     output, session = run_agent_session(agent, prompt, cfg, project, log, session_id=previous or None, model=model, effort=effort)
     if session:
         setattr(state, attr, session)
     if not agent_supports_resume(agent):
-        setattr(state, record_attr, (getattr(state, record_attr) + "\n" + output)[-8000:])
+        setattr(state, record_attr, _append_record(getattr(state, record_attr), output))
     return output
 
 
@@ -873,7 +913,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 coder_summary=state.coder_summary,
                 changed_files=_changed(project, state.task_start_tag),
                 task_ledger=ledger.tail_for_task(project, task["id"], limit=8),
-                resume=bool(state.tester_session),
+                session_mode=_session_mode(state, "tester"),
                 confirmation=confirmation,
                 suite_regression=using_suite_regression,
                 review_suggestions=state.review_suggestions_pending,
@@ -893,7 +933,8 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             test_cmd = str(decision.data.get("command", "")).strip() or state.test_cmd
             result = run_turn("coder", prompts.coder_task_prompt(
                 task["file"], test_cmd,
-                decision=decision.data, resume=bool(state.coder_session)),
+                decision=decision.data,
+                session_mode=_session_mode(state, "coder")),
                 parse_coder_decision)
             state.no_change_rounds = (
                 0 if state.round_changed else state.no_change_rounds + 1)
