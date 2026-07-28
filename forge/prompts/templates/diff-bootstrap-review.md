@@ -1,4 +1,9 @@
-ROLA: świeży, read-only recenzent przeglądu kierunku. Nie zmieniaj plików.
+ROLA: świeży recenzent przeglądu kierunku.
+
+Nie implementujesz poprawek — twoim jedynym wynikiem jest werdykt. Wolno ci
+natomiast uruchamiać kod i eksperymentować w drzewie, jeśli tylko tak da się
+sprawdzić tezę autora przeglądu; zgadywanie zamiast sprawdzenia jest gorsze.
+Po takim eksperymencie przywróć stan drzewa sprzed swojej tury i nie commituj.
 
 Przegląd kierunku właśnie zaktualizował BACKLOG.md i docs/PROJECT.md. Zobacz
 `git diff {{BASE}} -- BACKLOG.md docs/PROJECT.md`, przeczytaj docs/PROJECT.md

@@ -304,22 +304,53 @@ def test_review_budget_is_configurable(tmp_path: Path) -> None:
                       answers=(STEERED,) * 2, verdicts=(REJECT,) * 2)
 
 
-def test_review_writing_files_is_not_accepted_as_read_only(
+def test_reviewer_experiment_is_undone_without_losing_the_review(
         tmp_path: Path) -> None:
+    """Recenzentowi wolno eksperymentować; zostaje z tego tylko werdykt."""
     project, state, cfg = _steered_repo(tmp_path)
 
     def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
         if "recenzent przeglądu kierunku" in prompt:
             (Path(project_dir) / "app.py").write_text(
                 "HACK = 1\n", encoding="utf-8")
+            (Path(project_dir) / "probe.py").write_text(
+                "print('sonda')\n", encoding="utf-8")
             return APPROVE
         _write_in_scope(Path(project_dir))
         return STEERED
 
-    with patch("forge.orchestrate.run_agent", side_effect=agent), \
-         pytest.raises(orchestrate.AgentError, match="zmienił drzewo"):
+    with patch("forge.orchestrate.run_agent", side_effect=agent):
         orchestrate.phase_diff_bootstrap(
             cfg, str(project), state, lambda phase: phase, "cadence")
+
+    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
+    assert not Path(project, "probe.py").exists()
+    assert not orchestrate.has_changes(str(project))
+    # Praca autora przeglądu przeżywa cofnięcie tury recenzenta.
+    assert "tryb sieciowy" in Path(project, "BACKLOG.md").read_text(
+        encoding="utf-8")
+
+
+def test_reviewer_experiment_does_not_revert_the_authors_own_edit(
+        tmp_path: Path) -> None:
+    """Kotwicą jest stan sprzed tury recenzenta, nie sprzed całej fazy."""
+    project, state, cfg = _steered_repo(tmp_path)
+
+    def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
+        if "recenzent przeglądu kierunku" in prompt:
+            (Path(project_dir) / "BACKLOG.md").write_text(
+                "- [ ] notatka recenzenta\n", encoding="utf-8")
+            return APPROVE
+        _write_in_scope(Path(project_dir))
+        return STEERED
+
+    with patch("forge.orchestrate.run_agent", side_effect=agent):
+        orchestrate.phase_diff_bootstrap(
+            cfg, str(project), state, lambda phase: phase, "cadence")
+
+    backlog = Path(project, "BACKLOG.md").read_text(encoding="utf-8")
+    assert "tryb sieciowy" in backlog
+    assert "notatka recenzenta" not in backlog
 
 
 def test_review_reverts_writes_outside_its_scope(tmp_path: Path) -> None:
@@ -375,11 +406,13 @@ def test_failure_after_a_reviewer_write_still_leaves_a_clean_tree(
         tmp_path: Path) -> None:
     project, state, cfg = _steered_repo(tmp_path)
 
+    cfg.max_bootstrap_reviews = 1
+
     def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
         if "recenzent przeglądu kierunku" in prompt:
             (Path(project_dir) / "app.py").write_text(
                 "HACK = 1\n", encoding="utf-8")
-            return APPROVE
+            return REJECT
         _write_in_scope(Path(project_dir))
         return STEERED
 
@@ -392,26 +425,32 @@ def test_failure_after_a_reviewer_write_still_leaves_a_clean_tree(
     assert not orchestrate.has_changes(str(project))
 
 
-def test_reviewer_commit_is_caught_even_with_an_untouched_tree(
+def test_reviewer_commit_is_undone_without_stopping_the_phase(
         tmp_path: Path) -> None:
+    """Commit recenzenta unieważnia bazę porównania, więc HEAD wraca na swoje."""
     project, state, cfg = _steered_repo(tmp_path)
+    base = _git(project, "rev-parse", "HEAD").stdout.strip()
 
     def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
         if "recenzent przeglądu kierunku" in prompt:
+            (Path(project_dir) / "app.py").write_text(
+                "HACK = 1\n", encoding="utf-8")
             _git(Path(project_dir), "add", "-A")
             _git(Path(project_dir), "commit", "-qm", "recenzent commituje")
             return APPROVE
         _write_in_scope(Path(project_dir))
         return STEERED
 
-    with patch("forge.orchestrate.run_agent", side_effect=agent), \
-         pytest.raises(orchestrate.AgentError, match="zmienił historię"):
+    with patch("forge.orchestrate.run_agent", side_effect=agent):
         orchestrate.phase_diff_bootstrap(
             cfg, str(project), state, lambda phase: phase, "cadence")
 
     assert not orchestrate.has_changes(str(project))
-    assert Path(project, "BACKLOG.md").read_text(
-        encoding="utf-8") == "- [ ] stary wpis\n"
+    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
+    history = _git(project, "log", f"{base}..HEAD", "-p").stdout
+    assert "HACK = 1" not in history
+    assert "tryb sieciowy" in Path(project, "BACKLOG.md").read_text(
+        encoding="utf-8")
 
 
 def test_unreadable_brief_never_overwrites_the_snapshot(
@@ -637,7 +676,8 @@ def test_direction_review_prompt_judges_direction_not_style() -> None:
     prompt = prompts.diff_bootstrap_review_prompt(
         "HEAD", summary="dodałem sieć", goal_reached=True)
 
-    assert "read-only" in prompt
+    assert "Nie implementujesz poprawek" in prompt
+    assert "przywróć stan drzewa sprzed swojej tury" in prompt
     assert "dodałem sieć" in prompt
     assert "Deklaracja osiągnięcia celu: tak" in prompt
     assert "najcieńszym sensownym przyrostem" in prompt

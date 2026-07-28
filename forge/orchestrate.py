@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import replace
@@ -37,8 +38,10 @@ _TASK_STATE_FIELDS = (
 )
 
 
-def git(project: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=project, text=True, capture_output=True, check=check)
+def git(project: str, *args: str, check: bool = True,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=project, text=True, capture_output=True,
+                          check=check, env=env)
 
 
 def ensure_repo(project: str) -> None:
@@ -209,26 +212,36 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
 
     ``attempt(notes)`` wykonuje (kolejne) podejście i zwraca jego JSON;
     ``review_prompt(data)`` buduje prompt recenzji dla tego wyniku.
+
+    Recenzentowi wolno eksperymentować w drzewie — postawienie mocnej tezy o
+    kierunku często wymaga uruchomienia kodu i podmiany jednej linii, a zakaz
+    zapisu kupowałby czystość drzewa za cenę płytszej recenzji. Werdykt liczy
+    się jako jedyny wynik jego tury: cokolwiek zostawił w drzewie i w historii,
+    wraca do stanu, który sam oglądał.
     """
     reviewer, model, effort = cfg.role("bootstrap_reviewer")
     notes: list[str] = []
     for round_number in range(1, cfg.max_bootstrap_reviews + 1):
         data = attempt(notes)
-        tree = _tree_fingerprint(project)
+        before = _tree_manifest(project)
+        snapshot = _snapshot_tree(project)
         log(f"{label}: recenzja {round_number}/{cfg.max_bootstrap_reviews} "
-            "(świeży, read-only recenzent)…")
+            "(świeży recenzent)…")
         verdict = _decision_with_retry(
             review_prompt(data),
             lambda value: run_agent(
                 reviewer, value, cfg, project, logf(log_phase),
                 model=model, effort=effort),
             parse_review_decision)
-        if _tree_fingerprint(project) != tree:
-            raise AgentError(f"recenzent ({label}) zmienił drzewo")
         # Sam commit nie rusza plików, więc odcisk drzewa by go nie zauważył —
         # a przesunięty HEAD unieważnia bazę zarówno recenzji, jak i cofania.
-        if _restore_head(project, base_sha, f"{label} (recenzent)"):
-            raise AgentError(f"recenzent ({label}) zmienił historię repozytorium")
+        _restore_head(project, base_sha, f"{label} (recenzent)")
+        restored = _restore_snapshot(project, snapshot, before)
+        if restored:
+            log(f"{label}: cofnięto zmiany recenzenta: "
+                + _describe_turn_changes(restored))
+            ledger.append(project, f"{label}: cofnięto zmiany recenzenta "
+                                   + _describe_turn_changes(restored))
         notes = [str(note) for note in verdict.data.get("notes", [])]
         ledger.append(project, f"{label} recenzja {round_number}"
                                f"→{verdict.status}: {'; '.join(notes)[:160]}")
@@ -445,8 +458,8 @@ def phase_diff_bootstrap(cfg: Config, project: str, state: State, logf,
         # Niezaakceptowany kierunek nie ma prawa zostać w drzewie: następne
         # wznowienie zaczyna od stanu sprzed przeglądu, brief pozostaje
         # nierozliczony, a kolejna iteracja nie wywraca się na brudnym drzewie.
-        # Sprzątamy WSZYSTKO, co ruszyło się w tej fazie — także zapis
-        # recenzenta, który miał być read-only.
+        # Sprzątamy WSZYSTKO, co ruszyło się w tej fazie — także eksperymenty
+        # recenzenta, gdyby awaria wypadła przed ich cofnięciem.
         _restore_head(project, base_sha, "Diff-bootstrap")
         _revert_paths(project, base_sha,
                       _turn_changes(before, _tree_manifest(project)))
@@ -539,6 +552,38 @@ def _tree_fingerprint(project: str) -> str:
         digest.update(name.encode()); digest.update(b"\0")
         digest.update(file_hash.encode()); digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _snapshot_tree(project: str) -> str:
+    """Obiekt drzewa ze stanem worktree — bez ruszania indeksu i HEAD.
+
+    Kotwicą dla tury recenzenta nie może być SHA sprzed fazy: leży tam stan
+    sprzed pracy autora przeglądu, więc przywracanie z niego kasowałoby też jego
+    zmiany, gdyby recenzent dotknął tego samego pliku. Osobny indeks w katalogu
+    tymczasowym pozwala zapisać dokładnie to, co recenzent zobaczy.
+    """
+    index = Path(tempfile.mkdtemp(prefix="forge-snapshot-")) / "index"
+    env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+    try:
+        git(project, "add", "-A", env=env, check=False)
+        return git(project, "write-tree", env=env, check=False).stdout.strip()
+    finally:
+        shutil.rmtree(index.parent, ignore_errors=True)
+
+
+def _restore_snapshot(project: str, snapshot: str,
+                      before: dict[str, str]) -> list[str]:
+    """Przywróć drzewo do stanu ``snapshot``; zwróć cofnięte ścieżki."""
+    changed = _turn_changes(before, _tree_manifest(project))
+    if not changed or not snapshot:
+        return []
+    known = [name for name in changed if name in before]
+    if known:
+        git(project, "checkout", snapshot, "--", *known, check=False)
+    for name in changed:
+        if name not in before:
+            Path(project, name).unlink(missing_ok=True)
+    return changed
 
 
 def _turn_changes(before: dict[str, str], after: dict[str, str]) -> list[str]:
@@ -1232,8 +1277,6 @@ To wyjaśnienie, nie zakaz.
 
 def _housekeeping(cfg: Config, project: str) -> None:
     """Deterministyczne sprzątanie przed planowaniem, bez udziału agenta."""
-    import shutil
-
     runtime = Path(project, cfg.runtime_dir)
     tasks = runtime / "tasks"
     archive = tasks / "archive"

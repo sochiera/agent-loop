@@ -54,13 +54,19 @@ Zbyt duży diff zastępuje pełna treść briefu, a brief niemieszczący się w
 promptcie zatrzymuje przegląd z prośbą o podział dokumentu.
 
 Kierunek jest recenzowany, bo błąd na tym poziomie propaguje się na wszystkie
-kolejne zadania. Świeży, read-only recenzent (`bootstrap_reviewer`, najsilniejszy
+kolejne zadania. Świeży recenzent (`bootstrap_reviewer`, najsilniejszy
 model) ocenia kierunek, nie styl: czy zmiana wynika ze stanu projektu, czy krok
 jest najcieńszym sensownym przyrostem, czy nic nie zniknęło po cichu i czy
 `goal_reached` jest uczciwe. `request_changes` wraca do roli przeglądu z uwagami;
 budżet to `FORGE_MAX_BOOTSTRAP_REVIEWS` (domyślnie 4) recenzji. Wyczerpanie
 budżetu cofa zmiany i zatrzymuje przebieg z checkpointem — dalej potrzebna jest
 decyzja użytkownika. Ta sama pętla obowiązuje recenzję architektury bootstrapu.
+
+Recenzentowi kierunku wolno uruchamiać kod i eksperymentować w drzewie — bez
+tego mocna teza o kierunku wymagałaby zgadywania. Jego jedynym wynikiem
+pozostaje werdykt: po turze drzewo i HEAD wracają do stanu, który sam oglądał
+(snapshot sprzed recenzji, więc praca autora przeglądu zostaje nietknięta), a
+cofnięte ścieżki trafiają do ledgera.
 
 Nowy snapshot, skrót i kadencję zapisujemy dopiero po zaakceptowanym werdykcie,
 więc awaria zostawia poprzedni punkt odniesienia i operację można wznowić.
