@@ -425,6 +425,34 @@ def test_failure_after_a_reviewer_write_still_leaves_a_clean_tree(
     assert not orchestrate.has_changes(str(project))
 
 
+def test_reviewer_touching_an_untracked_file_leaves_it_untracked(
+        tmp_path: Path) -> None:
+    """Cofanie tury nie może zastagować pliku, którego faza nie umie posprzątać."""
+    project, state, cfg = _steered_repo(tmp_path)
+    cfg.max_bootstrap_reviews = 1
+    (project / "scratch.txt").write_text("robocze\n", encoding="utf-8")
+
+    def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
+        if "recenzent przeglądu kierunku" in prompt:
+            (Path(project_dir) / "scratch.txt").write_text(
+                "sonda\n", encoding="utf-8")
+            return REJECT
+        _write_in_scope(Path(project_dir))
+        return STEERED
+
+    with patch("forge.orchestrate.run_agent", side_effect=agent), \
+         pytest.raises(orchestrate.AgentError):
+        orchestrate.phase_diff_bootstrap(
+            cfg, str(project), state, lambda phase: phase, "cadence")
+
+    assert Path(project, "scratch.txt").read_text(
+        encoding="utf-8") == "robocze\n"
+    assert "scratch.txt" in orchestrate._untracked(str(project))
+    assert orchestrate.has_changes(str(project)) == bool(
+        orchestrate._untracked(str(project)))
+    assert not _git(project, "diff", "--cached", "--name-only").stdout.strip()
+
+
 def test_reviewer_commit_is_undone_without_stopping_the_phase(
         tmp_path: Path) -> None:
     """Commit recenzenta unieważnia bazę porównania, więc HEAD wraca na swoje."""

@@ -566,20 +566,30 @@ def _snapshot_tree(project: str) -> str:
     env = {**os.environ, "GIT_INDEX_FILE": str(index)}
     try:
         git(project, "add", "-A", env=env, check=False)
-        return git(project, "write-tree", env=env, check=False).stdout.strip()
+        snapshot = git(project, "write-tree", env=env, check=False).stdout.strip()
     finally:
         shutil.rmtree(index.parent, ignore_errors=True)
+    # Bez kotwicy nie ma czego przywracać, a cicha pustka wpuściłaby
+    # eksperymenty recenzenta do zaakceptowanego wyniku.
+    if not snapshot:
+        raise AgentError("nie udało się zapisać snapshotu drzewa przed recenzją")
+    return snapshot
 
 
 def _restore_snapshot(project: str, snapshot: str,
                       before: dict[str, str]) -> list[str]:
     """Przywróć drzewo do stanu ``snapshot``; zwróć cofnięte ścieżki."""
     changed = _turn_changes(before, _tree_manifest(project))
-    if not changed or not snapshot:
+    if not changed:
         return []
     known = [name for name in changed if name in before]
     if known:
-        git(project, "checkout", snapshot, "--", *known, check=False)
+        # `checkout <tree> -- ścieżki` zapisuje TAKŻE indeks: plik nieśledzony,
+        # którego dotknął recenzent, zostałby zastagowany i przestał być
+        # nieśledzony — a wtedy sprzątanie fazy (`_revert_paths`) nie umie go
+        # już usunąć. `restore --worktree` rusza wyłącznie drzewo robocze.
+        git(project, "restore", "--source", snapshot, "--worktree", "--",
+            *known, check=False)
     for name in changed:
         if name not in before:
             Path(project, name).unlink(missing_ok=True)
