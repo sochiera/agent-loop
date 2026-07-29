@@ -150,3 +150,7 @@ Nowa zmiana: w agent-loop zostało dodane review dla kroku bootstrap oraz podzia
 
 ---------------
 Nowa zmiana: w agent-loop dużo bugów i usprawnień zostało zaimplementowanych. Uwzględnij to. Warto chyba posprzątać repo gry też.
+
+
+-----------
+UWAGA - feedback dla agentów - prawdziwe MVP będzie wtedy, kiedy będą assety i tekstury. Nie musi być dużo budynków/rodzajów jednostek/terenu itp, ale żeby były jakieś sensowne prawdziwe assety.

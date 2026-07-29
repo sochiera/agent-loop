@@ -1,293 +1,340 @@
-# Context Capsule — design i plan wdrożenia
+# Context Capsule i prywatne notatniki — design i plan wdrożenia
 
-Status: propozycja zaakceptowana do implementacji.
+Status: zaakceptowane do implementacji.
 
 ## 1. Problem
 
 Tester i koder muszą zachować ciągłość w obrębie jednego zadania TDD. Obecnie
-Forge realizuje ją dwoma różnymi mechanizmami:
+Forge realizuje ją dwoma mechanizmami:
 
 - Codex wznawia pełną sesję;
-- pozostali agenci dostają dołączony surowy zapis maksymalnie dwóch ostatnich
-  odpowiedzi własnej roli, ograniczony do 4000 znaków.
+- pozostali agenci dostają surowy zapis maksymalnie dwóch ostatnich odpowiedzi
+  własnej roli, ograniczony do 4000 znaków.
 
-Oprócz tego prompt testera zawiera poprzednią decyzję, `coder_summary`, handoff,
-listę zmienionych plików i osiem wpisów dziennika. Część informacji występuje
-więc kilka razy:
+Prompt testera zawiera dodatkowo poprzednią decyzję, `coder_summary`, handoff,
+listę zmienionych plików i osiem wpisów dziennika. Te same informacje
+pojawiają się więc w kilku miejscach:
 
 - po `green` handoff jest równy `coder_summary`;
-- poprzednia decyzja testera znajduje się w `tester_decision`, prywatnym
-  rekordzie testera i dzienniku;
+- decyzja testera występuje w `State`, prywatnym rekordzie i dzienniku;
 - lista plików jest dostępna w Git, promptcie i dzienniku;
-- surowa odpowiedź zawiera tekst oraz JSON, choć sterowanie pętlą wykorzystuje
-  już sparsowany JSON.
+- rekord przechowuje całą końcową wypowiedź, chociaż tylko część jest przydatna
+  po powrocie roli.
 
-Mechanizm jest odporny na restart, ale nie jest optymalny:
+Pełna sesja rośnie, a surowy rekord wybiera tekst według kolejności i długości,
+nie według znaczenia. Potrzebujemy małego kontekstu procesu oraz miejsca, w
+którym sama rola może zachować wybrane przez siebie ustalenia.
 
-- budżet rekordu wybiera tekst według kolejności i długości, a nie znaczenia;
-- duplikaty zużywają kontekst i mogą przedstawiać ten sam fakt innymi słowami;
-- pełna sesja Codeksa rośnie przez całe zadanie;
-- trudno zmierzyć koszt poszczególnych źródeł kontekstu.
+## 2. Decyzja
 
-## 2. Cel
+Wprowadzamy dwa proste, niezależne elementy:
 
-Każde wywołanie testera i kodera ma dostać jedną, deterministyczną kapsułę
-bieżącego stanu zadania:
+1. **Context Capsule** — krótki, deterministyczny snapshot bieżącej tury,
+   generowany przez Forge z istniejącego stanu i Git.
+2. **Prywatny notatnik roli** — zwykły plik Markdown, który agent czyta i
+   modyfikuje według własnej oceny.
 
-1. tylko fakty potrzebne do najbliższej decyzji;
-2. dokładnie jedna kopia każdego faktu;
-3. ten sam kontrakt semantyczny niezależnie od providera;
-4. jawny i testowalny budżet rozmiaru;
-5. pełną zdolność wznowienia po przerwaniu procesu.
+Kapsuła odpowiada na pytanie „co dzieje się teraz?”. Notatnik odpowiada na
+pytanie „co chcę pamiętać, kiedy wrócę?”.
 
-Kapsuła nie jest dodatkową pamięcią. Jest widokiem generowanym przy wywołaniu
-z kanonicznego `State`, bieżącego Git oraz deterministycznych wyników bramek.
+Nie dodajemy osobnego modelu streszczającego, pól `self_note`,
+`knowledge_delta`, bazy wiedzy, automatycznego scalania ani mechanicznej
+izolacji notatników.
 
-## 3. Poza zakresem
+## 3. Cele
+
+- Jedna kopia każdego faktu procesowego w promptcie.
+- Ten sam minimalny handoff niezależnie od providera.
+- Brak pełnych transkryptów i dziennika zadania w promptach wykonawców.
+- Swobodna, prywatna pamięć testera i kodera bez rozbudowy `State`.
+- Odporność na restart procesu i utratę sesji CLI.
+- Brak notatników w commitach.
+- Zachowanie notatników jako diagnostyki nieudanego zadania.
+- Mały zakres zmian i krótka instrukcja dla agentów.
+
+## 4. Poza zakresem
+
+Poniższe rzeczy nie należą do pierwszego wdrożenia:
 
 - streszczanie historii przez dodatkowy model;
-- przenoszenie kontekstu testera do kodera lub odwrotnie poza jawnym handoffem;
-- dołączanie pełnych transkryptów albo outputu narzędzi;
-- zastępowanie pliku zadania, diffu i kodu ich opisem;
+- automatyczne wklejanie całego notatnika do każdego promptu;
+- twarde blokowanie jednej roli przed otwarciem notatnika drugiej;
+- walidowanie struktury lub treści notatnika;
+- mechaniczne limity, przycinanie i scalanie sekcji notatnika;
+- przenoszenie pełnej prywatnej historii między rolami;
+- zastępowanie pliku zadania, diffu i kodu ich streszczeniem;
 - zmiana odpowiedzialności ról TDD;
-- automatyczne wyłączenie sesji Codeksa bez pomiaru jakości.
+- wyłączenie `codex exec resume` bez osobnego pomiaru jakości.
 
-## 4. Warstwy kontekstu
+„Poza zakresem” oznacza brak implementacji w tym feature, a nie zakaz
+rozważenia w przyszłości.
 
-Kontekst należy traktować jako trzy osobne warstwy:
+## 5. Context Capsule
 
-### 4.1. Stabilne instrukcje roli
+Kapsuła nie jest pamięcią ani kolejnym obiektem zapisywanym do `State`. Jest
+widokiem budowanym tuż przed wywołaniem roli z danych, które Forge już posiada.
 
-Reguły testera albo kodera, kontrakt JSON i niezmienne ograniczenia. Powinny
-tworzyć stabilny prefiks, aby provider mógł wykorzystać prompt cache. Nie
-powinny zawierać stanu zadania.
-
-### 4.2. Context Capsule
-
-Mały, zmienny snapshot opisany poniżej. Jest jedynym tekstowym handoffem między
-turami i jedynym miejscem, w którym prompt przedstawia historię procesu.
-
-### 4.3. Źródła prawdy w repozytorium
-
-Plik zadania, aktualny diff, testy i kod pozostają na dysku. Agent czyta tylko
-potrzebne fragmenty narzędziami. Kapsuła wskazuje, od czego zacząć, ale nie
-kopiuje treści plików.
-
-## 5. Model kapsuły
-
-Kapsuła jest budowana osobno dla roli. Proponowany model logiczny:
-
-```json
-{
-  "version": 1,
-  "task": {
-    "id": "task-123",
-    "file": ".forge/tasks/task-123.md",
-    "round": 2
-  },
-  "turn": {
-    "role": "tester",
-    "phase": "confirmation",
-    "objective": "potwierdź bramkę po green kodera"
-  },
-  "last_own_decision": {
-    "status": "red",
-    "reason": "brakuje walidacji granicy",
-    "command": "pytest -q tests/test_api.py"
-  },
-  "incoming_handoff": {
-    "from": "coder",
-    "kind": "green",
-    "text": "dodano walidację; test ukierunkowany jest zielony"
-  },
-  "changed_files": [
-    "src/api.py",
-    "tests/test_api.py"
-  ],
-  "last_gate": {
-    "kind": "targeted",
-    "command": "pytest -q tests/test_api.py",
-    "status": "green",
-    "tail": ""
-  },
-  "review_notes": []
-}
-```
-
-Pola nieistotne dla danej fazy są pomijane, a nie renderowane jako seria
-`(brak)`. Koder otrzymuje analogiczną kapsułę, w której
-`incoming_handoff` jest bieżącą decyzją testera, a `last_own_decision` opisuje
-ostatni wynik kodera.
-
-## 6. Kanoniczne źródło każdego pola
-
-| Pole kapsuły | Źródło prawdy |
-|---|---|
-| `task.id`, `task.file` | `state.current_task` |
-| `task.round` | `state.tdd_round` |
-| `turn.role`, `turn.phase`, `turn.objective` | automat faz Forge |
-| `last_own_decision` testera | `state.tester_decision` |
-| `last_own_decision` kodera | nowe `state.coder_decision` |
-| `incoming_handoff` | jedno nowe pole `state.incoming_handoff` |
-| `changed_files` | `_changed(project, state.task_start_tag)` |
-| `last_gate` | nowe `state.last_gate` zapisywane przez Forge |
-| `review_notes` | `state.review_notes` tylko w aktywnym cyklu review |
-
-Docelowo `coder_summary` i tekstowy `tester_handoff` znikają. Ich znaczenie
-przejmuje strukturalny `coder_decision` oraz pojedynczy `incoming_handoff`.
-W okresie migracji stare pola są odczytywane wyłącznie jako fallback przy
-wznawianiu istniejącego `STATE.json`.
-
-## 7. Format renderowany
-
-Model danych pozostaje słownikiem, ale prompt dostaje krótki Markdown zamiast
-JSON-a. Markdown jest czytelniejszy dla agenta, a kolejność sekcji jest stała:
+Przykład dla testera:
 
 ```text
-KAPSUŁA KONTEKSTU v1
+KAPSUŁA KONTEKSTU
 Zadanie: task-123, runda 2, plik .forge/tasks/task-123.md
-Tura: tester / confirmation
-Cel: potwierdź bramkę po green kodera
-Poprzednia własna decyzja: red — brakuje walidacji granicy
-Handoff od kodera (green): dodano walidację; test ukierunkowany jest zielony
+Tura: tester / potwierdzenie po green kodera
+Handoff od kodera: dodano walidację; test ukierunkowany jest zielony
 Zmiany od startu zadania: src/api.py, tests/test_api.py
-Ostatnia bramka: targeted / green / pytest -q tests/test_api.py
+Aktywne uwagi review: brak
+Prywatny notatnik: .forge/notebooks/task-123/tester.md
 ```
 
-Nie dołączamy równolegle prywatnego rekordu ani wpisów dziennika zadania.
-Dziennik pozostaje telemetrią oraz pamięcią mistrza.
+Przykład dla kodera:
 
-## 8. Budżety
+```text
+KAPSUŁA KONTEKSTU
+Zadanie: task-123, runda 2, plik .forge/tasks/task-123.md
+Tura: koder / implementacja po red
+Decyzja testera: red — brakuje walidacji pustej listy
+Bramka testera: pytest -q tests/test_api.py
+Zmiany od startu zadania: tests/test_api.py
+Prywatny notatnik: .forge/notebooks/task-123/coder.md
+```
 
-Budżety obowiązują per pole, aby ważnego pola nie wyparł długi tekst innego:
+Kapsuła pokazuje wyłącznie pola potrzebne w bieżącej fazie. Nie renderuje
+serii `(brak)`. W szczególności:
 
-| Element | Limit |
-|---|---:|
-| handoff | 1200 znaków |
-| reason/summary własnej decyzji | 800 znaków |
-| ogon ostatniej czerwonej bramki | 2000 znaków |
-| lista zmienionych plików | 30 pozycji |
-| pojedyncza ścieżka | 240 znaków |
-| uwagi review łącznie | 1600 znaków |
-| cała kapsuła | 6000 znaków |
+- po `green` pokazuje handoff tylko raz, bez osobnego `coder_summary`;
+- nie dołącza prywatnego rekordu ostatnich odpowiedzi;
+- nie dołącza wpisów `ledger.md`;
+- nie kopiuje treści notatnika;
+- wskazuje dokładnie jeden notatnik właściwej roli.
 
-Cięcie tekstu jest jawne (`…[ucięto]`) i zachowuje ogon outputu bramki, bo tam
-zwykle znajduje się właściwy błąd. Listy są cięte po całych elementach.
+## 6. Źródła prawdy
 
-## 9. Obserwowalność przed zmianą zachowania
+| Informacja | Źródło |
+|---|---|
+| identyfikator i plik zadania | `state.current_task` |
+| numer rundy | `state.tdd_round` |
+| bieżąca faza i cel tury | automat TDD Forge |
+| decyzja testera i komenda bramki | `state.tester_decision` |
+| handoff do testera | istniejący `state.tester_handoff` |
+| zmienione pliki | `_changed(project, state.task_start_tag)` |
+| uwagi review | `state.review_notes` w aktywnym cyklu |
+| prywatna pamięć roli | wskazany plik notatnika |
+| historia procesu dla mistrza | `.forge/ledger.md` |
 
-Pierwszy etap wdrożenia nie zmienia promptów. Forge zapisuje do
-`.forge/context-usage.jsonl` dla każdej tury:
+Pierwsza implementacja wykorzystuje istniejące pola `State`. Nie dodajemy
+nowego modelu handoffu ani kopii kapsuły w `STATE.json`.
 
-- rolę, zadanie, rundę i tryb sesji;
-- liczbę znaków stabilnych instrukcji, dynamicznych pól, prywatnego rekordu
-  i całego promptu;
-- rozmiar kapsuły wygenerowanej w trybie shadow;
-- SHA-256 promptu i kapsuły, bez ponownego zapisywania ich treści;
-- usage providera, jeżeli adapter go raportuje;
-- wynik parsowania decyzji i liczbę zmian plików.
+Aktualny plik zadania, kod, diff, wyniki testów i obserwacje Forge mają
+pierwszeństwo przed treścią notatnika. Notatnik jest pomocą roli, nie źródłem
+kontraktu.
 
-Znaki są metryką provider-neutral. Tokeny raportowane przez CLI są metryką
-rozliczeniową; nie szacujemy ich jednym współczynnikiem znak/token, bo kod,
-polski tekst i różne tokenizery dają inne wyniki.
+## 7. Prywatne notatniki
 
-## 10. Sesje Codeksa
+### 7.1. Lokalizacja
 
-Kapsuła rozwiązuje ciągłość bez pełnej historii, ale samo jej wdrożenie nie
-wyłącza `codex exec resume`.
+```text
+.forge/notebooks/<task-id>/tester.md
+.forge/notebooks/<task-id>/coder.md
+```
 
-Po uruchomieniu kapsuły dla agentów bezsesyjnych należy porównać dwa tryby
-Codeksa na reprezentatywnych zadaniach:
+`.forge/` jest runtime'em ignorowanym przez Git. Zmiany notatnika nie mogą
+trafić do listy zmian zadania, bramki zakresu ani commita.
 
-- `resume + capsule`;
-- świeże wywołanie `capsule-only`.
+### 7.2. Template testera
 
-Porównujemy input tokens, liczbę tur, odsetek błędnych kontraktów, powtórzone
-odczyty plików i końcowy werdykt review. `capsule-only` może zostać domyślny
-dopiero wtedy, gdy zmniejszy wejście bez pogorszenia tych wskaźników. Do tego
-czasu sesje pozostają bez zmian.
+```markdown
+# Prywatny notatnik testera
 
-## 11. Plan implementacji
+## Następna tura
 
-### Etap 1 — pomiar i shadow capsule
+## Ustalenia
 
-1. Dodać `forge/context.py` z czystymi funkcjami budowania, limitowania i
-   renderowania kapsuły.
-2. Dodać zapis rozmiarów do `.forge/context-usage.jsonl`.
-3. Generować kapsułę obok starego promptu, ale jeszcze jej nie wysyłać.
-4. Dodać raport porównujący rozmiar starego kontekstu i kapsuły per rola.
+## Próby i pułapki
+```
 
-Pliki: `forge/context.py`, `forge/orchestrate.py`, `forge/report.py`,
-`tests/test_context.py`, `tests/test_report.py`.
+### 7.3. Template kodera
 
-### Etap 2 — kanoniczny stan handoffu
+```markdown
+# Prywatny notatnik kodera
 
-1. Dodać do `State` pola `coder_decision`, `incoming_handoff` i `last_gate`.
-2. Zapisywać wynik kodera po poprawnym parsowaniu, nie przed nim.
-3. Zapisywać obserwowany wynik bramki w kodzie Forge.
-4. Dodać migrację ze starych `coder_summary` i `tester_handoff`.
-5. Czyścić nowe pola razem z pozostałym stanem zadania.
+## Następna tura
 
-Pliki: `forge/state.py`, `forge/task_pipeline.py`, `forge/orchestrate.py`,
-`tests/test_task_pipeline.py`, `tests/test_task_lifecycle.py`.
+## Ustalenia
 
-### Etap 3 — przełączenie agentów bezsesyjnych
+## Próby i pułapki
+```
 
-1. Zastąpić argumenty kontekstowe `tester_task_prompt` i
-   `coder_task_prompt` jedną renderowaną kapsułą.
-2. Wyłączyć dopinanie `tester_record` i `coder_record`.
-3. Usunąć dziennik zadania z promptu testera.
-4. Pozostawić tymczasowy fallback dla aktywnego starego checkpointu.
-5. Po jednym pełnym cyklu zgodności usunąć stare pola ze `State`.
+Sekcje mogą pozostać puste. Agent może dowolnie przepisywać, skracać i usuwać
+zawartość. Notatnik nie jest dziennikiem append-only.
+
+### 7.4. Instrukcja roli
+
+Do promptu trafia jedno krótkie zdanie z konkretną ścieżką:
+
+> Twój prywatny notatnik to `.forge/notebooks/task-123/tester.md`. Czytaj i
+> aktualizuj go tylko wtedy, gdy pomoże ci w kolejnej turze; utrzymuj go krótko
+> i aktualnie. Nie czytaj notatników innych ról.
+
+To konwencja, nie zabezpieczenie. Zakładamy dobrą wolę agentów. Nie tworzymy
+osobnych sandboxów, uprawnień plikowych ani filtrów narzędzi.
+
+Notatnik nie jest automatycznie wklejany do promptu. Agent sam decyduje, czy
+warto wykonać jego odczyt. Nie musi aktualizować go po każdej turze.
+
+## 8. Cykl życia notatników
+
+### 8.1. Start zadania
+
+Po aktywowaniu nowego zadania Forge:
+
+1. tworzy `.forge/notebooks/<task-id>/`;
+2. tworzy `tester.md` i `coder.md` z powyższych template'ów;
+3. nigdy nie nadpisuje istniejących notatników przy wznowieniu tego samego
+   aktywnego zadania.
+
+### 8.2. Praca i restart
+
+Notatniki przeżywają checkpoint oraz restart Forge. Każde kolejne wywołanie
+dostaje tę samą ścieżkę właściwej roli.
+
+`codex exec resume` pozostaje bez zmian. Gdy resume zawiedzie i Forge uruchomi
+świeżą sesję, ścieżka notatnika nadal znajduje się w kapsule, więc agent może
+odzyskać wybrane przez siebie ustalenia.
+
+### 8.3. Sukces
+
+Po zielonej pełnej bramce i udanym commicie Forge usuwa:
+
+```text
+.forge/notebooks/<task-id>/
+```
+
+Usunięcie następuje dopiero po commicie. Awaria przed commitem nie może
+skasować pamięci potrzebnej do wznowienia.
+
+### 8.4. Nieudane zadanie
+
+Notatniki są częścią artefaktu porażki. `_fail_task` przenosi je do:
+
+```text
+.forge/failed/<task-id>/notebooks/tester.md
+.forge/failed/<task-id>/notebooks/coder.md
+```
+
+Obok pozostają istniejące `reason.txt`, zachowane pliki nieśledzone i ref
+`forge/failed/<task-id>`. Po przeniesieniu aktywny katalog
+`.forge/notebooks/<task-id>/` znika.
+
+Artefakt podlega istniejącej retencji `.forge/failed/` w housekeepingu. Nie
+jest commitowany.
+
+### 8.5. Osierocone katalogi
+
+Housekeeping może usunąć aktywny katalog notatników wyłącznie wtedy, gdy:
+
+- `State` nie ma aktywnego zadania o tym identyfikatorze;
+- nie jest to katalog wewnątrz `.forge/failed/`.
+
+Nie stosujemy dodatkowej archiwizacji udanych notatników.
+
+## 9. Migracja istniejącego stanu
+
+Nowe zadania korzystają wyłącznie z notatników. Dla zadania aktywnego podczas
+wdrożenia:
+
+1. Forge tworzy brakujące template'y bez nadpisywania istniejących plików.
+2. Jeżeli istnieje `tester_record` albo `coder_record`, zapisuje jego treść
+   jednorazowo pod dodatkowym nagłówkiem `## Poprzedni rekord po migracji`
+   w odpowiednim notatniku.
+3. Po zapisaniu checkpointu stare rekordy są czyszczone i nie są już dopinane
+   do promptu.
+
+Pola mogą pozostać w dataclassie `State` przez jeden okres zgodności, aby stare
+pliki JSON nadal się ładowały. Później zostaną usunięte.
+
+## 10. Plan implementacji
+
+### Etap 1 — helpery i cykl życia
+
+1. Dodać mały moduł `forge/notebooks.py`.
+2. Zaimplementować tworzenie template'ów bez nadpisywania.
+3. Wywołać inicjalizację przy starcie nowego zadania i przy wznowieniu starego.
+4. Dodać usuwanie katalogu po udanym commicie.
+5. Dodać przeniesienie notatników do artefaktu w `_fail_task`.
+6. Rozszerzyć housekeeping o bezpieczne usuwanie osieroconych katalogów.
+
+Pliki: `forge/notebooks.py`, `forge/orchestrate.py`,
+`tests/test_notebooks.py`, `tests/test_task_lifecycle.py`.
+
+### Etap 2 — kapsuła promptu
+
+1. Dodać czystą funkcję renderującą kapsułę z istniejącego `State`.
+2. Przekazywać tylko pola istotne dla aktualnej fazy.
+3. Dodać dokładną ścieżkę prywatnego notatnika roli.
+4. Usunąć duplikat `handoff`/`coder_summary`.
+5. Usunąć dziennik zadania z promptu testera.
+6. Przestać dopinać surowe `tester_record` i `coder_record`.
 
 Pliki: `forge/prompts/__init__.py`, `forge/prompts/templates/tester.md`,
-`forge/prompts/templates/coder.md`, `forge/orchestrate.py`, `forge/state.py`,
+`forge/prompts/templates/coder.md`, `forge/orchestrate.py`,
 `tests/test_role_context.py`, `tests/test_task_flow.py`.
 
-### Etap 4 — eksperyment sesji Codeksa
+### Etap 3 — migracja i porządki
 
-1. Dodać kontrolowany tryb `resume` kontra `capsule-only`.
-2. Zbierać usage jako przyrost bieżącej tury.
-3. Porównać co najmniej zadania proste, standardowe i z cyklem review.
-4. Zmienić domyślne zachowanie tylko na podstawie kryteriów z sekcji 10.
+1. Przenieść stare rekordy aktywnego zadania do notatników.
+2. Utrzymać ładowanie starych pól `STATE.json` przez okres zgodności.
+3. Usunąć `_append_record` i aktualizowanie rekordów.
+4. Po okresie zgodności usunąć pola `tester_record` i `coder_record`.
+5. Zaktualizować `docs/PIPELINE.md`.
 
-### Etap 5 — porządki
+### Etap 4 — osobny eksperyment Codeksa
 
-1. Usunąć `_append_record`, `tester_record`, `coder_record`,
-   `coder_summary` i `tester_handoff`, gdy nie istnieją już checkpointy
-   wymagające migracji.
-2. Zaktualizować `docs/PIPELINE.md`.
-3. Usunąć przejściowy tryb shadow i flagę rollbacku.
+Po stabilizacji kapsuły porównać:
 
-## 12. Testy akceptacyjne
+- `resume + capsule + notebook`;
+- świeże wywołanie `capsule + notebook`.
+
+Porównać input tokens, liczbę tur, powtarzane odczyty plików, błędne kontrakty
+i werdykty review. Nie zmieniać domyślnego resume bez pomiaru.
+
+## 11. Testy akceptacyjne
 
 Implementacja jest gotowa, gdy:
 
-- test renderera potwierdza, że każdy fakt występuje w promptcie dokładnie raz;
-- restart działa przed testerem, przed koderem, po `green`, po review i po
-  czerwonej pełnej bramce;
-- długa odpowiedź nie może wyciąć identyfikatora zadania, fazy ani komendy;
-- kapsuła jednej roli nie zawiera prywatnego rekordu drugiej;
-- pełne transkrypty i output narzędzi nigdy nie trafiają do kapsuły;
-- dynamiczna część promptu agentów bezsesyjnych jest mniejsza co najmniej
-  o 30% w korpusie pomiarowym;
-- nie rośnie liczba `InvalidDecision`, medianowa liczba rund TDD ani odsetek
-  `request_changes`;
+- start zadania tworzy oba notatniki z dokładnymi template'ami;
+- wznowienie nie nadpisuje treści zapisanej przez agenta;
+- prompt testera wskazuje tylko `tester.md`, a kodera tylko `coder.md`;
+- treść notatnika nie jest automatycznie kopiowana do promptu;
+- agent może zmienić notatnik bez oznaczenia rundy jako zmieniającej worktree;
+- notatniki nie trafiają do commita;
+- udany commit usuwa aktywny katalog notatników;
+- porażka przenosi oba notatniki do `.forge/failed/<task-id>/notebooks/`;
+- restart zachowuje aktywne notatniki;
+- migracja zachowuje zawartość starych rekordów;
+- prompt nie zawiera równolegle prywatnego rekordu ani dziennika zadania;
+- handoff po `green` występuje dokładnie raz;
+- pełne transkrypty i output narzędzi nie trafiają do kapsuły;
 - cały pakiet testów Forge pozostaje zielony.
 
-## 13. Ryzyka i zabezpieczenia
+## 12. Ryzyka i odpowiedzi
 
-| Ryzyko | Zabezpieczenie |
+| Ryzyko | Odpowiedź KISS |
 |---|---|
-| kapsuła zgubi istotny szczegół | etap shadow i fallback starego checkpointu |
-| nowy stan zdubluje stare pola | jedno źródło prawdy z tabeli w sekcji 6 |
-| limit utnie błąd testu | osobny budżet i zachowanie ogona bramki |
-| stateless Codex pogorszy jakość | osobny eksperyment, bez automatycznej zmiany |
-| telemetria zacznie kopiować prompty | zapis wyłącznie rozmiarów i hashy |
-| format będzie zależny od providera | wspólny renderer i testy kontraktowe |
+| agent nie przeczyta notatnika | notatnik jest opcjonalny; prompt podaje dokładną ścieżkę |
+| agent zapisze za dużo | prosimy o krótki, aktualny zapis; nie budujemy walidatora |
+| agent przeczyta cudzy notatnik | ufamy roli i dajemy prostą instrukcję |
+| notatka stanie się nieaktualna | agent może ją dowolnie przepisać; repo ma pierwszeństwo |
+| zapis notatnika doda tool call | agent aktualizuje ją tylko wtedy, gdy widzi wartość |
+| awaria zgubi pamięć | plik istnieje poza procesem i przeżywa checkpoint |
+| porażka usunie diagnostykę | notatniki wchodzą do artefaktu nieudanego zadania |
+| stary rekord zniknie przy migracji | jednorazowo przenosimy go do notatnika |
+| rozwiązanie urośnie | brak izolacji, schematów wiedzy, auto-injection i osobnego modelu |
 
-## 14. Decyzja
+## 13. Decyzja końcowa
 
-Wdrażamy Context Capsule etapami. Najpierw pomiar i shadow mode, następnie
-przełączenie testerów i koderów bezsesyjnych. Sesje Codeksa są osobnym,
-mierzalnym eksperymentem, a nie częścią pierwszej migracji.
+Wdrażamy małą kapsułę procesu oraz dwa swobodne notatniki Markdown na zadanie.
+Role same decydują, czy je czytać i aktualizować. Po sukcesie notatniki są
+usuwane; po porażce stają się częścią `.forge/failed/<task-id>/`.
+
+To rozwiązanie zastępuje surowe rekordy ról bez budowania nowego systemu
+pamięci.
