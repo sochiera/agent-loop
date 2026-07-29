@@ -1425,7 +1425,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--discard-legacy-task", action="store_true", help="Porzuć aktywny stary task i zachowaj stabilny stan.")
     parser.add_argument("--max-iters", type=int, default=0); parser.add_argument("--batch-size", type=int); parser.add_argument("--max-tdd-rounds", type=int)
     parser.add_argument("--tester-agent"); parser.add_argument("--coder-agent"); parser.add_argument("--reviewer-agent"); parser.add_argument("--planner-agent")
-    args = parser.parse_args(argv); cfg = Config(brief_path=args.brief)
+    args = parser.parse_args(argv)
+    try:
+        cfg = Config(brief_path=args.brief)
+    except ValueError as exc:
+        parser.error(str(exc))
     for key in ("batch_size", "max_tdd_rounds", "tester_agent", "coder_agent", "reviewer_agent", "planner_agent"):
         value = getattr(args, key)
         if value is not None: setattr(cfg, key, value)

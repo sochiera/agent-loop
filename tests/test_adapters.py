@@ -254,10 +254,15 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         # planner=gpt i tester=codex to jedna binarka — preflight nie może jej
         # liczyć dwa razy (ani dublować komunikatu o braku).
         cfg = Config(planner_agent="gpt", tester_agent="codex", coder_agent="codex",
-                     reviewer_agent="", verifier_agent="", master_agent="gpt")
+                     reviewer_agent="", verifier_agent="", master_agent="opencode")
         canon = [adapters.canonical_agent(a) for a in cfg.agents_in_use()]
         self.assertEqual(len(canon), len(set(canon)))
-        self.assertEqual(set(canon), {"codex"})
+        self.assertEqual(set(canon), {"codex", "opencode"})
+
+    def test_codex_and_its_aliases_are_rejected_for_master(self) -> None:
+        for agent in ("codex", "gpt", "chatgpt"):
+            with self.assertRaisesRegex(ValueError, "roli mistrza"):
+                Config(master_agent=agent)
 
     def test_known_generic_routing_reaches_template_arguments(self) -> None:
         """Routing providera musi trafić do argv, nie tylko do Config.role()."""

@@ -22,7 +22,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from .config import Config, ROLE_MODEL_LEVELS
+from .config import Config, ROLE_MODEL_LEVELS, validate_master_agent
 from . import report
 
 
@@ -35,6 +35,7 @@ STOP_TERM_DELAY_S = 8
 STOP_KILL_DELAY_S = 5
 SESSION_LOG_NAME = "gui_run.log"
 AGENTS = ("claude", "codex", "opencode", "grok", "kiro")
+MASTER_AGENTS = tuple(agent for agent in AGENTS if agent != "codex")
 ROLE_DEFS = (
     ("planner", "Planista", "Tworzy plan i dzieli pracę na zadania"),
     ("tester", "Tester", "Pisze testy i pilnuje czerwonej bramki"),
@@ -94,6 +95,8 @@ def build_launch(
         value = values["agent"].strip()
         if "\0" in value or "\n" in value or len(value) > 300:
             raise ValueError(f"Niepoprawna wartość pola {role}.agent.")
+        if role == "master":
+            validate_master_agent(value)
         env[ENV_FIELDS[role]["agent"]] = value
         # Stare ustawienia powłoki/GUI nie mogą po cichu obejść nowej polityki.
         env.pop(f"FORGE_{role.upper()}_MODEL", None)
@@ -141,9 +144,13 @@ def _string_list(values: tuple[str, ...], empty_label: str = "Domyślny") -> Gtk
 
 
 class RoleCard(Gtk.Box):
-    def __init__(self, role: str, title: str, description: str, default_agent: str):
+    def __init__(
+        self, role: str, title: str, description: str, default_agent: str,
+        agents: tuple[str, ...] = AGENTS,
+    ):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.role = role
+        self.agents = agents
         self.add_css_class("role-card")
 
         heading = Gtk.Label(xalign=0)
@@ -166,10 +173,10 @@ class RoleCard(Gtk.Box):
         routing.add_css_class("dim-label")
         self.append(routing)
 
-        self.agent = Gtk.DropDown(model=_string_list(AGENTS, "Agent"))
+        self.agent = Gtk.DropDown(model=_string_list(self.agents, "Agent"))
         self.agent.set_hexpand(True)
-        selected = default_agent if default_agent in AGENTS else AGENTS[0]
-        self.agent.set_selected(AGENTS.index(selected))
+        selected = default_agent if default_agent in self.agents else self.agents[0]
+        self.agent.set_selected(self.agents.index(selected))
 
         row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         caption = Gtk.Label(label="Agent", xalign=0)
@@ -179,7 +186,7 @@ class RoleCard(Gtk.Box):
         self.append(row)
 
     def values(self) -> dict[str, str]:
-        return {"agent": AGENTS[self.agent.get_selected()]}
+        return {"agent": self.agents[self.agent.get_selected()]}
 
     def set_sensitive_fields(self, enabled: bool) -> None:
         self.agent.set_sensitive(enabled)
@@ -326,7 +333,10 @@ class ForgeWindow(Adw.ApplicationWindow):
                 saved_agent = saved_role.get("agent")
                 if isinstance(saved_agent, str):
                     default_agent = saved_agent
-            card = RoleCard(role, title, description, default_agent)
+            card = RoleCard(
+                role, title, description, default_agent,
+                MASTER_AGENTS if role == "master" else AGENTS,
+            )
             card.set_size_request(270, -1)
             self.role_cards[role] = card
             roles_box.append(card)

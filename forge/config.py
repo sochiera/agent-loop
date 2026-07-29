@@ -114,6 +114,21 @@ _DEFAULT_PLANNER_MODEL = os.environ.get("FORGE_PLANNER_MODEL", "")
 _DEFAULT_PLANNER_EFFORT = os.environ.get("FORGE_PLANNER_EFFORT", "")
 
 
+def validate_master_agent(agent: str) -> None:
+    """Mistrz musi mieć prawdziwy tryb cienki, a Codex CLI go nie udostępnia.
+
+    Doklejenie promptu mistrza do zwykłego ``codex exec`` nadal ładuje pełny
+    agentowy harness i narzędzia. To przeczy celowi tej często wołanej,
+    jednoturowej roli, więc odrzucamy także aliasy Codeksa.
+    """
+    if adapters.canonical_agent(agent) == "codex":
+        raise ValueError(
+            "Codex nie jest dostępny dla roli mistrza: Codex CLI nie potrafi "
+            "zastąpić systemowego harnessu ani wyłączyć narzędzi. "
+            "Wybierz claude, opencode albo grok."
+        )
+
+
 # --- Wykrywanie wyczerpanych limitów / błędów przejściowych -----------------
 # Gdy trafimy na którykolwiek z tych wzorców w wyjściu CLI (przy niezerowym
 # kodzie wyjścia), traktujemy to jako "limit/błąd przejściowy" i robimy backoff
@@ -236,6 +251,8 @@ class Config:
     # Przed rollbackiem przy porażce: branch forge/failed/<id> na HEAD (+ residual commit).
     keep_failed_ref: bool = os.environ.get("FORGE_KEEP_FAILED_REF", "1") != "0"
 
+    def __post_init__(self) -> None:
+        validate_master_agent(self.master_agent)
 
     def effective_verify_targets(self, declared: list[str]) -> list[str]:
         """Targety po nadpisaniu użytkownika ("" = deklaracja bootstrapu)."""

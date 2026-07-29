@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 from forge.gui import (
+    MASTER_AGENTS,
     ROOT,
     build_launch,
     line_kind,
@@ -44,6 +45,7 @@ _ROLES = ("planner", "tester", "coder", "reviewer", "verifier", "master")
 class GuiLaunchTest(unittest.TestCase):
     def test_launch_uses_argv_and_role_environment(self) -> None:
         roles = {role: {"agent": "codex"} for role in _ROLES}
+        roles["master"]["agent"] = "opencode"
 
         command, env = build_launch("brief.md", "project", roles)
 
@@ -60,6 +62,14 @@ class GuiLaunchTest(unittest.TestCase):
         _command, env = build_launch("brief.md", "project", roles)
 
         self.assertEqual(env["FORGE_MASTER_AGENT"], "claude")
+
+    def test_codex_is_not_available_for_master(self) -> None:
+        self.assertNotIn("codex", MASTER_AGENTS)
+        roles = {role: {"agent": "claude"} for role in _ROLES}
+        roles["master"]["agent"] = "codex"
+
+        with self.assertRaisesRegex(ValueError, "Codex nie jest dostępny"):
+            build_launch("brief.md", "project", roles)
 
     def test_invalid_multiline_value_is_rejected(self) -> None:
         roles = {role: {"agent": "codex"} for role in _ROLES}
