@@ -1,6 +1,7 @@
 # Context Capsule i prywatne notatniki — design i plan wdrożenia
 
-Status: zaakceptowane do implementacji.
+Status: zaimplementowane. Decyzja z 2026-07-30: role wykonawcze zawsze używają
+świeżych wywołań; `codex exec resume` nie należy do pipeline'u TDD.
 
 ## 1. Problem
 
@@ -64,7 +65,6 @@ Poniższe rzeczy nie należą do pierwszego wdrożenia:
 - przenoszenie pełnej prywatnej historii między rolami;
 - zastępowanie pliku zadania, diffu i kodu ich streszczeniem;
 - zmiana odpowiedzialności ról TDD;
-- wyłączenie `codex exec resume` bez osobnego pomiaru jakości.
 
 „Poza zakresem” oznacza brak implementacji w tym feature, a nie zakaz
 rozważenia w przyszłości.
@@ -197,9 +197,10 @@ Po aktywowaniu nowego zadania Forge:
 Notatniki przeżywają checkpoint oraz restart Forge. Każde kolejne wywołanie
 dostaje tę samą ścieżkę właściwej roli.
 
-`codex exec resume` pozostaje bez zmian. Gdy resume zawiedzie i Forge uruchomi
-świeżą sesję, ścieżka notatnika nadal znajduje się w kapsule, więc agent może
-odzyskać wybrane przez siebie ustalenia.
+Każda tura testera i kodera jest świeżym wywołaniem, również dla Codexa.
+Forge nie przekazuje zapisanego `session_id` i nie zachowuje ID zwróconego
+przez nowe wywołanie. Ścieżka notatnika oraz deterministyczna kapsuła są
+jedynymi mechanizmami ciągłości między turami.
 
 ### 8.3. Sukces
 
@@ -287,15 +288,12 @@ Pliki: `forge/prompts/__init__.py`, `forge/prompts/templates/tester.md`,
 4. Po okresie zgodności usunąć pola `tester_record` i `coder_record`.
 5. Zaktualizować `docs/PIPELINE.md`.
 
-### Etap 4 — osobny eksperyment Codeksa
+### Etap 4 — świeże wywołania Codeksa
 
-Po stabilizacji kapsuły porównać:
-
-- `resume + capsule + notebook`;
-- świeże wywołanie `capsule + notebook`.
-
-Porównać input tokens, liczbę tur, powtarzane odczyty plików, błędne kontrakty
-i werdykty review. Nie zmieniać domyślnego resume bez pomiaru.
+Tester i koder zawsze startują bez `session_id`. Zwrócone ID sesji jest
+ignorowane, a stare identyfikatory w checkpointach są czyszczone przy
+wznowieniu zadania. Niskopoziomowa obsługa `codex exec resume` może pozostać
+w narzędziu diagnostycznym, ale pipeline TDD jej nie używa.
 
 ## 11. Testy akceptacyjne
 
@@ -337,4 +335,5 @@ Role same decydują, czy je czytać i aktualizować. Po sukcesie notatniki są
 usuwane; po porażce stają się częścią `.forge/failed/<task-id>/`.
 
 To rozwiązanie zastępuje surowe rekordy ról bez budowania nowego systemu
-pamięci.
+pamięci. Każda tura jest świeżym wywołaniem, więc poza kapsułą i notatnikiem
+nie istnieje ukryta ciągłość sesji.

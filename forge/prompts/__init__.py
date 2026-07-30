@@ -110,32 +110,70 @@ def plan_batch_prompt(
     )
 
 
-_SESSION_TEMPLATES = {
-    "session": "session-resume.md",   # agent wznawiający (codex)
-    "record": "session-record.md",    # agent bezsesyjny z własnym rekordem
-}
-
-
-def _session_block(mode: str) -> str:
-    """Zdanie o ciągłości roli. Musi zgadzać się z tym, co rola dostaje w promptcie:
-    obietnica „kontynuujesz sesję" przy pustej sesji to kłamstwo o jej historii."""
-    return read_template(_SESSION_TEMPLATES.get(mode, "session-new.md"))
+def context_capsule(
+        state, role: str, *, notebook_path: str,
+        changed_files: list[str] | None = None, handoff: str = "",
+        confirmation: bool = False, suite_regression: bool = False,
+        review_suggestions: bool = False, tester_gate: str = "") -> str:
+    """Renderuj wyłącznie fakty procesowe potrzebne roli w bieżącej turze."""
+    task = state.current_task
+    task_id = str(task.get("id", ""))
+    task_file = str(task.get("file", ""))
+    lines = [
+        "KAPSUŁA KONTEKSTU",
+        f"Zadanie: {task_id}, runda {state.tdd_round + 1}, plik {task_file}",
+    ]
+    if role == "tester":
+        if confirmation:
+            turn = "tester / potwierdzenie po green kodera"
+        elif suite_regression:
+            turn = "tester / ponowna ocena po czerwonej pełnej bramce"
+        elif review_suggestions:
+            turn = "tester / ocena sugestii review"
+        elif state.review_notes:
+            turn = "tester / nowy cykl po uwagach review"
+        else:
+            turn = "tester / projekt testu i decyzja TDD"
+        lines.append(f"Tura: {turn}")
+        previous = state.tester_decision
+        previous_status = str(previous.get("status", "")).strip()
+        previous_reason = str(previous.get("reason", "")).strip()
+        if previous_status:
+            decision_text = previous_status + (
+                f" — {previous_reason}" if previous_reason else "")
+            lines.append(f"Ostatnia decyzja testera: {decision_text}")
+        if handoff:
+            lines.append(f"Handoff do testera: {handoff}")
+        if state.review_notes:
+            lines.append(
+                "Aktywne uwagi review: " + "; ".join(state.review_notes))
+    else:
+        decision = state.tester_decision
+        status = str(decision.get("status", ""))
+        reason = str(decision.get("reason", "")).strip()
+        lines.append(
+            "Tura: koder / "
+            + ("implementacja po red" if status == "red"
+               else "implementacja decyzji testera"))
+        decision_text = status + (f" — {reason}" if reason else "")
+        if decision_text:
+            lines.append(f"Decyzja testera: {decision_text}")
+        command = tester_gate.strip() or str(
+            decision.get("command", "")).strip()
+        if command:
+            lines.append(f"Bramka testera: {command}")
+    if changed_files:
+        lines.append("Zmiany od startu zadania: " + ", ".join(changed_files))
+    lines.append(f"Prywatny notatnik: {notebook_path}")
+    return "\n".join(lines)
 
 
 def tester_task_prompt(
         task_file: str, full_test_cmd: str, *, suggested_test_cmd: str = "",
-        handoff: str = "", previous_decision: dict | None = None,
-        coder_summary: str = "", changed_files: list[str] | None = None,
-        task_ledger: str = "", session_mode: str = "new",
+        capsule: str = "",
         confirmation: bool = False, suite_regression: bool = False,
         review_suggestions: bool = False,
         review_notes: list[str] | None = None) -> str:
-    previous = previous_decision or {}
-    previous_text = (
-        f"{previous.get('status', '(brak)')} — "
-        f"{previous.get('reason', '(brak powodu)')}"
-    )
-    changed_text = ", ".join(changed_files or []) or "(brak)"
     # Potwierdzenie ma pierwszeństwo nad przyklejonym sygnałem regresji ze
     # starych checkpointów. W cyklu sugestii dostaje własny wariant.
     if confirmation and review_suggestions:
@@ -181,31 +219,20 @@ def tester_task_prompt(
     )
     return render(
         "tester.md",
-        SESSION=_session_block(session_mode),
         TASK_FILE=task_file,
-        PREVIOUS_TEXT=previous_text,
-        CODER_SUMMARY=coder_summary or "(brak)",
-        CHANGED_TEXT=changed_text,
-        TASK_LEDGER=task_ledger or "(brak)",
-        REVIEW_NOTES=(
-            "; ".join(review_notes or [])
-            if review_suggestions else "(brak)"
-        ),
+        CAPSULE=capsule,
         INSTRUCTIONS=instructions,
-        HANDOFF=handoff or "(brak)",
         STATUSES=statuses,
     )
 
 
 def coder_task_prompt(
         task_file: str, test_cmd: str, *, decision: dict,
-        session_mode: str = "new") -> str:
+        capsule: str = "") -> str:
     return render(
         "coder.md",
-        SESSION=_session_block(session_mode),
         TASK_FILE=task_file,
-        DECISION_STATUS=decision.get("status"),
-        DECISION_REASON=decision.get("reason", ""),
+        CAPSULE=capsule,
         TEST_CMD=test_cmd,
     )
 

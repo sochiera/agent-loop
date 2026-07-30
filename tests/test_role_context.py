@@ -1,30 +1,54 @@
 from pathlib import Path
 
 from forge import prompts
+from forge.state import State
 
 
-def test_private_role_prompts_only_allow_short_handoff() -> None:
-    tester = prompts.tester_task_prompt(
-        "task.md", "pytest",
-        handoff="coder reason",
-        previous_decision={"status": "red", "reason": "brakuje walidacji"},
+def test_private_role_prompts_use_capsule_without_record_or_ledger() -> None:
+    state = State(
+        current_task={"id": "task-001", "file": "task.md"},
+        tdd_round=1,
+        tester_decision={
+            "status": "red", "reason": "brakuje walidacji",
+            "command": "pytest tests/test_app.py",
+        },
         coder_summary="dodano walidację",
-        changed_files=["app.py", "tests/test_app.py"],
-        task_ledger="[12:00] task-001 r1 tester→red",
     )
-    coder = prompts.coder_task_prompt("task.md", "pytest", decision={"status": "red", "reason": "missing"})
-    assert "coder reason" in tester
-    assert "red" in tester and "brakuje walidacji" in tester
+    tester_capsule = prompts.context_capsule(
+        state, "tester",
+        notebook_path=".forge/notebooks/task-001/tester.md",
+        changed_files=["app.py", "tests/test_app.py"],
+        handoff="dodano walidację",
+        confirmation=True,
+    )
+    coder_capsule = prompts.context_capsule(
+        state, "coder",
+        notebook_path=".forge/notebooks/task-001/coder.md",
+        changed_files=["tests/test_app.py"],
+    )
+    tester = prompts.tester_task_prompt(
+        "task.md", "pytest", capsule=tester_capsule,
+    )
+    coder = prompts.coder_task_prompt(
+        "task.md", "pytest",
+        decision=state.tester_decision, capsule=coder_capsule)
     assert "dodano walidację" in tester
+    assert "Ostatnia decyzja testera: red — brakuje walidacji" in tester
     assert "app.py" in tester and "tests/test_app.py" in tester
-    assert "task-001 r1 tester→red" in tester
+    assert ".forge/notebooks/task-001/tester.md" in tester
+    assert ".forge/notebooks/task-001/coder.md" not in tester
+    assert "brakuje walidacji" in coder
+    assert "pytest tests/test_app.py" in coder
+    assert ".forge/notebooks/task-001/coder.md" in coder
+    assert ".forge/notebooks/task-001/tester.md" not in coder
+    assert "ostatnie wpisy dziennika" not in tester
+    assert "Prywatny, ograniczony zapis" not in tester + coder
     assert "zachować, poprawić albo przywrócić" in tester
     assert "Uwagi review rozpoczynają nowy cykl TDD" in tester
     assert "kolekcjonuje się" in tester
     assert "pada na asercji kontraktu" in tester
     assert "błędzie składni/importu/nazwy" in tester
     assert "napraw natychmiast" in tester
-    assert "SKIEROWANY DO CIEBIE" in tester
     assert "blocked" in tester
     assert "Decyzja testera" in coder and "transcript" not in coder.lower()
     assert "summary" in coder and "testerowi" in coder
@@ -38,7 +62,8 @@ def test_bootstrap_creates_informational_project_instructions() -> None:
     assert "CLAUDE.md" in prompt
     assert ".forge/" in prompt
     assert "runtime orkiestratora" in prompt
-    assert "kontekst dostajesz w promptcie" in prompt
+    assert "prywatny notatnik roli wskazany w kapsule" in prompt
+    assert "nie czytaj notatników innych ról" in prompt
 
 
 def test_bootstrap_creates_indexed_documentation_layout() -> None:
@@ -77,8 +102,7 @@ def test_planner_contract_owns_outcomes_not_test_design() -> None:
 def test_confirmation_prompt_checks_targeted_gate_criteria_and_test_quality() -> None:
     prompt = prompts.tester_task_prompt(
         "task.md", "pytest -q", confirmation=True,
-        suggested_test_cmd="pytest -q tests/test_app.py",
-        coder_summary="implemented")
+        suggested_test_cmd="pytest -q tests/test_app.py")
 
     assert "TURA POTWIERDZAJĄCA" in prompt
     assert "pytest -q tests/test_app.py" in prompt
@@ -92,8 +116,7 @@ def test_confirmation_prompt_checks_targeted_gate_criteria_and_test_quality() ->
 
 def test_confirmation_wins_over_sticky_regression_from_legacy_checkpoint() -> None:
     prompt = prompts.tester_task_prompt(
-        "task.md", "pytest -q", confirmation=True, suite_regression=True,
-        coder_summary="naprawiono regresję")
+        "task.md", "pytest -q", confirmation=True, suite_regression=True)
 
     assert "TURA POTWIERDZAJĄCA" in prompt
     assert "PEŁNA BRAMKA wykryła regresję" not in prompt
@@ -132,7 +155,11 @@ def test_suggestions_prompt_can_finalize_or_escalate() -> None:
     prompt = prompts.tester_task_prompt(
         "task.md",
         "pytest -q",
-        handoff="uprość helper",
+        capsule=(
+            "KAPSUŁA KONTEKSTU\n"
+            "Handoff do testera: uprość helper\n"
+            "Aktywne uwagi review: usuń duplikację; skróć nazwę"
+        ),
         review_suggestions=True,
         review_notes=["usuń duplikację", "skróć nazwę"],
     )

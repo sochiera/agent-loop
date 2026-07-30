@@ -23,9 +23,11 @@ obszarach, docs/ARCHITECTURE/00-INDEX.md i pliki architektury po obszarach oraz
 docs/DECISIONS/YYYY-MM.md dla decyzji z bieżącego miesiąca. Każdy 00-INDEX.md
 ma mapować obszar na plik i pozostać krótszy niż 2 KB.
 
-Utwórz też AGENTS.md i CLAUDE.md z krótką informacją: „.forge/ to runtime orkiestratora
-— plik twojego zadania i cały potrzebny kontekst dostajesz w promptcie, więc
-nie ma tam nic, czego potrzebujesz”. To wyjaśnienie, nie zakaz.
+Utwórz też AGENTS.md i CLAUDE.md z krótką informacją: „.forge/ to runtime orkiestratora.
+Nie przeglądaj go w poszukiwaniu kontekstu; wyjątkiem jest
+dokładnie jeden prywatny notatnik roli wskazany w kapsule — możesz go czytać
+i aktualizować, ale nie czytaj notatników innych ról ani archiwum zadań”.
+To wyjaśnienie, nie zakaz.
 
 {{CORRECTIONS}}
 Ustal profil końcowej weryfikacji: targets z smoke/ci/hardware i odpowiadające

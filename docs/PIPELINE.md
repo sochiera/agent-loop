@@ -103,7 +103,8 @@ decyzji `red` albo `code`; Forge przekazuje tę samą komendę koderowi. Koder m
 dołożyć inne wąskie testy dotkniętych komponentów. Pełna suita nie należy do
 wewnętrznych rund TDD: Forge uruchamia ją razem z buildem po zaakceptowanym
 review, bezpośrednio przed commitem. Jej regresja wraca do testera z pełną
-komendą i ogonem wyniku.
+komendą i diagnostycznym ogonem wyniku, aby nie musiał ponownie uruchamiać
+potencjalnie kosztownej albo niestabilnej suity.
 
 Tester odpowiada również za jakość dotkniętych testów. Przed dodaniem testu
 szuka realistycznego, dotąd niewykrywanego defektu; preferuje rozszerzenie lub
@@ -123,13 +124,41 @@ zaakceptowaną zmianę koderowi, a następnie wybiera `finalize`. Jeśli poprawk
 wyjdą poza mały zakres, zmienią publiczne zachowanie albo wzbudzą wątpliwości,
 tester wybiera `review`, świadomie ponosząc koszt nowej recenzji.
 
-Przy `request_changes` uwagi wracają do zachowanej sesji testera, która
-rozpoczyna nowy cykl TDD. Jeśli reviewer mimo roli read-only zapisze pliki,
+Przy `request_changes` uwagi wracają przez kapsułę do świeżego wywołania
+testera, które rozpoczyna nowy cykl TDD. Jeśli reviewer mimo roli read-only zapisze pliki,
 Forge nie porzuca ani nie cofa zadania: podaje testerowi dokładne ścieżki do
 oceny i wymaga zwykłej ścieżki review. `approve`, a także poprawne `finalize`,
 przechodzą do pełnej bramki i commitu.
-Sesje są czyszczone po udanym commicie albo zakończeniu zadania przez testera
-jako `blocked`.
+
+## Kapsuła kontekstu i notatniki ról
+
+Przed każdą turą testera albo kodera Forge buduje małą, deterministyczną
+kapsułę z aktywnego zadania, fazy TDD, bieżącej decyzji lub handoffu, listy
+zmian od tagu startowego i aktywnych uwag review. Kapsuła nie jest zapisywana
+do `STATE.json`. Prompt wykonawcy nie zawiera ledgera ani surowych rekordów
+poprzednich odpowiedzi; jedynym outputem narzędzia przekazywanym w kapsule jest
+diagnostyczny ogon czerwonej pełnej bramki. Handoff po `green` występuje tylko
+raz.
+
+Każda tura testera i kodera jest świeżym wywołaniem, także dla Codexa.
+Pipeline nigdy nie przekazuje `session_id` do resume i nie zapisuje ID zwróconej
+sesji. Stare identyfikatory w kompatybilnym checkpointcie są czyszczone przy
+wznowieniu zadania; całą kontrolowaną ciągłość zapewniają kapsuła i notatnik.
+
+Każde zadanie ma dwa opcjonalne, prywatne notatniki:
+`.forge/notebooks/<task-id>/tester.md` i
+`.forge/notebooks/<task-id>/coder.md`. Prompt wskazuje wyłącznie plik własnej
+roli, ale nie wkleja jego zawartości. Rola sama decyduje, czy go przeczytać
+lub przepisać. Kod, diff, plik zadania i wyniki uruchomionych testów zawsze
+mają przed nim pierwszeństwo.
+
+Brakujące template'y powstają zarówno przy starcie, jak i wznowieniu zadania,
+bez nadpisywania istniejących notatek. Stare `tester_record` i `coder_record`
+są jednorazowo przenoszone pod nagłówek migracyjny, po czym czyszczone w
+checkpointcie. Po udanym commicie katalog zadania jest usuwany. Przy porażce
+trafia do `.forge/failed/<task-id>/notebooks/` razem z pozostałą diagnostyką;
+housekeeping usuwa tylko osierocone katalogi aktywnych notatników i stosuje
+zwykłą retencję do całego artefaktu porażki.
 
 Bramka przed commitem i zapis reviewera raportują się w logu i w ledgerze.
 Czerwona bramka po `finalize` cofała zadanie do testera bez żadnego śladu:

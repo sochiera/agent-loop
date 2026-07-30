@@ -21,39 +21,20 @@ def test_worktree_fingerprint_detects_untracked_file(tmp_path: Path) -> None:
     assert orchestrate._tree_fingerprint(str(tmp_path)) != before
 
 
-def test_non_resumable_role_receives_only_its_private_record(tmp_path: Path) -> None:
-    state = State(current_task={"difficulty": "simple"}, tester_record="tester history")
-    with patch("forge.orchestrate.agent_supports_resume", return_value=False), \
-         patch("forge.orchestrate.run_agent_session", return_value=("new tester action", None)) as call:
+def test_role_call_does_not_inject_or_update_legacy_record(tmp_path: Path) -> None:
+    state = State(
+        current_task={"difficulty": "simple"},
+        tester_record="tester history",
+        tester_session="stale-session",
+    )
+    with patch(
+            "forge.orchestrate.run_agent_session",
+            return_value=("new tester action", "ignored-session")) as call:
         orchestrate._call_role(Config(), str(tmp_path), state, "tester", "prompt", "log")
-    assert "tester history" in call.call_args.args[1]
-    assert state.tester_record.endswith("new tester action")
-
-
-def test_record_is_cut_on_turn_boundaries_never_mid_json_block() -> None:
-    """Cięcie bajtowe wstrzykiwało roli urwany blok ```json dokładnie tam, gdzie
-    jej kontrakt każe zwrócić jeden poprawny obiekt JSON."""
-    turn = 'analiza\n```json\n{"status": "red"}\n```'
-    record = orchestrate._append_record(orchestrate._append_record("", turn), turn)
-    assert record.count("```") % 2 == 0
-
-    oversized = "x" * (orchestrate._RECORD_BUDGET + 500) + '\n```json\n{"status": "red"'
-    cut = orchestrate._append_record("", oversized)
-    assert cut.startswith("[…"), "ucięcie musi być jawne dla roli"
-    assert cut.count("```") % 2 == 0, "otwarty blok połknąłby resztę promptu"
-
-
-def test_record_keeps_only_the_newest_turns() -> None:
-    record = ""
-    for i in range(4):
-        record = orchestrate._append_record(record, f"runda {i}")
-    assert "runda 0" not in record and record.endswith("runda 3")
-
-
-def test_session_mode_reflects_where_continuity_actually_comes_from() -> None:
-    assert orchestrate._session_mode(State(), "tester") == "new"
-    assert orchestrate._session_mode(State(tester_record="x"), "tester") == "record"
-    assert orchestrate._session_mode(State(tester_session="s"), "tester") == "session"
+    assert call.call_args.args[1] == "prompt"
+    assert call.call_args.kwargs["session_id"] is None
+    assert state.tester_record == "tester history"
+    assert state.tester_session == ""
 
 
 def test_failure_creates_ref_artifact_and_removes_new_file(tmp_path: Path) -> None:

@@ -78,6 +78,7 @@ def test_full_happy_path_reaches_commit(tmp_path: Path) -> None:
     assert _git(tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "feat: Zmiana wartości"
     assert state.current_task == {}
     assert state.task_phase == ""
+    assert not (tmp_path / ".forge" / "notebooks" / "task-001").exists()
     assert state.tester_session == state.coder_session == ""
 
 
@@ -111,7 +112,7 @@ def test_review_request_changes_starts_a_new_tdd_cycle_then_commit(
         assert state.task_phase == "tester"
         assert state.current_task
         assert prompts_seen["coder"] == []
-        assert "ustaw 2" in state.tester_handoff
+        assert state.review_notes == ["ustaw 2"]
 
         # Tester rozpoczyna nowy cykl, przekazuje poprawkę koderowi i ponownie
         # kieruje wynik do świeżego reviewera.
@@ -157,8 +158,9 @@ def test_tester_receives_task_scoped_context_in_every_prompt(tmp_path: Path) -> 
     assert "brakuje VALUE=1" in confirmation
     assert "ustawiono VALUE na 1" in confirmation
     assert "app.py" in confirmation and "tests/test_app.py" in confirmation
-    assert "task-001 wcześniejszy wpis" in tester_prompts[0]
+    assert "task-001 wcześniejszy wpis" not in tester_prompts[0]
     assert "sekret innego zadania" not in tester_prompts[0]
+    assert "ostatnie wpisy dziennika" not in confirmation
 
 
 def test_independent_task_receives_failed_batch_handoff(tmp_path: Path) -> None:
@@ -217,6 +219,23 @@ def test_full_suite_failure_after_review_returns_to_tester_without_commit(
     assert "napraw albo zwróć `blocked`" in state.tester_handoff
     assert _git(
         tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "seed"
+
+    tester_prompts: list[str] = []
+
+    def capture_tester(
+            _cfg, _project, _state, role, prompt, _log):
+        assert role == "tester"
+        tester_prompts.append(prompt)
+        return '{"status":"blocked","reason":"koniec testu"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=capture_tester), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate._fail_task"):
+        orchestrate.run_task(
+            cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert "FAIL integration_test" in tester_prompts[0]
+    assert "trace tail" in tester_prompts[0]
 
 
 def test_red_commit_gate_announces_itself_in_log_and_ledger(
@@ -400,7 +419,7 @@ def test_legacy_coder_checkpoint_without_command_falls_back_to_full_suite(
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert len(coder_prompts) == 1
-    assert f"bramkę testera `{state.test_cmd}`" in coder_prompts[0]
+    assert f"Bramka testera: {state.test_cmd}" in coder_prompts[0]
 
 
 def test_review_suggestions_can_be_rejected_and_finalized_without_rereview(
@@ -557,7 +576,7 @@ def test_request_changes_notes_do_not_enter_backlog_before_fix(
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert state.task_phase == "tester"
-    assert "napraw kontrakt" in state.tester_handoff
+    assert state.review_notes == ["napraw kontrakt"]
     assert not (tmp_path / "BACKLOG.md").exists()
 
 
@@ -642,7 +661,7 @@ def test_legacy_corrections_checkpoint_returns_to_tester_without_coder(
     assert _git(tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "seed"
     assert state.current_task
     assert state.task_phase == "tester"
-    assert "ustaw 3" in state.tester_handoff
+    assert state.review_notes == ["ustaw 3"]
 
 
 def test_invalid_decision_gets_exactly_one_format_retry() -> None:

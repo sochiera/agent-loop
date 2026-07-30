@@ -10,11 +10,12 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
-from .agents import (AgentError, LimitExhausted, agent_supports_resume, extract_json,
+from .agents import (AgentError, LimitExhausted, extract_json,
                      log, run_agent, run_agent_session, run_planner)
 from .config import Config, DEFAULT_TASK_DIFFICULTY, TASK_DIFFICULTIES
 from . import brief
 from . import ledger
+from . import notebooks
 from . import prompts
 from . import verify
 from .shellrun import run_shellfree
@@ -614,58 +615,15 @@ def _checkpoint(project: str, state: State, phase: str) -> None:
     state.save(str(Path(project, ".forge", "STATE.json")))
 
 
-# Prywatny zapis roli bezsesyjnej — jej jedyna ciągłość między turami.
-#
-# Cięty po CAŁYCH turach, nie po bajtach. Cięcie bajtowe wstrzykiwało roli urwany
-# blok ```json dokładnie tam, gdzie jej kontrakt każe zwrócić jeden poprawny
-# obiekt JSON — najgorsze możliwe miejsce na obcięcie w połowie.
-#
-# Budżet jest jeden, bo zapis i wstrzyknięcie to teraz ta sama treść. Wcześniej
-# STATE.json trzymał 8000 znaków, a do promptu szło ostatnie 4000: połowa zapisu
-# nie była czytana nigdy.
-_RECORD_SEPARATOR = "\n\n=== poprzednia tura ===\n"
-_RECORD_TURNS = 2
-_RECORD_BUDGET = 4000
-
-
-def _balance_fences(text: str) -> str:
-    """Domknij niesparowany ```. Otwarty blok połyka resztę promptu."""
-    return text + "\n```" if text.count("```") % 2 else text
-
-
-def _append_record(record: str, output: str) -> str:
-    """Dopisz turę i przytnij zapis do ostatnich _RECORD_TURNS w budżecie."""
-    turns = [t for t in record.split(_RECORD_SEPARATOR) if t.strip()]
-    turns = (turns + [output.strip()])[-_RECORD_TURNS:]
-    while len(turns) > 1 and len(_RECORD_SEPARATOR.join(turns)) > _RECORD_BUDGET:
-        turns.pop(0)
-    joined = _RECORD_SEPARATOR.join(turns)
-    if len(joined) > _RECORD_BUDGET:
-        # Pojedyncza tura ponad budżet: zostaje ogon, bo tam stoi decyzja roli.
-        joined = "[…początek tury ucięty…]\n" + _balance_fences(joined[-_RECORD_BUDGET:])
-    return joined
-
-
-def _session_mode(state: State, role: str) -> str:
-    """Skąd rola ma ciągłość: z własnej sesji, z dziennika-rekordu, znikąd."""
-    suffix = "tester" if role == "tester" else "coder"
-    if getattr(state, f"{suffix}_session"):
-        return "session"
-    return "record" if getattr(state, f"{suffix}_record") else "new"
-
-
 def _call_role(cfg: Config, project: str, state: State, role: str, prompt: str, log: str) -> str:
     agent, model, effort = cfg.role(role, state.current_task.get("difficulty", DEFAULT_TASK_DIFFICULTY))
     attr = "tester_session" if role == "tester" else "coder_session"
-    previous = getattr(state, attr)
-    record_attr = "tester_record" if role == "tester" else "coder_record"
-    if not agent_supports_resume(agent) and getattr(state, record_attr):
-        prompt += "\n\nPrywatny, ograniczony zapis poprzednich działań tej samej roli:\n" + getattr(state, record_attr)
-    output, session = run_agent_session(agent, prompt, cfg, project, log, session_id=previous or None, model=model, effort=effort)
-    if session:
-        setattr(state, attr, session)
-    if not agent_supports_resume(agent):
-        setattr(state, record_attr, _append_record(getattr(state, record_attr), output))
+    # Każda tura jest świeża. Kontrolowaną ciągłość zapewniają wyłącznie
+    # Context Capsule i prywatny notatnik, również dla Codexa.
+    setattr(state, attr, "")
+    output, _session = run_agent_session(
+        agent, prompt, cfg, project, log, session_id=None,
+        model=model, effort=effort)
     return output
 
 
@@ -814,6 +772,13 @@ def _fail_task(cfg: Config, project: str, state: State, reason: str) -> None:
     artifact.mkdir(parents=True, exist_ok=True)
     artifact.joinpath("reason.txt").write_text(reason + "\n", encoding="utf-8")
     artifact.joinpath("diff.patch").write_text(git(project, "diff", "--no-ext-diff", state.task_start_tag, check=False).stdout, encoding="utf-8")
+    # Także porażka wznowiona bez przejścia przez ``run_task`` zachowuje
+    # komplet template'ów i ewentualne rekordy ze starego checkpointu.
+    notebooks.ensure(project, cfg.runtime_dir, task_id)
+    notebooks.migrate_records(
+        project, cfg.runtime_dir, task_id, state)
+    notebooks.move_to_failure(
+        project, cfg.runtime_dir, task_id, artifact)
     for rel in _untracked(project):
         source = Path(project, rel)
         if source.is_file():
@@ -895,9 +860,20 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         state.round_changed = False
         state.suite_regression = False
         state.review_suggestions_pending = False
+        notebooks.ensure(project, cfg.runtime_dir, task["id"])
         _checkpoint(project, state, "tester")
         log(f"Zadanie {task['id']} — {task['title']} (trudność: {task['difficulty']})")
         ledger.append(project, f"{task['id']} start: {task['title']} ({task['difficulty']})")
+    else:
+        # Wznowienie oraz migracja checkpointu sprzed Context Capsule.
+        notebooks.ensure(project, cfg.runtime_dir, task["id"])
+    had_legacy_sessions = bool(state.tester_session or state.coder_session)
+    state.tester_session = ""
+    state.coder_session = ""
+    if (notebooks.migrate_records(
+            project, cfg.runtime_dir, task["id"], state)
+            or had_legacy_sessions):
+        _checkpoint(project, state, state.task_phase)
     if state.task_phase in {"", "tester", "coder"}:
         # Mistrz jest wołany raz na rundę; ta sama notatka obsługuje kodera w
         # tej samej rundzie. Zmienna lokalna wystarcza — po restarcie kolejna
@@ -960,15 +936,21 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                         "suggestions")
                 return parsed
 
+            changed_files = _changed(project, state.task_start_tag)
+            capsule = prompts.context_capsule(
+                state, "tester",
+                notebook_path=notebooks.relative_path(
+                    cfg.runtime_dir, task["id"], "tester"),
+                changed_files=changed_files,
+                handoff=handoff,
+                confirmation=confirmation,
+                suite_regression=using_suite_regression,
+                review_suggestions=state.review_suggestions_pending,
+            )
             result = run_turn("tester", prompts.tester_task_prompt(
                 task["file"], state.test_cmd,
                 suggested_test_cmd=suggested_test_cmd,
-                handoff=handoff,
-                previous_decision=state.tester_decision,
-                coder_summary=state.coder_summary,
-                changed_files=_changed(project, state.task_start_tag),
-                task_ledger=ledger.tail_for_task(project, task["id"], limit=8),
-                session_mode=_session_mode(state, "tester"),
+                capsule=capsule,
                 confirmation=confirmation,
                 suite_regression=using_suite_regression,
                 review_suggestions=state.review_suggestions_pending,
@@ -986,10 +968,17 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             # Nowe decyzje red/code zawsze mają command. Fallback obsługuje
             # wyłącznie wznowienie starego checkpointu fazy coder.
             test_cmd = str(decision.data.get("command", "")).strip() or state.test_cmd
+            capsule = prompts.context_capsule(
+                state, "coder",
+                notebook_path=notebooks.relative_path(
+                    cfg.runtime_dir, task["id"], "coder"),
+                changed_files=_changed(project, state.task_start_tag),
+                tester_gate=test_cmd,
+            )
             result = run_turn("coder", prompts.coder_task_prompt(
                 task["file"], test_cmd,
                 decision=decision.data,
-                session_mode=_session_mode(state, "coder")),
+                capsule=capsule),
                 parse_coder_decision)
             state.no_change_rounds = (
                 0 if state.round_changed else state.no_change_rounds + 1)
@@ -1059,7 +1048,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             state.review_notes = review_notes
             state.tester_handoff = (
                 "Reviewer zażądał poprawek. Rozpocznij nowy cykl TDD "
-                f"i oceń uwagi: {'; '.join(review_notes) or '(brak konkretów)'}.")
+                "i oceń aktywne uwagi review.")
             if review_changes != "bez_zmian":
                 state.tester_handoff += (
                     " Reviewer zmienił też pliki "
@@ -1085,8 +1074,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             state.review_suggestions_pending = True
             state.tester_handoff = (
                 "Reviewer zaakceptował bieżący diff z opcjonalnymi sugestiami. "
-                "Oceń każdą, zastosuj albo odrzuć z powodem: "
-                f"{'; '.join(review_notes)}."
+                "Oceń każdą aktywną uwagę review, zastosuj albo odrzuć z powodem."
             )
             _checkpoint(project, state, "tester")
             return True
@@ -1098,7 +1086,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         # została usunięta: każda uwaga review wraca teraz przez testera.
         state.tester_handoff = (
             "Wznowiono stary checkpoint poprawek po review. Rozpocznij nowy cykl "
-            f"TDD i oceń uwagi: {'; '.join(state.review_notes) or '(brak konkretów)'}.")
+            "TDD i oceń aktywne uwagi review.")
         state.corrections_done = False
         state.corrections_tree_hash = ""
         state.review_suggestions_pending = False
@@ -1123,13 +1111,14 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                                f"powrót do testera; ogon: {suite_output[-160:]}")
         state.tester_handoff = (
             "Deterministyczna bramka przed commitem wykazała, że pełny pakiet "
-            f"jest czerwony po tym zadaniu. Pracuj na `{state.test_cmd}`, nie "
-            "na teście ukierunkowanym. Oceń ogon wyniku, napraw albo zwróć "
+            "jest czerwony po tym zadaniu. Pracuj na komendzie pełnej bramki "
+            "wskazanej niżej, oceń zachowany ogon wyniku, napraw albo zwróć "
             f"`blocked` z konkretnym powodem:\n{suite_output[-2000:]}"
         )
         _checkpoint(project, state, "tester")
         return True
     commit_all(project, f"feat: {task['title']}", cfg)
+    notebooks.remove(project, cfg.runtime_dir, task["id"])
     git(project, "tag", "-d", state.task_start_tag, check=False)
     log(f"Zadanie {task['id']} UKOŃCZONE i zacommitowane: {task['title']}")
     ledger.append(project, f"{task['id']} UKOŃCZONE po {state.tdd_round} rundach")
@@ -1276,6 +1265,20 @@ _AGENT_NOTE_FILES = ("AGENTS.md", "CLAUDE.md")
 def _agent_instruction_note(runtime_dir: str) -> str:
     return f"""# Notatka dla agentów
 
+`{runtime_dir}/` to runtime orkiestratora Forge. Nie przeglądaj go w
+poszukiwaniu ogólnego kontekstu: plik zadania i kapsułę dostajesz w promptcie.
+Wyjątkiem jest dokładnie jeden prywatny notatnik roli wskazany w kapsule —
+możesz go czytać i aktualizować. Nie czytaj notatników innych ról.
+
+Zwłaszcza `{runtime_dir}/tasks/archive/` zawiera zamknięte zadania; czytanie
+tego archiwum zapycha kontekst i nic nie wnosi. To wyjaśnienie, nie zakaz.
+"""
+
+
+def _old_agent_instruction_note(runtime_dir: str) -> str:
+    """Dokładna treść Forge sprzed notatników, wyłącznie do migracji."""
+    return f"""# Notatka dla agentów
+
 `{runtime_dir}/` to runtime orkiestratora Forge. Plik twojego zadania i cały
 potrzebny kontekst dostajesz w promptcie, więc nie ma tam nic, czego
 potrzebujesz. Dotyczy to zwłaszcza `{runtime_dir}/tasks/archive/` (zamknięte
@@ -1318,7 +1321,13 @@ def _housekeeping(cfg: Config, project: str) -> None:
 
     for name in _AGENT_NOTE_FILES:
         note = Path(project, name)
-        if not note.exists():  # nigdy nie nadpisujemy cudzej treści
+        if not note.exists():
+            note.write_text(
+                _agent_instruction_note(cfg.runtime_dir), encoding="utf-8")
+        elif note.read_text(encoding="utf-8") == _old_agent_instruction_note(
+                cfg.runtime_dir):
+            # Migrujemy tylko bajt-w-bajt własną starą notkę. Każda inna
+            # treść należy do użytkownika i pozostaje nietknięta.
             note.write_text(
                 _agent_instruction_note(cfg.runtime_dir), encoding="utf-8")
 
@@ -1329,6 +1338,20 @@ def _housekeeping(cfg: Config, project: str) -> None:
     ) if failed.is_dir() else []
     for artifact in artifacts[:-_RUNTIME_KEEP_ITEMS]:
         shutil.rmtree(artifact, ignore_errors=True)
+
+    state_path = runtime / "STATE.json"
+    active_task_id = ""
+    checkpoint_readable = True
+    if state_path.exists():
+        try:
+            active_task_id = str(
+                State.load(str(state_path)).current_task.get("id", ""))
+        except (OSError, ValueError):
+            # Uszkodzony checkpoint nie daje prawa usuwać potencjalnie
+            # potrzebnej pamięci aktywnego zadania.
+            checkpoint_readable = False
+    if checkpoint_readable:
+        notebooks.prune_orphans(project, cfg.runtime_dir, active_task_id)
 
     log_dir = _transcript_log_dir(project)
     iterations = []
