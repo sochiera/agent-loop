@@ -154,3 +154,102 @@ Nowa zmiana: w agent-loop dużo bugów i usprawnień zostało zaimplementowanych
 
 -----------
 UWAGA - feedback dla agentów - prawdziwe MVP będzie wtedy, kiedy będą assety i tekstury. Nie musi być dużo budynków/rodzajów jednostek/terenu itp, ale żeby były jakieś sensowne prawdziwe assety.
+
+
+## STAŁA REGUŁA PLANOWANIA: PRIORYTET OPRAWY GRAFICZNEJ
+
+To jest obowiązująca reguła wykonawcza, a nie sugestia.
+
+Dopóki nie zostanie osiągnięty opisany niżej próg jakości wizualnej, przy KAŻDYM
+wywołaniu planisty i przy KAŻDYM nowym batchu Forge:
+
+- batch musi zawierać co najmniej 4 zadania graficzne;
+- batch może zawierać najwyżej 2 zadania mechaniczne;
+- łączna liczba zadań w batchu nie może przekroczyć 6;
+- batch bez co najmniej 4 zadań graficznych jest nieprawidłowy i musi zostać
+  przeplanowany.
+
+Zadania mechaniczne wolno planować wyłącznie wtedy, gdy są bezpośrednią,
+niezbędną zależnością aktualnych zadań graficznych. Nie wolno planować
+niezależnych mechanik kosztem wymaganej liczby zadań graficznych.
+
+Jeśli backlog nie zawiera wystarczającej liczby zadań graficznych, planista nie
+może zwrócić `no_more_tasks`. Ma najpierw utworzyć konkretne małe zadania
+graficzne wynikające z tego wymagania i dopiero potem zbudować batch.
+
+### Co jest zadaniem graficznym
+
+Zadanie graficzne musi dostarczać widoczny efekt w natywnym kliencie Godot.
+Może obejmować:
+
+- dodanie nowych prawdziwych assetów CC0 lub CC-BY;
+- podmianę istniejących placeholderów na lepsze assety;
+- spójne kafle mapy, osady, budynki, tło, ikony rozkazów i sylwetki jednostek;
+- poprawę prezentacji zaznaczenia, celu, właściciela, armii i stanu gry;
+- podłączenie assetów do scen Godota;
+- poprawę kompozycji, skali, kontrastu i czytelności istniejących widoków;
+- aktualizację `CREDITS.md`, importu Godota i testów ładowania/prezentacji.
+
+Samo dodanie testu, dokumentacji albo refaktoru bez widocznego efektu w grze
+nie liczy się jako zadanie graficzne.
+
+Każde zadanie graficzne musi:
+
+- wskazywać konkretne assety lub elementy oprawy;
+- wskazywać miejsce ich użycia w grze;
+- kończyć się widocznym rezultatem po uruchomieniu Godota;
+- zawierać sprawdzenie rzeczywistego wyglądu przez screenshot albo ludzkie
+  review;
+- zapisywać źródło i licencję assetów w `CREDITS.md`.
+
+### Obowiązujący zakres wizualny
+
+K87 uznaj za techniczne minimum, a nie za zakończenie rozwoju grafiki.
+Istnienie obecnych tekstur nie zwalnia planisty z dalszego rozwijania oprawy.
+
+Kolejne przyrosty mają kolejno poprawić:
+
+1. spójność i różnorodność kafli mapy;
+2. wygląd osad i budynków;
+3. tło oraz kompozycję mapy strategicznej;
+4. ikony i prezentację rozkazów;
+5. sylwetki jednostek oraz czytelność ich stron;
+6. prezentację zaznaczenia celu i stanu gry;
+7. spójność stylistyczną obu widoków.
+
+Celem nie jest grafika AAA, lecz spójna, czytelna i wyraźnie mniej prototypowa
+gra 2D o średniowiecznym, realistycznym charakterze.
+
+### Bezwzględnie wykluczone
+
+Do czasu osiągnięcia progu jakości wizualnej nie planuj niezależnych zadań
+dotyczących:
+
+- nowych reguł gry;
+- AI;
+- ekonomii;
+- walki;
+- ruchu;
+- nowych rozkazów;
+- protokołu, snapshotu lub mostu;
+- zmian rdzenia Python;
+- zapisu i odczytu;
+- porządkowania repozytorium;
+- dokumentacji niezwiązanej bezpośrednio z oprawą.
+
+Zmiany rdzenia, mostu albo protokołu są dozwolone wyłącznie wtedy, gdy są
+bezpośrednią i niezbędną zależnością konkretnego zadania graficznego.
+
+### Warunek zakończenia priorytetu graficznego
+
+Priorytet graficzny można uznać za zakończony dopiero wtedy, gdy:
+
+- mapa strategiczna, osady i armie używają spójnych prawdziwych assetów;
+- widok bitwy ma czytelne kafle, jednostki i strony;
+- interfejs nie opiera się na przypadkowych placeholderach;
+- wszystkie nowe assety mają źródła i licencje;
+- człowiek zaakceptuje wygląd uruchomionej gry na podstawie screenshotów;
+- `docs/PROJECT.md` i `BACKLOG.md` opisują ten stan jako faktycznie osiągnięty.
+
+Do tego momentu zasada „minimum 4 zadania graficzne w każdym batchu” obowiązuje
+bez wyjątków.
