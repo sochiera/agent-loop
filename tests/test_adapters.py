@@ -103,7 +103,8 @@ class GenericSpecTest(unittest.TestCase):
         # Model NeuralWatt bez --variant (effort pusty) — flaga znika w całości.
         argv = adapters.expand_template(
             spec.template,
-            {"prompt": "zrob X", "model": "neuralwatt/glm-5.2", "effort": "",
+            {"prompt": "zrob X", "prompt_file": "/tmp/prompt.md",
+             "model": "neuralwatt/glm-5.2", "effort": "",
              "project": "", "output": ""},
         )
         self.assertEqual(
@@ -111,7 +112,8 @@ class GenericSpecTest(unittest.TestCase):
         # Model z effortem (GLM-5.2 wspiera --variant) — flaga zostaje.
         argv_effort = adapters.expand_template(
             spec.template,
-            {"prompt": "zrob X", "model": "neuralwatt/glm-5.2", "effort": "high",
+            {"prompt": "zrob X", "prompt_file": "/tmp/prompt.md",
+             "model": "neuralwatt/glm-5.2", "effort": "high",
              "project": "", "output": ""},
         )
         self.assertEqual(
@@ -128,7 +130,8 @@ class GenericSpecTest(unittest.TestCase):
         self.assertIsNotNone(spec)
         argv = adapters.expand_template(
             spec.template,
-            {"prompt": "journal", "system": "rules", "schema": '{"type":"object"}',
+            {"prompt": "journal", "prompt_file": "/tmp/prompt.md",
+             "system": "rules", "schema": '{"type":"object"}',
              "model": "grok-4.5", "effort": "low", "project": "/p",
              "output": ""},
         )
@@ -279,7 +282,8 @@ class ConfigRoleResolutionTest(unittest.TestCase):
             self.assertIsNotNone(spec)
             argv = adapters.expand_template(
                 spec.template,
-                {"prompt": "p", "model": model, "effort": effort,
+                {"prompt": "p", "prompt_file": "/tmp/prompt.md",
+                 "model": model, "effort": effort,
                  "project": "/project", "output": ""},
             )
             self.assertEqual((model, effort), expected)
@@ -292,13 +296,37 @@ class ConfigRoleResolutionTest(unittest.TestCase):
 
 
 class RunGenericAgentTest(unittest.TestCase):
+    def test_default_grok_prompt_is_not_put_in_argv(self) -> None:
+        from forge.agents import run_agent
+        with tempfile.TemporaryDirectory() as project:
+            captured = {}
+
+            def fake_backoff(argv, cwd, cfg_, log, stdin_text=None, env=None):
+                captured["argv"] = argv
+                captured["env"] = env
+                prompt_path = Path(argv[argv.index("--prompt-file") + 1])
+                self.assertEqual(prompt_path.read_text(encoding="utf-8"),
+                                 "bash scripts/test.sh")
+                return "ok"
+
+            with patch("forge.agents._isolated_agent_env", return_value={}), \
+                 patch("forge.agents._run_with_backoff", side_effect=fake_backoff):
+                out = run_agent("grok", "bash scripts/test.sh", Config(),
+                                project, "/tmp/log")
+
+            self.assertEqual(out, "ok")
+            self.assertNotIn("bash scripts/test.sh", captured["argv"])
+            self.assertFalse(Path(
+                captured["argv"][captured["argv"].index("--prompt-file") + 1]
+            ).exists())
+
     @patch.dict(os.environ, {"FORGE_AGENT_GROK_CMD": "grok --exec {prompt} --out {output}"})
     def test_generic_agent_output_file_path(self) -> None:
         from forge.agents import run_agent
         with tempfile.TemporaryDirectory() as project:
             captured = {}
 
-            def fake_backoff(argv, cwd, cfg_, log, stdin_text=None):
+            def fake_backoff(argv, cwd, cfg_, log, stdin_text=None, env=None):
                 captured["argv"] = argv
                 out_idx = argv.index("--out") + 1  # agent zapisuje wynik do {output}
                 Path(argv[out_idx]).write_text("WYNIK GROKA", encoding="utf-8")

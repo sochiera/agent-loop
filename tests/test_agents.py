@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from forge import agents
+from forge.adapters import GenericSpec
 from forge.agents import (
     AgentError,
     _aggregated_output_chars,
@@ -226,22 +227,27 @@ def test_isolated_cli_homes_link_auth_but_not_global_instructions(
     config = tmp_path / "config"
     codex_source = home / ".codex"
     claude_source = home / ".claude"
+    grok_source = home / ".grok"
     codex_source.mkdir(parents=True)
     claude_source.mkdir()
+    grok_source.mkdir()
     (codex_source / "auth.json").write_text("auth", encoding="utf-8")
     (codex_source / "config.toml").write_text("model='x'", encoding="utf-8")
     (codex_source / "AGENTS.md").write_text("private", encoding="utf-8")
     (claude_source / ".credentials.json").write_text(
         "credentials", encoding="utf-8")
     (claude_source / "CLAUDE.md").write_text("private", encoding="utf-8")
+    (grok_source / "auth.json").write_text("auth", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
 
     codex_env = _isolated_agent_env("codex")
     claude_env = _isolated_agent_env("claude")
+    grok_env = _isolated_agent_env("grok")
 
     codex_home = Path(codex_env["CODEX_HOME"])
     claude_home = Path(claude_env["CLAUDE_CONFIG_DIR"])
+    grok_home = Path(grok_env["GROK_HOME"])
     assert codex_home == config / "forge" / "codex"
     assert claude_home == config / "forge" / "claude"
     assert (codex_home / "auth.json").is_symlink()
@@ -249,6 +255,10 @@ def test_isolated_cli_homes_link_auth_but_not_global_instructions(
     assert (claude_home / ".credentials.json").is_symlink()
     assert not (codex_home / "AGENTS.md").exists()
     assert not (claude_home / "CLAUDE.md").exists()
+    assert grok_home == config / "forge" / "grok"
+    assert (grok_home / "auth.json").is_symlink()
+    assert "agents = false" in (grok_home / "config.toml").read_text()
+    assert not (grok_home / "CLAUDE.md").exists()
 
 
 def test_builtin_agents_receive_isolated_environment(tmp_path: Path) -> None:
@@ -266,6 +276,34 @@ def test_builtin_agents_receive_isolated_environment(tmp_path: Path) -> None:
                return_value="") as codex_run:
         run_codex("prompt", Config(), str(tmp_path), str(tmp_path / "x.log"))
     assert codex_run.call_args.kwargs["env"] == {"CODEX_ISOLATED": "1"}
+
+
+def test_generic_grok_receives_isolated_environment(tmp_path: Path) -> None:
+    with patch("forge.agents._isolated_agent_env",
+               return_value={"GROK_HOME": "/isolated/grok"}), \
+         patch("forge.agents._run_with_backoff", return_value="ok") as run:
+        run_agent("grok", "journal", Config(), str(tmp_path),
+                  str(tmp_path / "log"))
+    assert run.call_args.kwargs["env"] == {"GROK_HOME": "/isolated/grok"}
+
+
+def test_prompt_file_is_cleaned_when_template_expands_to_empty_argv(
+        tmp_path: Path) -> None:
+    spec = GenericSpec("grok", ["{prompt_file}"], False, True)
+    seen: dict[str, str] = {}
+
+    def expand(_template, subs):
+        seen["path"] = subs["prompt_file"]
+        return []
+
+    with patch("forge.agents.adapters.expand_template", side_effect=expand):
+        with pytest.raises(AgentError, match="Pusty szablon"):
+            agents._run_generic(
+                spec, "sekretny prompt", Config(), str(tmp_path),
+                str(tmp_path / "log"), model="", effort="")
+
+    assert seen["path"]
+    assert not Path(seen["path"]).exists()
 
 
 def test_aggregated_output_counter_walks_jsonl_events() -> None:

@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -53,6 +54,27 @@ def _isolated_agent_env(name: str) -> dict[str, str]:
             ((home / ".claude" / ".credentials.json", ".credentials.json"),),
         )
         env["CLAUDE_CONFIG_DIR"] = str(target)
+    elif name == "grok":
+        target = config_root / "grok"
+        _prepare_isolated_home(
+            target,
+            ((home / ".grok" / "auth.json", "auth.json"),),
+        )
+        # Grok's Claude-compatibility scanner otherwise loads the user's
+        # ~/.claude/CLAUDE.md even when GROK_HOME is isolated. This config is
+        # Forge-owned, entirely generated on every invocation, and intentionally
+        # contains no personal rules; user edits to this file are overwritten.
+        (target / "config.toml").write_text(
+            "[compat.claude]\n"
+            "skills = false\n"
+            "rules = false\n"
+            "agents = false\n"
+            "mcps = false\n"
+            "hooks = false\n"
+            "sessions = false\n",
+            encoding="utf-8",
+        )
+        env["GROK_HOME"] = str(target)
     return env
 
 
@@ -683,24 +705,40 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
     Obce CLI nie mają wspólnego formatu liczników, więc zapisujemy sam fakt
     wywołania — inaczej domyślny mistrz (opencode) nie istniałby w raporcie."""
     out_file = _prepare_last_msg_file(project_dir, cfg) if spec.uses_output_file else None
-    subs = {
-        "prompt": prompt, "system": system_prompt, "schema": json_schema,
-        "model": model or "", "effort": effort or "",
-        "project": project_dir, "output": out_file or "",
-    }
-    argv = adapters.expand_template(spec.template, subs)
-    if not argv:
-        raise AgentError(f"Pusty szablon komendy dla agenta '{spec.name}'.")
-    process_env = (
-        _opencode_thin_env(system_prompt)
-        if thin and spec.name == "opencode" else None)
-    kwargs = {}
-    if process_env is not None:
-        kwargs["env"] = process_env
-    if usage_dir:
-        kwargs["ledger_project"] = usage_dir
-    stream = _run_with_backoff(
-        argv, project_dir, cfg, log_path, **kwargs)
+    prompt_file = None
+    try:
+        if spec.uses_prompt_file:
+            with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", prefix="forge-prompt-",
+                    suffix=".md", delete=False) as handle:
+                handle.write(prompt)
+                prompt_file = handle.name
+        subs = {
+            "prompt": prompt, "prompt_file": prompt_file or "",
+            "system": system_prompt, "schema": json_schema,
+            "model": model or "", "effort": effort or "",
+            "project": project_dir, "output": out_file or "",
+        }
+        argv = adapters.expand_template(spec.template, subs)
+        if not argv:
+            raise AgentError(f"Pusty szablon komendy dla agenta '{spec.name}'.")
+        # This is the complete environment mapping, not a delta: subprocess
+        # callers must retain the user's PATH and other inherited variables.
+        base_env = _isolated_agent_env(spec.name)
+        process_env = (
+            _opencode_thin_env(system_prompt, base_env)
+            if thin and spec.name == "opencode" else base_env)
+        kwargs = {"env": process_env}
+        if usage_dir:
+            kwargs["ledger_project"] = usage_dir
+        stream = _run_with_backoff(
+            argv, project_dir, cfg, log_path, **kwargs)
+    finally:
+        if prompt_file:
+            try:
+                os.unlink(prompt_file)
+            except OSError:
+                pass
     _log_call_without_tokens(usage_dir or project_dir, cfg, log_path,
                              spec.name, model, effort)
     if out_file:
@@ -742,7 +780,9 @@ def _opencode_user_config() -> dict:
     return {}
 
 
-def _opencode_thin_env(system_prompt: str) -> dict[str, str]:
+def _opencode_thin_env(
+        system_prompt: str, base_env: dict[str, str] | None = None
+        ) -> dict[str, str]:
     config = _opencode_user_config()
     agents = dict(config.get("agent") or {})
     agents["forge-thin"] = {
@@ -752,7 +792,7 @@ def _opencode_thin_env(system_prompt: str) -> dict[str, str]:
         "tools": {name: False for name in _OPENCODE_TOOLS},
     }
     config["agent"] = agents
-    env = os.environ.copy()
+    env = dict(base_env or os.environ)
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, ensure_ascii=False)
     return env
 

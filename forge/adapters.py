@@ -8,8 +8,9 @@ w zmiennej środowiskowej:
     export FORGE_AGENT_GROK_CMD='grok --model {model} --exec {prompt} --out {output}'
     python3 -m forge.orchestrate --coder-agent grok
 
-Placeholdery szablonu: {prompt} {system} {schema} {model} {effort} {project}
-{output}.
+Placeholdery szablonu: {prompt} {prompt_file} {system} {schema} {model} {effort}
+{project} {output}. {prompt_file} jest obsługiwany przez Forge dla CLI, które
+czytają prompt z pliku, i pozwala uniknąć ujawniania treści promptu w argv.
 - Jeśli szablon zawiera {output}, wynik czytamy z TEGO pliku; inaczej ze stdout.
 - Token, który jest czystym placeholderem i rozwinie się do pustego stringa
   (np. {model} przy nieustawionym modelu), jest pomijany — nie zostawiamy pustych
@@ -51,7 +52,8 @@ BUILTIN_AGENTS = ("claude", "codex")
 RESUMABLE_AGENTS = ("codex",)
 
 _PLACEHOLDERS = (
-    "prompt", "system", "schema", "model", "effort", "project", "output",
+    "prompt", "prompt_file", "system", "schema", "model", "effort",
+    "project", "output",
 )
 
 # Aliasy nazw agentów — "gpt"/"chatgpt" to po prostu Codex CLI (agent OpenAI
@@ -72,10 +74,12 @@ def canonical_agent(name: str) -> str:
 # gwarancja zgodności z Twoją zainstalowaną wersją CLI. Nadpisz swoim
 # szablonem, jeśli flagi się zmieniły albo używasz forka/innej wersji.
 KNOWN_TEMPLATES: dict[str, str] = {
-    # xAI Grok Build CLI: `grok -p "<prompt>" -m <model> --effort low|medium|high`
-    # (docs.x.ai/build/cli/reference). --always-approve — pełna autonomia,
-    # spójnie z pozostałymi agentami forge.
-    "grok": "grok -p {prompt} -m {model} --effort {effort} --always-approve",
+    # xAI Grok Build CLI. Prompt goes through a file rather than argv: Forge
+    # prompts contain shell snippets and must not become visible to broad
+    # process-name filters such as `pkill -f`.
+    # Verified against the installed Grok 0.2.106 `grok --help`:
+    # --prompt-file and --always-approve are supported options.
+    "grok": "grok --prompt-file {prompt_file} -m {model} --effort {effort} --always-approve",
     # Kiro CLI (AWS): headless mode nie ma dziś flag wyboru modelu ani effortu.
     # Routing Kiro jest więc tylko metadanymi dla własnego szablonu użytkownika;
     # ten domyślny szablon zawsze korzysta z ustawień ~/.kiro/settings/cli.json.
@@ -95,10 +99,11 @@ KNOWN_TEMPLATES: dict[str, str] = {
 # Tryb cienki jest potrzebą roli doradczej. Claude ma obsługę wbudowaną
 # (zachowuje własne parsowanie JSON i telemetrykę), a znane generyczne CLI
 # dostają osobny szablon. Brak wpisu oznacza bezpieczny fallback do normalnego
-# wywołania, nie błąd.
+# wywołania, nie błąd. W Groku główny prompt jest plikiem; krótki system prompt
+# i schema pozostają inline, bo te opcje przyjmują wartości tekstowe.
 THIN_TEMPLATES: dict[str, str] = {
     "grok": (
-        "grok -p {prompt} -m {model} --effort {effort} "
+        "grok --prompt-file {prompt_file} -m {model} --effort {effort} "
         "--system-prompt-override {system} --tools \"\" --no-subagents "
         "--no-memory --disable-web-search --max-turns 1 --json-schema {schema}"
     ),
@@ -115,6 +120,7 @@ class GenericSpec:
     name: str
     template: list[str]        # tokeny argv z placeholderami
     uses_output_file: bool     # True → wynik z pliku {output}; False → ze stdout
+    uses_prompt_file: bool     # True → prompt z pliku {prompt_file}, nie argv
 
 
 def expand_template(template: list[str], subs: dict[str, str]) -> list[str]:
@@ -159,6 +165,7 @@ def _spec(name: str, template: str) -> GenericSpec | None:
         name=name,
         template=tokens,
         uses_output_file=any("{output}" in token for token in tokens),
+        uses_prompt_file=any("{prompt_file}" in token for token in tokens),
     )
 
 
