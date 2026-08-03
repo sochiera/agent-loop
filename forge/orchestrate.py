@@ -69,8 +69,11 @@ def has_changes(project: str) -> bool:
 
 
 def _require_clean(project: str, phase: str) -> None:
-    if has_changes(project):
-        raise AgentError(f"drzewo robocze nie jest czyste przed {phase}; zatwierdź lub odłóż własne zmiany")
+    dirty = git(project, "status", "--porcelain").stdout.strip()
+    if dirty:
+        raise AgentError(
+            f"drzewo robocze nie jest czyste przed {phase}; zatwierdź lub odłóż "
+            f"własne zmiany:\n{dirty[:2000]}")
 
 
 def commit_all(project: str, message: str, cfg: Config | None = None) -> None:
@@ -275,9 +278,13 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
             raise AgentError(f"bootstrap nie utworzył {brief.PROJECT_DOC_PATH}")
         log(f"Bootstrap: test_cmd={data['test_cmd']!r} "
             f"build_cmd={data.get('build_cmd', '')!r} kind={data.get('kind', 'app')!r}")
-        if not build_then_test(project, data.get("build_cmd", ""),
-                               data["test_cmd"], cfg.agent_timeout_s):
-            raise AgentError("testy bootstrapu nie przeszły")
+        suite_ok, suite_output = build_then_test_result(
+            project, data.get("build_cmd", ""), data["test_cmd"],
+            cfg.agent_timeout_s)
+        if not suite_ok:
+            detail = (suite_output or "").strip()
+            suffix = f": {detail[-2000:]}" if detail else ""
+            raise AgentError(f"testy bootstrapu nie przeszły{suffix}")
         log("Bootstrap: testy początkowe zielone.")
         return data
 
@@ -847,8 +854,7 @@ def _dependent_task_ids(tasks: list[dict], failed_id: str) -> set[str]:
 def run_task(cfg: Config, project: str, state: State, logf) -> bool:
     task = state.current_task
     if not task:
-        if has_changes(project):
-            raise AgentError("drzewo robocze nie jest czyste przed startem zadania; zatwierdź lub odłóż własne zmiany")
+        _require_clean(project, "startem zadania")
         task = state.task_queue.pop(0)
         state.current_task = task
         state.task_start_tag = f"forge/{task['id']}-start"

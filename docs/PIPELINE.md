@@ -113,6 +113,10 @@ refaktor testów oraz wspólnej infrastruktury, usuwając duplikacje i
 change-detectory bez osłabiania pokrycia. Kod produkcyjny i jego refaktor nadal
 należą do kodera.
 
+Porażka bramki niesie ze sobą output nieudanej komendy — także dla testów
+bootstrapu — żeby błąd startu procesu (np. brakujący interpreter) dało się
+odróżnić od nieprzechodzącej asercji.
+
 Po decyzji `review` świeży, read-only reviewer wykonuje zwykłe code review:
 szuka błędów, przypadków brzegowych, naruszeń kontraktu i SOLID/KISS, design
 smells, zbędnej złożoności, duplikacji, mylących nazw oraz testów bez wartości.

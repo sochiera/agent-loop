@@ -649,7 +649,7 @@ def test_rejected_bootstrap_is_rebuilt_with_the_review_notes(
     with patch("forge.orchestrate.run_planner", side_effect=planner), \
          patch("forge.orchestrate.run_agent",
                side_effect=lambda *_a, **_k: next(verdicts)), \
-         patch("forge.orchestrate.build_then_test", return_value=True):
+         patch("forge.orchestrate.build_then_test_result", return_value=(True, "")):
         orchestrate.phase_bootstrap(cfg, str(project), state, lambda p: p)
 
     assert len(seen) == 2
