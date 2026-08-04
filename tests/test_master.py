@@ -104,7 +104,7 @@ def test_master_only_intervenes_on_observable_process_patterns() -> None:
 
     assert "co najmniej dwie kolejne tury" in prompt
     assert "zmianę pliku testowego przez kodera" in prompt
-    assert "kolejne `recenzja→request_changes` bez zmian" in prompt
+    assert "kolejne pełne cykle `recenzja→tester→koder→recenzja`" in prompt
     assert "co najmniej dwa zadania na liście `round_limit`" in prompt
     assert "nie oceniaj poprawności implementacji" in prompt
     assert "kompletności `reason`/`summary`" in prompt

@@ -34,9 +34,9 @@ Interweniuj tylko, gdy dane bezpośrednio pokazują:
   `pliki=bez_zmian` — zacytuj powtarzany wpis i poproś tę rolę o zmianę
   podejścia albo o `blocked` z konkretnym powodem;
 - zmianę pliku testowego przez kodera — poproś testera o świadomą ocenę;
-- kolejne `recenzja→request_changes` bez zmian w plikach — poproś testera, by
-  przerwał pętlę: wdrożył uwagi recenzji albo zwrócił `blocked` z konkretnym
-  powodem;
+- kolejne pełne cykle `recenzja→tester→koder→recenzja` bez żadnych zmian w
+  plikach oznaczają pętlę — poproś testera, by przerwał pętlę: wdrożył
+  uwagi recenzji albo zwrócił `blocked`;
 - co najmniej dwa zadania na liście `round_limit` — poproś planistę o mniejsze
   zadania. Ta uwaga dotyczy planisty, więc obowiązuje mimo `PORZUCONE`.
 
