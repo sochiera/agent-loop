@@ -360,10 +360,13 @@ Ten sam prompt, oba modele:
 
 ```
 -ngl 999 --n-cpu-moe 28 -c 65536 -fa on --jinja
+--load-mode none -np 2 -kvu
 --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0
 ```
 
 Sampling zgodny z zaleceniami Qwen dla zadań programistycznych.
+`--load-mode none -np 2 -kvu` dodane 2026-08-06 — uzasadnienie i pomiary w sekcji 11.6
+(prompt processing +64%, czas zapytania −25%, kosztem ~13.6 GB odzyskiwalnego RAM).
 
 ### Usługa
 
@@ -565,56 +568,120 @@ z pomiarem z sekcji 10, gdzie samo podniesienie ncmoe do 30 dało 33.9 t/s.
 jakości, oficjalne wagi w IQ4_XS (~17.4 GiB) dałyby ncmoe ~26, czyli ~43 t/s i ~1.5 GiB
 więcej zapasu VRAM — przy tych samych oficjalnych wagach, bez odcenzurowanego finetune'u.
 
-### 11.6. Co zrobić z zasobami zamiast zwiększać kwantyzację
+### 11.6. Co zrobić z zasobami zamiast zwiększać kwantyzację — **zmierzone**
 
-Trzy rzeczy dają więcej niż piąty bit, w kolejności opłacalności.
+> Ta sekcja była pierwotnie listą hipotez. Zostały sprawdzone 2026-08-06; wyniki i jedna
+> istotna korekta poniżej. Metodyka: prompt 4699 tokenów, `n_predict 300`, `ignore_eos`,
+> `cache_prompt: false`, 5–8 powtórzeń, mediana. **Nie porównuj z sekcjami 4 i 10** —
+> inny prompt.
 
-#### (a) `--no-mmap` — llama.cpp sam to podpowiada, a nie jest włączone
+#### Wyniki
 
-W logu startowym serwera, linia 9:
+| Konfiguracja | pp t/s | tg t/s | czas zapytania | RS w VRAM | RAM `available` |
+|---|---|---|---|---|---|
+| mmap, `-np` auto (serwer po 8 h pracy) | 335.6 | 34.53 | 22.7 s | 251 MiB | 23.3 GB |
+| **mmap, `-np` auto (świeży) — punkt odniesienia** | **390.5** | **35.83** | **20.5 s** | 251 MiB | 25.5 GB |
+| `--load-mode none` | 637.2 | 37.45 | 15.3 s | 251 MiB | 11.0 GB |
+| **`--load-mode none -np 2 -kvu` — wdrożone** | **641.7** | **37.34** | **15.3 s** | **126 MiB** | 11.9 GB |
+
+**Prompt processing rośnie o 64%, generacja o 4%, czas zapytania spada o 25%.**
+Rozrzut też się zawala: na mmap tg wahało się 34.2–36.4 i pp 376–402, po zmianie
+pp trzyma się 635–645, a tg 36.9–37.8 (±1%).
+
+#### (a) `--load-mode none` — **wdrożone, największy zysk**
+
+Ostrzeżenie z logu startowego było trafne, ale flaga z niego jest w buildzie `b10284`
+przestarzała:
 
 ```
 W llama_model_loader: tensor overrides to CPU are used with mmap enabled
                       - consider using --no-mmap for better performance
+
+--mmap, --no-mmap    DEPRECATED in favor of `--load-mode`
+-lm, --load-mode MODE    none | mmap | mlock | mmap+mlock | dio   (default: mmap)
 ```
 
-To jest ostrzeżenie skierowane dokładnie do naszej konfiguracji. Przy `--n-cpu-moe` eksperty
-czytane są z pliku zmapowanego przez `mmap` (sekcja 8 opisuje to jako zaletę — i jest zaletą
-dla odporności na OOM, ale **nie dla prędkości**). Z `--no-mmap` trafiają do zwykłej pamięci
-anonimowej, co eliminuje narzut page-faultów przy każdym odczycie eksperta.
+**Moje pierwotne wyjaśnienie — „narzut page-faultów" — było niepełne.** Prawdziwy mechanizm
+widać dopiero w logu przy `-lv 5`: zmienia się **typ bufora**, w którym siedzą eksperty.
 
-Bilans jest realny w obie strony:
+```
+mmap:               CPU_Mapped model buffer size = 14670.68 MiB
+--load-mode none:  Vulkan_Host model buffer size = 13605.31 MiB
+```
 
-| | mmap (obecnie) | `--no-mmap` |
+`Vulkan_Host` to pamięć hosta zarejestrowana w sterowniku Vulkana — GPU sięga po nią
+bezpośrednio przez DMA. `CPU_Mapped` wymaga kopii przez bufor pośredni. Dlatego zysk jest
+tak niesymetryczny: prompt processing przetacza przez magistralę ogromne ilości tensorów
+ekspertów i zyskuje 64%, a generacja tokenów jest ograniczona przepustowością RAM przy
+odczycie 8 aktywnych ekspertów i zyskuje tylko 4%.
+
+Cena jest realna i trzeba ją znać:
+
+| | mmap | `--load-mode none` |
 |---|---|---|
-| Prędkość odczytu ekspertów | z page cache, przez page fault | wprost z RAM |
-| Zachowanie przy braku RAM | jądro odrzuca strony, doczytuje z NVMe | **OOM-killer** |
-| `free -h` pokazuje | `buff/cache` | `used` |
-| Start serwera | szybki | wolniejszy (pełny odczyt 20.8 GiB) |
+| Bufor ekspertów | `CPU_Mapped` (kopia pośrednia) | `Vulkan_Host` (DMA) |
+| `free -m`: `used` / `available` | 5.4 GB / **25.5 GB** | 19.0 GB / **11.9 GB** |
+| Przy braku RAM | jądro odrzuca strony, doczyt z NVMe | **OOM-killer** |
+| Swap procesu w teście | 77 MB | **0** |
+| Czas startu (ciepły cache) | 16 s | 11 s |
 
-Przy 7.5 GiB zajętych przez aplikacje i 14.8 GiB modelu margines wynosi ~8 GiB — powinno
-wystarczyć, ale utrata siatki bezpieczeństwa jest prawdziwa. **Do zmierzenia, nie do wdrożenia
-w ciemno.** Jeśli zysk jest w granicach szumu, zostaw mmap dla bezpieczeństwa.
+**Tracisz ~13.6 GB odzyskiwalnego zapasu RAM.** Zostaje ~11.9 GB — na przeglądarkę i pracę
+wystarczy, ale to koniec siatki bezpieczeństwa opisanej w sekcji 8: model nie jest już
+page cache'em, którego jądro może się pozbyć. Przy ciężkim buildzie równolegle z modelem
+możliwy jest OOM. **Jeśli to wystąpi, wróć do `--load-mode mmap`** — kosztuje 25% czasu
+zapytania, nie działanie.
 
-#### (b) Kontekst 65k → 128k kosztuje mniej, niż się wydaje
+Start jest **szybszy**, nie wolniejszy, wbrew przewidywaniu — bo plik i tak jest w page cache.
 
-Patrz 11.7 — atencja pełna działa tylko w 10 z 40 warstw, więc podwojenie kontekstu to
-+1.25 GiB KV, nie +2.5 GiB. Przy zapasie 1706 MiB (ncmoe 28) trzeba by zejść na ncmoe 29
-(zapas 2210 MiB, tg 36.3 t/s) i wyszłoby ~930 MiB zapasu przy 131k kontekstu.
-**Dwukrotny kontekst za 9% prędkości** — lepszy interes niż piąty bit za 20%.
+Warianty `mlock` i `mmap+mlock` **odpadają bez roota**: `ulimit -l` to 8192 kB (twardy),
+a podniesienie wymaga `/etc/security/limits.conf`.
 
-#### (c) `-np 2` zamiast domyślnych 4 slotów
+#### (b) Kontekst 65k → 128k — nietestowane, niepotrzebne
 
-Log potwierdza patologię z sekcji 8 pomiarem. Przy dwóch równoległych zadaniach:
+Zgodnie z ustaleniem duży kontekst nie jest w tej chwili potrzebny, więc wariantu nie
+mierzono. Rachunek z 11.7 pozostaje aktualny: podwojenie kontekstu to +1.25 GiB KV
+(nie +2.5 GiB), więc gdyby kiedyś było potrzebne — jest tanie.
+
+#### (c) `-np 2` — **rekomendacja była BŁĘDNA w tej postaci**
+
+Samo `-np 2` szkodzi. Log przy `-lv 5` pokazuje dlaczego:
 
 ```
-slot 1 | prompt processing, n_tokens = 2048 | 348.82 t/s
-slot 2 | prompt processing, n_tokens =   47 |   2.54 t/s
+-np 4:   n_ctx_seq = 16384   kv_unified = false
+         n_ctx_seq (16384) < n_ctx_train (262144) -- the full capacity
+                                     of the model will not be utilized
 ```
 
-Slot 2 dostał **2.54 t/s** — 137 razy mniej niż slot 1. Cztery sloty przy jednym użytkowniku
-nie dają współbieżności, tylko głodzenie i dodatkowy stan rekurencyjny w VRAM
-(~63 MiB na slot). `-np 2` zwalnia ~125 MiB i ogranicza problem.
+Pomoc `llama-server` wyjaśnia regułę:
+
+```
+-kvu, --kv-unified   use single unified KV buffer shared across all sequences
+                     (default: enabled if number of slots is auto)
+```
+
+**Podanie `-np N` jawnie wyłącza unified KV i dzieli kontekst między sloty.** Przy `-np 4`
+każdy slot dostaje 65536/4 = **16 384 tokeny**, nie 65 536. Samo `-np 2` dałoby 32 768.
+Domyślna konfiguracja (bez `-np`) jest pod tym względem lepsza, niż zakładałam — używa
+wspólnej puli i każdy slot może wziąć pełne 65 536.
+
+Poprawna postać to **`-np 2 -kvu`**: jawnie przywraca unified KV. Zmierzone:
+
+```
+-np 2 -kvu:  n_slots = 2, n_ctx_slot = 65536, kv_unified = 'true'
+             llama_memory_recurrent: size = 125.62 MiB (2 seqs)   ← było 251.25 MiB
+```
+
+Kontekst zachowany, **125.6 MiB VRAM odzyskane**, wydajność bez zmian (641.7 vs 637.2 pp —
+w granicach szumu). Zysk jest skromny, ale darmowy.
+
+Głodzenia slotów to **nie naprawia** — obserwacja `2.54 t/s vs 348 t/s` z sekcji 8 to
+zwykła rywalizacja o wsad obliczeniowy przy współbieżnych zapytaniach, nieodłączna od
+batchowania. Mniej slotów zmniejsza tylko szansę, że dojdzie do niej przypadkiem.
+
+#### Czy odzyskane 126 MiB pozwala zejść na `ncmoe 27`?
+
+Nie warto. Sweep z sekcji 10 daje dla `27` tg 39.4 wobec 39.8 przy `28` — zysku nie ma,
+a zapas VRAM spada o pół giga. Zostawiamy `28`.
 
 ### 11.7. Korekta sekcji 3: KV cache to ~20 KB/token, nie 40
 
@@ -639,15 +706,39 @@ Pełną atencję ma **10 z 40 warstw**; pozostałe 30 to warstwy rekurencyjne o 
 × 65 536 tokenów                      ≈ 1.25 GiB
 ```
 
-plus ~63 MiB stanu rekurencyjnego na slot (×4 sloty ≈ 250 MiB). Razem ~1.5 GiB, wobec
-~2.9 GiB zmierzonych na KV i bufory — reszta to bufory obliczeniowe, więc rząd wielkości
-się zgadza.
+plus ~63 MiB stanu rekurencyjnego na slot.
+
+#### Potwierdzone pomiarem
+
+Uruchomienie z `-lv 5` wypisuje alokację wprost i **zgadza się co do bajta**:
+
+```
+llama_kv_cache: layer  0: filtered      ← 30 warstw rekurencyjnych, bez KV
+llama_kv_cache: layer  1: filtered
+llama_kv_cache: layer  2: filtered
+llama_kv_cache: layer  3: dev = Vulkan0 ← co czwarta warstwa ma pełną atencję
+...
+llama_kv_cache: size = 1280.00 MiB (65536 cells, 10 layers, 2/1 seqs),
+                K (f16): 640.00 MiB, V (f16): 640.00 MiB
+llama_memory_recurrent: size = 125.62 MiB (2 cells, 40 layers, 2 seqs)
+```
+
+`640 MiB / 65 536 tokenów = 10 KiB` na K, tyle samo na V → **dokładnie 20 KiB/token**,
+w **10 warstwach**. Stan rekurencyjny: 125.62/2 = **62.8 MiB na slot** wobec
+szacowanych 63 MiB.
+
+Zgadzają się też wagi: `Vulkan0 model buffer size = 7708.80 MiB` (7.53 GiB) wobec
+7.43 GiB wyliczonych w 11.5, i `CPU_Mapped = 14670.68 MiB` (14.33 GiB) po stronie RAM.
 
 **Konsekwencja praktyczna:** kontekst w tym modelu jest tani i skaluje się liniowo tylko
 w ¼ warstw. Wniosek z sekcji 5, że kwantyzacja KV (`q8_0`) nie opłaca się na Vulkanie,
 zyskuje drugi argument — nie ma tu wiele do zaoszczędzenia, bo KV i tak jest małe.
 
-> Liczby w tej sekcji są wyprowadzone z metadanych GGUF i skonfrontowane ze zmierzonym
-> zużyciem VRAM, ale **nie odczytane wprost z logu alokacji** — llama.cpp b10284 przy
-> obecnym poziomie logowania nie wypisuje linii `llama_kv_cache: ... KV buffer size`.
-> Żeby potwierdzić, uruchom serwer z `-lv 5` i sprawdź fazę ładowania.
+Przy okazji log ujawnia, że `Q4_K_XL` to nie jest jednolita czwórka:
+
+```
+done_getting_tensors: tensor 'blk.0.ffn_down_exps.weight' (q5_K) (and 83 others)
+```
+
+projekcje `down` ekspertów siedzą w `q5_K` — to jest właśnie „Dynamic" w nazwie Unslotha
+i dodatkowy argument, dlaczego przejście na pełne Q5 niewiele by dało (sekcja 11.5).
