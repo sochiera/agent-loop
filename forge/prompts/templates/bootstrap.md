@@ -24,9 +24,9 @@ docs/DECISIONS/YYYY-MM.md dla decyzji z bieżącego miesiąca. Każdy 00-INDEX.m
 ma mapować obszar na plik i pozostać krótszy niż 2 KB.
 
 Utwórz też AGENTS.md i CLAUDE.md z krótką informacją: „.forge/ to runtime orkiestratora.
-Nie przeglądaj go w poszukiwaniu kontekstu; wyjątkiem jest
-dokładnie jeden prywatny notatnik roli wskazany w kapsule — możesz go czytać
-i aktualizować, ale nie czytaj notatników innych ról ani archiwum zadań”.
+Nie przeglądaj go w poszukiwaniu kontekstu. Prywatny notatnik roli dostajesz
+w kapsule — nie czytaj go z dysku i nie zapisuj sam; wpisy oddajesz polem
+`notebook` swojej decyzji. Nie czytaj notatników innych ról ani archiwum zadań”.
 To wyjaśnienie, nie zakaz.
 
 {{CORRECTIONS}}

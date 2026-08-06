@@ -205,9 +205,9 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         self.assertEqual(cfg.role("tester", "simple"),
                          ("codex", "gpt-5.6-luna", "high"))
         self.assertEqual(cfg.role("tester", "complex"),
-                         ("codex", "gpt-5.6-sol", "low"))
+                         ("codex", "gpt-5.6-luna", "xhigh"))
         self.assertEqual(cfg.role("coder", "simple"),
-                         ("codex", "gpt-5.6-luna", "medium"))
+                         ("codex", "gpt-5.6-luna", "high"))
         self.assertEqual(cfg.role("coder", "standard"),
                          ("codex", "gpt-5.6-luna", "high"))
 
@@ -223,7 +223,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
     def test_codex_planner_is_always_strong(self) -> None:
         cfg = Config(planner_agent="codex", planner_model="", planner_effort="",
                      codex_model="gpt-x", codex_effort="high")
-        self.assertEqual(cfg.role("planner"), ("codex", "gpt-5.6-sol", "medium"))
+        self.assertEqual(cfg.role("planner"), ("codex", "gpt-5.6-terra", "high"))
         self.assertEqual(cfg.role("bootstrap"), ("codex", "gpt-5.6-sol", "high"))
 
     def test_known_generic_role_uses_fixed_matrix(self) -> None:
@@ -245,13 +245,13 @@ class ConfigRoleResolutionTest(unittest.TestCase):
 
     def test_gpt_alias_uses_codex_matrix(self) -> None:
         cfg = Config(tester_agent="gpt", tester_model="", codex_model="gpt-x", codex_effort="high")
-        self.assertEqual(cfg.role("tester"), ("gpt", "gpt-5.6-sol", "low"))
+        self.assertEqual(cfg.role("tester"), ("gpt", "gpt-5.6-luna", "xhigh"))
 
     def test_reviewer_alias_uses_reviewer_matrix(self) -> None:
         cfg = Config(tester_agent="codex", tester_model="custom-m", tester_effort="high",
                      reviewer_agent="gpt", reviewer_model="",
                      codex_model="fallback-m", codex_effort="low")
-        self.assertEqual(cfg.role("reviewer"), ("gpt", "gpt-5.6-sol", "low"))
+        self.assertEqual(cfg.role("reviewer"), ("gpt", "gpt-5.6-luna", "xhigh"))
 
     def test_agents_in_use_dedups_aliases(self) -> None:
         # planner=gpt i tester=codex to jedna binarka — preflight nie może jej

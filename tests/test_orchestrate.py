@@ -273,13 +273,16 @@ def test_housekeeping_seeds_agent_instruction_files_without_overwriting(
     assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == "własna treść"
     seeded = (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
     assert ".forge/" in seeded
-    assert "prywatny notatnik roli wskazany w kapsule" in seeded
+    assert "nie czytaj go z dysku i nie\nzapisuj sam" in seeded
     assert "wyjaśnienie, nie zakaz" in seeded
 
 
-def test_housekeeping_migrates_only_exact_old_forge_instruction(
-        tmp_path) -> None:
-    old = orchestrate._old_agent_instruction_note(".forge")
+@pytest.mark.parametrize("superseded", range(2))
+def test_housekeeping_migrates_only_exact_older_forge_instructions(
+        tmp_path, superseded: int) -> None:
+    # Notka sprzed pola `notebook` licencjonowała czytanie notatnika z dysku,
+    # więc pozostawiona w projekcie kupowałaby z powrotem usuniętą turę.
+    old = orchestrate._superseded_agent_notes(".forge")[superseded]
     (tmp_path / "AGENTS.md").write_text(old, encoding="utf-8")
     (tmp_path / "CLAUDE.md").write_text(
         old + "\nwłasny dopisek\n", encoding="utf-8")
@@ -287,7 +290,7 @@ def test_housekeeping_migrates_only_exact_old_forge_instruction(
     _housekeeping(Config(), str(tmp_path))
 
     agents = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
-    assert "prywatny notatnik roli wskazany w kapsule" in agents
+    assert "wpisy oddajesz polem `notebook`" in agents
     assert (tmp_path / "CLAUDE.md").read_text(
         encoding="utf-8").endswith("własny dopisek\n")
 

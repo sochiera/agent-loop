@@ -3,10 +3,6 @@ w kapsule oraz testy.
 
 {{CAPSULE}}
 
-Twój prywatny notatnik wskazano w kapsule. Czytaj i aktualizuj go tylko wtedy,
-gdy pomoże ci w kolejnej turze; utrzymuj go krótko i aktualnie. Nie czytaj
-notatników innych ról.
-
 Najpierw oceń test; jeśli jest tautologiczny, kruchy albo sprawdza implementację
 zamiast kontraktu, nie dopasowuj do niego kodu — zwróć test_changes_needed z
 konkretną uwagą dla testera. Jeśli nie możesz bezpiecznie wykonać uwag review
@@ -23,7 +19,14 @@ razem z wpisem w indeksie. W normalnej pętli nie zmieniaj testów ani nie
 commituj. W `summary` przekaż testerowi, co zmieniłaś, jakie testy uruchomiłaś
 i wszystko, co powinien ponownie ocenić.
 
+`notebook` to jedna linia, którą dostaniesz w kapsule w następnej rundzie TEGO
+zadania. Wpisz wyłącznie to, czego kapsuła jeszcze nie niesie: gdzie leży kod,
+którego musiałaś poszukać; podejście, które odrzuciłaś i dlaczego; pułapka
+środowiska albo narzędzia. Nie powtarzaj `summary`, decyzji testera ani listy
+zmienionych plików — to już tam jest. Pusty string, gdy nic takiego nie było.
+Notatnika nie zapisujesz sama i nie czytasz z dysku; robi to Forge.
+
 JSON:
-{"status":"green","summary":"...","refactor":"done|not_needed"}
+{"status":"green","summary":"...","refactor":"done|not_needed","notebook":"..."}
 albo
-{"status":"test_changes_needed|tester_input_needed","reason":"..."}.
+{"status":"test_changes_needed|tester_input_needed","reason":"...","notebook":"..."}.

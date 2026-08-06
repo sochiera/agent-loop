@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from forge import ledger, orchestrate
+from forge import ledger, notebooks, orchestrate
 from forge.config import Config
 from forge.state import State
 from forge.task_pipeline import InvalidDecision
@@ -122,6 +122,76 @@ def test_review_request_changes_starts_a_new_tdd_cycle_then_commit(
     assert "uwaga review: ustaw wartość 2" in prompts_seen["coder"][0]
     assert "ustawiono VALUE=2" in prompts_seen["tester"][2]
     assert _git(tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "feat: Zmiana wartości"
+
+
+def test_notebook_lines_are_persisted_and_return_in_the_next_round(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+    tester_answers = iter((
+        '{"status":"red","command":"python3 -m pytest -q tests/test_app.py",'
+        '"notebook":"bramka celowana to tests/test_app.py, nie cała suita"}',
+        '{"status":"code","command":"python3 -m pytest -q tests/test_app.py",'
+        '"reason":"popraw wartość","notebook":""}',
+        '{"status":"review"}',
+    ))
+    coder_answers = iter((
+        '{"status":"green","summary":"ustawiono","refactor":"done",'
+        '"notebook":"stała żyje w app.py:1, nie w konfiguracji"}',
+        # Pusta notatka nie zostawia śladu, a `summary` nie wchodzi do notatnika.
+        '{"status":"green","summary":"poprawiono","refactor":"done",'
+        '"notebook":""}',
+    ))
+    seen: dict[str, list[str]] = {"tester": [], "coder": []}
+
+    def role_call(_cfg, project, _state, role, prompt, _log):
+        seen[role].append(prompt)
+        if role == "tester":
+            return next(tester_answers)
+        Path(project, "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        return next(coder_answers)
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent",
+               return_value='{"verdict":"approve"}'):
+        assert orchestrate.run_task(
+            cfg, str(tmp_path), state, lambda phase: phase)
+
+    # Notatka z rundy 1 wraca w rundzie 2 bez tury narzędziowej, a `summary`
+    # i `reason` — które kapsuła niesie osobno — do notatnika nie wchodzą.
+    assert "stała żyje w app.py:1" not in seen["coder"][0]
+    assert "- r1: stała żyje w app.py:1, nie w konfiguracji" in seen["coder"][1]
+    assert "ustawiono" not in seen["coder"][1]
+    assert "bramka celowana" not in seen["tester"][0]
+    assert "- r1: bramka celowana to tests/test_app.py, nie cała suita" \
+        in seen["tester"][1]
+    # Notatniki są prywatne: wpis roli nie może wyciec do drugiej.
+    assert "bramka celowana" not in seen["coder"][1]
+    assert "stała żyje" not in seen["tester"][1]
+
+
+def test_oversized_notebook_announces_itself_in_the_log(
+        tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+    notebooks.ensure(str(tmp_path), ".forge", "task-001")
+    Path(tmp_path, ".forge", "notebooks", "task-001", "tester.md").write_text(
+        "- r1: " + "x" * 5000 + "\n", encoding="utf-8")
+    messages: list[str] = []
+
+    def role_call(_cfg, project, _state, role, _prompt, _log):
+        if role == "tester":
+            return '{"status":"review"}'
+        return '{"status":"green","summary":"nic","refactor":"not_needed"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.log", side_effect=messages.append), \
+         patch("forge.orchestrate.run_agent",
+               return_value='{"verdict":"approve"}'):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert any("notatnik roli tester" in message and "znaków" in message
+               for message in messages)
 
 
 def test_tester_receives_task_scoped_context_in_every_prompt(tmp_path: Path) -> None:

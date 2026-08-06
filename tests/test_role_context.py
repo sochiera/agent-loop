@@ -16,14 +16,14 @@ def test_private_role_prompts_use_capsule_without_record_or_ledger() -> None:
     )
     tester_capsule = prompts.context_capsule(
         state, "tester",
-        notebook_path=".forge/notebooks/task-001/tester.md",
+        notebook_text="- r1: bramka pytest tests/test_app.py → 2 passed",
         changed_files=["app.py", "tests/test_app.py"],
         handoff="dodano walidację",
         confirmation=True,
     )
     coder_capsule = prompts.context_capsule(
         state, "coder",
-        notebook_path=".forge/notebooks/task-001/coder.md",
+        notebook_text="- r1: most żyje w bridge_client.gd:158",
         changed_files=["tests/test_app.py"],
     )
     tester = prompts.tester_task_prompt(
@@ -35,12 +35,14 @@ def test_private_role_prompts_use_capsule_without_record_or_ledger() -> None:
     assert "dodano walidację" in tester
     assert "Ostatnia decyzja testera: red — brakuje walidacji" in tester
     assert "app.py" in tester and "tests/test_app.py" in tester
-    assert ".forge/notebooks/task-001/tester.md" in tester
-    assert ".forge/notebooks/task-001/coder.md" not in tester
+    assert "- r1: bramka pytest tests/test_app.py → 2 passed" in tester
+    assert ".forge/notebooks/" not in tester
     assert "brakuje walidacji" in coder
     assert "pytest tests/test_app.py" in coder
-    assert ".forge/notebooks/task-001/coder.md" in coder
-    assert ".forge/notebooks/task-001/tester.md" not in coder
+    # Koder nie dotyka pliku notatnika, więc ścieżka byłaby dla niego tylko
+    # zaproszeniem do zbędnej tury narzędziowej.
+    assert ".forge/notebooks/" not in coder
+    assert "most żyje w bridge_client.gd:158" in coder
     assert "ostatnie wpisy dziennika" not in tester
     assert "Prywatny, ograniczony zapis" not in tester + coder
     assert "zachować, poprawić albo przywrócić" in tester
@@ -55,6 +57,44 @@ def test_private_role_prompts_use_capsule_without_record_or_ledger() -> None:
     assert "tester_input_needed" in coder
 
 
+def test_notebooks_reach_roles_inline_instead_of_through_a_tool_turn() -> None:
+    state = State(current_task={"id": "task-001", "file": "task.md"})
+    filled = [
+        prompts.context_capsule(
+            state, role, notebook_text="- r1: sonda wymaga --headless")
+        for role in ("tester", "coder")
+    ]
+    empty = [prompts.context_capsule(state, role)
+             for role in ("tester", "coder")]
+
+    for capsule in filled:
+        assert "- r1: sonda wymaga --headless" in capsule
+        # Ścieżka byłaby jedynym powodem, żeby mimo wszystko sięgnąć na dysk.
+        assert ".forge" not in capsule
+    for capsule in empty:
+        # Pusty notatnik nie zostawia nagłówka sugerującego pamięć, której nie
+        # ma, ani ścieżki zapraszającej do tury narzędziowej.
+        assert "notat" not in capsule.lower()
+        assert ".forge" not in capsule
+
+
+def test_both_roles_return_their_notebook_line_inside_the_decision() -> None:
+    coder = prompts.coder_task_prompt(
+        "task.md", "pytest", decision={"status": "red", "reason": "missing"})
+    tester = prompts.tester_task_prompt("task.md", "pytest")
+
+    for prompt in (coder, tester):
+        assert '"notebook":"..."' in prompt
+        assert "Notatnika nie zapisujesz sama i nie czytasz z dysku" in prompt
+    assert "gdzie leży kod" in coder
+    assert "Nie powtarzaj `summary`" in coder
+    assert "dokładną komendę wartą ponownego użycia" in tester
+    assert "Nie zapisuj bieżącego `passed`/`failed`" in tester
+    assert "Nie powtarzaj `reason`" in tester
+    # Kontrakt append-only musi być jawny, bo tester traci możliwość rewizji.
+    assert "nie poprawisz nimi wcześniejszej rundy" in tester
+
+
 def test_bootstrap_creates_informational_project_instructions() -> None:
     prompt = prompts.bootstrap_prompt("brief")
 
@@ -62,8 +102,9 @@ def test_bootstrap_creates_informational_project_instructions() -> None:
     assert "CLAUDE.md" in prompt
     assert ".forge/" in prompt
     assert "runtime orkiestratora" in prompt
-    assert "prywatny notatnik roli wskazany w kapsule" in prompt
-    assert "nie czytaj notatników innych ról" in prompt
+    assert "Prywatny notatnik roli dostajesz\nw kapsule" in prompt
+    assert "wpisy oddajesz polem" in prompt
+    assert "Nie czytaj notatników innych ról" in prompt
 
 
 def test_bootstrap_creates_indexed_documentation_layout() -> None:

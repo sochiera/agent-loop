@@ -634,6 +634,13 @@ def _call_role(cfg: Config, project: str, state: State, role: str, prompt: str, 
     return output
 
 
+# Notatek nie przycinamy — sygnalizujemy tylko, że kontrakt „jedna linia”
+# przestał obowiązywać. Drugi próg pilnuje strony naprawdę drogiej: notatnik
+# wchodzi w całości do każdej kolejnej tury roli aż do końca zadania, więc
+# liczy się suma, a nie pojedynczy wpis.
+_LONG_NOTEBOOK_ENTRY = 600
+_LARGE_NOTEBOOK = 4000
+
 _MASTER_ROLES = ("tester", "coder", "planner")
 # Wzmianka o zadaniu, a nie segment ścieżki: uwaga mistrza cytuje wpisy z
 # `pliki=[…]`, więc `tests/task-002.py` w poprawnej uwadze o task-001 nie może
@@ -899,6 +906,22 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                     task_id=str(task.get("id", "")), next_role=next_role))
                 consulted = True
 
+        def notebook_for(role: str) -> str:
+            text = notebooks.read(
+                project, cfg.runtime_dir, task["id"], role)
+            if len(text) > _LARGE_NOTEBOOK:
+                log(f"  UWAGA: notatnik roli {role} ma {len(text)} znaków "
+                    "i wchodzi w całości do każdej kolejnej tury")
+            return text
+
+        def record_notebook(role: str, data: dict) -> None:
+            written = notebooks.append_entry(
+                project, cfg.runtime_dir, task["id"], role,
+                state.tdd_round + 1, data.get("notebook", ""))
+            if len(written) > _LONG_NOTEBOOK_ENTRY:
+                log(f"  UWAGA: nowy wpis notatnika roli {role} ma "
+                    f"{len(written)} znaków zamiast jednej linii")
+
         def run_turn(role: str, prompt: str, parser):
             """Jedna tura roli: nota mistrza, decyzja, log i wpis do dziennika
             wraz z listą plików zmienionych w tej konkretnej turze."""
@@ -945,8 +968,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             changed_files = _changed(project, state.task_start_tag)
             capsule = prompts.context_capsule(
                 state, "tester",
-                notebook_path=notebooks.relative_path(
-                    cfg.runtime_dir, task["id"], "tester"),
+                notebook_text=notebook_for("tester"),
                 changed_files=changed_files,
                 handoff=handoff,
                 confirmation=confirmation,
@@ -962,6 +984,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 review_suggestions=state.review_suggestions_pending,
                 review_notes=state.review_notes),
                 parse_for_current_review_cycle)
+            record_notebook("tester", result.data)
             # To jednorazowy sygnał kierujący najbliższą turę testera na pełną
             # bramkę. Czyścimy go dopiero po poprawnie sparsowanej odpowiedzi:
             # checkpoint sprzed tury nadal umożliwia bezpieczne wznowienie.
@@ -976,8 +999,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             test_cmd = str(decision.data.get("command", "")).strip() or state.test_cmd
             capsule = prompts.context_capsule(
                 state, "coder",
-                notebook_path=notebooks.relative_path(
-                    cfg.runtime_dir, task["id"], "coder"),
+                notebook_text=notebook_for("coder"),
                 changed_files=_changed(project, state.task_start_tag),
                 tester_gate=test_cmd,
             )
@@ -986,6 +1008,10 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 decision=decision.data,
                 capsule=capsule),
                 parse_coder_decision)
+            # Zapis notatki kanałem, którym decyzja i tak wraca. Tura
+            # narzędziowa kosztowałaby tu dziesiątki tysięcy tokenów wejścia i
+            # — jak pokazuje historia pustych notatników — bywa pomijana.
+            record_notebook("coder", result.data)
             state.no_change_rounds = (
                 0 if state.round_changed else state.no_change_rounds + 1)
             return result
@@ -1273,15 +1299,38 @@ def _agent_instruction_note(runtime_dir: str) -> str:
 
 `{runtime_dir}/` to runtime orkiestratora Forge. Nie przeglądaj go w
 poszukiwaniu ogólnego kontekstu: plik zadania i kapsułę dostajesz w promptcie.
-Wyjątkiem jest dokładnie jeden prywatny notatnik roli wskazany w kapsule —
-możesz go czytać i aktualizować. Nie czytaj notatników innych ról.
+Twój prywatny notatnik też jest w kapsule — nie czytaj go z dysku i nie
+zapisuj sam; wpisy oddajesz polem `notebook` swojej decyzji, a plikiem
+zarządza Forge.
 
 Zwłaszcza `{runtime_dir}/tasks/archive/` zawiera zamknięte zadania; czytanie
 tego archiwum zapycha kontekst i nic nie wnosi. To wyjaśnienie, nie zakaz.
 """
 
 
-def _old_agent_instruction_note(runtime_dir: str) -> str:
+def _superseded_agent_notes(runtime_dir: str) -> tuple[str, ...]:
+    """Każda poprzednia treść Forge, wyłącznie do migracji bajt-w-bajt.
+
+    Notka zostawiona w wersji sprzed pola `notebook` licencjonowałaby czytanie
+    i zapisywanie notatnika z dysku — czyli dokładnie tę turę narzędziową,
+    której pozbywa się kapsuła.
+    """
+    return (
+        _oldest_agent_instruction_note(runtime_dir),
+        f"""# Notatka dla agentów
+
+`{runtime_dir}/` to runtime orkiestratora Forge. Nie przeglądaj go w
+poszukiwaniu ogólnego kontekstu: plik zadania i kapsułę dostajesz w promptcie.
+Wyjątkiem jest dokładnie jeden prywatny notatnik roli wskazany w kapsule —
+możesz go czytać i aktualizować. Nie czytaj notatników innych ról.
+
+Zwłaszcza `{runtime_dir}/tasks/archive/` zawiera zamknięte zadania; czytanie
+tego archiwum zapycha kontekst i nic nie wnosi. To wyjaśnienie, nie zakaz.
+""",
+    )
+
+
+def _oldest_agent_instruction_note(runtime_dir: str) -> str:
     """Dokładna treść Forge sprzed notatników, wyłącznie do migracji."""
     return f"""# Notatka dla agentów
 
@@ -1330,9 +1379,9 @@ def _housekeeping(cfg: Config, project: str) -> None:
         if not note.exists():
             note.write_text(
                 _agent_instruction_note(cfg.runtime_dir), encoding="utf-8")
-        elif note.read_text(encoding="utf-8") == _old_agent_instruction_note(
+        elif note.read_text(encoding="utf-8") in _superseded_agent_notes(
                 cfg.runtime_dir):
-            # Migrujemy tylko bajt-w-bajt własną starą notkę. Każda inna
+            # Migrujemy tylko bajt-w-bajt własne starsze notki. Każda inna
             # treść należy do użytkownika i pozostaje nietknięta.
             note.write_text(
                 _agent_instruction_note(cfg.runtime_dir), encoding="utf-8")

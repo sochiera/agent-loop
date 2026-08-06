@@ -111,7 +111,7 @@ def plan_batch_prompt(
 
 
 def context_capsule(
-        state, role: str, *, notebook_path: str,
+        state, role: str, *, notebook_text: str = "",
         changed_files: list[str] | None = None, handoff: str = "",
         confirmation: bool = False, suite_regression: bool = False,
         review_suggestions: bool = False, tester_gate: str = "") -> str:
@@ -164,7 +164,14 @@ def context_capsule(
             lines.append(f"Bramka testera: {command}")
     if changed_files:
         lines.append("Zmiany od startu zadania: " + ", ".join(changed_files))
-    lines.append(f"Prywatny notatnik: {notebook_path}")
+    # Treść notatnika wklejamy zamiast kazać roli sięgnąć po nią narzędziem:
+    # jedna tura narzędziowa kosztuje w tej pętli o dwa rzędy wielkości więcej
+    # niż te kilkaset tokenów. Żadna rola nie dostaje ścieżki — obie oddają
+    # wpisy polem `notebook` swojej decyzji, a plikiem zarządza Forge. Ścieżka
+    # byłaby jedynym powodem, by mimo wszystko sięgnąć na dysk.
+    if notebook_text:
+        lines.append("Twoje notatki z poprzednich rund (komplet):")
+        lines.append(notebook_text)
     return "\n".join(lines)
 
 
