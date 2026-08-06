@@ -68,33 +68,13 @@ MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
         "strong": ("grok-4.5", "high"),
         "max": ("grok-4.5", "high"),
     },
-    # NeuralWatt (przez opencode). Dwie osie doboru, obie liczą się osobno:
-    #   1) rodzina modelu — rośnie z poziomem, bo tego wymaga zadanie;
-    #   2) wariant — ZAWSZE najtańszy, który wystarcza:
-    #      -flex  = tańsza kolejka; pętla jest wsadowa, więc bierzemy zawsze
-    #               gdy istnieje (nie ma jej gemma/qwen);
-    #      -fast  = bez rozumowania, czyli bez tokenów myślenia — tam, gdzie
-    #               rola i tak nie planuje (mistrz, proste zadania);
-    #      -short = mniejsze okno; bierzemy, gdy 1M kontekstu jest zbędne.
-    # Blok "cost" w ~/.config/opencode/opencode.json podaje tę samą stawkę dla
-    # wszystkich wariantów rodziny — to uproszczenie metadanych, nie rachunek.
-    # Prawdziwy koszt schodzi z każdym sufiksem, więc nie optymalizuj po tych
-    # liczbach; służą tylko do porównywania RODZIN między sobą.
-    #   economy   qwen3.6-35b-fast       mistrz i proste zadania; zmierzone na
-    #                                    realnym dzienniku: łapie wzorzec pętli
-    #                                    ~100 tokenami wyjścia, gdy kimi-k2.6
-    #                                    wypisuje na to samo ~3000
-    #   efficient kimi-k2.6-flex         workhorse: 262k, rozumowanie, tania kolejka
-    #   balanced  kimi-k2.7-code-flex    specjalista od kodu tam, gdzie koder
-    #                                    i tester robią realną robotę
-    #   strong    glm-5.2-short-flex     recenzja: szerokość zamiast 1M okna
-    #   max       glm-5.2-flex           bootstrap: pełne 1M kontekstu
-    # --variant obsługuje tylko rodzina glm-5.2, więc reszta ma pusty effort
-    # (adapters.py wycina pusty placeholder razem z flagą).
+    # Lokalny llama.cpp przez opencode. Wariant z reasoningiem jest świadomie
+    # używany na trzech najniższych poziomach; alias modelu jest związany z
+    # usługą llama-qwen36-coder.service i plikiem UD-Q4_K_XL.
     "opencode": {
-        "economy": ("neuralwatt/qwen3.6-35b-fast", ""),
-        "efficient": ("neuralwatt/kimi-k2.6-flex", ""),
-        "balanced": ("neuralwatt/kimi-k2.7-code-flex", ""),
+        "economy": ("llamacpp/qwen36-coder", ""),
+        "efficient": ("llamacpp/qwen36-coder", ""),
+        "balanced": ("llamacpp/qwen36-coder", ""),
         "strong": ("neuralwatt/glm-5.2-short-flex", "medium"),
         "max": ("neuralwatt/glm-5.2-flex", "high"),
     },

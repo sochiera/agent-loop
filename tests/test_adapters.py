@@ -274,7 +274,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
             ("opencode", "reviewer", "complex",
              ("neuralwatt/glm-5.2-short-flex", "medium")),
             ("opencode", "coder", "simple",
-             ("neuralwatt/qwen3.6-35b-fast", "")),
+             ("llamacpp/qwen36-coder", "")),
         ):
             cfg = Config(**{f"{role}_agent": agent})
             _, model, effort = cfg.role(role, difficulty)
