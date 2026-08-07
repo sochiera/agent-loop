@@ -126,7 +126,8 @@ def main(argv: list[str] | None = None) -> int:
     # Domyślnie sprawdzamy ten sam posture co normalny przebieg Forge.
     cfg.codex_sandbox = os.environ.get(
         "FORGE_SMOKE_SANDBOX", "danger-full-access")
-    cfg.codex_effort = os.environ.get("FORGE_SMOKE_EFFORT", "minimal")
+    # Bieżące modele codex nie przyjmują już 'minimal' (400 unsupported_value).
+    cfg.codex_effort = os.environ.get("FORGE_SMOKE_EFFORT", "low")
     cfg.agent_timeout_s = int(os.environ.get("FORGE_SMOKE_TIMEOUT", "300"))
     cfg.max_limit_retries = 1
 
