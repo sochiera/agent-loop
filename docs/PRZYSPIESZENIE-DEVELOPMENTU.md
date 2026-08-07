@@ -1,8 +1,13 @@
 # Przyspieszenie developmentu — 7 propozycji
 
 Cel: **więcej kodu na jednostkę czasu, bez spadku jakości i bez wzrostu kosztu
-na linię kodu.** Trzeci warunek jest wiążący: propozycja, która przyspiesza
-przebieg kosztem $/linię, jest tu odrzucona, nawet jeśli skraca zegar.
+na zadanie.** Trzeci warunek jest wiążący: propozycja, która przyspiesza
+przebieg kosztem $/zadanie, jest tu odrzucona, nawet jeśli skraca zegar.
+
+> **Stan wdrożenia.** Plan wykonawczy pięciu wybranych strumieni jest w
+> [PLAN-WDROZENIA.md](PLAN-WDROZENIA.md); ten dokument został po nim poprawiony
+> tam, gdzie plan znalazł w nim błędy. Jednostką kosztu jest **zadanie**, nie
+> linia kodu — patrz §1a.
 
 Źródła danych: `docs/ANALIZA-2026-07-25.md` (okno 1 h, 76 wywołań),
 `docs/ANALIZA-2026-07-26.md` (przebieg 6 h 20 m, 291 wywołań, 27 zadań) oraz
@@ -33,24 +38,64 @@ rundy, które nie produkują kodu**. Wszystko inne jest szumem.
 
 ---
 
-## 1. Warunek wstępny: metryka $/linia i widoczny odsiew planisty
+## 1. Warunek wstępny: metryka $/zadanie i widoczny odsiew planisty
 
 Bez tego żadna propozycja z listy nie jest weryfikowalna względem trzeciego
 warunku zadania.
 
-**1a. `$/linia` w `forge/report.py`.** Raport sumuje dziś tokeny per
-(agent, faza) i nie zna ani linii, ani dolarów
-([report.py:72](../forge/report.py#L72)). Wszystkie dane już są:
+**1a. `$/zadanie` w `forge/report.py`.** *(wdrożone)* Jednostką jest **zadanie**,
+nie linia kodu — `git log --numstat` wypadł z planu w całości. Linia kodu nie
+jest tu jednostką pracy: koder pisze i kasuje w tej samej rundzie, a refaktor
+o ujemnym bilansie linii bywa najcenniejszą turą przebiegu.
 
-- linie: `git log --numstat` między tagiem `forge/<task-id>-start`
-  ([orchestrate.py:867](../forge/orchestrate.py#L867)) a commitem zadania;
-- tokeny: `.forge/usage.jsonl` z polem `phase`, które łączy jedno z drugim;
-- stawki: tabela cen per (agent, model) — jedyna nowa dana w całej zmianie.
+Trzy liczby na przebieg: **`$/przebieg`**, **`$/zadanie`**, **`$/rundę`**.
+`$/rundę` jest ważniejsze, niż wygląda: runda, a nie zadanie, jest właściwą
+jednostką kosztu w tej pętli (tester ~200 k in + koder ~307 k in na rundę), a
+P4 działa dokładnie na liczbie rund. Bez tej liczby nie da się odróżnić
+„zadania staniały" od „zadania się skurczyły".
 
-Docelowo trzy liczby na przebieg: `$/zadanie`, `$/linię netto`, `linie/h`.
-Bez nich „nie pogorszyliśmy $/linię" jest opinią, nie pomiarem.
+Mianowniki biorą się z dziennika: wpisy `UKOŃCZONE po N rundach`
+([`ledger.completed_tasks`](../forge/ledger.py)). **Zadania `PORZUCONE` liczą
+się do kosztu, nie do mianownika** — doliczenie ich maskowałoby dokładnie tę
+stratę, którą chcemy widzieć.
 
-**1b. Odsiew planisty musi być widoczny.** `phase_plan_batch` przyjmuje zadanie
+**Pułapka semantyki tokenów** — to jedyne miejsce, gdzie łatwo o błąd wart
+dziesiątek procent rachunku. Providerzy liczą wejście niezgodnie:
+
+| provider | `input_tokens` | cache |
+|---|---|---|
+| Claude | **wyłącznie tokeny nieocache'owane** | `cache_creation_input_tokens` (zapis, 1,25×) i `cache_read_input_tokens` (odczyt, 0,1×) osobno |
+| Codex | **całość wejścia**, z cache włącznie | `cached_input_tokens` jest podzbiorem `input_tokens` |
+
+Dlatego wycena idzie przez znormalizowaną czwórkę
+`(uncached_in, cache_write, cache_read, out)`, a nie przez dawną trójkę.
+Pominięcie `cache_creation` dla Claude'a gubi najdroższą pozycję; zsumowanie
+`input` i `cached` dla Codeksa liczy te same tokeny dwa razy.
+
+Stawki — `forge/pricing.py`, USD za milion tokenów:
+
+```python
+CLAUDE_RATES = {
+    #            in     cache_write(1,25×)  cache_read(0,1×)   out
+    "opus":    (5.00,   6.25,               0.50,              25.00),
+    "sonnet":  (3.00,   3.75,               0.30,              15.00),
+    "haiku":   (1.00,   1.25,               0.10,               5.00),
+}
+```
+
+Promocji Sonneta ($2/$10 do 2026-08-31) świadomie nie wpisujemy: wygaśnie w
+połowie okresu pomiarowego i porównanie dwóch przebiegów przestałoby być
+uczciwe. Codex trzyma mnożniki względem Sola (`terra` 0,40, `luna` 0,04) i
+kotwicę w `FORGE_PRICE_SOL_IN`/`FORGE_PRICE_SOL_OUT`; pusta kotwica daje w
+raporcie jawne `—`, nigdy zera. `llamacpp/*` → `0.00` z adnotacją „prąd, nie
+API". Nieznany `(agent, model)` → `—` plus jedno ostrzeżenie na przebieg.
+
+**Zastrzeżenie:** `$/zadanie` jest porównywalne tylko dopóki rozmiar zadania
+się nie zmienia. **P7 tę metrykę z definicji psuje** — przy ewentualnym P7
+punktem odniesienia musi być `$/przebieg` przy tej samej zawartości briefu.
+Dla P3–P6 problemu nie ma, bo żadna z nich nie rusza rozmiaru zadania.
+
+**1b. Odsiew planisty musi być widoczny.** *(wdrożone)* `phase_plan_batch` przyjmuje zadanie
 tylko wtedy, gdy planista faktycznie zapisał jego plik:
 
 ```python
@@ -64,6 +109,14 @@ logu i bez wpisu w dzienniku** — inaczej niż zadanie o błędnym identyfikato
 które ma obie ścieżki obsłużone ([orchestrate.py:179-182](../forge/orchestrate.py#L179-L182)).
 Dziś to drobiazg. Przy większym wsadzie (P6) to jedyny sygnał, że planista
 przestał domykać wsad — i musi być policzalny, zanim ruszymy pokrętło.
+
+Wdrożone na trzech poziomach widoczności, bo mają trzech różnych odbiorców:
+`log()` per odsiane zadanie (człowiek przy konsoli, z rozróżnieniem „brak pola
+`file`" od „plik nie istnieje na dysku"), jeden wpis **zbiorczy** do dziennika
+`plan: zadeklarowano N, przyjęto M (odsiew: …)` (mistrz — to jego jedyne
+wejście, więc trzy osobne linie rozmyłyby jego słownik wzorców) i linia w
+raporcie (pomiar). Wpis zbiorczy powstaje **tylko przy niezerowym odsiewie**;
+przy pełnym wsadzie istniejąca linia `plan: utworzono N zadań` wystarcza.
 
 Koszt obu punktów: kilkadziesiąt linii, zero wywołań LLM.
 
@@ -166,7 +219,7 @@ się zmierzyć, czy werdykty fallbacku różnią się jakością.
 
 ---
 
-## P3. Deterministyczna bramka przed wywołaniem mistrza
+## P3. Deterministyczna bramka przed wywołaniem mistrza *(ODRZUCONE)*
 
 ### Co
 
@@ -186,16 +239,60 @@ sprawdzalne z danych, które Forge **już liczy**:
 Policz je w Pythonie, wołaj LLM tylko przy trafieniu. Sformułowanie noty zostaw
 modelowi — cytuje `reason` i powtarzany wpis dziennika, tego regułą nie zrobisz.
 
-### Bilans
+### Bilans — poprawiony
 
-~102 → ~18 wywołań. To ~6,5 min zegara, ale ważniejsze jest zdjęcie presji z tej
-samej kwoty, która o 06:07 zablokowała review na dwie godziny. Znika też
-patologia z analizy: `cache_creation` mistrza (117 k) jest **wyższe** niż
-`cache_read` (98 k) — każde wywołanie zapisuje do cache'u unikalny dziennik,
-który nigdy nie zostanie odczytany, po stawce 1,25×.
+Wcześniejsza wersja tego akapitu przypisywała P3 „zdjęcie presji z kwoty, która
+o 06:07 zablokowała review na dwie godziny". **To było przesadzone.** Z tabeli
+tokenów przebiegu 26.07:
 
-$/linię: **ściśle w dół**. Jakość: bez zmian, reguły zostają identyczne —
+| rola | wywołań | wejście | % tokenów Claude'a | ~$ | % $ |
+|---|---:|---:|---:|---:|---:|
+| review | 35 | 4,62 M | 58% | ~7,0 | ~55% |
+| plan | 6 | 3,12 M | 39% | ~5,0 | ~40% |
+| **mistrz** | **93** | **0,22 M** | **2,7%** | **~0,6** | **~5%** |
+
+Mistrz to 69% wywołań, ale 2,7% tokenów. Limity subskrypcji są ważone
+tokenami, nie liczbą żądań — wycięcie 84 z 93 wywołań zwalnia ~2,5% puli i
+**nie odblokowuje** dwugodzinnego backoffu. Ten backoff wygenerowały review i
+planista; adresuje go **P2**, nie P3. Rozbieżność z przebiegiem 25.07 (mistrz
+$2,15 z $7,88) dotyczy starej konfiguracji: mistrz chodził wtedy na mocniejszym
+modelu i z pełnym harnessem agentowym, a dziś ma `efficient` i tryb cienki.
+
+Zostają trzy realne zyski, w kolejności ważności:
+
+1. **Patologia cache'u.** `cache_creation` mistrza (117 k) jest **wyższe** niż
+   `cache_read` (98 k) — każde wywołanie zapisuje do cache'u unikalny dziennik,
+   który nigdy nie zostanie odczytany, po stawce 1,25×. To nie jest
+   nieefektywność, tylko płacenie premii za cache, którego z definicji nie da
+   się użyć.
+2. ~6,5 min zegara (~102 → ~18 wywołań).
+3. ~5% rachunku Claude'a.
+
+$/zadanie: **ściśle w dół**. Jakość: bez zmian, reguły zostają identyczne —
 zmienia się tylko to, kto sprawdza warunek wyzwolenia.
+
+### Werdykt: bramka NIE wchodzi — `FORGE_MASTER_GATE=off` domyślnie
+
+Kod bramki istnieje i jest przetestowany, ale **domyślnie jest wyłączona i nie
+rekomendujemy jej włączania.** Powód jest wprost w powyższym bilansie: mistrz
+to ~2,7% tokenów i ~5% rachunku, więc górna granica zysku to kilka procent.
+Po drugiej stronie stoi pojedyncza pominięta interwencja — pętla, której nikt
+nie przerwał, kosztuje rundy po ~500 tys. tokenów wejścia każda, a przy
+`max_tdd_rounds` kończy się `git reset --hard` i utratą **całej** pracy nad
+zadaniem. Kilka procent oszczędności przeciw ryzyku straty rzędu setek procent
+kosztu zadania to ten sam asymetryczny zakład, za który odrzucamy P7.
+
+Ryzyko nie jest hipotetyczne. Bramka musi odwzorowywać **wszystkie** warunki
+promptu mistrza 1:1; przegląd wykazał, że pierwsza wersja pominęła piąty
+(powtórzony odsiew planisty) i w trybie `on` wyciszałaby mistrza dokładnie tam,
+gdzie wymaga tego 1b. Każde przyszłe rozszerzenie promptu ma ten sam problem —
+i to jest stały koszt utrzymania, a nie jednorazowa naprawa. Pilnuje go test
+`test_every_prompt_rule_has_a_gate_predicate`.
+
+`FORGE_MASTER_GATE=shadow` zostaje dostępne: nigdy nie wycisza mistrza,
+kosztuje jedną linię logu na wywołanie i pozwala zmierzyć bramkę, gdyby temat
+wrócił. Włączenie rozpoznaje `on`, `1`, `true` i `tak`; wartość nierozpoznana
+znaczy `off`, bo pokrętło o niepewnym znaczeniu nie ma prawa wyciszyć nadzoru.
 
 ---
 
@@ -219,24 +316,69 @@ z pliku zadania albo jawnie wymieniać, które są świadomie odłożone i dlacz
 Tura potwierdzająca ma prowadzić do rozszerzenia tej samej bramki w bieżącej
 rundzie, a nie do otwarcia nowego cyklu.
 
+### Wdrażany jest wariant UMIARKOWANY
+
+Powyższa wersja maksymalna („wszystkie kryteria") nie wchodzi. Wdrożony wariant
+to **2–3 kryteria na bramkę**, plus mapa kryteriów wyliczana w pierwszej turze
+`red` (w `reason` i notatniku, nie jako nowe pole JSON-a — nowe pole dotknęłoby
+`parse_tester_decision` i schematu, przez co wycofanie przestałoby być rewertem
+dwóch szablonów). Niemal ten sam zysk przy istotnie mniejszym ryzyku.
+
+Uzasadnienie szerokości: **reguła „jeden test na cykl" nie obowiązuje w tej
+pętli.** Klasyczne TDD trzyma ją z dwóch powodów i żaden tu nie działa —
+lokalizacja defektu (koder dostaje pełne wyjście komendy, więc trzy nazwane
+asercje lokalizują lepiej niż jedna) i latencja pętli (człowiek chce zielono co
+2 minuty, a tu jedna runda to ~200 k tokenów testera + ~307 k kodera).
+**Runda jest jednostką kosztu, nie test.**
+
+Warunku, którego nie wolno rozluźnić razem z poszerzeniem bramki: **każdy** test
+w bramce ma się kolekcjonować i padać na asercji kontraktu, a nie na błędzie
+składni/importu/nazwy. Przy trzech testach jeden może paść z niewłaściwego
+powodu i tester może tego nie zauważyć — a to psuje dokładnie tę własność
+czerwonej bramki, dla której cała pętla istnieje.
+
+Zmiana działa też **przeciwnie do asymetrii, którą pogłębia P7**: przekroczenie
+`max_tdd_rounds` woła `_fail_task`, a ten robi `git reset --hard`, więc mniej
+rund to mniejsze `p(porażki)` przy niezmienionym koszcie zadania.
+
 ### Bilans
 
 Runda jest jednocześnie jednostką czasu i kosztu: tester ~200 k in, koder
 ~307 k in na wywołanie. Zejście ze średnio ~2,6 do ~2,0 rund na zadanie to
-**~20–25% mniej wywołań ról — szybciej i taniej na linię jednocześnie**.
+**~20–25% mniej wywołań ról — szybciej i taniej na zadanie jednocześnie**.
 
 **To jedyna propozycja z realnym ryzykiem jakości** i nie wolno jej wdrażać w
-ciemno. Metryki kontrolne, wszystkie dostępne z `ledger.md` i `usage.jsonl`:
+ciemno. Ryzyko jest po stronie **zielonej**, nie czerwonej: LLM napisze trzy
+testy równie łatwo co jeden, ale koder musi zaspokoić N asercji w jednej turze
+→ większy diff → gorsza lokalizacja przy porażce → więcej
+`test_changes_needed` / `tester_input_needed`.
 
-- rundy/zadanie — musi spaść;
-- `recenzja→changes` — nie może wzrosnąć;
-- `blocked` i `PORZUCONE` — w przebiegu 26.07 oba zero, muszą zostać zerem.
+Metryki kontrolne, wszystkie dostępne z `ledger.md` i `usage.jsonl`:
+
+- rundy/zadanie — musi spaść (baseline ~2,63);
+- `$/zadanie` — musi spaść;
+- `recenzja→changes` — nie może wzrosnąć (baseline 7/35);
+- `blocked` i `PORZUCONE` — w przebiegu 26.07 oba zero, muszą zostać zerem;
+- **pushback kodera** — odsetek `test_changes_needed` + `tester_input_needed`
+  na turę kodera; nie może wzrosnąć (baseline 14/61 ≈ 23%). Tej metryki
+  brakowało w pierwszej wersji dokumentu, a jest jedyną, która wprost wykrywa
+  „bramka za szeroka". Liczy ją `report.coder_pushback`.
+
+Naruszenie któregokolwiek warunku → wycofanie (`git revert` dwóch szablonów).
 
 Wycofanie jest tanie: to zmiana dwóch szablonów promptów, bez migracji stanu.
 
 ---
 
-## P5. Prefetch planisty i spekulatywna bramka pakietu
+## P5. Prefetch planisty i spekulatywna bramka pakietu *(ODRZUCONE)*
+
+**Odrzucone decyzją planu wdrożenia.** Podana niżej liczba 8–12% zegara
+zawierała prefetch planisty; **sama bramka spekulatywna to ~2–3%**. Za te 2–3%
+wprowadza równoległe uruchomienie pełnego pakietu w tym samym drzewie roboczym,
+w którym pracuje reviewer — nową klasę ryzyka w miejscu, które dziś jest
+szeregowe i przewidywalne. Stosunek zysku do ryzyka jest zły. Prefetch samego
+planisty może wrócić osobno, po P1, gdy równoległość drzew i tak będzie
+rozwiązana.
 
 Dwie rzeczy blokują dziś pętlę, choć niczego nie potrzebują od bieżącej tury.
 
@@ -280,17 +422,36 @@ modelu, effortu ani jakości planowania.
 
 1. **Kadencja przeglądu kierunku liczy WSADY, nie zadania**
    ([config.py:174-179](../forge/config.py#L174-L179)). `steering_batches=2` przy
-   wsadzie 6 to przegląd co 12 zadań; przy wsadzie 10 — co 20. Komentarz w
-   kodzie ostrzega przed tym wprost: „podniesienie wsadu bez zejścia tutaj
-   kupiłoby oszczędność opóźnieniem korekty kursu". Iloczyn
-   `batch_size × steering_batches` ma zostać ~12.
+   wsadzie 6 to przegląd co 12 zadań; przy wsadzie 10 — co 20.
 2. **Przy `replan` ginie CAŁA kolejka**
-   ([orchestrate.py:476-482](../forge/orchestrate.py#L476-L482)). Większy wsad to
-   większa strata na jeden przegląd zmieniający kierunek. Przy warunku (1)
-   przegląd trafia w kolejkę prawie pustą, więc ryzyko jest ograniczone — ale
-   to warunek (1) je ogranicza, nie sam wsad.
+   ([orchestrate.py:476-482](../forge/orchestrate.py#L476-L482)) — i to jest
+   miejsce, w którym pierwsza wersja tego dokumentu **się myliła**. Twierdziła,
+   że „przy warunku (1) przegląd trafia w kolejkę prawie pustą, więc ryzyko
+   jest ograniczone". Przy ówczesnym kodzie było odwrotnie:
+
+   - wyzwalacz przeglądu sprawdzany był, gdy `not state.current_task`, i **nie
+     patrzył na kolejkę**;
+   - `plan_batches` rośnie w chwili **zaplanowania** wsadu, a planowanie i start
+     pierwszego zadania dzieją się w **tej samej iteracji**.
+
+   Przy `steering_batches=2` i wsadzie 6: wsad 1 → 6 zadań → kolejka pusta →
+   wsad 2 zaplanowany (`plan_batches=2`, kolejka = 6 świeżych zadań) → pierwsze
+   zadanie wykonane → granica zadań → kadencja dojrzała → **przegląd startował z
+   5 świeżymi zadaniami w kolejce**, a `replan=true` kasował je razem z całym
+   wywołaniem planisty (~520 k tokenów wejścia). Dotyczyło to konfiguracji
+   sprzed poprawki niezależnie od P6; **podniesienie wsadu bez tej poprawki
+   mnożyłoby stratę**.
+
+   Naprawa: gałąź kadencji w `_steering_trigger` dostaje warunek
+   `not state.task_queue`. Gałęzie `brief` i `backlog` zostają natychmiastowe —
+   zmiana briefu ma wygrywać z kolejką, a `steering_due` jest ustawiane właśnie
+   przy pustym backlogu. Ponieważ wyzwalacz jest sprawdzany **przed** blokiem
+   planowania, przegląd trafia dokładnie w moment pustej kolejki i `replan` nie
+   ma czego zniszczyć. Efekt uboczny na plus: jednorazowa notatka przeglądu
+   ląduje bezpośrednio przed planowaniem, zamiast czekać na dopracowanie reszty
+   wsadu.
 3. **Odsiew planisty musi być widoczny** (punkt 1b). Rosnący wsad to rosnąca
-   szansa, że planista nie domknie ostatnich zadań; dziś znikają bez śladu.
+   szansa, że planista nie domknie ostatnich zadań; dawniej znikały bez śladu.
 
 ### Dlaczego to idzie w parze z P1, a nie przeciw niemu
 
@@ -301,10 +462,22 @@ P1 potrzebuje kolejki dość głębokiej, by zapełnić K torów po odsianiu
 zależności, a przy wsadzie 6 i K=3 często zapełni dwa. Wsad 8–10 jest więc
 **wymuszony przez P1**, nie niezależnym pomysłem.
 
-**Rekomendacja:** 6 → 8 razem z P1, `steering_batches` skorygowane do 1 albo 2
-tak, by iloczyn został ~12; 10 dopiero po pomiarze `round_limit` i odsiewu.
-Nie ruszać wsadu przed P1 — samo pokrętło daje wtedy oszczędność dolara przy
-zerowym zysku czasu i realnym koszcie starzenia planu.
+**Rekomendacja (poprawiona):** **wsad 8, `steering_batches=2`, iloczyn 16** —
+świadome odejście od dawnej reguły „iloczyn ~12". Reguła ~12 była kalibrowana
+**pod błędem opisanym w warunku (2)**, gdzie przegląd trafiający w pełną
+kolejkę kosztował cały wsad planisty, więc ciasna kadencja była tanim
+ubezpieczeniem. Po poprawce jedynym kosztem luźniejszej kadencji jest opóźniona
+korekta kursu, a przegląd zawsze ląduje na granicy wsadów z pustą kolejką —
+w najbezpieczniejszym możliwym momencie. Przegląd kierunku chodzi przy tym na
+poziomie `max` ([config.py:28-30](../forge/config.py#L28-L30)), więc zejście do
+`steering_batches=1` kupowałoby korektę kursu za +50% wywołań najdroższej roli
+w systemie, czyli zjadłoby oszczędność, dla której podnosimy wsad. Wyzwalacz
+odwrotu: wzrost odsetka przeglądów z `replan=true` albo zauważalny dryf
+kierunku → `FORGE_STEERING_BATCHES=1`.
+
+Bilans wsadu 6 → 8: wywołań planisty na zadanie 0,167 → 0,125, czyli ~25%
+kosztu planisty ≈ ~10% rachunku Claude'a. Zysku zegara nie ma — to zmiana
+czysto kosztowa. 10 dopiero po pomiarze odsiewu (1b) i `round_limit`.
 
 ---
 
@@ -357,22 +530,26 @@ porzucenie na `round_limit` po tej zmianie oznacza wycofanie.
 
 ## Kolejność wdrożenia
 
-| # | propozycja | zysk zegara | $/linię | ryzyko jakości |
+| # | propozycja | zysk zegara | $/zadanie | ryzyko jakości |
 |---|---|---|---|---|
-| 1 | metryka `$/linia` + widoczny odsiew | — | — | brak (warunek wstępny) |
-| P3 | bramka przed mistrzem | ~2% + zwolniona kwota | **w dół** | brak |
+| 1 | metryka `$/zadanie` + widoczny odsiew | — | — | brak (warunek wstępny) |
+| P3 | bramka przed mistrzem | ~2% | w dół (~5% rachunku) | **ODRZUCONE** — zysk kilka %, ryzyko utraty zadania |
 | P2 | fallback providera | do +33% | neutralny/w dół | niskie, mierzalne |
-| P5 | prefetch planisty + spekulatywna bramka | ~8–12% | neutralny | brak |
+| P5 | prefetch planisty + spekulatywna bramka | ~2–3% (nie 8–12%) | neutralny | **odrzucone** |
 | P1 | równoległe tory (K=3) | **×1,8–2,2** | neutralny | średnie, tnie je K |
-| P6 | wsad 6 → 8 (tylko z P1) | pośrednio, przez P1 | **w dół** | niskie przy warunkach 1–3 |
-| P4 | jedna bramka na komplet kryteriów | ~20% mniej rund | **w dół** | realne — tylko z pomiarem |
+| P6 | wsad 6 → 8 | — (czysto kosztowa) | **w dół** (~10% rachunku) | niskie przy warunkach 1–3 |
+| P4 | szersza pierwsza bramka (wariant umiarkowany) | ~20% mniej rund | **w dół** | realne — tylko z pomiarem |
 | P7 | większe zadania | — | pozornie w dół | **odrzucone** do czasu P4 |
 
-Uzasadnienie kolejności: P3 i P2 są tanie i natychmiast zwalniają kwotę oraz
-zegar. P5 nie zmienia żadnego kontraktu. P1 to właściwy skok przepustowości i
-zjada najwięcej pracy, więc idzie po tanich zyskach. P6 jest domknięciem P1, nie
-osobnym pokrętłem. P4 na końcu, bo jako jedyna wymaga porównania dwóch
-przebiegów — a przy włączonym P1 porównanie jest szybsze o połowę.
+Wsad 8 (P6) nie czeka już na P1: po naprawie kolejności kadencji jest zmianą
+samodzielną i bezpieczną. P1 nadal go potrzebuje, żeby zapełnić tory.
+
+Uzasadnienie kolejności: P2 jest tanie i natychmiast zwalnia zegar. P1 to
+właściwy skok przepustowości i zjada najwięcej pracy, więc idzie po tanich
+zyskach. P6 wchodzi samodzielnie po naprawie kolejności kadencji i domyka P1.
+P4 na końcu, bo jako jedyna wymaga porównania dwóch przebiegów — a przy
+włączonym P1 porównanie jest szybsze o połowę. P3 i P5 wypadły z kolejki:
+obie kupowały kilka procent za nową klasę ryzyka.
 
 ---
 
@@ -383,8 +560,13 @@ bo trzy z powyższych propozycji kuszą, by w te miejsca wejść:
 
 - **Prompty ról** — mieszczą się w kilkuset tokenach, nie ma tam czego ciąć.
   P4 zmienia w nich *treść kontraktu*, nie *długość*.
-- **`ledger.compact_tail()`** ([ledger.py:91](../forge/ledger.py#L91)) — cięcie
-  chroniące `pliki=…` jest dobrze pomyślane i jest wejściem bramki z P3.
+- **`ledger.compact_tail()`** ([ledger.py](../forge/ledger.py)) — cięcie
+  chroniące `pliki=…` (tnie POWÓD, nie listę plików) jest dobrze pomyślane i
+  jest wejściem bramki z P3. Po wdrożeniu P3 to już nie tylko dobra praktyka,
+  ale **własność, od której zależy poprawność bramki**: trzy z jej czterech
+  warunków czytają `pliki=`, więc utrata tej listy przy cięciu wyciszałaby
+  mistrza tam, gdzie miał zareagować. Pilnuje jej test regresyjny w
+  `tests/test_master_gate.py`.
 - **Sesje codeksa** — 93–94% trafień w cache. To jest powód, dla którego P2
   wolno fallbackować testera/kodera wyłącznie na granicy rundy.
 - **Bramka pełnego pakietu przed commitem** — ~13 min na 6 h 20 m. P5 ją
