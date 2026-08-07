@@ -125,8 +125,10 @@ def _next_task_index(project: str) -> int:
 # formatu `_next_task_index` i porządkowanie archiwum wyliczają numer następnego
 # wsadu, więc identyfikator poza nim nie zostałby policzony i kolejny wsad
 # nadpisałby pliki zadań. `_TASK_ID_MENTION` musi opisywać tę samą gramatykę —
-# stąd jeden wzorzec, a nie dwa, które mogłyby się rozjechać.
-_TASK_ID_BODY = r"task-\d+"
+# stąd jeden wzorzec, a nie dwa, które mogłyby się rozjechać. Sam wzorzec
+# mieszka w `ledger`, bo czyta go też bramka mistrza i mianowniki raportu, a
+# `ledger` jest jedynym modułem-liściem widocznym dla wszystkich trzech.
+_TASK_ID_BODY = ledger.TASK_ID_BODY
 _TASK_ID = re.compile(_TASK_ID_BODY)
 
 

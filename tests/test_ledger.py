@@ -36,6 +36,42 @@ def test_ledger_keeps_only_most_recent_entries(tmp_path: Path) -> None:
     assert lines[-1].endswith(f"wpis {ledger.KEEP_LINES + 24}")
 
 
+def test_master_window_does_not_grow_with_ledger_memory(tmp_path: Path) -> None:
+    """`KEEP_LINES` to miejsce na dysku, `MASTER_LINES` to tokeny w KAŻDYM
+    wywołaniu roli wołanej co rundę. Powiększanie pamięci dziennika nie ma
+    prawa dołożyć ani jednej linii do promptu mistrza."""
+    for index in range(ledger.KEEP_LINES):
+        ledger.append(str(tmp_path), f"task-001 r{index} tester→red pliki=bez_zmian: x")
+
+    assert len(ledger.compact_tail(str(tmp_path)).splitlines()) == ledger.MASTER_LINES
+
+
+def test_round_limit_horizon_stays_recent_despite_a_long_ledger(
+        tmp_path: Path) -> None:
+    """Reguła „planista tnie za grubo" ma opisywać porażki ŚWIEŻE. Na całej
+    pamięci dziennika mistrz wypominałby zadania sprzed kilku przebiegów."""
+    ledger.append(str(tmp_path), "task-001 PORZUCONE: round_limit: limit 10")
+    for index in range(ledger.ROUND_LIMIT_LINES):
+        ledger.append(str(tmp_path), f"task-002 r{index} tester→red pliki=bez_zmian: x")
+    ledger.append(str(tmp_path), "task-002 PORZUCONE: round_limit: limit 10")
+
+    # Stara porażka nadal jest w pliku — ale poza horyzontem reguły.
+    assert "task-001 PORZUCONE" in ledger.tail(str(tmp_path))
+    assert ledger.round_limit_tasks(str(tmp_path)) == ["task-002"]
+
+
+def test_report_denominators_see_further_than_the_master(tmp_path: Path) -> None:
+    """To jest właściwy zysk z większej pamięci: mianowniki `$/zadanie` mają
+    pokrywać cały przebieg, a nie ułamek jednego wsadu."""
+    ledger.append(str(tmp_path), "task-001 UKOŃCZONE po 2 rundach")
+    for index in range(ledger.MASTER_LINES * 5):
+        ledger.append(str(tmp_path), f"task-002 r{index} koder→green pliki=[a.py]: x")
+    ledger.append(str(tmp_path), "task-002 UKOŃCZONE po 3 rundach")
+
+    assert ledger.completed_tasks(str(tmp_path)) == [
+        ("task-001", 2), ("task-002", 3)]
+
+
 def test_tail_limit_returns_only_last_entries(tmp_path: Path) -> None:
     for index in range(10):
         ledger.append(str(tmp_path), f"wpis {index}")
