@@ -289,12 +289,22 @@ def master_ledger_prompt(
         ledger_tail: str,
         round_limit_tasks: list[str] | None = None,
         task_id: str = "",
-        next_role: str = "") -> str:
+        next_role: str = "",
+        plan_sift_streak: int = 0) -> str:
+    """Dziennik plus wzorce, których z jego okna nie da się odczytać.
+
+    ``round_limit_tasks`` i ``plan_sift_streak`` są liczone osobno z tego samego
+    powodu: jedno zadanie idące na limit rund zajmuje więcej linii niż całe okno
+    mistrza, a jeden wsad ośmiu zadań — więcej niż cała pamięć dziennika. Oba
+    wzorce są więc z ``compact_tail`` strukturalnie niewidoczne i trzeba mu je
+    policzyć, zamiast liczyć na to, że je wypatrzy.
+    """
     failures = ", ".join(round_limit_tasks or []) or "(brak)"
     return render(
         "master-ledger.md",
         POSITION=master_position(task_id, next_role),
         FAILURES=failures,
+        SIFT_STREAK=str(max(0, int(plan_sift_streak))),
         LEDGER_TAIL=ledger_tail or "(pusty)",
     )
 

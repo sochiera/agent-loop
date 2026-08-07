@@ -38,7 +38,14 @@ Interweniuj tylko, gdy dane bezpośrednio pokazują:
   plikach oznaczają pętlę — poproś testera, by przerwał pętlę: wdrożył
   uwagi recenzji albo zwrócił `blocked`;
 - co najmniej dwa zadania na liście `round_limit` — poproś planistę o mniejsze
-  zadania. Ta uwaga dotyczy planisty, więc obowiązuje mimo `PORZUCONE`.
+  zadania. Ta uwaga dotyczy planisty, więc obowiązuje mimo `PORZUCONE`;
+- licznik `WSADY PLANISTY Z ODSIEWEM POD RZĄD` równy co najmniej 2 — planista
+  przestał domykać wsad. Poproś planistę o mniejszy wsad albo o zapisywanie
+  pliku opisu każdego deklarowanego zadania. Ta uwaga dotyczy planisty, więc
+  obowiązuje niezależnie od aktywnego zadania. Przy liczniku 0 albo 1 nie
+  interweniuj: pojedynczy odsiew to szum. Wpisu `plan: zadeklarowano N,
+  przyjęto M` w dzienniku NIE licz samodzielnie — okno dziennika mieści
+  ułamek jednego wsadu, więc widzisz najwyżej ostatni z nich.
 
 Poza nią nie wydawaj wskazówek dotyczących zadania, które późniejszy wpis
 oznacza jako `UKOŃCZONE` albo `PORZUCONE`, ani żadnego innego niż zadanie

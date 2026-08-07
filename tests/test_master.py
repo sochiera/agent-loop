@@ -106,6 +106,11 @@ def test_master_only_intervenes_on_observable_process_patterns() -> None:
     assert "zmianę pliku testowego przez kodera" in prompt
     assert "kolejne pełne cykle `recenzja→tester→koder→recenzja`" in prompt
     assert "co najmniej dwa zadania na liście `round_limit`" in prompt
+    # Odsiew planisty: JEDNORAZOWY jest szumem, dopiero powtórzony niesie sygnał
+    # o wsadzie przekraczającym zdolność planisty do jego domknięcia. Licznik
+    # przychodzi osobnym polem, bo z okna dziennika jest niepoliczalny.
+    assert "`WSADY PLANISTY Z ODSIEWEM POD RZĄD` równy co najmniej 2" in prompt
+    assert "NIE licz samodzielnie" in prompt
     assert "nie oceniaj poprawności implementacji" in prompt
     assert "kompletności `reason`/`summary`" in prompt
     assert "UKOŃCZONE" in prompt and "PORZUCONE" in prompt
@@ -119,7 +124,7 @@ def test_every_intervention_rule_says_what_to_ask_for() -> None:
         "Interweniuj tylko")[2].partition("\n\n")[0]
     rules = [_flat(rule) for rule in block.split("\n- ")[1:]]
 
-    assert len(rules) == 4
+    assert len(rules) == 5
     for rule in rules:
         assert "—" in rule, f"reguła bez zalecenia: {rule}"
 
@@ -607,3 +612,99 @@ def test_master_cannot_change_the_worktree(tmp_path: Path) -> None:
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert not (tmp_path / "mistrz-zmiana.py").exists()
+
+
+# --- Bramka mistrza i licznik odsiewu planisty ------------------------------
+
+def test_master_gate_is_off_by_default(tmp_path) -> None:
+    """Bramka oszczędza kilka procent rachunku, a jedna pominięta interwencja
+    kosztuje rundy albo całe zadanie. Ten zakład jest asymetryczny w złą
+    stronę, więc domyślnie mistrz jest wołany zawsze."""
+    with patch("forge.orchestrate.run_agent", return_value="{}") as run_agent:
+        orchestrate._master_notes(
+            Config(), str(tmp_path),
+            lambda phase: str(tmp_path / f"{phase}.log"),
+            task_id="task-001", next_role="tester")
+
+    assert Config().master_gate == "off"
+    run_agent.assert_called_once()
+
+
+def test_gate_mode_accepts_the_shorthand_people_actually_type() -> None:
+    """`=1` czytało się dawniej jako `off` — czyli odwrotnie do intencji."""
+    assert orchestrate._master_gate_mode("1") == "on"
+    assert orchestrate._master_gate_mode("true") == "on"
+    assert orchestrate._master_gate_mode(" On ") == "on"
+    assert orchestrate._master_gate_mode("shadow") == "shadow"
+    # Wartość nierozpoznana nie ma prawa wyciszyć nadzoru.
+    assert orchestrate._master_gate_mode("byle co") == "off"
+    assert orchestrate._master_gate_mode("") == "off"
+
+
+def test_master_gate_on_silences_the_call_when_no_condition_fires(
+        tmp_path) -> None:
+    ledger.append(str(tmp_path), "task-001 r1 tester→red pliki=[tests/a.py]: bramka")
+
+    with patch("forge.orchestrate.run_agent") as run_agent:
+        notes = orchestrate._master_notes(
+            Config(master_gate="on"), str(tmp_path),
+            lambda phase: str(tmp_path / f"{phase}.log"),
+            task_id="task-001", next_role="coder")
+
+    assert notes == {}
+    run_agent.assert_not_called()
+
+
+def test_master_gate_on_still_calls_the_master_when_a_condition_fires(
+        tmp_path) -> None:
+    ledger.append(str(tmp_path), "task-001 r1 koder→green pliki=[tests/a.py]: zielono")
+
+    with patch("forge.orchestrate.run_agent", return_value="{}") as run_agent:
+        orchestrate._master_notes(
+            Config(master_gate="on"), str(tmp_path),
+            lambda phase: str(tmp_path / f"{phase}.log"),
+            task_id="task-001", next_role="tester")
+
+    run_agent.assert_called_once()
+
+
+def test_shadow_mode_measures_the_gate_instead_of_trusting_it(tmp_path) -> None:
+    """Tryb cieni woła mistrza normalnie i loguje parę (trigger, czy nota).
+    Rozbieżność `trigger="" ∧ nota=TAK` to przypadek, który tryb `on` by
+    wyciszył — dopiero zero takich przypadków przepuszcza wdrożenie."""
+    messages: list[str] = []
+    note = '{"tester":"zmień podejście albo zwróć blocked"}'
+
+    with patch("forge.orchestrate.run_agent", return_value=note) as run_agent, \
+         patch("forge.orchestrate.log", side_effect=messages.append):
+        orchestrate._master_notes(
+            Config(master_gate="shadow"), str(tmp_path),
+            lambda phase: str(tmp_path / f"{phase}.log"),
+            task_id="task-001", next_role="tester")
+
+    run_agent.assert_called_once()
+    assert 'mistrz-bramka: trigger="" → nota: TAK' in " ".join(messages)
+
+
+def test_master_gate_off_keeps_the_old_behaviour(tmp_path) -> None:
+    messages: list[str] = []
+
+    with patch("forge.orchestrate.run_agent", return_value="{}") as run_agent, \
+         patch("forge.orchestrate.log", side_effect=messages.append):
+        orchestrate._master_notes(
+            Config(master_gate="off"), str(tmp_path),
+            lambda phase: str(tmp_path / f"{phase}.log"),
+            task_id="task-001", next_role="tester")
+
+    run_agent.assert_called_once()
+    assert not any("mistrz-bramka" in line for line in messages)
+
+
+def test_sift_streak_reaches_the_master_prompt(tmp_path) -> None:
+    with patch("forge.orchestrate.run_agent", return_value="{}") as run_agent:
+        orchestrate._master_notes(
+            Config(), str(tmp_path),
+            lambda phase: str(tmp_path / f"{phase}.log"),
+            plan_sift_streak=2)
+
+    assert "WSADY PLANISTY Z ODSIEWEM POD RZĄD: 2" in run_agent.call_args.args[1]

@@ -26,6 +26,11 @@ class State:
     goal_confirmed: bool = False
     # Bezpiecznik przed jałową parą planista↔przegląd na najsilniejszym modelu.
     empty_plans: int = 0
+    # Ile wsadów POD RZĄD planista zadeklarował szerzej, niż domknął plikami
+    # opisu. Licznik żyje tutaj, a nie w dzienniku, bo jeden wsad ośmiu zadań
+    # to kilkadziesiąt wpisów — dwa kolejne odsiewy nigdy nie zmieściłyby się
+    # razem ani w oknie mistrza (20 linii), ani w całej pamięci dziennika (80).
+    plan_sift_streak: int = 0
     test_cmd: str = ""
     build_cmd: str = ""
     project_kind: str = "app"

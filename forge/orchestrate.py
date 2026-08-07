@@ -15,6 +15,7 @@ from .agents import (AgentError, LimitExhausted, extract_json,
 from .config import Config, DEFAULT_TASK_DIFFICULTY, TASK_DIFFICULTIES
 from . import brief
 from . import ledger
+from . import master_gate
 from . import notebooks
 from . import prompts
 from . import verify
@@ -166,13 +167,21 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     # Mistrz widzi w dzienniku również historię wsadów — serię zadań ginących
     # na round_limit potrafi skomentować zanim planista utnie kolejny za grubo.
     plan_prompt += prompts.master_note_suffix(
-        _master_notes(cfg, project, logf).get("planner", ""))
+        _master_notes(cfg, project, logf,
+                      plan_sift_streak=state.plan_sift_streak).get("planner", ""))
     data = _decision_with_retry(
         plan_prompt,
         lambda value: run_planner(value, cfg, project, logf("plan")),
         _parse_json_object)
     tasks = []
+    # Odsiew musi być POLICZALNY, nie tylko widoczny w logu: to jedyny sygnał,
+    # że pokrętło `batch_size` przekroczyło zdolność planisty do domykania
+    # wsadu. Bez niego "utworzono 5 zadań" po prośbie o 8 nie odróżnia "planista
+    # uznał, że więcej nie trzeba" od "planista się urwał w połowie".
+    declared = 0
+    sifted: list[str] = []
     for raw in data.get("tasks", []):
+        declared += 1
         task = build_task_from_plan(project, raw)
         if not valid_task_id(task["id"]):
             # Odrzucamy zamiast renumerować: zgadnięty numer mógłby wskazać
@@ -182,9 +191,35 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
                 "— wymagany format task-NNN.")
             ledger.append(project, "plan: pominięto zadanie o niepoprawnym "
                                    f"identyfikatorze {task['id']!r}")
+            sifted.append(task["id"] or "(bez identyfikatora)")
             continue
-        if task["file"] and Path(project, task["file"]).is_file():
-            tasks.append(task)
+        # Dwie różne awarie planisty, więc dwa różne komunikaty: brak pola
+        # `file` znaczy "nie zadeklarował opisu", a brak pliku na dysku —
+        # "zadeklarował i nie zapisał".
+        if not task["file"]:
+            log(f"Planowanie: odsiewam {task['id']} — planista nie podał pliku "
+                "opisu zadania.")
+            sifted.append(task["id"])
+            continue
+        if not Path(project, task["file"]).is_file():
+            log(f"Planowanie: odsiewam {task['id']} — opis {task['file']!r} "
+                "nie istnieje na dysku.")
+            sifted.append(task["id"])
+            continue
+        tasks.append(task)
+    # Seria liczy się przez WSADY, a nie przez wpisy dziennika: jeden odsiew to
+    # szum (planista bywa ucięty przez limit), dopiero powtórzony znaczy, że
+    # `batch_size` przekroczył jego zdolność domykania wsadu.
+    state.plan_sift_streak = state.plan_sift_streak + 1 if sifted else 0
+    if sifted:
+        # Jeden wpis zbiorczy, nie jeden na zadanie: dziennik jest wejściem
+        # mistrza, a trzy linie o tym samym zdarzeniu rozmyłyby jego słownik
+        # wzorców. Stoi PRZED linią wsadu, którą uszczegóławia — raport czyta
+        # obie razem (patrz report.plan_batches). Zapisujemy przed jawnym
+        # błędem poniżej: wsad odsiany w całości jest najmocniejszym sygnałem,
+        # jaki mistrz może dostać, i musi przeżyć checkpoint.
+        ledger.append(project, f"plan: zadeklarowano {declared}, przyjęto "
+                               f"{len(tasks)} (odsiew: {', '.join(sifted)})")
     if not tasks and not data.get("no_more_tasks"):
         raise AgentError("planista nie utworzył żadnego poprawnego zadania")
     state.plan_batches = next_batch
@@ -686,25 +721,12 @@ def _scoped_master_notes(notes: dict[str, str], task_id: str) -> dict[str, str]:
     return kept
 
 
-def _master_notes(cfg: Config, project: str, logf, *, task_id: str = "",
-                  next_role: str = "") -> dict[str, str]:
-    """Notatki mistrza per rola — nadzór procesu, nie merytoryki.
-
-    Mistrz jest doradczy Z KONSTRUKCJI, więc każda jego awaria (błąd, limit,
-    śmieciowa odpowiedź) daje brak notatek i pipeline zachowuje się dokładnie
-    tak jak bez niego. Widzi wyłącznie dziennik przekazany w promptcie i
-    pracuje w katalogu tymczasowym — fizycznie nie ma dostępu do repozytorium,
-    więc nie może zmienić drzewa ani wyjść poza swoją rolę.
-
-    ``task_id`` i ``next_role`` mówią mu, gdzie stoi pętla: bez tego brak wpisu
-    tury, która dopiero ma ruszyć, wyglądał jak urwany cykl.
-    """
+def _ask_master(cfg: Config, project: str, logf, prompt: str,
+                task_id: str) -> dict[str, str]:
+    """Jedno wywołanie mistrza; każda jego awaria daje po prostu brak notatek."""
     agent, model, effort = cfg.role("master")
     # Rola doradcza nie ma prawa przespać godzin backoffu przed realną pracą.
     advisory = replace(cfg, max_limit_retries=0)
-    prompt = prompts.master_ledger_prompt(
-        ledger.compact_tail(project), ledger.round_limit_tasks(project),
-        task_id=task_id, next_role=next_role)
     try:
         with tempfile.TemporaryDirectory(prefix="forge-master-") as sandbox:
             # Sandbox jest katalogiem roboczym, ale koszt roli wołanej co rundę
@@ -725,6 +747,66 @@ def _master_notes(cfg: Config, project: str, logf, *, task_id: str = "",
         task_id)
     for role, note in notes.items():
         log(f"  mistrz → {role}: {note}")
+    return notes
+
+
+def _master_gate_mode(value: str) -> str:
+    """`off` / `shadow` / `on` z tolerancją na potoczne zapisy włączenia.
+
+    Dokumentacja i nawyk podpowiadają `=1`, więc rozpoznanie wyłącznie `on`
+    dawało po cichu tryb `off` — czyli przeciwieństwo intencji operatora.
+    Wartość nierozpoznana celowo znaczy `off`: pokrętło o niepewnym znaczeniu
+    nie ma prawa wyciszyć nadzoru.
+    """
+    mode = (value or "").strip().lower()
+    if mode in {"on", "1", "true", "yes", "tak"}:
+        return "on"
+    return "shadow" if mode == "shadow" else "off"
+
+
+def _master_notes(cfg: Config, project: str, logf, *, task_id: str = "",
+                  next_role: str = "", plan_sift_streak: int = 0) -> dict[str, str]:
+    """Notatki mistrza per rola — nadzór procesu, nie merytoryki.
+
+    Mistrz jest doradczy Z KONSTRUKCJI, więc każda jego awaria (błąd, limit,
+    śmieciowa odpowiedź) daje brak notatek i pipeline zachowuje się dokładnie
+    tak jak bez niego. Widzi wyłącznie dziennik przekazany w promptcie i
+    pracuje w katalogu tymczasowym — fizycznie nie ma dostępu do repozytorium,
+    więc nie może zmienić drzewa ani wyjść poza swoją rolę.
+
+    ``task_id`` i ``next_role`` mówią mu, gdzie stoi pętla: bez tego brak wpisu
+    tury, która dopiero ma ruszyć, wyglądał jak urwany cykl.
+    ``plan_sift_streak`` niesie wzorzec, którego z okna dziennika nie da się
+    odczytać — patrz ``prompts.master_ledger_prompt``.
+
+    Deterministyczna bramka (``master_gate``) potrafi sprawdzić jego warunki
+    interwencji w Pythonie i pominąć całe wywołanie, ale DOMYŚLNIE JEST
+    WYŁĄCZONA: oszczędza kilka procent rachunku, a jedna pominięta interwencja
+    kosztuje rundy albo całe zadanie (patrz komentarz przy ``Config.master_gate``).
+    """
+    # Bramka MUSI liczyć się z tych samych dwóch wejść co prompt mistrza —
+    # inaczej po restarcie albo po zmianie zapisu wpisu obie widziałyby co
+    # innego, a bramka wyciszałaby go tam, gdzie on by zareagował.
+    compact_tail = ledger.compact_tail(project)
+    round_limits = ledger.round_limit_tasks(project)
+    gate = _master_gate_mode(cfg.master_gate)
+    fired = ""
+    if gate in {"shadow", "on"}:
+        fired = master_gate.trigger(compact_tail, round_limits,
+                                    task_id=task_id, next_role=next_role,
+                                    plan_sift_streak=plan_sift_streak)
+        if gate == "on" and not fired:
+            return {}
+    notes = _ask_master(cfg, project, logf, prompts.master_ledger_prompt(
+        compact_tail, round_limits, task_id=task_id, next_role=next_role,
+        plan_sift_streak=plan_sift_streak),
+        task_id)
+    if gate == "shadow":
+        # Rozbieżność, której szukamy, to `trigger="" ∧ nota=TAK`: dokładnie te
+        # przypadki bramka wyciszyłaby w trybie `on`. Zero z nich w całym
+        # przebiegu jest warunkiem przejścia na `on`.
+        log(f"  mistrz-bramka: trigger={fired or '\"\"'} → nota: "
+            + ("TAK" if notes else "NIE"))
     return notes
 
 

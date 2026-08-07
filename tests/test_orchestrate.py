@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from forge import orchestrate
+from forge import ledger, orchestrate
 from forge.agents import AgentError
 from forge.config import Config
 from forge.orchestrate import (
@@ -205,6 +205,111 @@ def test_task_with_non_canonical_id_is_rejected_not_renumbered(tmp_path) -> None
             Config(git_push=False), str(tmp_path), state, lambda phase: phase)
 
     assert [task["id"] for task in state.task_queue] == ["task-001"]
+
+
+def _plan_repo(tmp_path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.test"],
+                   cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Forge Tests"],
+                   cwd=tmp_path, check=True)
+    (tmp_path / ".forge" / "tasks").mkdir(parents=True)
+
+
+def _run_plan(tmp_path, plan: str, state: State, messages: list[str]):
+    with patch("forge.orchestrate._housekeeping"), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.log", side_effect=messages.append), \
+         patch("forge.orchestrate.run_planner", return_value=plan):
+        return orchestrate.phase_plan_batch(
+            Config(git_push=False), str(tmp_path), state, lambda phase: phase)
+
+
+def test_task_declared_without_a_file_on_disk_is_sifted_visibly(
+        tmp_path) -> None:
+    """Bez tego zadanie znikało bez wpisu w logu I w dzienniku — a to jedyny
+    sygnał, że planista przestał domykać wsad."""
+    _plan_repo(tmp_path)
+    (tmp_path / ".forge" / "tasks" / "task-001.md").write_text(
+        "Cel: cokolwiek\n", encoding="utf-8")
+    plan = (
+        '{"tasks":['
+        '{"id":"task-001","title":"Jest","file":".forge/tasks/task-001.md"},'
+        '{"id":"task-002","title":"Nie zapisane","file":".forge/tasks/task-002.md"},'
+        '{"id":"task-003","title":"Bez pola file"}'
+        ']}'
+    )
+    state = State(bootstrapped=True)
+    messages: list[str] = []
+
+    _run_plan(tmp_path, plan, state, messages)
+
+    assert [task["id"] for task in state.task_queue] == ["task-001"]
+    assert any("task-002" in line and "nie istnieje na dysku" in line
+               for line in messages)
+    assert any("task-003" in line and "nie podał pliku" in line
+               for line in messages)
+    entries = ledger.tail(str(tmp_path))
+    assert "plan: zadeklarowano 3, przyjęto 1 (odsiew: task-002, task-003)" in entries
+
+
+def test_sift_streak_survives_batches_the_ledger_window_cannot_hold(
+        tmp_path) -> None:
+    """Jeden wsad ośmiu zadań to kilkadziesiąt wpisów, więc dwa kolejne odsiewy
+    nigdy nie zmieszczą się razem ani w oknie mistrza (20 linii), ani w całej
+    pamięci dziennika (80). Seria musi więc żyć w stanie, nie w dzienniku."""
+    _plan_repo(tmp_path)
+    sifted = ('{"tasks":[{"id":"task-001","title":"Nie zapisane",'
+              '"file":".forge/tasks/task-001.md"},'
+              '{"id":"task-002","title":"Też nie","file":".forge/tasks/task-002.md"},'
+              '{"id":"task-003","title":"Jest","file":".forge/tasks/task-003.md"}]}')
+    (tmp_path / ".forge" / "tasks" / "task-003.md").write_text(
+        "Cel: cokolwiek\n", encoding="utf-8")
+    state = State(bootstrapped=True)
+
+    _run_plan(tmp_path, sifted, state, [])
+    assert state.plan_sift_streak == 1
+
+    # Wsad zadań między jednym planowaniem a drugim wypycha stary wpis z okna.
+    for index in range(ledger.KEEP_LINES + 5):
+        ledger.append(str(tmp_path), f"task-003 r{index} tester→red pliki=bez_zmian: x")
+    assert "zadeklarowano" not in ledger.tail(str(tmp_path))
+
+    _run_plan(tmp_path, sifted, state, [])
+    assert state.plan_sift_streak == 2
+
+    full = ('{"tasks":[{"id":"task-003","title":"Jest",'
+            '"file":".forge/tasks/task-003.md"}]}')
+    _run_plan(tmp_path, full, state, [])
+    assert state.plan_sift_streak == 0
+
+
+def test_full_batch_leaves_no_sift_entry_in_the_ledger(tmp_path) -> None:
+    _plan_repo(tmp_path)
+    (tmp_path / ".forge" / "tasks" / "task-001.md").write_text(
+        "Cel: cokolwiek\n", encoding="utf-8")
+    plan = ('{"tasks":[{"id":"task-001","title":"Jest",'
+            '"file":".forge/tasks/task-001.md"}]}')
+
+    _run_plan(tmp_path, plan, State(bootstrapped=True), [])
+
+    entries = ledger.tail(str(tmp_path))
+    assert "zadeklarowano" not in entries
+    assert "plan: utworzono 1 zadań (task-001…task-001)" in entries
+
+
+def test_whole_batch_sifted_still_fails_the_phase_explicitly(tmp_path) -> None:
+    """Widoczny odsiew jest addytywny: nie wolno mu przesłonić starego błędu.
+    Wpis zbiorczy ma za to przeżyć checkpoint — wsad odsiany w całości jest
+    najmocniejszym sygnałem, jaki mistrz może dostać o planiście."""
+    _plan_repo(tmp_path)
+    plan = ('{"tasks":[{"id":"task-001","title":"Nie zapisane",'
+            '"file":".forge/tasks/task-001.md"}]}')
+
+    with pytest.raises(AgentError, match="żadnego poprawnego zadania"):
+        _run_plan(tmp_path, plan, State(bootstrapped=True), [])
+
+    assert "plan: zadeklarowano 1, przyjęto 0" in ledger.tail(str(tmp_path))
 
 
 def test_all_tasks_rejected_stops_the_batch_explicitly(tmp_path) -> None:

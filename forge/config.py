@@ -221,6 +221,23 @@ class Config:
     master_agent: str = os.environ.get("FORGE_MASTER_AGENT", "opencode")
     master_model: str = os.environ.get("FORGE_MASTER_MODEL", "")
     master_effort: str = os.environ.get("FORGE_MASTER_EFFORT", "")
+    # Deterministyczna bramka przed mistrzem (patrz master_gate.py):
+    #   off    — mistrz wołany co rundę (DOMYŚLNIE);
+    #   shadow — bramka liczy się i loguje, ale mistrz jest wołany normalnie;
+    #   on     — pusty trigger wycisza wywołanie.
+    #
+    # Domyślnie `off` decyzją, nie przez ostrożność. Bilans jest jednoznacznie
+    # zły: mistrz to ~2,7% tokenów Claude'a i ~5% rachunku, więc wyciszenie go
+    # oszczędza kilka procent. Po drugiej stronie stoi pojedyncza pominięta
+    # interwencja — pętla, której nikt nie przerwał, kosztuje rundy po ~500 tys.
+    # tokenów wejścia każda, a przy `max_tdd_rounds` kończy się `git reset
+    # --hard` i utratą CAŁEJ pracy nad zadaniem. Kilkuprocentowa oszczędność
+    # przeciw ryzyku straty rzędu setek procent kosztu zadania to zakład
+    # asymetryczny w złą stronę.
+    #
+    # `shadow` zostaje dostępne: nigdy nie wycisza mistrza, kosztuje jedną
+    # linię logu na wywołanie i pozwala zmierzyć bramkę, gdyby temat wrócił.
+    master_gate: str = os.environ.get("FORGE_MASTER_GATE", "off")
 
     # Recenzent zadania: pusty agent = agent testera, ale ZAWSZE świeży
     # kontekst (bez sesji i dziennika) — autor nie recenzuje własnej pracy.
