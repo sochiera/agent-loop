@@ -167,15 +167,25 @@ class Config:
     # którym błąd kumuluje się na cały projekt.
     #
     # Górna granica jest jakościowa, nie kosztowa: dalsze zadania wsadu planuje
-    # się na coraz starszym stanie repo. Stąd 6, nie 8.
-    batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "6"))
+    # się na coraz starszym stanie repo. Stąd 8: przy wsadzie 6 planista
+    # przypada 0,167 raza na zadanie, przy 8 — 0,125, czyli ~25% mniej jego
+    # (najdroższego stałego) kosztu. 10 dopiero po pomiarze odsiewu planisty
+    # (wpis `plan: zadeklarowano N, przyjęto M`) i zadań padłych na round_limit.
+    batch_size: int = int(os.environ.get("FORGE_BATCH_SIZE", "8"))
     # Co ile wsadów planisty przegląd kierunku ocenia, dokąd idzie projekt.
     # Backlog jest z założenia krótki, więc to ten przegląd, a nie bootstrap,
     # odpowiada za rozwój zakresu projektu w czasie.
     #
-    # Liczy WSADY, nie zadania, więc idzie w parze z batch_size: 2×6 trzyma
-    # kadencję na 12 zadaniach, czyli tam, gdzie było przy 3×4. Podniesienie
-    # wsadu bez zejścia tutaj kupiłoby oszczędność opóźnieniem korekty kursu.
+    # Liczy WSADY, nie zadania, więc iloczyn z batch_size to dziś 2×8 = 16, a
+    # nie dawne ~12. Reguła „iloczyn ~12" była kalibrowana pod BŁĘDEM, który
+    # naprawia warunek pustej kolejki w `_steering_trigger`: przegląd trafiający
+    # w pełną kolejkę kosztował wtedy cały wsad planisty, więc ciasna kadencja
+    # była tanim ubezpieczeniem. Po naprawie przegląd zawsze ląduje na granicy
+    # wsadów z pustą kolejką, a jedynym kosztem luźniejszej kadencji jest
+    # opóźniona korekta kursu. Zejście do 1 kupowałoby ją za +50% wywołań roli
+    # chodzącej na poziomie `max` — czyli za oszczędność, dla której podnieśliśmy
+    # wsad. Wyzwalacz odwrotu: wzrost odsetka przeglądów z `replan=true` albo
+    # zauważalny dryf kierunku → FORGE_STEERING_BATCHES=1.
     steering_batches: int = int(os.environ.get("FORGE_STEERING_BATCHES", "2"))
     # Budżet recenzji bootstrapu i przeglądu kierunku. Wyczerpanie oznacza, że
     # rozbieżności nie da się rozstrzygnąć bez decyzji użytkownika.

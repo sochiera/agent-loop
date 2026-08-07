@@ -358,13 +358,25 @@ def _steering_trigger(cfg: Config, project: str, state: State) -> str:
 
     Zmiana briefu wygrywa z kadencją: to najmocniejsze wejście, jakie przegląd
     może dostać, i chcemy je zobaczyć w promptcie nawet wtedy, gdy licznik
-    wsadów akurat też dojrzał.
+    wsadów akurat też dojrzał. `backlog` też jest natychmiastowy — ustawia go
+    dokładnie wyczerpany backlog, więc kolejka i tak jest wtedy pusta.
     """
     if brief.changed(project, state.brief_digest, brief.read(cfg.brief_path)):
         return "brief"
     if state.steering_due:
         return "backlog"
-    if state.plan_batches - state.steered_at_batch >= cfg.steering_batches:
+    # Pusta kolejka NIE jest tu kosmetyką i nie wolno tego „uprościć" z
+    # powrotem. `plan_batches` rośnie w chwili ZAPLANOWANIA wsadu, a planowanie
+    # i start pierwszego zadania dzieją się w tej samej iteracji — więc bez
+    # tego warunku dojrzała kadencja wyzwalała przegląd zaraz po pierwszym
+    # zadaniu świeżego wsadu. Przy `replan=true` przegląd czyści CAŁĄ
+    # `task_queue`, co kasowało resztę dopiero co zaplanowanego wsadu razem z
+    # całym wywołaniem planisty (~520 tys. tokenów wejścia). Wyzwalacz jest
+    # sprawdzany PRZED blokiem planowania, więc z tym warunkiem przegląd trafia
+    # dokładnie na granicę wsadów: `replan` nie ma wtedy czego zniszczyć, a
+    # jednorazowa notatka przeglądu ląduje bezpośrednio przed planowaniem.
+    if (not state.task_queue
+            and state.plan_batches - state.steered_at_batch >= cfg.steering_batches):
         return "cadence"
     return ""
 

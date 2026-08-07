@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -143,6 +144,76 @@ def test_project_bootstrapped_before_the_mechanism_syncs_once(
     state.brief_digest = ""
 
     assert orchestrate._steering_trigger(cfg, str(project), state) == "brief"
+
+
+# --- Kolejność: kadencja czeka na pustą kolejkę ------------------------------
+
+def test_mature_cadence_waits_for_an_empty_queue(tmp_path: Path) -> None:
+    """`plan_batches` rośnie w chwili ZAPLANOWANIA wsadu, a planowanie i start
+    pierwszego zadania dzieją się w jednej iteracji. Bez tego warunku dojrzała
+    kadencja wyzwalała przegląd zaraz po pierwszym zadaniu świeżego wsadu, a
+    `replan` kasował resztę razem z całym wywołaniem planisty."""
+    project, state, cfg = _steered_repo(tmp_path)
+    state.plan_batches = cfg.steering_batches
+    state.task_queue = [{"id": "task-007", "title": "Świeżo zaplanowane"}]
+
+    assert orchestrate._steering_trigger(cfg, str(project), state) == ""
+
+    state.task_queue = []
+
+    assert orchestrate._steering_trigger(cfg, str(project), state) == "cadence"
+
+
+def test_changed_brief_still_wins_over_a_full_queue(tmp_path: Path) -> None:
+    """Regresja: zmiana briefu to najmocniejsze wejście przeglądu i ma wygrywać
+    z kolejką. Ta gałąź celowo NIE dostaje warunku pustej kolejki."""
+    project, state, cfg = _steered_repo(tmp_path)
+    state.task_queue = [{"id": "task-007", "title": "Świeżo zaplanowane"}]
+    _change_brief(cfg)
+
+    assert orchestrate._steering_trigger(cfg, str(project), state) == "brief"
+
+
+def test_exhausted_backlog_still_wins_over_a_full_queue(tmp_path: Path) -> None:
+    """Regresja: `steering_due` ustawia wyłącznie wyczerpany backlog."""
+    project, state, cfg = _steered_repo(tmp_path)
+    state.task_queue = [{"id": "task-007", "title": "Świeżo zaplanowane"}]
+    state.steering_due = True
+
+    assert orchestrate._steering_trigger(cfg, str(project), state) == "backlog"
+
+
+def test_cadence_review_lands_on_the_batch_boundary_and_loses_nothing(
+        tmp_path: Path) -> None:
+    """Scenariusz dwóch wsadów: przegląd wypada dopiero przy pustej kolejce,
+    więc `replan` nie ma czego zniszczyć — zero utraconych zadań."""
+    project, state, cfg = _steered_repo(tmp_path)
+    cfg = replace(cfg, steering_batches=1)
+    planned: list[list[dict]] = []
+
+    def plan(_cfg, _project, plan_state, _logf):
+        plan_state.plan_batches += 1
+        plan_state.task_queue = [
+            {"id": f"task-{plan_state.plan_batches:03d}{index}", "title": "x"}
+            for index in range(3)]
+        planned.append(list(plan_state.task_queue))
+        return {"no_more_tasks": False}
+
+    with patch("forge.orchestrate.phase_plan_batch", side_effect=plan), \
+         patch("forge.orchestrate.run_task", return_value=True) as run_task:
+        # Iteracja 1: brak kolejki → planowanie wsadu i start pierwszego zadania.
+        orchestrate.one_iteration(cfg, str(project), state)
+        # Kadencja jest już dojrzała, ale kolejka niepusta → nadal zadania.
+        state.task_queue.pop(0)
+        orchestrate.one_iteration(cfg, str(project), state)
+
+    assert run_task.call_count == 2
+    assert len(planned) == 1
+
+    # Dopiero po wyczerpaniu wsadu przegląd przejmuje iterację.
+    state.task_queue = []
+
+    assert orchestrate._steering_trigger(cfg, str(project), state) == "cadence"
 
 
 # --- Przebieg przeglądu ------------------------------------------------------
