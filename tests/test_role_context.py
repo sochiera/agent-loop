@@ -4,6 +4,12 @@ from forge import prompts
 from forge.state import State
 
 
+def _flat(text: str) -> str:
+    """Prompt jest zawijany dla czytelności — asercje mają pilnować treści,
+    nie miejsca łamania linii."""
+    return " ".join(text.split())
+
+
 def test_private_role_prompts_use_capsule_without_record_or_ledger() -> None:
     state = State(
         current_task={"id": "task-001", "file": "task.md"},
@@ -153,6 +159,28 @@ def test_confirmation_prompt_checks_targeted_gate_criteria_and_test_quality() ->
     assert "należy do Forge przed commitem" in prompt
     assert "Nie oceniaj jakości implementacji" in prompt
     assert "świeżego reviewera" in prompt
+
+
+def test_first_red_gate_maps_the_criteria_and_covers_more_than_one() -> None:
+    """Runda, nie test, jest w tej pętli jednostką kosztu: bez mapy kryteriów
+    tester odkrywa kolejne dopiero po zielonym i każde kupuje własną rundę."""
+    prompt = _flat(prompts.tester_task_prompt("task.md", "pytest -q"))
+
+    assert "KRYTERIA AKCEPTACJI z pliku zadania" in prompt
+    assert "Bramka ma pokrywać 2–3 kryteria naraz, nie jedno i nie wszystkie" in prompt
+    assert "świadomie odłożone wymień jawnie razem z powodem" in prompt
+    # Warunku czerwonej bramki nie wolno rozluźnić razem z jej poszerzeniem.
+    assert "KAŻDY test bramki kolekcjonuje się i pada na asercji kontraktu" in prompt
+    assert "minimalny czerwony test" not in prompt
+
+
+def test_confirmation_extends_the_gate_instead_of_opening_a_new_cycle() -> None:
+    prompt = _flat(prompts.tester_task_prompt(
+        "task.md", "pytest -q", confirmation=True))
+
+    assert "ROZSZERZ o nie bieżącą bramkę w TEJ rundzie" in prompt
+    assert "zamiast otwierać nowy cykl `red`" in prompt
+    assert "wymaga osobnej bramki" in prompt
 
 
 def test_confirmation_wins_over_sticky_regression_from_legacy_checkpoint() -> None:
