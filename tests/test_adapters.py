@@ -271,6 +271,8 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         """Routing providera musi trafić do argv, nie tylko do Config.role()."""
         for agent, role, difficulty, expected in (
             ("grok", "coder", "complex", ("grok-4.5", "medium")),
+            ("opencode", "reviewer", "standard",
+             ("zai-coding-plan/glm-5.2", "high")),
             ("opencode", "reviewer", "complex",
              ("zai-coding-plan/glm-5.2", "high")),
             ("opencode", "coder", "simple",

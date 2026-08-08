@@ -68,14 +68,14 @@ MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
         "strong": ("grok-4.5", "high"),
         "max": ("grok-4.5", "high"),
     },
-    # OpenCode jako most do dwóch dostawców: trzy niższe poziomy idą na tanią
-    # Lunę (reasoning_options: none/low/medium/high/xhigh/max), a dwa górne na
+    # OpenCode jako most do dwóch dostawców: dwa niższe poziomy idą na tanią
+    # Lunę (reasoning_options: none/low/medium/high/xhigh/max), a trzy górne na
     # GLM-5.2 z planu kodowego z.ai — ten model wystawia TYLKO dwa poziomy
     # wysiłku, "high" i "max", więc nie ma tu czego zejść niżej.
     "opencode": {
         "economy": ("openai/gpt-5.6-luna", "medium"),
         "efficient": ("openai/gpt-5.6-luna", "high"),
-        "balanced": ("openai/gpt-5.6-luna", "xhigh"),
+        "balanced": ("zai-coding-plan/glm-5.2", "high"),
         "strong": ("zai-coding-plan/glm-5.2", "high"),
         "max": ("zai-coding-plan/glm-5.2", "max"),
     },
