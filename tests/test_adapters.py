@@ -272,7 +272,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         for agent, role, difficulty, expected in (
             ("grok", "coder", "complex", ("grok-4.5", "medium")),
             ("opencode", "reviewer", "standard",
-             ("zai-coding-plan/glm-5.2", "high")),
+             ("openai/gpt-5.6-luna", "xhigh")),
             ("opencode", "reviewer", "complex",
              ("zai-coding-plan/glm-5.2", "high")),
             ("opencode", "coder", "simple",
