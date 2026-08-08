@@ -406,3 +406,72 @@ def test_workspace_sandbox_stays_available_as_an_opt_in_and_keeps_network(
     assert argv[argv.index("-s") + 1] == "workspace-write"
     assert "sandbox_workspace_write.network_access=true" in argv
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+
+
+def test_extract_json_reads_verdict_behind_unpaired_quote_in_prose() -> None:
+    """Polskie „…" domknięte ASCII-`"` rozjeżdżało ręczny skaner stanu stringów
+    i gubiło POPRAWNY werdykt agenta — cała tura szła do kosza."""
+    text = ('a „wybór osady dla rozkazów wojskowych" jest poza zakresem\n'
+            '{"verdict":"request_changes","notes":["konkret"]}')
+
+    assert agents.extract_json(text) == {
+        "verdict": "request_changes", "notes": ["konkret"]}
+
+
+def test_extract_json_falls_back_to_scan_when_fence_is_broken() -> None:
+    text = '```json\n{niepoprawny}\n```\n{"verdict":"approve","notes":[]}'
+
+    assert agents.extract_json(text) == {"verdict": "approve", "notes": []}
+
+
+def test_extract_json_prefers_last_fence_over_trailing_prose_object() -> None:
+    text = ('```json\n{"verdict":"approve","notes":[]}\n```\n'
+            'przykład formatu: {"verdict":"request_changes"}')
+
+    assert agents.extract_json(text) == {"verdict": "approve", "notes": []}
+
+
+def test_extract_json_rejects_truncated_batch_instead_of_returning_subtask() -> None:
+    """Urwana partia planisty musi dać None: zwrócenie ostatniego DOMKNIĘTEGO
+    podzadania podaje wywołującemu „poprawny" dict bez pola `tasks`, więc
+    korekta formatu nigdy nie startuje, a bieg umiera na mylącym błędzie."""
+    truncated = ('{"tasks":[{"id":"task-001","title":"a"},'
+                 '{"id":"task-002","title":"b"},{"id":"task-003","tit')
+
+    assert agents.extract_json(truncated) is None
+
+
+def test_extract_json_rejects_malformed_object_instead_of_nested_value() -> None:
+    assert agents.extract_json(
+        '{"verdict":"request_changes","notes":["a",],"meta":{"x":1}}') is None
+
+
+def test_extract_json_rejects_json_broken_by_unescaped_quote_in_value() -> None:
+    """Ten sam nawyk typograficzny WEWNĄTRZ wartości to już realnie zepsuty
+    JSON — nie wolno go ratować, bo retry ma dostać prawdziwy powód."""
+    assert agents.extract_json('{"verdict":"approve","notes":["a („b") c"]}') is None
+
+
+def test_extract_json_keeps_whole_batch_when_planner_output_is_valid() -> None:
+    data = agents.extract_json(
+        '{"tasks":[{"id":"task-001"},{"id":"task-002"}]}')
+
+    assert [task["id"] for task in data["tasks"]] == ["task-001", "task-002"]
+
+
+@pytest.mark.parametrize("prose", [
+    "Podsumowując,\n",                      # przecinek + nowa linia to zdanie
+    "Werdykt: ",                            # dwukropek prozy, nie klucza
+    "kod `if (x) {` psuje naiwny skan\n",   # niesparowana klamra w prozie
+    "",
+])
+def test_extract_json_treats_prose_before_verdict_as_prose(prose: str) -> None:
+    assert agents.extract_json(
+        prose + '{"verdict":"approve","notes":[]}') == {
+            "verdict": "approve", "notes": []}
+
+
+def test_extract_json_returns_none_without_any_object() -> None:
+    assert agents.extract_json("bez JSON-a") is None
+    assert agents.extract_json("") is None
+    assert agents.extract_json('[{"verdict":"approve"}]') is None

@@ -114,29 +114,51 @@ def _looks_like_limit(text: str) -> bool:
     return bool(_LIMIT_RE.search(text or ""))
 
 
-def _balanced_objects(text: str) -> list[str]:
-    """Zwróć wszystkie zbalansowane obiekty {...} z tekstu (ignorując nawiasy
-    w stringach). Kolejność wystąpienia."""
-    out, depth, start, in_str, esc = [], 0, -1, False, False
-    for i, ch in enumerate(text):
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
+def _is_nested_value(text: str, start: int) -> bool:
+    """Czy `{` w `start` jest wartością wewnątrz większej struktury JSON?
+
+    Dowodem jest `,` albo `[` przylegające w TEJ SAMEJ linii (agent pisze
+    werdykt zwarcie: `[{`, `},{`) albo `:` domykające klucz — czyli poprzedzone
+    cudzysłowem, jak w `"meta":{`. Przełamanie linii zostawiamy prozie, bo
+    „Podsumowując,\\n{…}" to zdanie, a nie zagnieżdżenie; z tego samego powodu
+    samo `:` nie wystarcza — „Werdykt: {…}" też jest zdaniem."""
+    i = start - 1
+    while i >= 0 and text[i] in " \t":
+        i -= 1
+    if i < 0:
+        return False
+    if text[i] in ",[":
+        return True
+    return text[i] == ":" and i > 0 and text[i - 1] == '"'
+
+
+def _scan_json_objects(text: str) -> list[dict]:
+    """Znajdź obiekty JSON najwyższego poziomu, próbując dekodować od każdego
+    `{`. Odporne na niesparowane cudzysłowy w otaczającej prozie (np. polskie
+    „…" domknięte ASCII-`"`), bo nie modeluje stanu string/nie-string poza
+    samym parserem JSON — po prostu pyta go o każdą pozycję.
+
+    Nieudany kandydat przesuwa skan do miejsca, w którym parser się wyłożył
+    (`e.pos`), a nie o jeden znak. Bez tego urwana partia planisty
+    (`{"tasks":[{…},{…},{"id":"task-003","tit`) zwracałaby ostatnie DOMKNIĘTE
+    podzadanie zamiast `None`: wywołujący dostawał „poprawny" dict bez pola,
+    którego szuka, więc korekta formatu nigdy nie startowała, a bieg umierał
+    później na mylącym błędzie."""
+    decoder = json.JSONDecoder()
+    out: list[dict] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
             continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}" and depth > 0:
-            depth -= 1
-            if depth == 0:
-                out.append(text[start:i + 1])
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError as exc:
+            i = max(exc.pos, i + 1)
+            continue
+        if not _is_nested_value(text, i):
+            out.append(obj)
+        i = max(end, i + 1)
     return out
 
 
@@ -314,20 +336,22 @@ def _usage_delta(cumulative: dict, baseline: dict | None) -> dict | None:
 def extract_json(text: str) -> dict | None:
     """Wyłuskaj OSTATNI poprawny blok JSON z odpowiedzi agenta.
 
-    Najpierw preferuje ogrodzenie ```json ...```; awaryjnie skanuje zbalansowane
-    obiekty {...} i próbuje od ostatniego (agent zwykle kończy werdyktem)."""
+    Najpierw próbuje ogrodzeń ```json ...``` (od ostatniego, agent zwykle
+    kończy werdyktem); dopiero gdy żadne nie da poprawnego obiektu, skanuje
+    cały tekst — fence, który się nie sparsował, nie może ukryć poprawnego
+    obiektu leżącego poza nim."""
     if not text:
         return None
     fences = re.findall(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
-    candidates = list(fences) or _balanced_objects(text)
-    for raw in reversed(candidates):
+    for raw in reversed(fences):
         try:
             obj = json.loads(raw)
             if isinstance(obj, dict):
                 return obj
         except json.JSONDecodeError:
             continue
-    return None
+    objects = _scan_json_objects(text)
+    return objects[-1] if objects else None
 
 
 def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,

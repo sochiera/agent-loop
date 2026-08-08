@@ -802,3 +802,60 @@ def test_second_invalid_decision_stops() -> None:
             lambda prompt: calls.append(prompt) or "still-not-json",
             orchestrate.parse_tester_decision)
     assert len(calls) == 2
+
+
+def test_second_invalid_decision_carries_both_raw_attempts() -> None:
+    answers = iter(("pierwsze wyjście", "drugie wyjście"))
+
+    with pytest.raises(InvalidDecision) as caught:
+        orchestrate._decision_with_retry(
+            "base", lambda _prompt: next(answers),
+            orchestrate.parse_tester_decision)
+
+    assert caught.value.raw_attempts == ["pierwsze wyjście", "drugie wyjście"]
+
+
+def test_dump_invalid_decision_writes_both_attempts(tmp_path: Path) -> None:
+    state = State()
+    state.current_task = {"id": "task-645"}
+    state.task_phase = "review"
+    exc = InvalidDecision("agent nie zwrócił poprawnego JSON-a")
+    exc.raw_attempts = ["surowe A", "surowe B"]
+
+    orchestrate._dump_invalid_decision(
+        str(tmp_path), Config(), state, exc)
+
+    dumps = list((tmp_path / ".forge" / "failed" / "task-645"
+                  / "invalid_json").glob("*.txt"))
+    assert len(dumps) == 1
+    body = dumps[0].read_text(encoding="utf-8")
+    assert "faza=review" in body
+    assert "agent nie zwrócił poprawnego JSON-a" in body
+    assert "surowe A" in body and "surowe B" in body
+
+
+def test_dump_invalid_decision_without_raw_attempts_writes_nothing(
+        tmp_path: Path) -> None:
+    orchestrate._dump_invalid_decision(
+        str(tmp_path), Config(), State(),
+        InvalidDecision("niedozwolony werdykt"))
+
+    assert not (tmp_path / ".forge").exists()
+
+
+def test_dump_invalid_decision_survives_unwritable_target(
+        tmp_path: Path) -> None:
+    """Zrzut biegnie w handlerze ostatniej szansy: OSError nie może zjeść
+    komunikatu o bezpiecznym zatrzymaniu ani kontraktu kodów wyjścia."""
+    state = State()
+    state.current_task = {"id": "task-645"}
+    blocker = tmp_path / ".forge" / "failed"
+    blocker.parent.mkdir(parents=True)
+    blocker.write_text("plik tam, gdzie orkiestrator chce katalog\n",
+                       encoding="utf-8")
+    exc = InvalidDecision("agent nie zwrócił poprawnego JSON-a")
+    exc.raw_attempts = ["surowe A", "surowe B"]
+
+    orchestrate._dump_invalid_decision(str(tmp_path), Config(), state, exc)
+
+    assert blocker.is_file()

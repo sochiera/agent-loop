@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import os
 import re
 import shutil
@@ -824,14 +825,47 @@ def _master_notes(cfg: Config, project: str, logf, *, task_id: str = "",
 
 def _decision_with_retry(prompt: str, invoke, parser):
     """Jedna tania korekta formatu, potem jawny błąd zamiast ukrytej pętli."""
+    first_raw = invoke(prompt)
     try:
-        return parser(invoke(prompt))
+        return parser(first_raw)
     except InvalidDecision as exc:
         reason = str(exc)[:500]
         retry_prompt = (
             prompt + _JSON_RETRY + f"\nPowód odrzucenia: {reason}\n"
         )
-        return parser(invoke(retry_prompt))
+        retry_raw = invoke(retry_prompt)
+        try:
+            return parser(retry_raw)
+        except InvalidDecision as retry_exc:
+            retry_exc.raw_attempts = [first_raw, retry_raw]
+            raise
+
+
+def _dump_invalid_decision(project: str, cfg: Config, state: State, exc: InvalidDecision) -> None:
+    """Zachowaj surowe wyjście agenta, które ubiło bieg: bez tego diagnoza
+    formatu po fakcie wymaga surowej telemetrii spoza projektu (jeśli w ogóle
+    przeżyła), zamiast jednego pliku obok checkpointu.
+
+    Zrzut jest best-effort i biegnie w handlerze ostatniej szansy: awaria
+    zapisu (pełny albo read-only dysk, plik w miejscu katalogu) nie może zjeść
+    komunikatu o bezpiecznym zatrzymaniu ani kontraktu kodów wyjścia."""
+    raw_attempts = getattr(exc, "raw_attempts", None)
+    if not raw_attempts:
+        return
+    task_id = (state.current_task or {}).get("id") or "_bez_zadania"
+    phase = state.task_phase or "nieznana"
+    dest = Path(project, cfg.runtime_dir, "failed", task_id, "invalid_json")
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    body = f"faza={phase}\npowód={exc}\n\n"
+    for i, raw in enumerate(raw_attempts, start=1):
+        body += f"===== próba {i}/{len(raw_attempts)} =====\n{raw}\n\n"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        dest.joinpath(f"{stamp}.txt").write_text(body, encoding="utf-8")
+    except OSError as io_exc:
+        log(f"  UWAGA: nie zapisano surowego wyjścia agenta ({io_exc})")
+        return
+    log(f"  Surowe wyjście agenta zapisane w {dest}/{stamp}.txt")
 
 
 def _parse_json_object(text: str) -> dict:
@@ -1634,6 +1668,8 @@ def main(argv: list[str] | None = None) -> int:
             state.save(str(path)); count += 1
     except (AgentError, InvalidDecision, LimitExhausted) as exc:
         state.save(str(path))
+        if isinstance(exc, InvalidDecision):
+            _dump_invalid_decision(args.project, cfg, state, exc)
         print(f"Forge zatrzymany bezpiecznie: {exc}. Checkpoint zapisano w {path}.",
               file=__import__("sys").stderr, flush=True)
         return 3 if isinstance(exc, LimitExhausted) else 1
