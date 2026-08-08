@@ -141,6 +141,22 @@ def test_local_model_is_free_because_the_cost_is_electricity() -> None:
     assert pricing.rates("opencode", "neuralwatt/glm-5.2-flex") is None
 
 
+def test_subscription_models_are_priced_at_api_list_rates() -> None:
+    """Abonament nie może udawać zera — wyceniamy pracę, nie fakturę."""
+    # Luna chodzi na OAuth konta, GLM-5.2 na Coding Planie; oba mimo to
+    # dostają stawkę katalogową API, bo tylko ona jest porównywalna
+    # między providerami.
+    assert pricing.cost_usd("opencode", "openai/gpt-5.6-luna",
+                            (1_000_000, 1_000_000, 1_000_000, 1_000_000)) \
+        == pytest.approx(0.20 + 0.25 + 0.02 + 1.20)
+    assert pricing.cost_usd("opencode", "zai-coding-plan/glm-5.2",
+                            (1_000_000, 0, 1_000_000, 1_000_000)) \
+        == pytest.approx(1.40 + 0.26 + 4.40)
+    # Pozostałe endpointy tego samego modelu mają ten sam cennik katalogowy.
+    assert pricing.rates("opencode", "zai/glm-5.2") \
+        == pricing.rates("opencode", "zai-coding-plan/glm-5.2")
+
+
 def test_claude_cost_uses_all_four_rates() -> None:
     cost = pricing.cost_usd("claude", "opus",
                             (1_000_000, 1_000_000, 1_000_000, 1_000_000))

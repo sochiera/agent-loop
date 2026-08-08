@@ -48,7 +48,7 @@ ROLE_MODEL_LEVELS: dict[str, dict[str, str]] = {
 # konfiguracji. Poziom modelu wynika osobno z roli i trudności zadania.
 MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
     "codex": {
-        "economy": ("gpt-5.6-luna", "high"),
+        "economy": ("gpt-5.6-luna", "medium"),
         "efficient": ("gpt-5.6-luna", "high"),
         "balanced": ("gpt-5.6-luna", "xhigh"),
         "strong": ("gpt-5.6-terra", "high"),
@@ -68,15 +68,16 @@ MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
         "strong": ("grok-4.5", "high"),
         "max": ("grok-4.5", "high"),
     },
-    # Lokalny llama.cpp przez opencode. Wariant z reasoningiem jest świadomie
-    # używany na trzech najniższych poziomach; alias modelu jest związany z
-    # usługą llama-qwen36-coder.service i plikiem UD-Q4_K_XL.
+    # OpenCode jako most do dwóch dostawców: trzy niższe poziomy idą na tanią
+    # Lunę (reasoning_options: none/low/medium/high/xhigh/max), a dwa górne na
+    # GLM-5.2 z planu kodowego z.ai — ten model wystawia TYLKO dwa poziomy
+    # wysiłku, "high" i "max", więc nie ma tu czego zejść niżej.
     "opencode": {
-        "economy": ("llamacpp/qwen36-coder", ""),
-        "efficient": ("llamacpp/qwen36-coder", ""),
-        "balanced": ("llamacpp/qwen36-coder", ""),
-        "strong": ("neuralwatt/glm-5.2-short-flex", "medium"),
-        "max": ("neuralwatt/glm-5.2-flex", "high"),
+        "economy": ("openai/gpt-5.6-luna", "medium"),
+        "efficient": ("openai/gpt-5.6-luna", "high"),
+        "balanced": ("openai/gpt-5.6-luna", "xhigh"),
+        "strong": ("zai-coding-plan/glm-5.2", "high"),
+        "max": ("zai-coding-plan/glm-5.2", "max"),
     },
     # Kiro użyje tych wartości tylko, gdy jego szablon CLI zawiera {model}/{effort}.
     "kiro": {

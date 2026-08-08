@@ -207,7 +207,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         self.assertEqual(cfg.role("tester", "complex"),
                          ("codex", "gpt-5.6-luna", "xhigh"))
         self.assertEqual(cfg.role("coder", "simple"),
-                         ("codex", "gpt-5.6-luna", "high"))
+                         ("codex", "gpt-5.6-luna", "medium"))
         self.assertEqual(cfg.role("coder", "standard"),
                          ("codex", "gpt-5.6-luna", "high"))
 
@@ -272,9 +272,9 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         for agent, role, difficulty, expected in (
             ("grok", "coder", "complex", ("grok-4.5", "medium")),
             ("opencode", "reviewer", "complex",
-             ("neuralwatt/glm-5.2-short-flex", "medium")),
+             ("zai-coding-plan/glm-5.2", "high")),
             ("opencode", "coder", "simple",
-             ("llamacpp/qwen36-coder", "")),
+             ("openai/gpt-5.6-luna", "medium")),
         ):
             cfg = Config(**{f"{role}_agent": agent})
             _, model, effort = cfg.role(role, difficulty)

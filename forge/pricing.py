@@ -47,6 +47,31 @@ LOCAL_PREFIXES = ("llamacpp/",)
 # uzupełnienie było jedną linią, a nie nową gałęzią w ``rates``.
 NEURALWATT_RATES: dict[str, Rates] = {}
 
+# Cennik KATALOGOWY API (models.dev) dla modeli wołanych przez opencode,
+# kluczowany pełnym ``provider/model``.
+#
+# To ŚWIADOMY rozdźwięk z fakturą: Luna chodzi na OAuth konta, a GLM-5.2 na
+# abonamencie Coding Plan, więc realnie te tokeny kosztują mniej albo nic.
+# Wyceniamy je mimo to stawką „jak po API", bo ``$/zadanie`` ma mierzyć pracę
+# modelu i pozwalać porównywać przebiegi między providerami — a nie to, który
+# abonament akurat mamy wykupiony. Liczba jest więc górnym ograniczeniem
+# kosztu, nie rachunkiem do zapłaty.
+#
+# Dwa zastrzeżenia do samych liczb:
+# * Luna ma próg kontekstu — powyżej 272k tokenów wszystkie cztery stawki
+#   podwajają się (0,40 / 0,50 / 0,04 / 1,80). Czwórka stawek nie ma wymiaru
+#   „rozmiar kontekstu", więc trzymamy próg dolny i świadomie zaniżamy wycenę
+#   najdłuższych sesji.
+# * Zera w kolumnie zapisu cache'u dla GLM to FAKT z cennika z.ai (ten
+#   provider nie rozlicza zapisu osobno), a nie brak danych.
+API_LIST_RATES: dict[str, Rates] = {
+    #                            in    cache_write  cache_read    out
+    "openai/gpt-5.6-luna":     (0.20,  0.25,        0.02,        1.20),
+    "zai-coding-plan/glm-5.2": (1.40,  0.00,        0.26,        4.40),
+    "zai/glm-5.2":             (1.40,  0.00,        0.26,        4.40),
+    "zhipuai/glm-5.2":         (1.40,  0.00,        0.26,        4.40),
+}
+
 
 def _codex_anchor() -> tuple[float, float]:
     """Kotwica cenowa Sola (wejście, wyjście) w USD/mln; 0 = brak wyceny.
@@ -81,6 +106,9 @@ def rates(agent: str, model: str) -> Rates | None:
                 anchor_out * multiplier)
     if model.startswith(LOCAL_PREFIXES):
         return (0.0, 0.0, 0.0, 0.0)
+    listed = API_LIST_RATES.get(model.lower())
+    if listed is not None:
+        return listed
     if model.startswith("neuralwatt/"):
         return NEURALWATT_RATES.get(model)
     return None
