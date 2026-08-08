@@ -57,7 +57,7 @@ MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
     "claude": {
         "economy": ("haiku", ""),
         "efficient": ("sonnet", "low"),
-        "balanced": ("opus", "low"),
+        "balanced": ("sonnet", "low"),
         "strong": ("opus", "medium"),
         "max": ("opus", "high"),
     },
