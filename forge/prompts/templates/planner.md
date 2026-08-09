@@ -35,8 +35,9 @@ podobnej funkcji.
 Jeśli kryterium zależy od zachowania konkretnej wersji narzędzia lub silnika,
 zweryfikuj je uruchomieniem i zapisz wynik w zadaniu. Dla każdego zadania
 podaj `depends_on` jako listę identyfikatorów wcześniejszych zadań, od których
-naprawdę zależy.
+naprawdę zależy, oraz `story` z ID historyjki z BACKLOG.md. Puste `story` jest
+dozwolone wyłącznie dla długu technicznego lub dokumentacyjnego.
 
 Nie commituj. JSON:
 {{JSON_RULES}}
-{"no_more_tasks":false,"tasks":[{"id":"task-{{START_INDEX}}","title":"...","file":".forge/tasks/task-{{START_INDEX}}.md","depends_on":[],"difficulty":"standard"}]}.
+{"no_more_tasks":false,"tasks":[{"id":"task-{{START_INDEX}}","title":"...","file":".forge/tasks/task-{{START_INDEX}}.md","story":"US-007","depends_on":[],"difficulty":"standard"}]}.

@@ -22,17 +22,18 @@ MODEL_LEVELS = ("economy", "efficient", "balanced", "strong", "max")
 # Trudność opisuje zakres zadania, a poziom modelu politykę routingu providera.
 ROLE_MODEL_LEVELS: dict[str, dict[str, str]] = {
     "bootstrap": {d: "max" for d in TASK_DIFFICULTIES},
-    # Przegląd kierunku rozstrzyga, dokąd idzie projekt — myli się raz, a skutek
+    # Product Owner rozstrzyga, dokąd idzie projekt — myli się raz, a skutek
     # niesie cały dalszy plan. Jego recenzent ma tę samą wagę: to ostatnia
     # bramka przed propagacją błędnego kierunku na wszystkie kolejne zadania.
-    "diff_bootstrap": {d: "max" for d in TASK_DIFFICULTIES},
+    "product_owner": {d: "max" for d in TASK_DIFFICULTIES},
+    "po_reviewer": {d: "strong" for d in TASK_DIFFICULTIES},
     "bootstrap_reviewer": {d: "max" for d in TASK_DIFFICULTIES},
     "planner": {d: "strong" for d in TASK_DIFFICULTIES},
     "planner_escalation": {d: "max" for d in TASK_DIFFICULTIES},
     "tester": {"simple": "efficient", "standard": "balanced", "complex": "balanced"},
     "coder": {"simple": "economy", "standard": "efficient", "complex": "balanced"},
     "reviewer": {"simple": "efficient", "standard": "balanced", "complex": "strong"},
-    "verifier": {"simple": "economy", "standard": "efficient", "complex": "balanced"},
+    "verifier": {d: "strong" for d in TASK_DIFFICULTIES},
     # Mistrz czyta kilkadziesiąt krótkich linii dziennika i nigdy nie czyta
     # kodu — to rozpoznawanie wzorca, nie rozumowanie o implementacji. Wołany
     # co rundę, więc dla prostych i standardowych zadań dostaje efficient,
@@ -187,6 +188,10 @@ class Config:
     # wsad. Wyzwalacz odwrotu: wzrost odsetka przeglądów z `replan=true` albo
     # zauważalny dryf kierunku → FORGE_STEERING_BATCHES=1.
     steering_batches: int = int(os.environ.get("FORGE_STEERING_BATCHES", "2"))
+    # Próg wyzwalacza refill; nie jest limitem jakości backlogu.
+    backlog_low_water: int = int(os.environ.get("FORGE_BACKLOG_LOW_WATER", "2"))
+    # Miękki sufit dla recenzenta PO; migracja może go legalnie przekroczyć.
+    max_backlog_stories: int = int(os.environ.get("FORGE_MAX_BACKLOG_STORIES", "6"))
     # Budżet recenzji bootstrapu i przeglądu kierunku. Wyczerpanie oznacza, że
     # rozbieżności nie da się rozstrzygnąć bez decyzji użytkownika.
     max_bootstrap_reviews: int = int(
@@ -254,7 +259,6 @@ class Config:
     reviewer_agent: str = os.environ.get("FORGE_REVIEWER_AGENT", "opencode")
     reviewer_model: str = os.environ.get("FORGE_REVIEWER_MODEL", "neuralwatt/glm-5.2-flex")
     reviewer_effort: str = os.environ.get("FORGE_REVIEWER_EFFORT", "")
-
     # Przed rollbackiem przy porażce: branch forge/failed/<id> na HEAD (+ residual commit).
     keep_failed_ref: bool = os.environ.get("FORGE_KEEP_FAILED_REF", "1") != "0"
 
@@ -295,7 +299,8 @@ class Config:
             "planner_escalation": (self.planner_agent, self.planner_model, self.planner_effort),
             # Bootstrap używa agenta planisty, lecz ma własną politykę poziomu.
             "bootstrap": (self.planner_agent, self.planner_model, self.planner_effort),
-            "diff_bootstrap": (self.planner_agent, self.planner_model, self.planner_effort),
+            "product_owner": (self.planner_agent, self.planner_model, self.planner_effort),
+            "po_reviewer": (self.planner_agent, self.planner_model, self.planner_effort),
             "bootstrap_reviewer": (self.planner_agent, self.planner_model, self.planner_effort),
             "tester": (self.tester_agent, self.tester_model, self.tester_effort),
             "coder": (self.coder_agent, self.coder_model, self.coder_effort),
@@ -322,7 +327,8 @@ class Config:
         # Jawne ustawienie planisty jest intencją operatora; routing trudności
         # dotyczy wykonawców pojedynczego zadania.
         if (name in {"planner", "planner_escalation", "bootstrap",
-                     "diff_bootstrap", "bootstrap_reviewer"}
+                     "product_owner", "po_reviewer",
+                     "bootstrap_reviewer"}
                 and configured_model):
             return (agent, *self._role_model_effort(agent, configured_model, configured_effort))
         canonical = adapters.canonical_agent(agent)

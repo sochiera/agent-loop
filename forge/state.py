@@ -11,17 +11,25 @@ from .task_pipeline import TASK_PHASES
 @dataclass
 class State:
     bootstrapped: bool = False
-    # Skrót briefu zaakceptowany przez ostatni bootstrap albo diff-bootstrap.
+    # Skrót briefu zaakceptowany przez ostatni bootstrap albo Product Ownera.
     # Pusty przy projekcie sprzed tego mechanizmu → pierwsza synchronizacja.
     brief_digest: str = ""
     iteration: int = 0
     plan_batches: int = 0
-    # --- Zwinne sterowanie kierunkiem (diff-bootstrap) ----------------------
+    # --- Zwinne sterowanie kierunkiem (Product Owner) ------------------------
     # Kadencja przeglądu: numer wsadu i commit ostatniego przeglądu kierunku.
     steered_at_batch: int = 0
     steered_at_sha: str = ""
     # Wyczerpany backlog prosi o przegląd, zamiast kończyć projekt.
     steering_due: bool = False
+    # Product Owner: ostatni wsad, w którym wykonano refill, oraz świeżość
+    # raportu historyjek. Nazwy steering_* pozostają dla migracji STATE.json.
+    # -1 to sentinel „nigdy": żaden prawdziwy `plan_batches` (>= 0) go nie
+    # trafi przypadkiem, więc pierwszy refill zawsze przechodzi przez strażnika
+    # pętli, nawet gdy `plan_batches` wciąż wynosi 0.
+    po_refill_batch: int = -1
+    stories_verified_at_batch: int = 0
+    stories_verified_sha: str = ""
     # Krótki ostatni wsad oznacza drenaż backlogu. Nie ustawiamy tu
     # ``steering_due``: ono nie ma strażnika pustej kolejki.
     batch_drained: bool = False
@@ -65,6 +73,9 @@ class State:
     ci_status_cmd: str = ""
     ci_logs_cmd: str = ""
     verify_cycle: int = 0
+    # Product Owner: stan migracji BACKLOG.md. Brak pola w starym STATE.json
+    # oznacza brak migracji i jest uzupełniany deterministycznie przez preflight.
+    backlog_migrated: bool = False
 
     @classmethod
     def load(cls, path: str) -> "State":

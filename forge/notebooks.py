@@ -19,6 +19,25 @@ _TEMPLATES = {
 """,
 }
 
+PROJECT_NOTEBOOKS = {
+    "product-owner": "# Notatnik Product Ownera\n\n## Obserwacje\n"
+}
+
+
+def project_path(project: str, runtime_dir: str, role: str) -> Path:
+    """Ścieżka notatnika projektu, poza katalogami pojedynczych tasków."""
+    if role not in PROJECT_NOTEBOOKS:
+        raise ValueError(f"nieznany notatnik projektu: {role}")
+    return Path(project, runtime_dir, "notebooks", f"{role}.md")
+
+
+def ensure_project(project: str, runtime_dir: str) -> None:
+    for role, template in PROJECT_NOTEBOOKS.items():
+        path = project_path(project, runtime_dir, role)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(template, encoding="utf-8")
+
 # Nietknięty notatnik po zmianie szablonu roli nadal musi być rozpoznawany jako
 # pusty — inaczej archiwum porzuconego zadania dostałoby „diagnostykę”, która
 # jest samym nagłówkiem, a wznowione zadanie wnosiłoby te nagłówki do każdej
@@ -224,6 +243,12 @@ def prune_orphans(
     for directory in root.iterdir():
         if directory.is_dir() and directory.name != active_task_id:
             shutil.rmtree(directory, ignore_errors=True)
+    # Notatniki projektu żyją bezpośrednio w katalogu `notebooks`, a nie pod
+    # identyfikatorem taska; housekeeping nie może ich pomylić z sierotą.
+    for role in PROJECT_NOTEBOOKS:
+        path = root / f"{role}.md"
+        if path.exists() and not path.is_file():
+            shutil.rmtree(path, ignore_errors=True)
     try:
         root.rmdir()
     except OSError:

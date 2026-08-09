@@ -15,10 +15,12 @@ from .agents import (AgentError, LimitExhausted, _extract_json_detail, extract_j
                      log, run_agent, run_agent_session, run_planner)
 from .config import Config, DEFAULT_TASK_DIFFICULTY, TASK_DIFFICULTIES
 from . import brief
+from . import backlog
 from . import ledger
 from . import master_gate
 from . import notebooks
 from . import prompts
+from . import preflight
 from . import verify
 from .shellrun import run_shellfree
 from .state import State
@@ -76,8 +78,8 @@ def _require_clean(project: str, phase: str) -> None:
     dirty = git(project, "status", "--porcelain").stdout.strip()
     if dirty:
         raise AgentError(
-            f"drzewo robocze nie jest czyste przed {phase}; zatwierdź lub odłóż "
-            f"własne zmiany:\n{dirty[:2000]}")
+            f"niezmiennik Forge złamany: drzewo robocze nie jest czyste przed "
+            f"{phase}; preflight powinien był je obsłużyć:\n{dirty[:2000]}")
 
 
 def commit_all(project: str, message: str, cfg: Config | None = None) -> None:
@@ -150,7 +152,60 @@ def build_task_from_plan(project: str, raw: dict) -> dict:
     return {"id": str(raw.get("id", "")), "title": raw.get("title", "(bez tytułu)"),
             "file": raw.get("file", ""),
             "difficulty": difficulty,
+            "story": str(raw.get("story", "") or "").strip(),
             "depends_on": [str(item) for item in dependencies if str(item)]}
+
+
+def _warn_unknown_story(project: str, task: dict) -> None:
+    story = str(task.get("story", "")).strip()
+    if not story:
+        return
+    known, _orphans = backlog.load(project)
+    if story not in {item.id for item in known}:
+        message = (f"plan: ostrzeżenie — {task.get('id', '?')} wskazuje "
+                   f"nieznaną historyjkę {story}")
+        log(message)
+        ledger.append(project, message)
+
+
+def _set_story_status(project: str, story_id: str, status: str,
+                      reason: str = "") -> bool:
+    if not story_id:
+        return False
+    path = Path(project, "BACKLOG.md")
+    if not path.is_file():
+        return False
+    try:
+        old = path.read_text(encoding="utf-8")
+        new = backlog.set_status(old, story_id, status, reason)
+    except KeyError:
+        ledger.append(project, f"story: ostrzeżenie — nieznana historyjka {story_id}")
+        return False
+    if new != old:
+        path.write_text(new, encoding="utf-8")
+        ledger.append(project, f"story: {story_id} → {status}")
+        return True
+    return False
+
+
+def _story_status(project: str, story_id: str) -> str:
+    stories, _ = backlog.load(project)
+    for story in stories:
+        if story.id == story_id:
+            return story.status
+    return ""
+
+
+def stories_touched_since(project: str, sha: str = "") -> set[str]:
+    """Historyjki z ukończonych tasków; SHA jest markerem świeżości raportu."""
+    del sha  # ledger jest runtime'em i nie jest commitowany razem ze zmianą taska.
+    found: set[str] = set()
+    pattern = re.compile(r"task-\d+ UKOŃCZONE(?:\s+\((US-\d{3})\))?")
+    for line in ledger.tail(project, ledger.KEEP_LINES).splitlines():
+        match = pattern.search(line)
+        if match and match.group(1):
+            found.add(match.group(1))
+    return found
 
 
 def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
@@ -210,6 +265,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
             sifted.append(task["id"])
             continue
         tasks.append(task)
+        _warn_unknown_story(project, task)
     # Seria liczy się przez WSADY, a nie przez wpisy dziennika: jeden odsiew to
     # szum (planista bywa ucięty przez limit), dopiero powtórzony znaczy, że
     # `batch_size` przekroczył jego zdolność domykania wsadu.
@@ -236,6 +292,12 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
         ledger.append(project, "plan: planista zgłosił brak dalszych zadań")
         state.empty_plans += 1
     state.task_queue = tasks
+    for task in tasks:
+        story = str(task.get("story", "")).strip()
+        if story and _story_status(project, story) == "do weryfikacji":
+            # Nowy wsad świadomie dokłada pracę do wcześniej zamkniętej
+            # historyjki; to normalny powrót do stanu `w toku`, nie regres.
+            _set_story_status(project, story, "w toku")
     # Wsad wyraźnie krótszy od zamówionego jest jedynym sygnałem drenażu,
     # który mamy bez czytania BACKLOG.md przed następnym planowaniem.
     state.batch_drained = len(tasks) * 2 < cfg.batch_size
@@ -248,7 +310,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
 
 def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
                         attempt, review_prompt, log_phase: str,
-                        base_sha: str = "") -> dict:
+                        base_sha: str = "", reviewer_role: str = "bootstrap_reviewer") -> dict:
     """Buduj i recenzuj, aż recenzent zaakceptuje albo skończy się budżet.
 
     Bootstrap i przegląd kierunku wyznaczają kierunek całej dalszej pracy, więc
@@ -266,7 +328,7 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
     się jako jedyny wynik jego tury: cokolwiek zostawił w drzewie i w historii,
     wraca do stanu, który sam oglądał.
     """
-    reviewer, model, effort = cfg.role("bootstrap_reviewer")
+    reviewer, model, effort = cfg.role(reviewer_role)
     notes: list[str] = []
     for round_number in range(1, cfg.max_bootstrap_reviews + 1):
         data = attempt(notes)
@@ -371,41 +433,25 @@ def _steering_path(cfg: Config, project: str) -> Path:
     return Path(project, cfg.runtime_dir, "steering.md")
 
 
-def _steering_trigger(cfg: Config, project: str, state: State) -> str:
-    """Powód uruchomienia przeglądu kierunku albo pusty string.
-
-    Zmiana briefu wygrywa z kadencją: to najmocniejsze wejście, jakie przegląd
-    może dostać, i chcemy je zobaczyć w promptcie nawet wtedy, gdy licznik
-    wsadów akurat też dojrzał. `backlog` też jest natychmiastowy — ustawia go
-    dokładnie wyczerpany backlog, więc kolejka i tak jest wtedy pusta.
-    """
+def _po_trigger(cfg: Config, project: str, state: State) -> str:
+    """Wyzwalacze Product Ownera: brief, refill, potem kadencja."""
     if brief.changed(project, state.brief_digest, brief.read(cfg.brief_path)):
         return "brief"
+    if state.current_task or state.task_queue:
+        return ""
+    stories, _orphans = backlog.load(project)
+    if not state.backlog_migrated:
+        return "refill"
+    if (backlog.count_open(stories) < cfg.backlog_low_water
+            and state.po_refill_batch != state.plan_batches):
+        return "refill"
     if state.steering_due:
-        return "backlog"
-    # Pusta kolejka NIE jest tu kosmetyką i nie wolno tego „uprościć" z
-    # powrotem. `plan_batches` rośnie w chwili ZAPLANOWANIA wsadu, a planowanie
-    # i start pierwszego zadania dzieją się w tej samej iteracji — więc bez
-    # tego warunku dojrzała kadencja wyzwalała przegląd zaraz po pierwszym
-    # zadaniu świeżego wsadu. Przy `replan=true` przegląd czyści CAŁĄ
-    # `task_queue`, co kasowało resztę dopiero co zaplanowanego wsadu razem z
-    # całym wywołaniem planisty (~520 tys. tokenów wejścia). Wyzwalacz jest
-    # sprawdzany PRZED blokiem planowania, więc z tym warunkiem przegląd trafia
-    # dokładnie na granicę wsadów: `replan` nie ma wtedy czego zniszczyć, a
-    # jednorazowa notatka przeglądu ląduje bezpośrednio przed planowaniem.
-    if (not state.task_queue and (
-            state.plan_batches - state.steered_at_batch >= cfg.steering_batches
-            or state.batch_drained)):
+        return "refill"
+    if state.plan_batches - state.steered_at_batch >= cfg.steering_batches:
+        return "cadence"
+    if state.batch_drained:
         return "cadence"
     return ""
-
-
-def _recent_commits(project: str, since_sha: str, limit: int = 30) -> str:
-    """Co powstało od ostatniego przeglądu — tanie wejście zamiast czytania kodu."""
-    span = f"{since_sha}..HEAD" if since_sha else f"-{limit}"
-    result = git(project, "log", "--oneline", f"--max-count={limit}", span,
-                 check=False)
-    return result.stdout.strip()
 
 
 def _restore_head(project: str, base_sha: str, label: str) -> bool:
@@ -472,121 +518,180 @@ def _write_steering_note(cfg: Config, project: str, data: dict,
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def phase_diff_bootstrap(cfg: Config, project: str, state: State, logf,
-                         trigger: str = "cadence") -> None:
-    """Przegląd kierunku: gdzie jest projekt i jaki jest następny przyrost.
+def _append_product_owner_note(project: str, text: str) -> None:
+    if not text.strip():
+        return
+    notebooks.ensure_project(project, ".forge")
+    path = notebooks.project_path(project, ".forge", "product-owner")
+    existing = path.read_text(encoding="utf-8")
+    entry = "- " + " ".join(text.split())
+    if entry not in existing.splitlines():
+        path.write_text(existing.rstrip() + "\n" + entry + "\n", encoding="utf-8")
 
-    Pełny bootstrap jest nieidempotentny, więc ani zmiana briefu, ani upływ
-    kolejnych wsadów nie mogą go powtórzyć. Ta faza ma węższy zakres zapisu
-    (backlog i opis projektu) i nie dotyka kodu, testów ani architektury
-    będącej wynikiem zrealizowanych zadań.
-    """
+
+def phase_product_owner(cfg: Config, project: str, state: State, logf,
+                        trigger: str = "cadence", story_report: str = "") -> None:
+    """Jedna, recenzowana tura Product Ownera z parserem przed recenzją."""
+    from . import backlog
+
+    if trigger == "backlog":
+        trigger = "refill"
     current = brief.read(cfg.brief_path)
     previous = brief.snapshot(project)
-    initial = not previous
-    log(f"Diff-bootstrap: przegląd kierunku (powód: {trigger})"
-        + (" — pierwszy przegląd, brak snapshotu briefu" if initial else "") + "…")
-    agent, model, effort = cfg.role("diff_bootstrap")
-    base_sha = git(project, "rev-parse", "HEAD", check=False).stdout.strip()
-    before = _tree_manifest(project)
-    queued = [f"{task.get('id', '?')}: {task.get('title', '')}"
-              for task in state.task_queue]
-    recent = _recent_commits(project, state.steered_at_sha)
     try:
-        change = brief.diff(previous, current) if trigger == "brief" else ""
+        change = brief.diff(previous, current) if trigger == "brief" and current is not None else ""
     except brief.TooLargeToSync as exc:
-        # Cichy skrót gubiłby wymagania na zawsze: snapshot zapisuje CAŁY brief.
         raise AgentError(f"brief zbyt duży do synchronizacji: {exc}") from exc
 
-    def attempt(notes: list[str]) -> dict:
-        if notes:
-            log("Diff-bootstrap: poprawiam przegląd po uwagach recenzenta…")
-        result = _decision_with_retry(
-            prompts.diff_bootstrap_prompt(
-                change, trigger=trigger, batches=cfg.steering_batches,
-                initial=initial, queued_tasks=queued, recent=recent,
-                review_notes=notes),
-            lambda value: run_agent(
-                agent, value, cfg, project, logf("diff-bootstrap"),
-                model=model, effort=effort),
-            lambda text: _parse_steering_decision(text, project=project))
-        # Zakres pilnujemy po KAŻDEJ próbie, także poprawkowej: recenzent ma
-        # oceniać kierunek, a nie sprzątać po zapisie poza uprawnieniami.
-        # Najpierw HEAD, bo własny commit roli unieważniłby bazę porównania.
-        _restore_head(project, base_sha, "Diff-bootstrap")
-        reverted = _revert_out_of_scope(
-            project, base_sha, _turn_changes(before, _tree_manifest(project)))
-        if reverted:
-            log("Diff-bootstrap: cofnięto zmiany poza zakresem: "
-                + _describe_turn_changes(reverted))
-            ledger.append(project, "diff-bootstrap: cofnięto zmiany poza zakresem "
-                                   + _describe_turn_changes(reverted))
-        return result
-
+    base_sha = git(project, "rev-parse", "HEAD", check=False).stdout.strip()
+    before_manifest = _tree_manifest(project)
+    before_stories, before_orphans = backlog.load(project)
+    if before_orphans:
+        # Stary backlog przechodzi przez migrację PO; dla już kanonicznego
+        # pliku nieparsowalność jest błędem wejściowym, nie opinią recenzenta.
+        ledger.append(project, "po: backlog przed turą zawiera sieroty")
+    queued = [f"{task.get('id', '?')}: {task.get('title', '')}"
+              for task in state.task_queue]
+    parked_path = Path(project, ".forge", "parked.md")
+    parked = parked_path.read_text(encoding="utf-8") if parked_path.exists() else ""
+    notebook_path = str(Path(cfg.runtime_dir, "notebooks", "product-owner.md"))
+    migration = not state.backlog_migrated
+    parser_corrections: list[str] = []
+    review_corrections: list[str] = []
+    data: dict = {}
+    approved = False
+    last_notes: list[str] = []
     try:
-        data = _reviewed_bootstrap(
-            cfg, project, logf, label="Diff-bootstrap", attempt=attempt,
-            review_prompt=lambda result: prompts.diff_bootstrap_review_prompt(
-                base_sha or "HEAD", summary=result["summary"],
-                goal_reached=result["goal_reached"]),
-            log_phase="diff-bootstrap-review", base_sha=base_sha)
-    except Exception as exc:  # noqa: BLE001 — awaria zawsze zostawia czyste drzewo
-        # Niezaakceptowany kierunek nie ma prawa zostać w drzewie: następne
-        # wznowienie zaczyna od stanu sprzed przeglądu, brief pozostaje
-        # nierozliczony, a kolejna iteracja nie wywraca się na brudnym drzewie.
-        # Sprzątamy WSZYSTKO, co ruszyło się w tej fazie — także eksperymenty
-        # recenzenta, gdyby awaria wypadła przed ich cofnięciem.
-        changed = _turn_changes(before, _tree_manifest(project))
-        dest = _dump_phase_work(project, cfg, "Diff-bootstrap", base_sha, changed, exc)
+        for round_number in range(1, cfg.max_bootstrap_reviews + 1):
+            prompt = prompts.product_owner_prompt(
+                trigger=trigger, brief_diff=change, story_report=story_report,
+                queued_tasks=queued, parked=parked, migration=migration,
+                notebook_path=notebook_path, review_notes=review_corrections,
+                max_backlog=cfg.max_backlog_stories)
+            if parser_corrections:
+                prompt += "\n\n" + prompts.po_parse_corrections_prompt(parser_corrections)
+            data = _decision_with_retry(
+                prompt,
+                lambda value: run_agent(
+                    cfg.role("product_owner")[0], value, cfg, project,
+                    logf("product-owner"),
+                    model=cfg.role("product_owner")[1],
+                    effort=cfg.role("product_owner")[2]),
+                lambda text: _parse_product_owner_decision(text, project=project),
+            )
+            _restore_head(project, base_sha, "Product Owner")
+            reverted = _revert_out_of_scope(
+                project, base_sha, _turn_changes(before_manifest, _tree_manifest(project)))
+            if reverted:
+                ledger.append(project, "po: cofnięto zmiany poza zakresem "
+                               + _describe_turn_changes(reverted))
+
+            after_stories, orphans = backlog.load(project)
+            violations = backlog.validate_hard(
+                before_stories, after_stories, data["stories_dropped"], orphans)
+            if violations:
+                parser_corrections = violations
+                review_corrections = []
+                ledger.append(project, "po parser: " + "; ".join(violations)[:240])
+                log("Product Owner: korekta strukturalna "
+                    f"{round_number}/{cfg.max_bootstrap_reviews}")
+                continue
+
+            reviewer, model, effort = cfg.role("po_reviewer")
+            review_before = _tree_manifest(project)
+            review_snapshot = _snapshot_tree(project)
+            verdict = _decision_with_retry(
+                prompts.po_review_prompt(data, max_backlog=cfg.max_backlog_stories),
+                lambda value: run_agent(
+                    reviewer, value, cfg, project, logf("po-review"),
+                    model=model, effort=effort),
+                lambda text: parse_review_decision(text, project=project),
+            )
+            # Recenzentowi wolno eksperymentować w drzewie jak wszędzie indziej
+            # (_reviewed_bootstrap) — werdykt liczy się jako jedyny wynik jego
+            # tury, cokolwiek zostawił wraca do stanu sprzed recenzji.
+            _restore_head(project, base_sha, "Product Owner (recenzent)")
+            reviewer_reverted = _restore_snapshot(project, review_snapshot, review_before)
+            if reviewer_reverted:
+                ledger.append(project, "po: cofnięto zmiany recenzenta "
+                               + _describe_turn_changes(reviewer_reverted))
+            last_notes = [str(note) for note in verdict.data.get("notes", [])]
+            ledger.append(project, f"po recenzja {round_number}→{verdict.status}: "
+                           + "; ".join(last_notes)[:200])
+            if verdict.status == "approve":
+                approved = True
+                break
+            review_corrections = last_notes
+            parser_corrections = []
+            # Recenzent ocenia semantykę; następna tura dostaje uwagi przez
+            # jawny slot korekt zamiast mieszać je z błędami parsera.
+            prompt_notes = review_corrections
+            # Zachowaj je w lokalnym buforze i dołącz przy następnym obrocie.
+            # `corrections` jest rozróżnialne po prefiksie w ledgerze, ale dla
+            # modelu wystarczy wspólny mechanizm uwag.
+            if prompt_notes:
+                ledger.append(project, "po: request_changes — " + "; ".join(prompt_notes)[:200])
+        if not approved:
+            raise AgentError(
+                "Product Owner: wyczerpano budżet korekt/recenzji; "
+                + "; ".join(last_notes or parser_corrections)[:300])
+    except Exception as exc:  # noqa: BLE001 — faza nie zostawia pół-zmian
+        changed = _turn_changes(before_manifest, _tree_manifest(project))
+        dest = _dump_phase_work(project, cfg, "Product Owner", base_sha, changed, exc)
         if dest:
-            log(f"Diff-bootstrap: praca przed rewertem zachowana w {dest}")
-            ledger.append(project, f"diff-bootstrap: praca zachowana w {dest}")
-        _restore_head(project, base_sha, "Diff-bootstrap")
+            ledger.append(project, f"po: praca zachowana w {dest}")
+        _restore_head(project, base_sha, "Product Owner")
         _revert_paths(project, base_sha, changed)
         raise
-    replan = data["replan"]
-    dropped = state.task_queue if replan else []
-    _write_steering_note(cfg, project, data, dropped)
-    if replan:
-        # Kolejka mogła zakładać nieaktualny kierunek. Zadania nie znikają po
-        # cichu: ich tytuły wracają do planisty w notatce przeglądu, więc to on
-        # rozstrzyga, co przeplanować, a co porzucić.
+
+    # Dopiero zaakceptowana tura może poprosić Forge o deterministyczne fakty.
+    for item in data["stories_dropped"]:
+        try:
+            path = Path(project, "BACKLOG.md")
+            path.write_text(
+                backlog.set_status(path.read_text(encoding="utf-8"), item["id"],
+                                   "porzucona", item["reason"]),
+                encoding="utf-8")
+            ledger.append(project, f"po: {item['id']} porzucona ({item['reason']})")
+        except KeyError:
+            ledger.append(project, f"po: ostrzeżenie — nieznane stories_dropped {item['id']}")
+
+    _append_product_owner_note(project, data.get("notebook", ""))
+    _write_steering_note(cfg, project, data, state.task_queue if data["replan"] else [])
+    if data["replan"]:
         state.task_queue = []
         state.task_phase = ""
-    # Dopiero teraz brief i kadencja są rozliczone — wcześniejsza awaria
-    # zostawia poprzedni punkt odniesienia i pozwala wznowić operację.
-    if current is None:
-        # Nieczytelny brief podczas przeglądu z kadencji: zapisany teraz pusty
-        # snapshot skasowałby bazę diffu i udawał później pierwszą synchronizację.
-        log("Diff-bootstrap: brief nieczytelny — zachowuję poprzedni snapshot.")
-        ledger.append(project, "diff-bootstrap: brief nieczytelny, snapshot bez zmian")
-    else:
+    if current is not None:
         brief.write_snapshot(project, current)
         state.brief_digest = brief.digest(current)
     state.steered_at_batch = state.plan_batches
     state.steering_due = False
     state.batch_drained = False
-    state.goal_confirmed = data["goal_reached"]
+    if trigger == "refill":
+        state.po_refill_batch = state.plan_batches
+    state.backlog_migrated = True
+    state.goal_confirmed = bool(data["goal_reached"])
     if state.goal_confirmed:
-        # Kontrakt promptu: zaakceptowany `goal_reached` idzie PROSTO do
-        # końcowej weryfikacji. Kolejny wsad planisty byłby zbędnym kosztem, a
-        # dokańczanie starej kolejki przy replan=false wprost łamałoby werdykt.
         state.task_queue = []
         state.task_phase = "verify_goal"
-    summary = str(data["summary"]).strip()
-    log(f"Diff-bootstrap: gotowe (replan={replan}, "
-        f"goal_reached={state.goal_confirmed}). {summary[:200]}")
-    ledger.append(project, f"diff-bootstrap ({trigger}): replan={replan} "
-                           f"goal_reached={state.goal_confirmed}, wycofano "
-                           f"{len(dropped)} zadań: {summary[:160]}")
-    commit_all(project, "docs: przegląd kierunku projektu", cfg)
+    parked_path.unlink(missing_ok=True)
+    ledger.append(
+        project,
+        f"po ({trigger}): +{len(data['stories_added'])} historyjek, "
+        f"-{len(data['stories_dropped'])} porzuconych, "
+        f"replan={data['replan']}, goal={state.goal_confirmed}",
+    )
+    commit_all(project, "docs: przegląd Product Ownera", cfg)
     state.steered_at_sha = git(project, "rev-parse", "HEAD", check=False).stdout.strip()
 
 
 def _write_current_task(project: str, task: dict) -> None:
     source, target = Path(project, task["file"]), Path(project, ".forge", "current_task.md")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    body = source.read_text(encoding="utf-8")
+    story = str(task.get("story", "")).strip()
+    target.write_text((f"Historyjka: {story}\n\n" if story else "") + body,
+                      encoding="utf-8")
 
 
 def _append_review_nits(cfg: Config, project: str, task_id: str,
@@ -976,6 +1081,33 @@ def _parse_steering_decision(text: str, *, project: str = "") -> dict:
     return data
 
 
+def _parse_product_owner_decision(text: str, *, project: str = "") -> dict:
+    """Parsuj kontrakt PO, nie nadając statusom znaczenia modelowego."""
+    data = _parse_steering_decision(text, project=project)
+    added = data.get("stories_added", [])
+    dropped = data.get("stories_dropped", [])
+    if isinstance(added, str) or not isinstance(added, (list, tuple)):
+        raise InvalidDecision("pole `stories_added` musi być listą ID")
+    if not isinstance(dropped, (list, tuple)):
+        raise InvalidDecision("pole `stories_dropped` musi być listą obiektów")
+    normalized_dropped: list[dict[str, str]] = []
+    for item in dropped:
+        if not isinstance(item, dict):
+            raise InvalidDecision("element stories_dropped musi być obiektem")
+        story_id = str(item.get("id", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+        if not story_id or not reason:
+            raise InvalidDecision("stories_dropped wymaga niepustego id i reason")
+        normalized_dropped.append({"id": story_id, "reason": reason})
+    notebook = data.get("notebook", "")
+    if not isinstance(notebook, str):
+        raise InvalidDecision("pole `notebook` musi być tekstem")
+    data["stories_added"] = [str(item).strip() for item in added if str(item).strip()]
+    data["stories_dropped"] = normalized_dropped
+    data["notebook"] = notebook.strip()
+    return data
+
+
 def _clear_task_state(state: State) -> None:
     defaults = State()
     for field in _TASK_STATE_FIELDS:
@@ -1071,6 +1203,9 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         state.task_start_tag = f"forge/{task['id']}-start"
         git(project, "tag", state.task_start_tag)
         _write_current_task(project, task)
+        story = str(task.get("story", "")).strip()
+        if story and _story_status(project, story) == "nowa":
+            _set_story_status(project, story, "w toku")
         state.task_phase = "tester"
         state.tester_handoff = str(task.get("batch_handoff", "")).strip()
         state.no_change_rounds = 0
@@ -1080,7 +1215,9 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         notebooks.ensure(project, cfg.runtime_dir, task["id"])
         _checkpoint(project, state, "tester")
         log(f"Zadanie {task['id']} — {task['title']} (trudność: {task['difficulty']})")
-        ledger.append(project, f"{task['id']} start: {task['title']} ({task['difficulty']})")
+        story_suffix = f" ({task['story']})" if task.get("story") else ""
+        ledger.append(project, f"{task['id']} start: {task['title']} "
+                       f"({task['difficulty']}){story_suffix}")
     else:
         # Wznowienie oraz migracja checkpointu sprzed Context Capsule.
         notebooks.ensure(project, cfg.runtime_dir, task["id"])
@@ -1358,14 +1495,130 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         )
         _checkpoint(project, state, "tester")
         return True
+    story = str(task.get("story", "")).strip()
+    if story and not any(str(item.get("story", "")).strip() == story
+                         for item in state.task_queue):
+        _set_story_status(project, story, "do weryfikacji")
     commit_all(project, f"feat: {task['title']}", cfg)
     notebooks.remove(project, cfg.runtime_dir, task["id"])
     git(project, "tag", "-d", state.task_start_tag, check=False)
     log(f"Zadanie {task['id']} UKOŃCZONE i zacommitowane: {task['title']}")
-    ledger.append(project, f"{task['id']} UKOŃCZONE po {state.tdd_round} rundach")
+    story_suffix = f" ({story})" if story else ""
+    ledger.append(project, f"{task['id']} UKOŃCZONE{story_suffix} po "
+                   f"{state.tdd_round} rundach")
     _clear_task_state(state)
     _checkpoint(project, state, "")
     return True
+
+def _story_report_path(project: str) -> Path:
+    return Path(project, ".forge", "verification", "stories-latest.md")
+
+
+def _fresh_story_report(project: str, state: State) -> str:
+    """Raport jest ważny tylko przy zgodnych polach stanu i nagłówka."""
+    path = _story_report_path(project)
+    if not path.is_file() or not state.stories_verified_sha:
+        return ""
+    text = path.read_text(encoding="utf-8")
+    batch = re.search(r"verified_at_batch:\s*(\d+)", text)
+    sha = re.search(r"verified_sha:\s*([^\s]+)", text)
+    if (not batch or not sha
+            or int(batch.group(1)) != state.stories_verified_at_batch
+            or sha.group(1) != state.stories_verified_sha):
+        return ""
+    return text
+
+
+def _parse_story_verification(text: str, *, project: str = "") -> dict:
+    data = _parse_json_object(text, project=project)
+    entries = data.get("stories")
+    if not isinstance(entries, list):
+        raise InvalidDecision("weryfikator historyjek musi zwrócić listę stories")
+    normalized = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("status") not in {
+                "potwierdzona", "niepotwierdzona", "częściowa"}:
+            raise InvalidDecision("każdy wpis stories wymaga poprawnego statusu")
+        normalized.append({
+            "id": str(entry.get("id", "")).strip(),
+            "status": entry["status"],
+            "evidence": str(entry.get("evidence", "")).strip(),
+        })
+    data["stories"] = normalized
+    data["notes"] = [str(item) for item in data.get("notes", [])]
+    return data
+
+
+def phase_verify_stories(cfg: Config, project: str, state: State, logf) -> bool:
+    """Zweryfikuj historyjki oczekujące na dowód; pusty zbiór nic nie kosztuje."""
+    candidates, _ = backlog.load(project)
+    touched = stories_touched_since(project, state.stories_verified_sha)
+    if not state.stories_verified_sha:
+        # Pierwsza inwentaryzacja migracji nie może udawać, że nic nie
+        # zrobiono tylko dlatego, że stare wpisy mają status `nowa`.
+        selected = [story for story in candidates if story.status != "porzucona"][:
+            cfg.max_backlog_stories]
+    else:
+        selected = [story for story in candidates
+                    if story.status == "do weryfikacji" or story.id in touched]
+    if not selected:
+        return False
+
+    before = _tree_manifest(project)
+    snapshot = _snapshot_tree(project)
+    sha_before = git(project, "rev-parse", "HEAD", check=False).stdout.strip()
+    cycle_dir = str(Path(project, cfg.runtime_dir, "verification", "stories-cycle"))
+    evidence = verify.collect_evidence(
+        project, state, cfg, cycle_dir, sha=sha_before,
+        targets=cfg.effective_verify_targets(state.verify_targets))
+    stories_text = "\n".join(
+        f"- {story.id}: {story.check} (dlaczego: {story.why_now})"
+        for story in selected)
+    evidence_text = "\n".join(
+        f"- {name}: rc={item.get('rc')}, log={item.get('log', '')}"
+        for name, item in evidence.items()) or "(brak targetów mechanicznych)"
+    verifier, model, effort = cfg.role("verifier")
+    try:
+        data = _decision_with_retry(
+            prompts.verify_stories_prompt(stories=stories_text, evidence=evidence_text),
+            lambda value: run_agent(
+                verifier, value, cfg, project, logf("verify-stories"),
+                model=model, effort=effort),
+            lambda text: _parse_story_verification(text, project=project),
+        )
+    finally:
+        _restore_head(project, sha_before, "Weryfikator historyjek")
+        restored = _restore_snapshot(project, snapshot, before)
+        if restored:
+            ledger.append(project, "verify-stories: cofnięto zmiany weryfikatora "
+                           + _describe_turn_changes(restored))
+
+    verdicts = {item["id"]: item for item in data["stories"]}
+    for story in selected:
+        result = verdicts.get(story.id)
+        if not result:
+            continue
+        target_status = "zrobiona" if result["status"] == "potwierdzona" else "w toku"
+        _set_story_status(project, story.id, target_status)
+        ledger.append(project, f"verify-story {story.id}: {result['status']} "
+                       f"{result['evidence'][:160]}")
+
+    commit_all(project, "docs: weryfikacja historyjek", cfg)
+    verified_sha = git(project, "rev-parse", "HEAD", check=False).stdout.strip()
+    report_path = _story_report_path(project)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        f"<!-- verified_at_batch: {state.plan_batches} -->\n"
+        f"<!-- verified_sha: {verified_sha} -->\n\n"
+        + str(data.get("verdict", "changes")) + "\n\n"
+        + "\n".join(
+            f"- {item['id']}: {item['status']} — {item['evidence']}"
+            for item in data["stories"]),
+        encoding="utf-8")
+    state.stories_verified_at_batch = state.plan_batches
+    state.stories_verified_sha = verified_sha
+    return True
+
 
 def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
     """Końcowa weryfikacja celu zostaje poza pipeline'em pojedynczego zadania."""
@@ -1393,7 +1646,8 @@ def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
         return True
     agent, model, effort = cfg.role("verifier", DEFAULT_TASK_DIFFICULTY)
     verify_prompt = prompts.verify_goal_prompt(
-        state.verify_cycle, evidence, cycle_dir)
+        state.verify_cycle, evidence, cycle_dir,
+        story_report=_fresh_story_report(project, state))
     try:
         data = _decision_with_retry(
             verify_prompt,
@@ -1435,12 +1689,22 @@ def one_iteration(cfg: Config, project: str, state: State) -> bool:
     # kierunku: aktywne zadanie ma dokończyć swój cykl na założeniach, z którymi
     # ruszyło. Weryfikacja starego celu po zmianie kierunku byłaby stratą, więc
     # przegląd wyprzedza także ją.
-    trigger = "" if state.current_task else _steering_trigger(cfg, project, state)
+    trigger = "" if state.current_task else _po_trigger(cfg, project, state)
     if trigger:
         _require_clean(project, "przeglądem kierunku")
-        phase_diff_bootstrap(cfg, project, state, logf, trigger)
+        report = ""
+        if trigger == "cadence":
+            phase_verify_stories(cfg, project, state, logf)
+        elif trigger == "brief":
+            if (state.stories_verified_sha and
+                    state.plan_batches - state.stories_verified_at_batch
+                    < cfg.steering_batches):
+                report = _fresh_story_report(project, state)
+        phase_product_owner(cfg, project, state, logf, trigger,
+                            story_report=report)
         return True
     if state.task_phase == "verify_goal":
+        phase_verify_stories(cfg, project, state, logf)
         return phase_verify_goal(cfg, project, state, logf)
     if not state.current_task and not state.task_queue:
         _require_clean(project, "planowaniem")
@@ -1736,6 +2000,11 @@ def main(argv: list[str] | None = None) -> int:
     runtime_path = Path(args.project, cfg.runtime_dir, "STATE.json")
     if path != runtime_path:
         state.save(str(runtime_path)); path = runtime_path
+    # Preflight jest operacją procesu, nie iteracji: musi zobaczyć zastane
+    # zmiany zanim pierwsza faza zacznie wymagać czystego drzewa.
+    ensure_repo(args.project)
+    preflight.run(args.project, cfg, state)
+    state.save(str(path))
     log(f"Start Forge — project={args.project} brief={args.brief} "
         f"batch_size={cfg.batch_size} max_tdd_rounds={cfg.max_tdd_rounds}")
     count = 0

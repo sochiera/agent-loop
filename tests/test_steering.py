@@ -1,8 +1,11 @@
-"""Przegląd kierunku (diff-bootstrap): kadencja, zakres, recenzja i koniec projektu."""
+"""Product Owner: wyzwalacze, zakres zapisu, recenzja i osadzenie w pętli.
+
+Bootstrap, brief-diff i notatka `steering.md` zostają tu też — to generyczna
+maszyneria, z której PO korzysta razem z resztą ról nadzadaniowych.
+"""
 from __future__ import annotations
 
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,8 +18,17 @@ from forge.task_pipeline import InvalidDecision
 
 APPROVE = '{"verdict":"approve","notes":[]}'
 REJECT = '{"verdict":"request_changes","notes":["za dużo naprzód"]}'
-STEERED = ('{"summary":"kolejny plasterek","changes":["sieć"],'
-           '"replan":true,"goal_reached":false}')
+
+BACKLOG = """# Backlog
+
+## US-001 — Pierwszy wynik  [nowa]
+
+Jako użytkownik chcę zobaczyć wynik, żeby podjąć decyzję.
+
+- Dlaczego teraz: PROJECT.md opisuje tę potrzebę.
+- Sprawdzenie: uruchom demo i zobacz wynik.
+- Poza zakresem: historia wyników.
+"""
 
 
 def _git(project: Path, *args: str) -> subprocess.CompletedProcess:
@@ -24,15 +36,15 @@ def _git(project: Path, *args: str) -> subprocess.CompletedProcess:
         ["git", *args], cwd=project, check=True, text=True, capture_output=True)
 
 
-def _steered_repo(tmp_path: Path) -> tuple[Path, State, Config]:
-    """Projekt po bootstrapie: snapshot briefu zgodny z plikiem briefu."""
+def _po_repo(tmp_path: Path) -> tuple[Path, State, Config]:
+    """Projekt po bootstrapie, backlog już w formacie historyjek."""
     project = tmp_path / "project"
     project.mkdir()
     _git(project, "init", "-q")
     _git(project, "config", "user.email", "tests@example.test")
     _git(project, "config", "user.name", "Forge Tests")
     (project / ".gitignore").write_text(".forge/\n", encoding="utf-8")
-    (project / "BACKLOG.md").write_text("- [ ] stary wpis\n", encoding="utf-8")
+    (project / "BACKLOG.md").write_text(BACKLOG, encoding="utf-8")
     (project / "app.py").write_text("VALUE = 0\n", encoding="utf-8")
     docs = project / "docs"
     docs.mkdir()
@@ -43,264 +55,193 @@ def _steered_repo(tmp_path: Path) -> tuple[Path, State, Config]:
     _git(project, "add", ".")
     _git(project, "commit", "-qm", "seed")
     state = State(
-        bootstrapped=True, test_cmd="python3 -m pytest -q",
+        bootstrapped=True, test_cmd="python3 -m pytest -q", backlog_migrated=True,
         brief_digest=brief.digest("Cel: gra.\n"))
-    return project, state, Config(brief_path=str(brief_path), git_push=False)
+    return project, state, Config(brief_path=str(brief_path), git_push=False,
+                                  max_bootstrap_reviews=4)
 
 
-def _change_brief(cfg: Config, text: str = "Cel: gra.\nTryb sieciowy.\n") -> None:
-    Path(cfg.brief_path).write_text(text, encoding="utf-8")
+def _decision(**overrides) -> str:
+    import json
+    data = {"summary": "aktualizacja", "stories_added": [], "stories_dropped": [],
+             "changes": ["zmiana"], "replan": False, "goal_reached": False,
+             "notebook": ""}
+    data.update(overrides)
+    return json.dumps(data)
 
 
-def _write_in_scope(project_dir: Path) -> None:
-    (project_dir / "BACKLOG.md").write_text(
-        "- [ ] stary wpis\n- [ ] tryb sieciowy\n", encoding="utf-8")
-    (project_dir / "docs" / "PROJECT.md").write_text(
-        "# Projekt\n\nNowy cel.\n", encoding="utf-8")
-
-
-def _run_steering(project: Path, state: State, cfg: Config, *,
-                  trigger: str = "cadence", answers=(STEERED,),
-                  verdicts=(APPROVE,), write=_write_in_scope) -> list[str]:
-    """Uruchom przegląd, rozdzielając wywołania przeglądu od jego recenzji."""
+def _run_po(project: Path, state: State, cfg: Config, *, trigger: str = "cadence",
+           answers=(_decision(),), verdicts=(APPROVE,), write=None) -> list[str]:
+    """Uruchom turę PO, rozdzielając wywołania autora od jego recenzentki."""
     seen: list[str] = []
-    steering = iter(answers)
+    author = iter(answers)
     review = iter(verdicts)
 
     def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
         seen.append(prompt)
-        if "recenzent przeglądu kierunku" in prompt:
+        if "świeża recenzentka Product Ownera" in prompt:
             return next(review)
         if write:
             write(Path(project_dir))
-        return next(steering)
+        return next(author)
 
     with patch("forge.orchestrate.run_agent", side_effect=agent):
-        orchestrate.phase_diff_bootstrap(
+        orchestrate.phase_product_owner(
             cfg, str(project), state, lambda phase: phase, trigger)
     return seen
 
 
-# --- Wyzwalacze --------------------------------------------------------------
+# --- Wyzwalacze ---------------------------------------------------------------
 
-def test_settled_project_does_not_ask_for_a_review(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == ""
-
-
-def test_cadence_triggers_review_after_configured_batches(
-        tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    state.plan_batches = cfg.steering_batches - 1
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == ""
-
-    state.plan_batches = cfg.steering_batches
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == "cadence"
-
-
-def test_cadence_counts_from_the_last_review(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    state.steered_at_batch = 3
-    state.plan_batches = state.steered_at_batch + cfg.steering_batches - 1
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == ""
-
-    state.plan_batches += 1
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == "cadence"
-
-
-def test_changed_brief_wins_over_every_other_reason(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
+def test_brief_change_wins_over_every_other_reason(tmp_path: Path) -> None:
+    project, state, cfg = _po_repo(tmp_path)
     state.plan_batches, state.steering_due = 9, True
-    _change_brief(cfg)
+    Path(cfg.brief_path).write_text("Cel: gra.\nTryb sieciowy.\n", encoding="utf-8")
 
-    assert orchestrate._steering_trigger(cfg, str(project), state) == "brief"
-
-
-def test_exhausted_backlog_asks_for_a_review(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    state.steering_due = True
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == "backlog"
+    assert orchestrate._po_trigger(cfg, str(project), state) == "brief"
 
 
-def test_missing_brief_file_never_triggers_a_brief_review(
-        tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    Path(cfg.brief_path).unlink()
+def test_refill_fires_when_backlog_runs_low(tmp_path: Path) -> None:
+    project, state, cfg = _po_repo(tmp_path)
+    cfg.backlog_low_water = 2
 
-    assert orchestrate._steering_trigger(cfg, str(project), state) == ""
-
-
-def test_project_bootstrapped_before_the_mechanism_syncs_once(
-        tmp_path: Path) -> None:
-    """Brak snapshotu i skrótu = jednorazowa migracja, nie pełny bootstrap."""
-    project, state, cfg = _steered_repo(tmp_path)
-    Path(project, brief.SNAPSHOT_PATH).unlink()
-    state.brief_digest = ""
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == "brief"
+    assert orchestrate._po_trigger(cfg, str(project), state) == "refill"
 
 
-# --- Kolejność: kadencja czeka na pustą kolejkę ------------------------------
-
-def test_mature_cadence_waits_for_an_empty_queue(tmp_path: Path) -> None:
-    """`plan_batches` rośnie w chwili ZAPLANOWANIA wsadu, a planowanie i start
-    pierwszego zadania dzieją się w jednej iteracji. Bez tego warunku dojrzała
-    kadencja wyzwalała przegląd zaraz po pierwszym zadaniu świeżego wsadu, a
-    `replan` kasował resztę razem z całym wywołaniem planisty."""
-    project, state, cfg = _steered_repo(tmp_path)
+def test_cadence_fires_after_configured_batches_once_stocked(tmp_path: Path) -> None:
+    project, state, cfg = _po_repo(tmp_path)
+    cfg.backlog_low_water = 0
     state.plan_batches = cfg.steering_batches
-    state.task_queue = [{"id": "task-007", "title": "Świeżo zaplanowane"}]
 
-    assert orchestrate._steering_trigger(cfg, str(project), state) == ""
-
-    state.task_queue = []
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == "cadence"
+    assert orchestrate._po_trigger(cfg, str(project), state) == "cadence"
 
 
-def test_short_batch_triggers_cadence_on_next_empty_queue(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    state.plan_batches = 1
-    state.batch_drained = True
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == "cadence"
-
-
-def test_short_batch_does_not_trigger_while_queue_not_empty(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    state.batch_drained = True
-    state.task_queue = [{"id": "task-007", "title": "świeże zadanie"}]
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == ""
-
-
-def test_full_batch_keeps_existing_cadence(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    state.plan_batches = cfg.steering_batches - 1
-    state.batch_drained = False
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == ""
-
-
-def test_changed_brief_still_wins_over_a_full_queue(tmp_path: Path) -> None:
-    """Regresja: zmiana briefu to najmocniejsze wejście przeglądu i ma wygrywać
-    z kolejką. Ta gałąź celowo NIE dostaje warunku pustej kolejki."""
-    project, state, cfg = _steered_repo(tmp_path)
-    state.task_queue = [{"id": "task-007", "title": "Świeżo zaplanowane"}]
-    _change_brief(cfg)
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == "brief"
-
-
-def test_exhausted_backlog_still_wins_over_a_full_queue(tmp_path: Path) -> None:
-    """Regresja: `steering_due` ustawia wyłącznie wyczerpany backlog."""
-    project, state, cfg = _steered_repo(tmp_path)
-    state.task_queue = [{"id": "task-007", "title": "Świeżo zaplanowane"}]
-    state.steering_due = True
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == "backlog"
-
-
-def test_cadence_review_lands_on_the_batch_boundary_and_loses_nothing(
+def test_refill_guard_does_not_loop_before_any_batch_is_planned(
         tmp_path: Path) -> None:
-    """Scenariusz dwóch wsadów: przegląd wypada dopiero przy pustej kolejce,
-    więc `replan` nie ma czego zniszczyć — zero utraconych zadań."""
-    project, state, cfg = _steered_repo(tmp_path)
-    cfg = replace(cfg, steering_batches=1)
-    planned: list[list[dict]] = []
+    """Regresja: `po_refill_batch` musi blokować drugi `refill` nawet gdy
+    `plan_batches` wciąż wynosi 0, bo żaden wsad jeszcze nie ruszył."""
+    project, state, cfg = _po_repo(tmp_path)
+    cfg.backlog_low_water = 2
+    assert state.plan_batches == 0
 
-    def plan(_cfg, _project, plan_state, _logf):
-        plan_state.plan_batches += 1
-        plan_state.task_queue = [
-            {"id": f"task-{plan_state.plan_batches:03d}{index}", "title": "x"}
-            for index in range(3)]
-        planned.append(list(plan_state.task_queue))
-        return {"no_more_tasks": False}
+    assert orchestrate._po_trigger(cfg, str(project), state) == "refill"
+    state.po_refill_batch = state.plan_batches
 
-    with patch("forge.orchestrate.phase_plan_batch", side_effect=plan), \
-         patch("forge.orchestrate.run_task", return_value=True) as run_task:
-        # Iteracja 1: brak kolejki → planowanie wsadu i start pierwszego zadania.
-        orchestrate.one_iteration(cfg, str(project), state)
-        # Kadencja jest już dojrzała, ale kolejka niepusta → nadal zadania.
-        state.task_queue.pop(0)
-        orchestrate.one_iteration(cfg, str(project), state)
-
-    assert run_task.call_count == 2
-    assert len(planned) == 1
-
-    # Dopiero po wyczerpaniu wsadu przegląd przejmuje iterację.
-    state.task_queue = []
-
-    assert orchestrate._steering_trigger(cfg, str(project), state) == "cadence"
+    # Backlog nadal ubogi, ale ten sam wsad (0) już dostał swój refill.
+    assert orchestrate._po_trigger(cfg, str(project), state) == ""
 
 
-# --- Przebieg przeglądu ------------------------------------------------------
+def test_active_task_or_queue_blocks_every_po_trigger(tmp_path: Path) -> None:
+    project, state, cfg = _po_repo(tmp_path)
+    cfg.backlog_low_water = 2
+    state.task_queue = [{"id": "task-001"}]
 
-def test_review_records_its_own_cadence_and_requeues_planning(
+    assert orchestrate._po_trigger(cfg, str(project), state) == ""
+
+
+# --- Zakres zapisu i recenzja --------------------------------------------------
+
+def test_po_reviewer_experiment_is_undone_without_losing_the_turn(
         tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    state.plan_batches = 3
-    state.task_queue = [{"id": "task-007", "title": "Stary plan"}]
-    state.task_phase = "verify_goal"
-    _change_brief(cfg)
+    """Recenzentce wolno eksperymentować; zostaje z tego tylko werdykt."""
+    project, state, cfg = _po_repo(tmp_path)
 
-    _run_steering(project, state, cfg, trigger="brief")
+    def write(project_dir: Path) -> None:
+        (project_dir / "docs" / "PROJECT.md").write_text(
+            "# Projekt\n\nNowy cel.\n", encoding="utf-8")
 
-    assert state.brief_digest == brief.digest("Cel: gra.\nTryb sieciowy.\n")
-    assert Path(project, brief.SNAPSHOT_PATH).read_text(
-        encoding="utf-8") == "Cel: gra.\nTryb sieciowy.\n"
-    assert state.steered_at_batch == 3
-    assert state.steered_at_sha
-    assert state.task_queue == []
-    assert state.task_phase == ""
-    assert state.goal_confirmed is False
+    def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
+        if "świeża recenzentka Product Ownera" in prompt:
+            (Path(project_dir) / "app.py").write_text("HACK = 1\n", encoding="utf-8")
+            (Path(project_dir) / "probe.py").write_text(
+                "print('sonda')\n", encoding="utf-8")
+            return APPROVE
+        write(Path(project_dir))
+        return _decision()
+
+    with patch("forge.orchestrate.run_agent", side_effect=agent):
+        orchestrate.phase_product_owner(
+            cfg, str(project), state, lambda phase: phase, "cadence")
+
+    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
+    assert not Path(project, "probe.py").exists()
     assert not orchestrate.has_changes(str(project))
-    note = Path(project, ".forge", "steering.md").read_text(encoding="utf-8")
-    assert "kolejny plasterek" in note
-    assert "task-007: Stary plan" in note
+    # Praca autora PO przeżywa cofnięcie tury recenzentki.
+    assert "Nowy cel" in Path(project, "docs", "PROJECT.md").read_text(
+        encoding="utf-8")
 
 
-def test_reached_goal_goes_straight_to_final_verification(
+def test_po_review_reverts_writes_outside_its_scope(tmp_path: Path) -> None:
+    project, state, cfg = _po_repo(tmp_path)
+
+    def write(project_dir: Path) -> None:
+        (project_dir / "docs" / "PROJECT.md").write_text(
+            "# Projekt\n\nNowy cel.\n", encoding="utf-8")
+        (project_dir / "app.py").write_text("VALUE = 99\n", encoding="utf-8")
+        (project_dir / "hack.py").write_text("print('nowy')\n", encoding="utf-8")
+
+    _run_po(project, state, cfg, write=write)
+
+    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
+    assert not Path(project, "hack.py").exists()
+    assert "Nowy cel" in Path(project, "docs", "PROJECT.md").read_text(
+        encoding="utf-8")
+
+
+def test_po_own_commit_does_not_smuggle_changes_past_the_scope_gate(
         tmp_path: Path) -> None:
-    """Nawet przy replan=false stara kolejka nie może przeżyć osiągniętego celu."""
-    project, state, cfg = _steered_repo(tmp_path)
+    project, state, cfg = _po_repo(tmp_path)
+    base = _git(project, "rev-parse", "HEAD").stdout.strip()
+
+    def write(project_dir: Path) -> None:
+        (project_dir / "docs" / "PROJECT.md").write_text(
+            "# Projekt\n\nNowy cel.\n", encoding="utf-8")
+        (project_dir / "app.py").write_text("VALUE = 99\n", encoding="utf-8")
+        _git(project_dir, "add", "-A")
+        _git(project_dir, "commit", "-qm", "przemycam kod")
+
+    _run_po(project, state, cfg, write=write)
+
+    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
+    history = _git(project, "log", f"{base}..HEAD", "-p").stdout
+    assert "VALUE = 99" not in history
+
+
+def test_review_budget_is_configurable(tmp_path: Path) -> None:
+    project, state, cfg = _po_repo(tmp_path)
+    cfg.max_bootstrap_reviews = 2
+
+    with pytest.raises(orchestrate.AgentError):
+        _run_po(project, state, cfg,
+                answers=(_decision(),) * 2, verdicts=(REJECT,) * 2)
+
+    assert not orchestrate.has_changes(str(project))
+
+
+def test_rejected_review_gets_the_notes_and_a_second_chance(
+        tmp_path: Path) -> None:
+    project, state, cfg = _po_repo(tmp_path)
+
+    seen = _run_po(project, state, cfg,
+                   answers=(_decision(), _decision()),
+                   verdicts=(REJECT, APPROVE))
+
+    author_prompts = [p for p in seen if "świeża recenzentka" not in p]
+    assert len(author_prompts) == 2
+    assert "za dużo naprzód" in author_prompts[1]
+
+
+def test_goal_reached_goes_straight_to_final_verification(
+        tmp_path: Path) -> None:
+    project, state, cfg = _po_repo(tmp_path)
     state.task_queue = [{"id": "task-007", "title": "Stary plan"}]
 
-    _run_steering(project, state, cfg,
-                  answers=('{"summary":"gotowe","replan":false,'
-                           '"goal_reached":true}',))
+    _run_po(project, state, cfg,
+            answers=(_decision(replan=False, goal_reached=True),))
 
     assert state.goal_confirmed is True
     assert state.task_queue == []
     assert state.task_phase == "verify_goal"
-
-    with patch("forge.orchestrate.phase_plan_batch") as plan, \
-         patch("forge.orchestrate.phase_verify_goal",
-               return_value=False) as verify:
-        orchestrate.one_iteration(cfg, str(project), state)
-
-    verify.assert_called_once()
-    plan.assert_not_called()
-
-
-def test_red_verification_forgets_the_confirmed_goal(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    state.goal_confirmed = True
-    state.verify_targets = ["smoke"]
-    state.smoke_cmd = "false"
-
-    with patch("forge.verify.collect_evidence",
-               return_value={"smoke": {"rc": 1}}):
-        assert orchestrate.phase_verify_goal(
-            cfg, str(project), state, lambda phase: phase) is True
-
-    assert state.goal_confirmed is False
 
 
 def test_string_booleans_are_refused_instead_of_ending_the_project() -> None:
@@ -317,336 +258,80 @@ def test_string_booleans_are_refused_instead_of_ending_the_project() -> None:
         orchestrate._parse_steering_decision('{"replan":true}')
 
 
-def test_valid_verdict_keeps_its_defaults(tmp_path: Path) -> None:
+def test_valid_verdict_keeps_its_defaults() -> None:
     data = orchestrate._parse_steering_decision('{"summary":" x "}')
 
     assert data == {"summary": "x", "replan": True, "goal_reached": False,
                     "changes": []}
 
 
-def test_typed_verdict_error_gets_one_cheap_correction(
-        tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
+def test_red_verification_forgets_the_confirmed_goal(tmp_path: Path) -> None:
+    project, state, cfg = _po_repo(tmp_path)
+    state.goal_confirmed = True
+    state.verify_targets = ["smoke"]
+    state.smoke_cmd = "false"
 
-    _run_steering(project, state, cfg,
-                  answers=('{"summary":"x","goal_reached":"true"}', STEERED))
+    with patch("forge.verify.collect_evidence",
+               return_value={"smoke": {"rc": 1}}):
+        assert orchestrate.phase_verify_goal(
+            cfg, str(project), state, lambda phase: phase) is True
 
     assert state.goal_confirmed is False
-    assert state.task_phase == ""
-
-
-def test_cadence_review_does_not_resend_the_unchanged_brief(
-        tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-
-    seen = _run_steering(project, state, cfg, trigger="cadence")
-
-    assert "brief bez zmian od ostatniego przeglądu" in seen[0]
-    assert "Cel: gra." not in seen[0]
-
-
-def test_review_sees_what_was_built_since_the_last_one(
-        tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    state.steered_at_sha = _git(project, "rev-parse", "HEAD").stdout.strip()
-    (project / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
-    _git(project, "commit", "-qam", "feat: nowa wartość")
-
-    seen = _run_steering(project, state, cfg)
-
-    assert "feat: nowa wartość" in seen[0]
-    assert "seed" not in seen[0]
-
-
-def test_rejected_review_gets_the_notes_and_a_second_chance(
-        tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-
-    seen = _run_steering(project, state, cfg,
-                         answers=(STEERED, STEERED),
-                         verdicts=(REJECT, APPROVE))
-
-    steering_prompts = [
-        p for p in seen if "recenzent przeglądu kierunku" not in p]
-    assert len(steering_prompts) == 2
-    assert "POPRAWKI PO RECENZJI" not in steering_prompts[0]
-    assert "za dużo naprzód" in steering_prompts[1]
-
-
-def test_four_rejections_stop_the_run_and_leave_the_tree_untouched(
-        tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    _change_brief(cfg)
-
-    with pytest.raises(orchestrate.AgentError, match="decyzja użytkownika"):
-        _run_steering(project, state, cfg, trigger="brief",
-                      answers=(STEERED,) * 4, verdicts=(REJECT,) * 4)
-
-    assert Path(project, "BACKLOG.md").read_text(
-        encoding="utf-8") == "- [ ] stary wpis\n"
-    assert Path(project, "docs", "PROJECT.md").read_text(
-        encoding="utf-8") == "# Projekt\n\nStary cel.\n"
-    assert state.brief_digest == brief.digest("Cel: gra.\n")
-    assert orchestrate._steering_trigger(cfg, str(project), state) == "brief"
-
-
-def test_review_budget_is_configurable(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    cfg.max_bootstrap_reviews = 2
-
-    with pytest.raises(orchestrate.AgentError):
-        _run_steering(project, state, cfg,
-                      answers=(STEERED,) * 2, verdicts=(REJECT,) * 2)
-
-
-def test_reviewer_experiment_is_undone_without_losing_the_review(
-        tmp_path: Path) -> None:
-    """Recenzentowi wolno eksperymentować; zostaje z tego tylko werdykt."""
-    project, state, cfg = _steered_repo(tmp_path)
-
-    def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
-        if "recenzent przeglądu kierunku" in prompt:
-            (Path(project_dir) / "app.py").write_text(
-                "HACK = 1\n", encoding="utf-8")
-            (Path(project_dir) / "probe.py").write_text(
-                "print('sonda')\n", encoding="utf-8")
-            return APPROVE
-        _write_in_scope(Path(project_dir))
-        return STEERED
-
-    with patch("forge.orchestrate.run_agent", side_effect=agent):
-        orchestrate.phase_diff_bootstrap(
-            cfg, str(project), state, lambda phase: phase, "cadence")
-
-    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
-    assert not Path(project, "probe.py").exists()
-    assert not orchestrate.has_changes(str(project))
-    # Praca autora przeglądu przeżywa cofnięcie tury recenzenta.
-    assert "tryb sieciowy" in Path(project, "BACKLOG.md").read_text(
-        encoding="utf-8")
-
-
-def test_reviewer_experiment_does_not_revert_the_authors_own_edit(
-        tmp_path: Path) -> None:
-    """Kotwicą jest stan sprzed tury recenzenta, nie sprzed całej fazy."""
-    project, state, cfg = _steered_repo(tmp_path)
-
-    def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
-        if "recenzent przeglądu kierunku" in prompt:
-            (Path(project_dir) / "BACKLOG.md").write_text(
-                "- [ ] notatka recenzenta\n", encoding="utf-8")
-            return APPROVE
-        _write_in_scope(Path(project_dir))
-        return STEERED
-
-    with patch("forge.orchestrate.run_agent", side_effect=agent):
-        orchestrate.phase_diff_bootstrap(
-            cfg, str(project), state, lambda phase: phase, "cadence")
-
-    backlog = Path(project, "BACKLOG.md").read_text(encoding="utf-8")
-    assert "tryb sieciowy" in backlog
-    assert "notatka recenzenta" not in backlog
-
-
-def test_review_reverts_writes_outside_its_scope(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-
-    def write(project_dir: Path) -> None:
-        (project_dir / "BACKLOG.md").write_text(
-            "- [ ] tryb sieciowy\n", encoding="utf-8")
-        (project_dir / "app.py").write_text("VALUE = 99\n", encoding="utf-8")
-        (project_dir / "hack.py").write_text("print('nowy')\n", encoding="utf-8")
-
-    _run_steering(project, state, cfg, write=write)
-
-    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
-    assert not Path(project, "hack.py").exists()
-    assert Path(project, "BACKLOG.md").read_text(
-        encoding="utf-8") == "- [ ] tryb sieciowy\n"
-
-
-def test_own_commit_does_not_smuggle_changes_past_the_scope_gate(
-        tmp_path: Path) -> None:
-    """Cofanie musi kotwiczyć się na SHA sprzed fazy, nie na ruchomym HEAD."""
-    project, state, cfg = _steered_repo(tmp_path)
-    base = _git(project, "rev-parse", "HEAD").stdout.strip()
-
-    def write(project_dir: Path) -> None:
-        _write_in_scope(project_dir)
-        (project_dir / "app.py").write_text("VALUE = 99\n", encoding="utf-8")
-        _git(project_dir, "add", "-A")
-        _git(project_dir, "commit", "-qm", "przemycam kod")
-
-    _run_steering(project, state, cfg, write=write)
-
-    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
-    history = _git(project, "log", f"{base}..HEAD", "-p").stdout
-    assert "VALUE = 99" not in history
-    assert "tryb sieciowy" in Path(project, "BACKLOG.md").read_text(
-        encoding="utf-8")
-
-
-def test_review_prompt_diffs_against_the_state_before_the_phase(
-        tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    base = _git(project, "rev-parse", "HEAD").stdout.strip()
-
-    seen = _run_steering(project, state, cfg)
-
-    review = [p for p in seen if "recenzent przeglądu kierunku" in p][0]
-    assert base in review
-
-
-def test_failure_after_a_reviewer_write_still_leaves_a_clean_tree(
-        tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-
-    cfg.max_bootstrap_reviews = 1
-
-    def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
-        if "recenzent przeglądu kierunku" in prompt:
-            (Path(project_dir) / "app.py").write_text(
-                "HACK = 1\n", encoding="utf-8")
-            return REJECT
-        _write_in_scope(Path(project_dir))
-        return STEERED
-
-    with patch("forge.orchestrate.run_agent", side_effect=agent), \
-         pytest.raises(orchestrate.AgentError):
-        orchestrate.phase_diff_bootstrap(
-            cfg, str(project), state, lambda phase: phase, "cadence")
-
-    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
-    assert not orchestrate.has_changes(str(project))
-
-
-def test_reviewer_touching_an_untracked_file_leaves_it_untracked(
-        tmp_path: Path) -> None:
-    """Cofanie tury nie może zastagować pliku, którego faza nie umie posprzątać."""
-    project, state, cfg = _steered_repo(tmp_path)
-    cfg.max_bootstrap_reviews = 1
-    (project / "scratch.txt").write_text("robocze\n", encoding="utf-8")
-
-    def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
-        if "recenzent przeglądu kierunku" in prompt:
-            (Path(project_dir) / "scratch.txt").write_text(
-                "sonda\n", encoding="utf-8")
-            return REJECT
-        _write_in_scope(Path(project_dir))
-        return STEERED
-
-    with patch("forge.orchestrate.run_agent", side_effect=agent), \
-         pytest.raises(orchestrate.AgentError):
-        orchestrate.phase_diff_bootstrap(
-            cfg, str(project), state, lambda phase: phase, "cadence")
-
-    assert Path(project, "scratch.txt").read_text(
-        encoding="utf-8") == "robocze\n"
-    assert "scratch.txt" in orchestrate._untracked(str(project))
-    assert orchestrate.has_changes(str(project)) == bool(
-        orchestrate._untracked(str(project)))
-    assert not _git(project, "diff", "--cached", "--name-only").stdout.strip()
-
-
-def test_reviewer_commit_is_undone_without_stopping_the_phase(
-        tmp_path: Path) -> None:
-    """Commit recenzenta unieważnia bazę porównania, więc HEAD wraca na swoje."""
-    project, state, cfg = _steered_repo(tmp_path)
-    base = _git(project, "rev-parse", "HEAD").stdout.strip()
-
-    def agent(_name, prompt, _cfg, project_dir, _log, **_kwargs):
-        if "recenzent przeglądu kierunku" in prompt:
-            (Path(project_dir) / "app.py").write_text(
-                "HACK = 1\n", encoding="utf-8")
-            _git(Path(project_dir), "add", "-A")
-            _git(Path(project_dir), "commit", "-qm", "recenzent commituje")
-            return APPROVE
-        _write_in_scope(Path(project_dir))
-        return STEERED
-
-    with patch("forge.orchestrate.run_agent", side_effect=agent):
-        orchestrate.phase_diff_bootstrap(
-            cfg, str(project), state, lambda phase: phase, "cadence")
-
-    assert not orchestrate.has_changes(str(project))
-    assert Path(project, "app.py").read_text(encoding="utf-8") == "VALUE = 0\n"
-    history = _git(project, "log", f"{base}..HEAD", "-p").stdout
-    assert "HACK = 1" not in history
-    assert "tryb sieciowy" in Path(project, "BACKLOG.md").read_text(
-        encoding="utf-8")
 
 
 def test_unreadable_brief_never_overwrites_the_snapshot(
         tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
+    project, state, cfg = _po_repo(tmp_path)
     Path(cfg.brief_path).unlink()
 
-    _run_steering(project, state, cfg, trigger="cadence")
+    _run_po(project, state, cfg, trigger="cadence")
 
     assert Path(project, brief.SNAPSHOT_PATH).read_text(
         encoding="utf-8") == "Cel: gra.\n"
     assert state.brief_digest == brief.digest("Cel: gra.\n")
 
 
-def test_unparsable_verdict_keeps_the_previous_brief_as_reference(
-        tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    _change_brief(cfg)
-
-    with pytest.raises(InvalidDecision):
-        _run_steering(project, state, cfg, trigger="brief",
-                      answers=("bez JSON-a", "nadal bez JSON-a"))
-
-    assert state.brief_digest == brief.digest("Cel: gra.\n")
-    assert Path(project, brief.SNAPSHOT_PATH).read_text(
-        encoding="utf-8") == "Cel: gra.\n"
-    # Brudne drzewo wywróciłoby następną iterację na bramce czystości.
-    assert not orchestrate.has_changes(str(project))
-
-
-# --- Osadzenie w pętli -------------------------------------------------------
+# --- Osadzenie w pętli ---------------------------------------------------------
 
 def test_iteration_reviews_direction_before_planning(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    state.plan_batches = 3
+    project, state, cfg = _po_repo(tmp_path)
+    cfg.backlog_low_water = 0
+    state.plan_batches = cfg.steering_batches
 
-    with patch("forge.orchestrate.phase_diff_bootstrap") as steering, \
+    with patch("forge.orchestrate.phase_product_owner") as po, \
+         patch("forge.orchestrate.phase_verify_stories"), \
          patch("forge.orchestrate.phase_plan_batch") as plan:
         orchestrate.one_iteration(cfg, str(project), state)
 
-    assert steering.call_args.args[-1] == "cadence"
+    assert po.call_args.args[4] == "cadence"
     plan.assert_not_called()
 
 
 def test_iteration_never_reviews_during_an_active_task(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    state.plan_batches = 9
+    project, state, cfg = _po_repo(tmp_path)
+    cfg.backlog_low_water = 2
     state.current_task = {"id": "task-001", "title": "W toku",
                           "file": "task.md", "difficulty": "simple"}
     state.task_phase = "tester"
 
-    with patch("forge.orchestrate.phase_diff_bootstrap") as steering, \
+    with patch("forge.orchestrate.phase_product_owner") as po, \
          patch("forge.orchestrate.run_task", return_value=True):
         orchestrate.one_iteration(cfg, str(project), state)
 
-    steering.assert_not_called()
-
-
-def _plan_iteration(project: Path, state: State, cfg: Config, no_more: bool):
-    with patch("forge.orchestrate.phase_plan_batch",
-               return_value={"no_more_tasks": no_more}) as plan, \
-         patch("forge.orchestrate.phase_verify_goal",
-               return_value=False) as verify, \
-         patch("forge.orchestrate.run_task", return_value=True):
-        result = orchestrate.one_iteration(cfg, str(project), state)
-    return result, plan, verify
+    po.assert_not_called()
 
 
 def test_empty_backlog_asks_for_direction_instead_of_ending_the_project(
         tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
+    project, state, cfg = _po_repo(tmp_path)
+    cfg.backlog_low_water = 0
 
-    result, _plan, verify = _plan_iteration(project, state, cfg, no_more=True)
+    with patch("forge.orchestrate.phase_plan_batch",
+               return_value={"no_more_tasks": True}), \
+         patch("forge.orchestrate.phase_verify_goal",
+               return_value=False) as verify, \
+         patch("forge.orchestrate.run_task", return_value=True):
+        result = orchestrate.one_iteration(cfg, str(project), state)
 
     assert result is True
     verify.assert_not_called()
@@ -655,28 +340,23 @@ def test_empty_backlog_asks_for_direction_instead_of_ending_the_project(
 
 def test_confirmed_goal_lets_the_empty_backlog_finish_the_project(
         tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
+    project, state, cfg = _po_repo(tmp_path)
+    cfg.backlog_low_water = 0
     state.goal_confirmed = True
 
-    _result, _plan, verify = _plan_iteration(project, state, cfg, no_more=True)
-
-    verify.assert_called_once()
-
-
-def test_two_idle_reviews_in_a_row_still_reach_final_verification(
-        tmp_path: Path) -> None:
-    """Bezpiecznik: para planista↔przegląd nie może kręcić się w nieskończoność."""
-    project, state, cfg = _steered_repo(tmp_path)
-    state.empty_plans = 2
-
-    _result, _plan, verify = _plan_iteration(project, state, cfg, no_more=True)
+    with patch("forge.orchestrate.phase_plan_batch",
+               return_value={"no_more_tasks": True}), \
+         patch("forge.orchestrate.phase_verify_goal",
+               return_value=False) as verify, \
+         patch("forge.orchestrate.run_task", return_value=True):
+        orchestrate.one_iteration(cfg, str(project), state)
 
     verify.assert_called_once()
 
 
 def test_planner_counts_idle_batches_and_forgets_them_after_real_work(
         tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
+    project, state, cfg = _po_repo(tmp_path)
     answers = iter(('{"no_more_tasks":true,"tasks":[]}',
                     '{"no_more_tasks":false,"tasks":[{"id":"task-001",'
                     '"title":"Coś","file":"BACKLOG.md"}]}'))
@@ -694,7 +374,7 @@ def test_planner_counts_idle_batches_and_forgets_them_after_real_work(
 
 def test_planner_consumes_the_steering_note_exactly_once(
         tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
+    project, state, cfg = _po_repo(tmp_path)
     note = Path(project, ".forge", "steering.md")
     note.parent.mkdir(parents=True, exist_ok=True)
     note.write_text("# Przegląd kierunku\n", encoding="utf-8")
@@ -715,7 +395,7 @@ def test_planner_consumes_the_steering_note_exactly_once(
     assert not note.exists()
 
 
-# --- Bootstrap ---------------------------------------------------------------
+# --- Bootstrap ------------------------------------------------------------------
 
 def test_bootstrap_plans_only_a_thin_demo_slice() -> None:
     prompt = prompts.bootstrap_prompt("brief")
@@ -730,7 +410,7 @@ def test_bootstrap_plans_only_a_thin_demo_slice() -> None:
 
 def test_rejected_bootstrap_is_rebuilt_with_the_review_notes(
         tmp_path: Path) -> None:
-    project, _seeded, cfg = _steered_repo(tmp_path)
+    project, _seeded, cfg = _po_repo(tmp_path)
     state = State()
     seen: list[str] = []
     verdicts = iter((REJECT, APPROVE))
@@ -754,80 +434,7 @@ def test_rejected_bootstrap_is_rebuilt_with_the_review_notes(
     assert state.test_cmd == "true"
 
 
-def test_failed_steering_saves_work_before_revert(tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    original = (project / "BACKLOG.md").read_text(encoding="utf-8")
-    answers = iter(("bez JSON-a", "nadal bez JSON-a"))
-
-    def agent(_name, _prompt, _cfg, project_dir, _log, **_kwargs):
-        _write_in_scope(Path(project_dir))
-        return next(answers)
-
-    with patch("forge.orchestrate.run_agent", side_effect=agent), \
-         pytest.raises(InvalidDecision):
-        orchestrate.phase_diff_bootstrap(
-            cfg, str(project), state, lambda phase: phase, "cadence")
-
-    assert (project / "BACKLOG.md").read_text(encoding="utf-8") == original
-    archives = list((project / ".forge" / "failed" / "_diff-bootstrap").glob("*/diff.patch"))
-    assert len(archives) == 1
-    assert "BACKLOG.md" in archives[0].read_text(encoding="utf-8")
-
-
-# --- Prompty i routing -------------------------------------------------------
-
-def test_steering_prompt_states_its_narrow_write_scope() -> None:
-    prompt = prompts.diff_bootstrap_prompt(
-        trigger="cadence", batches=3, queued_tasks=["task-007: Stary plan"])
-
-    assert "WYŁĄCZNIE BACKLOG.md oraz docs/PROJECT.md" in prompt
-    assert "task-007: Stary plan" in prompt
-    assert "Nie dotykaj kodu" in prompt
-    assert "nie cofa ukończonego kodu" in prompt
-    assert "Nie kasuj po cichu" in prompt
-    assert "najcieńszy sensowny plasterek" in prompt
-    assert "nie planuj całego produktu naprzód" in prompt
-    assert '"goal_reached":false' in prompt
-    assert "3 wsady planisty" in prompt
-    assert "POPRAWKI PO RECENZJI" not in prompt
-
-
-def test_steering_prompt_carries_the_reason_it_was_started() -> None:
-    backlog = prompts.diff_bootstrap_prompt(trigger="backlog")
-    change = prompts.diff_bootstrap_prompt("-stare\n+nowe", trigger="brief")
-
-    assert "wyczerpany backlog" in backlog
-    assert "goal_reached" in backlog
-    assert "zmiana briefu" in change
-    assert "-stare" in change and "+nowe" in change
-
-
-def test_first_review_prompt_explains_the_missing_snapshot() -> None:
-    prompt = prompts.diff_bootstrap_prompt(
-        "+cały brief", trigger="brief", initial=True)
-
-    assert "PIERWSZA synchronizacja" in prompt
-    assert "traktuj zrealizowaną już część projektu jako fakt" in prompt
-
-
-def test_unknown_trigger_is_refused_instead_of_silently_rendered() -> None:
-    with pytest.raises(ValueError, match="powód przeglądu"):
-        prompts.diff_bootstrap_prompt(trigger="whatever")
-
-
-def test_direction_review_prompt_judges_direction_not_style() -> None:
-    prompt = prompts.diff_bootstrap_review_prompt(
-        "HEAD", summary="dodałem sieć", goal_reached=True)
-
-    assert "Nie implementujesz poprawek" in prompt
-    assert "przywróć stan drzewa sprzed swojej tury" in prompt
-    assert "dodałem sieć" in prompt
-    assert "Deklaracja osiągnięcia celu: tak" in prompt
-    assert "najcieńszym sensownym przyrostem" in prompt
-    assert "zniknął po cichu" in prompt
-    assert "Nie oceniaj jakości kodu" in prompt
-    assert '"verdict":"request_changes"' in prompt
-
+# --- Prompty i routing ------------------------------------------------------------
 
 def test_planner_reads_project_context_instead_of_the_brief() -> None:
     prompt = prompts.plan_batch_prompt(4, 1)
@@ -846,10 +453,16 @@ def test_steering_note_reaches_the_planner_prompt() -> None:
     assert "przed resztą backlogu" in prompt
 
 
-def test_direction_roles_use_the_strongest_model() -> None:
+def test_po_prompt_rejects_unknown_trigger() -> None:
+    with pytest.raises(ValueError, match="powód uruchomienia Product Ownera"):
+        prompts.product_owner_prompt(trigger="whatever")
+
+
+def test_direction_roles_use_the_strongest_models() -> None:
     cfg = Config()
 
-    assert cfg.model_level("diff_bootstrap", "standard") == "max"
+    assert cfg.model_level("product_owner", "standard") == "max"
+    assert cfg.model_level("po_reviewer", "standard") == "strong"
     assert cfg.model_level("bootstrap_reviewer", "standard") == "max"
     assert cfg.role("bootstrap_reviewer")[0] == cfg.role("bootstrap")[0]
 
@@ -882,14 +495,14 @@ def test_brief_too_large_to_sync_stops_instead_of_guessing() -> None:
 
 def test_unsyncable_brief_stops_the_run_without_touching_the_snapshot(
         tmp_path: Path) -> None:
-    project, state, cfg = _steered_repo(tmp_path)
-    _change_brief(cfg, "nowy\n" * 5000)
+    project, state, cfg = _po_repo(tmp_path)
+    Path(cfg.brief_path).write_text("nowy\n" * 5000, encoding="utf-8")
     cfg_limits = {"limit": 10, "full_limit": 100}
 
     with patch("forge.brief.DIFF_LIMIT", cfg_limits["limit"]), \
          patch("forge.brief.FULL_LIMIT", cfg_limits["full_limit"]), \
          pytest.raises(orchestrate.AgentError, match="zbyt duży"):
-        _run_steering(project, state, cfg, trigger="brief")
+        _run_po(project, state, cfg, trigger="brief")
 
     assert state.brief_digest == brief.digest("Cel: gra.\n")
     assert Path(project, brief.SNAPSHOT_PATH).read_text(

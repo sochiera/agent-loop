@@ -31,8 +31,15 @@ from . import pricing
 # Kolejność ma znaczenie: pierwszy pasujący wzorzec wygrywa.
 _PHASE_GROUPS: list[tuple[str, str]] = [
     (r"^bootstrap", "bootstrap"),
+    # Rola diff-bootstrap (przegląd kierunku) jest usunięta z kodu, ale stare
+    # transkrypty i wpisy dziennika sprzed migracji na Product Ownera nadal
+    # noszą ten prefiks — bez wpisu ich koszt wpadłby do "unknown" i zepsuł
+    # historyczne `$/zadanie`.
     (r"^diff-bootstrap-review", "diff-bootstrap-review"),
     (r"^diff-bootstrap", "diff-bootstrap"),
+    (r"^product-owner", "product-owner"),
+    (r"^po-review", "po-review"),
+    (r"^verify-stories", "verify-stories"),
     (r"^plan", "plan"),
     (r"^tester", "tester"),
     (r"^coder", "coder"),
@@ -228,6 +235,19 @@ _PLAN_CREATED = re.compile(r"plan: utworzono (\d+) zadań")
 _PLAN_EMPTY = "plan: planista zgłosił brak dalszych zadań"
 _CODER_TURN = re.compile(
     rf"{ledger.TASK_ID_BODY} r\d+ koder→(\w+)")
+_STORY_TASK = re.compile(rf"({ledger.TASK_ID_BODY}).*?\((US-\d{{3}})\)")
+
+
+def story_task_groups(ledger_text: str) -> dict[str, list[str]]:
+    """Grupuj taski po historyjkach na potrzeby raportu kosztu i postępu."""
+    groups: dict[str, list[str]] = {}
+    for line in ledger_text.splitlines():
+        match = _STORY_TASK.search(line)
+        if match:
+            groups.setdefault(match.group(2), [])
+            if match.group(1) not in groups[match.group(2)]:
+                groups[match.group(2)].append(match.group(1))
+    return groups
 
 
 def plan_batches(ledger_text: str) -> list[tuple[int, int]]:
@@ -317,6 +337,12 @@ def summary_block(rows: dict, records: list[dict], project: str,
     if completed:
         lines.append("rozkład rund (rundy×zadania): "
                      + _round_histogram([count for _, count in completed]))
+    groups = story_task_groups(ledger_text)
+    if groups:
+        lines.append("historyjki: " + "; ".join(
+            f"{story}={len(tasks)} zadań" for story, tasks in sorted(groups.items())))
+        if spent is not None:
+            lines.append(f"$/historyjkę: {spent / len(groups):.2f}{partial}")
     batches = plan_batches(ledger_text)
     if batches:
         declared = sum(item[0] for item in batches)

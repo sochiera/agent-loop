@@ -2,7 +2,7 @@
 
 Brief jest źródłem intencji, ale po bootstrapie przestawał uczestniczyć w
 procesie. Ten moduł daje Forge deterministyczną odpowiedź na pytanie „czy brief
-się zmienił" oraz materiał dla roli diff-bootstrapu: zwarty diff zamiast dwóch
+się zmienił" oraz materiał dla Product Ownera: zwarty diff zamiast dwóch
 pełnych dokumentów w promptcie.
 
 Snapshot leży w repozytorium projektu, a nie w ``.forge/`` — dzięki temu

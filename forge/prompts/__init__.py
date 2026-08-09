@@ -27,48 +27,65 @@ def bootstrap_architecture_review_prompt(
     )
 
 
-STEERING_TRIGGERS = ("cadence", "brief", "backlog")
+PO_TRIGGERS = ("refill", "brief", "cadence")
 
 
-def _steering_trigger(trigger: str, batches: int) -> str:
-    if trigger == "cadence":
-        return render("diff-bootstrap-trigger-cadence.md", BATCHES=batches)
-    if trigger not in STEERING_TRIGGERS:
-        raise ValueError(f"nieznany powód przeglądu kierunku: {trigger!r}")
-    return read_template(f"diff-bootstrap-trigger-{trigger}.md")
+def _po_trigger(trigger: str) -> str:
+    # `backlog` jest nazwą starego wyzwalacza; przy renderowaniu nowej roli
+    # oznacza dokładnie refill.
+    trigger = "refill" if trigger == "backlog" else trigger
+    if trigger not in PO_TRIGGERS:
+        raise ValueError(f"nieznany powód uruchomienia Product Ownera: {trigger!r}")
+    return read_template(f"po-trigger-{trigger}.md")
 
 
-def diff_bootstrap_prompt(
-        brief_diff: str = "", *, trigger: str = "cadence", batches: int = 0,
-        initial: bool = False, queued_tasks: list[str] | None = None,
-        recent: str = "", review_notes: list[str] | None = None) -> str:
-    """Przegląd kierunku: sam diff briefu i lista commitów, nie pełne dokumenty.
-
-    Rola sama czyta docs/PROJECT.md i BACKLOG.md, więc prompt niesie wyłącznie
-    to, czego nie ma na dysku: powód uruchomienia, zmianę briefu i to, co
-    powstało od poprzedniego przeglądu.
-    """
+def product_owner_prompt(*, trigger: str, brief_diff: str = "",
+                         story_report: str = "", queued_tasks=None,
+                         parked: str = "", migration: bool = False,
+                         notebook_path: str = "", review_notes=None,
+                         max_backlog: int = 6) -> str:
+    """Prompt PO niesie wyłącznie wejścia, których nie ma w jego plikach."""
+    corrections = _corrections("po-corrections.md", review_notes)
+    parked_text = render("po-parked.md", PARKED_TEXT=parked) if parked else ""
+    migration_text = read_template("po-migration.md") if migration else ""
+    notebook = (
+        f"Twój notatnik roboczy: `{notebook_path}`. Zwróć wpis w polu `notebook`; "
+        "Forge doklei go do pliku."
+        if notebook_path else "")
+    current = brief_diff or "(brak nowego diffu briefu)"
+    report = story_report or "(brak świeżego raportu historyjek)"
     return render(
-        "diff-bootstrap.md",
-        TRIGGER=_steering_trigger(trigger, batches),
-        INITIAL=read_template("diff-bootstrap-initial.md") if initial else "",
-        BRIEF_CHANGE=(
-            brief_diff or read_template("diff-bootstrap-brief-unchanged.md")),
-        RECENT=recent or "(brak nowych commitów)",
-        QUEUED="; ".join(queued_tasks or []) or "(brak)",
-        CORRECTIONS=_corrections(
-            "diff-bootstrap-corrections.md", review_notes),
+        "product-owner.md",
+        TRIGGER=_po_trigger(trigger),
+        BRIEF_CHANGE="Zmiana briefu:\n" + current,
+        STORY_REPORT="Raport weryfikatora historyjek:\n" + report,
+        QUEUED="; ".join(str(item) for item in (queued_tasks or [])) or "(brak)",
+        PARKED=parked_text,
+        MIGRATION=migration_text,
+        NOTEBOOK=notebook,
+        CORRECTIONS=corrections,
+        MAX_BACKLOG=max_backlog,
     )
 
 
-def diff_bootstrap_review_prompt(
-        base: str, *, summary: str = "", goal_reached: bool = False) -> str:
+def po_review_prompt(result: dict, *, max_backlog: int = 6) -> str:
     return render(
-        "diff-bootstrap-review.md",
-        BASE=base,
-        SUMMARY=summary or "(brak)",
-        GOAL_REACHED="tak" if goal_reached else "nie",
+        "po-review.md",
+        SUMMARY=str(result.get("summary", "(brak)")),
+        GOAL_REACHED="tak" if result.get("goal_reached") else "nie",
+        MAX_BACKLOG=max_backlog,
     )
+
+
+def po_parse_corrections_prompt(violations: list[str]) -> str:
+    return render(
+        "po-parse-corrections.md",
+        VIOLATIONS="\n".join(f"- {item}" for item in violations),
+    )
+
+
+def verify_stories_prompt(*, stories: str, evidence: str) -> str:
+    return render("verify-stories.md", STORIES=stories, EVIDENCE=evidence)
 
 
 def plan_batch_prompt(
@@ -327,10 +344,12 @@ def no_change_rounds_suffix(rounds: int) -> str:
 
 
 def verify_goal_prompt(
-        cycle: int, evidence: dict, cycle_dir: str, **_ignored) -> str:
+        cycle: int, evidence: dict, cycle_dir: str, story_report: str = "",
+        **_ignored) -> str:
     return render(
         "verify-goal.md",
         CYCLE=cycle,
         EVIDENCE=evidence,
         CYCLE_DIR=cycle_dir,
+        STORY_REPORT=story_report or "(brak)",
     )

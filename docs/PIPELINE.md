@@ -15,7 +15,7 @@ potrzebę podziału zadania. Wyłącznie po `suggestions` tester może też zwr�
 `finalize` z niepustym uzasadnieniem rozliczającym sugestie jako zastosowane
 albo odrzucone.
 
-## Bootstrap i przegląd kierunku
+## Bootstrap, preflight i Product Owner
 
 Projekt prowadzimy zwinnie: zakres nie jest ustalany z góry, tylko rośnie w
 kolejnych przeglądach kierunku.
@@ -29,18 +29,27 @@ i rzeczy świadomie odłożone, z jawnym rozróżnieniem wymagań, preferencji i
 pomysłów opcjonalnych. Po zaakceptowanej recenzji Forge zapisuje kopię briefu w
 `docs/BRIEF-SNAPSHOT.md` i jego skrót w stanie.
 
-Przegląd kierunku (`diff-bootstrap`) rusza na granicy między zadaniami — przed
+Preflight na starcie parkuje zastane zmiany tylko przy istniejącym HEAD i braku
+aktywnego zadania. Przy unborn HEAD niczego nie parkuje, bo cały katalog jest
+materiałem dla bootstrapu. Powrót odbywa się po jawnej nazwie gałęzi albo SHA;
+`git switch -` jest zakazane.
+
+Przegląd kierunku Product Ownera rusza na granicy między zadaniami — przed
 planowaniem i przed weryfikacją celu, nigdy w trakcie aktywnego zadania — gdy
 zajdzie którykolwiek warunek:
 
 - **zmiana briefu** (skrót różny od snapshotu) — najmocniejsze wejście, wygrywa
   z pozostałymi powodami;
 - **kadencja** — minęły `FORGE_STEERING_BATCHES` (domyślnie 2) wsady planisty
-  od ostatniego przeglądu, czyli co 2×`FORGE_BATCH_SIZE` = 12 zadań;
-- **wyczerpany backlog** — planista zgłosił `no_more_tasks`.
+  od ostatniego przeglądu, czyli co 2×`FORGE_BATCH_SIZE` = 16 zadań;
+- **refill** — otwartych historyjek jest mniej niż `FORGE_BACKLOG_LOW_WATER`
+  (domyślnie 2);
+- **wyczerpany backlog** — planista zgłosił `no_more_tasks` i to jest bezpiecznik
+  refill.
 
-Rola dostaje powód uruchomienia, diff briefu (tylko gdy się zmienił), listę
-commitów od poprzedniego przeglądu i listę niezaczętych zadań; `docs/PROJECT.md`
+Rola dostaje powód uruchomienia, diff briefu (tylko gdy się zmienił), raport
+weryfikatora historyjek przy kadencji, listę niezaczętych zadań, notatkę
+parkingu i ścieżkę notatnika; `docs/PROJECT.md`
 i `BACKLOG.md` czyta sama. Wolno jej zapisać wyłącznie te dwa pliki — każdą inną
 zmianę Forge wykrywa manifestem drzewa i cofa, zanim cokolwiek trafi do commita.
 Bramka kotwiczy się na SHA sprzed fazy, nie na bieżącym HEAD: własny commit roli
@@ -193,6 +202,19 @@ sterowanie planiście.
 Niepoprawna decyzja JSON dostaje dokładnie jedną prośbę o korektę samego
 formatu. Druga niepoprawna odpowiedź zatrzymuje przebieg z zapisanym
 checkpointem.
+
+### Historyjki, statusy i raport
+
+`BACKLOG.md` jest parsowalną kolejką `US-NNN`. Każda historyjka ma
+`Dlaczego teraz`, `Sprawdzenie` i `Poza zakresem`; parser przed recenzją egzekwuje
+format, unikalność ID, brak znikających wpisów i zakaz samodzielnej zmiany
+statusu przez PO. Recenzent ocenia dopiero semantykę.
+
+Zadania niosą pole `story`, a Forge deterministycznie przeprowadza statusy
+`nowa → w toku → do weryfikacji → zrobiona` albo wraca do `w toku` po
+niepotwierdzeniu. Weryfikator historyjek wykonuje zewnętrzne `Sprawdzenie:` i
+zapisuje raport z `verified_at_batch` oraz `verified_sha`; nie czyta diffu i nie
+zastępuje code review. Niezgodny nagłówek raportu oznacza brak świeżego raportu.
 
 Kanoniczna pełna suita repozytorium:
 

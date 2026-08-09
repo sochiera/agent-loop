@@ -238,3 +238,12 @@ def test_notebook_edits_do_not_count_as_task_changes(tmp_path: Path) -> None:
     assert orchestrate._changed(
         str(tmp_path), "forge/task-123-start") == []
     assert not orchestrate.has_changes(str(tmp_path))
+
+
+def test_project_product_owner_notebook_survives_orphan_pruning(tmp_path: Path) -> None:
+    notebooks.ensure_project(str(tmp_path), ".forge")
+    notebooks.ensure(str(tmp_path), ".forge", "task-999")
+    orchestrate._housekeeping(Config(), str(tmp_path))
+    assert notebooks.project_path(
+        str(tmp_path), ".forge", "product-owner").exists()
+    assert not notebooks.task_dir(str(tmp_path), ".forge", "task-999").exists()

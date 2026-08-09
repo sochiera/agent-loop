@@ -5,12 +5,16 @@ Forge is a non-commercial, MIT-licensed experiment in reliable AI agent orchestr
 ## How it works
 
 ```text
-planner → tester ↔ coder → tester → reviewer
+product owner → planner → tester ↔ coder → reviewer
+                    ↑                          │
+                    └── weryfikator historyjek ┘
 ```
 
+- Product Owner utrzymuje cel projektu i cienki, uporządkowany backlog historyjek.
 - The planner creates small batches of focused tasks.
 - The tester and coder iterate using explicit TDD states.
 - A fresh, read-only reviewer approves changes or requests corrections.
+- A story verifier checks observable outcomes and updates story lifecycle status.
 - A ledger and checkpoints keep progress visible and recoverable.
 
 See [docs/PIPELINE.md](docs/PIPELINE.md) for details.
