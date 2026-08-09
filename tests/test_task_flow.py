@@ -551,6 +551,15 @@ def test_nits_do_not_reopen_tdd_loop(tmp_path: Path) -> None:
         tmp_path / ".forge" / "nits.md").read_text(encoding="utf-8")
 
 
+def test_nits_follow_configured_runtime_dir(tmp_path: Path) -> None:
+    cfg = Config(runtime_dir=".forge-runtime", git_push=False)
+
+    orchestrate._append_review_nits(cfg, str(tmp_path), "task-001", ["kosmetyka"])
+
+    assert (tmp_path / ".forge-runtime" / "nits.md").read_text(
+        encoding="utf-8") == "- task-001: kosmetyka\n"
+
+
 def test_interrupt_after_finalize_resumes_at_commit(
         tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)

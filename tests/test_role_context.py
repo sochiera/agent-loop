@@ -226,6 +226,9 @@ def test_reviewer_prompt_is_plain_code_review() -> None:
     assert '"verdict":"suggestions"' in prompt
     assert '"verdict":"request_changes"' in prompt
     assert "można bezpiecznie zacommitować" in prompt
+    assert "użyj `suggestions`" in prompt
+    assert "użyj `request_changes`" in prompt
+    assert "umieść ją w `nits`" in prompt
 
 
 def test_suggestions_prompt_can_finalize_or_escalate() -> None:

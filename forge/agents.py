@@ -258,13 +258,12 @@ def extract_opencode_usage(stream: str) -> dict:
     sumowanie zawyżyłoby rachunek o wszystkie stany pośrednie.
     """
     messages: dict[str, dict] = {}
-    anonymous = 0
     for line in (stream or "").splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict) or event.get("type") != "message.updated":
+        if not isinstance(event, dict):
             continue
         properties = event.get("properties")
         candidates = (
@@ -274,10 +273,12 @@ def extract_opencode_usage(stream: str) -> dict:
         info = next((item for item in candidates if isinstance(item, dict)), None)
         if not info or info.get("role") != "assistant" or not isinstance(info.get("tokens"), dict):
             continue
-        message_id = str(info.get("id") or event.get("id") or "")
+        message_id = str(info.get("id") or "")
         if not message_id:
-            anonymous += 1
-            message_id = f"anonymous-{anonymous}"
+            # Bez stabilnego id nie wiemy, czy kolejne zdarzenie jest nową
+            # wiadomością, czy narastającą wersją poprzedniej. Pominięcie
+            # zachowuje uczciwy fallback zamiast wielokrotnie zawyżać koszt.
+            continue
         messages[message_id] = info["tokens"]
     if not messages:
         return {}
@@ -917,6 +918,9 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
             "model": model, "effort": effort, "usage": usage,
         })
     else:
+        if spec.name == "opencode" and stream.strip():
+            log("  UWAGA: OpenCode zwrócił strumień bez liczników tokenów; "
+                "zapisuję usage_unavailable (sprawdź format zdarzeń CLI).")
         _log_call_without_tokens(usage_dir or project_dir, cfg, log_path,
                                  spec.name, model, effort)
     if out_file:

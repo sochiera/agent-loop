@@ -22,16 +22,19 @@ Wybierz dokładnie jeden werdykt:
   o poprawki, nie definitywne odrzucenie zadania; po zmianach nastąpi nowe
   review.
 
-Pierwszy test rozstrzygający: czy diff można bezpiecznie zacommitować bez
-zastosowania uwagi? `notes` zawiera wyłącznie uwagi, których pominięcie
-zostawi w repo błąd zachowania, złamany kontrakt, mylącą nazwę publiczną albo
-test nieweryfikujący deklarowanego zachowania. `nits` zawiera wszystko pozostałe:
-brzmienie docstringa, nazwę prywatnej stałej, redundantną asercję czy drobne
-uproszczenie. Nity są zapisane do notatnika i NIE uruchamiają dodatkowej rundy.
+Test rozstrzygający: jeśli żadna uwaga nie zostanie zastosowana, czy diff nadal
+można bezpiecznie zacommitować? Jeśli nie, użyj `request_changes`. Jeśli tak,
+ale jest konkretne, niekosmetyczne usprawnienie warte oceny przez tester→koder,
+użyj `suggestions`. Jeśli uwaga jest wyłącznie kosmetyczna, użyj `approve` i
+umieść ją w `nits`. Nie unikaj `request_changes` tylko po to, by zakończyć
+zadanie.
 
-Test rozstrzygający dla nita: czy pominięcie uwagi na zawsze zostawi w repo
-coś, co wprowadzi w błąd czytelnika kodu albo użytkownika? Jeśli nie, to nit.
-Nie chowaj prawdziwego defektu w `nits` tylko po to, by zakończyć zadanie.
+`notes` to wspólny kanał konkretnych, niekosmetycznych uwag dla
+`suggestions` i `request_changes`; werdykt mówi, czy ich pominięcie blokuje
+commit. `nits` zawiera wyłącznie kosmetykę: brzmienie docstringa, nazwę
+prywatnej stałej, redundantną asercję czy drobne uproszczenie. Nity są trwałym
+śladem audytowym i NIE uruchamiają dodatkowej rundy. Nie chowaj prawdziwego
+defektu w `nits` tylko po to, by zakończyć zadanie.
 
 Każda pozycja ma wskazać konkretny problem lub usprawnienie, jego skutek oraz
 ograniczony oczekiwany rezultat. `approve` wymaga pustego `notes`, ale może

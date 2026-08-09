@@ -589,15 +589,18 @@ def _write_current_task(project: str, task: dict) -> None:
     target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
 
 
-def _append_review_nits(project: str, task_id: str, nits: list[str]) -> None:
+def _append_review_nits(cfg: Config, project: str, task_id: str,
+                        nits: list[str]) -> None:
     """Zachowaj kosmetyczne uwagi poza pętlą TDD.
 
-    To celowo nie jest stan zadania ani handoff: ponowne podanie nita testerowi
-    lub koderowi wywołałoby kosztowną rundę, której ten kanał ma zapobiegać.
+    To celowo trwały, nieograniczony ślad audytowy, a nie stan zadania ani
+    handoff: Forge nie podaje go automatycznie agentom. Ponowne podanie nita
+    testerowi lub koderowi wywołałoby kosztowną rundę, której ten kanał ma
+    zapobiegać.
     """
     if not nits:
         return
-    path = Path(project, ".forge", "nits.md")
+    path = Path(project, cfg.runtime_dir, "nits.md")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as target:
         for nit in nits:
@@ -1277,7 +1280,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         review_notes = list(review.data.get("notes", []))
         nits = list(review.data.get("nits", []))
         if nits:
-            _append_review_nits(project, task["id"], nits)
+            _append_review_nits(cfg, project, task["id"], nits)
             ledger.append(project, f"{task['id']} review-nits: "
                                    f"{'; '.join(nits)[:160]}")
         if review.status == "request_changes":

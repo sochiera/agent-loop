@@ -289,7 +289,7 @@ def test_generic_grok_receives_isolated_environment(tmp_path: Path) -> None:
 
 def test_opencode_usage_sums_last_version_of_each_message() -> None:
     def event(message_id: str, input_tokens: int) -> str:
-        return json.dumps({"type": "message.updated", "properties": {"info": {
+        return json.dumps({"type": "message.updated.1", "properties": {"info": {
             "id": message_id, "role": "assistant", "tokens": {
                 "input": input_tokens, "output": input_tokens // 10,
                 "reasoning": input_tokens // 20, "cache": {"read": 4, "write": 2},
@@ -308,7 +308,7 @@ def test_opencode_usage_sums_last_version_of_each_message() -> None:
 
 
 def test_opencode_usage_maps_cache_read_and_write() -> None:
-    stream = json.dumps({"type": "message.updated", "info": {
+    stream = json.dumps({"type": "unknown-future-event", "info": {
         "id": "msg", "role": "assistant", "tokens": {
             "input": 12, "output": 3, "reasoning": 2,
             "cache": {"read": 9, "write": 5},
@@ -324,6 +324,14 @@ def test_opencode_usage_maps_cache_read_and_write() -> None:
 
 def test_opencode_usage_empty_stream_returns_empty() -> None:
     assert agents.extract_opencode_usage("not json\n{}") == {}
+
+
+def test_opencode_usage_skips_messages_without_stable_id() -> None:
+    stream = "\n".join(json.dumps({"info": {
+        "role": "assistant", "tokens": {"input": input_tokens},
+    }}) for input_tokens in (10, 20))
+
+    assert agents.extract_opencode_usage(stream) == {}
 
 
 def test_generic_opencode_extracts_text_without_thin_and_logs_usage(
@@ -351,6 +359,16 @@ def test_generic_opencode_extracts_text_without_thin_and_logs_usage(
         "cache_creation_input_tokens": 3, "output_tokens": 4,
         "reasoning_output_tokens": 1,
     }
+
+
+def test_generic_opencode_warns_when_stream_has_no_usage(tmp_path: Path) -> None:
+    with patch("forge.agents._run_with_backoff", return_value='{"type":"future"}'), \
+         patch("forge.agents.log") as warning:
+        run_agent("opencode", "prompt", Config(), str(tmp_path),
+                  str(tmp_path / "review.log"))
+
+    assert any("bez liczników tokenów" in str(call.args[0])
+               for call in warning.call_args_list)
 
 
 def test_prompt_file_is_cleaned_when_template_expands_to_empty_argv(
