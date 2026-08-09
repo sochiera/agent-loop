@@ -90,12 +90,27 @@ def _prepare_isolated_home(
         pass
     for source, name in links:
         destination = target / name
-        if not source.exists() or destination.exists() or destination.is_symlink():
+        if not source.exists():
             continue
         try:
-            destination.symlink_to(source)
-        except FileExistsError:
+            if destination.is_symlink() and destination.resolve() == source.resolve():
+                continue
+        except OSError:
+            # A dangling or unreadable link must be replaced below.
             pass
+        temporary = target / f".{name}.{uuid.uuid4().hex}.tmp"
+        try:
+            temporary.symlink_to(source)
+            # Older Forge releases left a copied credential here.  Replacing it
+            # atomically keeps the isolated home pointed at the session that
+            # the user's CLI refreshes in its normal configuration directory.
+            os.replace(temporary, destination)
+        except OSError:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def _ts() -> str:

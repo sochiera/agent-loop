@@ -261,6 +261,28 @@ def test_isolated_cli_homes_link_auth_but_not_global_instructions(
     assert not (grok_home / "CLAUDE.md").exists()
 
 
+def test_isolated_claude_home_replaces_stale_credential_copy(
+        tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    config = tmp_path / "config"
+    source = home / ".claude" / ".credentials.json"
+    destination = config / "forge" / "claude" / ".credentials.json"
+    source.parent.mkdir(parents=True)
+    destination.parent.mkdir(parents=True)
+    source.write_text("fresh", encoding="utf-8")
+    # This is the state produced by an older Forge run: a stale copy that
+    # cannot observe an OAuth refresh done by the normal Claude CLI.
+    destination.write_text("expired", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
+
+    _isolated_agent_env("claude")
+
+    assert destination.is_symlink()
+    assert destination.resolve() == source
+    assert destination.read_text(encoding="utf-8") == "fresh"
+
+
 def test_builtin_agents_receive_isolated_environment(tmp_path: Path) -> None:
     claude_raw = '{"result":"ok"}'
     with patch("forge.agents._isolated_agent_env",
