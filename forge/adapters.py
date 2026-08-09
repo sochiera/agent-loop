@@ -35,9 +35,12 @@ KONTRAKT generycznego agenta (nie wykryjemy tego za Ciebie — CLI bywają róż
 - finalną odpowiedź (blok ```json wymagany przez rolę) wypisz na STDOUT albo do
   pliku {output}; komunikaty diagnostyczne kieruj na STDERR,
 - nie znamy zużycia tokenów generyka — nie trafia do .forge/usage.jsonl.
-  Wyjątek: domyślny OpenCode działa z `--format json`, więc Forge rozumie jego
-  zdarzenia `message.updated` i zapisuje ich końcowe liczniki. Własny szablon
-  OpenCode powinien zachować tę flagę, aby telemetryka pozostała dostępna.
+  Wyjątki: domyślny OpenCode działa z `--format json`, więc Forge rozumie jego
+  zdarzenia i zapisuje końcowe liczniki (własny szablon powinien zachować tę
+  flagę). Domyślny Grok trzyma stdout w formacie 'plain' (nie zmieniamy, jak
+  czytana jest odpowiedź), ale przekazuje mu Forge-owy `--session-id`, więc
+  po zakończeniu procesu Forge czyta liczniki z lokalnego pliku sesji, który
+  Grok i tak zapisuje na dysku niezależnie od formatu stdout.
 """
 from __future__ import annotations
 
@@ -56,7 +59,7 @@ RESUMABLE_AGENTS = ("codex",)
 
 _PLACEHOLDERS = (
     "prompt", "prompt_file", "system", "schema", "model", "effort",
-    "project", "output",
+    "project", "output", "session_id",
 )
 
 # Aliasy nazw agentów — "gpt"/"chatgpt" to po prostu Codex CLI (agent OpenAI
@@ -82,7 +85,12 @@ KNOWN_TEMPLATES: dict[str, str] = {
     # process-name filters such as `pkill -f`.
     # Verified against the installed Grok 0.2.106 `grok --help`:
     # --prompt-file and --always-approve are supported options.
-    "grok": "grok --prompt-file {prompt_file} -m {model} --effort {effort} --always-approve",
+    # --session-id names a NEW conversation with a Forge-chosen UUID (Grok
+    # forbids passing an existing id here): stdout stays plain text (the
+    # response format callers rely on is unchanged), while Forge separately
+    # reads the token usage Grok writes locally under that session id.
+    "grok": ("grok --prompt-file {prompt_file} -m {model} --effort {effort} "
+             "--always-approve --session-id {session_id}"),
     # Kiro CLI (AWS): headless mode nie ma dziś flag wyboru modelu ani effortu.
     # Routing Kiro jest więc tylko metadanymi dla własnego szablonu użytkownika;
     # ten domyślny szablon zawsze korzysta z ustawień ~/.kiro/settings/cli.json.
@@ -111,7 +119,8 @@ THIN_TEMPLATES: dict[str, str] = {
     "grok": (
         "grok --prompt-file {prompt_file} -m {model} --effort {effort} "
         "--system-prompt-override {system} --tools \"\" --no-subagents "
-        "--no-memory --disable-web-search --max-turns 1 --json-schema {schema}"
+        "--no-memory --disable-web-search --max-turns 1 --json-schema {schema} "
+        "--session-id {session_id}"
     ),
     "opencode": (
         "opencode run {prompt} -m {model} --variant {effort} "

@@ -15,8 +15,10 @@ import re
 import subprocess
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 from . import adapters
 from . import ledger
@@ -251,12 +253,50 @@ def extract_codex_usage(stream: str) -> dict:
 
 
 def extract_opencode_usage(stream: str) -> dict:
-    """Zsumuj końcowe liczniki wiadomości asystenta z JSONL OpenCode.
+    """Zużycie tokenów z JSONL OpenCode — nowy format, z awaryjnym starym.
 
-    ``message.updated`` pojawia się wielokrotnie dla tej samej, narastającej
-    wiadomości. Dlatego ostatnia wersja każdego id zastępuje poprzednią; ich
-    sumowanie zawyżyłoby rachunek o wszystkie stany pośrednie.
-    """
+    Instalacja z sierpnia 2026 emituje ``step_finish`` z ``part.tokens``, a
+    licznik w KAŻDYM kolejnym zdarzeniu tej rodziny jest NARASTAJĄCY dla
+    całego wywołania (nie per wiadomość) — ostatnie zdarzenie w strumieniu
+    niesie już pełną sumę, więc bierzemy TYLKO jego licznik. Starszy format
+    (``message.updated`` / ``info.tokens`` per rola asystenta) jest
+    zachowany jako fallback dla instalacji, które go jeszcze zwracają."""
+    new = _extract_opencode_usage_step_finish(stream)
+    if new:
+        return new
+    return _extract_opencode_usage_legacy(stream)
+
+
+def _extract_opencode_usage_step_finish(stream: str) -> dict:
+    last_tokens: dict | None = None
+    for line in (stream or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "step_finish":
+            continue
+        part = event.get("part")
+        tokens = part.get("tokens") if isinstance(part, dict) else None
+        if isinstance(tokens, dict):
+            last_tokens = tokens  # ostatnie zdarzenie niesie sumę całego wywołania
+    if not last_tokens:
+        return {}
+    cache = last_tokens.get("cache") if isinstance(last_tokens.get("cache"), dict) else {}
+    return {
+        "input_tokens": int(last_tokens.get("input") or 0),
+        "cache_read_input_tokens": int(cache.get("read") or 0),
+        "cache_creation_input_tokens": int(cache.get("write") or 0),
+        "output_tokens": int(last_tokens.get("output") or 0),
+        "reasoning_output_tokens": int(last_tokens.get("reasoning") or 0),
+    }
+
+
+def _extract_opencode_usage_legacy(stream: str) -> dict:
+    """Format sprzed sierpnia 2026: ``message.updated`` pojawia się
+    wielokrotnie dla tej samej, narastającej wiadomości. Dlatego ostatnia
+    wersja każdego id zastępuje poprzednią; ich sumowanie zawyżyłoby
+    rachunek o wszystkie stany pośrednie."""
     messages: dict[str, dict] = {}
     for line in (stream or "").splitlines():
         try:
@@ -303,6 +343,51 @@ def extract_opencode_usage(stream: str) -> dict:
             if isinstance(value, (int, float)):
                 totals[target] += int(value)
     return totals
+
+
+def _grok_session_updates_path(grok_home: str, cwd: str, session_id: str) -> Path:
+    escaped_cwd = quote(str(Path(cwd).resolve()), safe="")
+    return Path(grok_home) / "sessions" / escaped_cwd / session_id / "updates.jsonl"
+
+
+def extract_grok_usage(grok_home: str, cwd: str, session_id: str) -> dict:
+    """Zużycie tokenów Grok z lokalnego pliku sesji.
+
+    Domyślny szablon Grok trzyma stdout w formacie 'plain' — zmiana na JSON
+    zmieniłaby sposób odczytu odpowiedzi dla wszystkich ról. Zamiast tego
+    Forge nadaje sesji własny ``--session-id`` i po zakończeniu procesu czyta
+    ``updates.jsonl``, który Grok i tak zapisuje lokalnie niezależnie od
+    formatu stdout. Zdarzenie ``turn_completed`` niesie licznik NARASTAJĄCY
+    dla całej sesji, więc liczy się tylko ostatnie wystąpienie."""
+    if not grok_home or not session_id:
+        return {}
+    try:
+        lines = _grok_session_updates_path(
+            grok_home, cwd, session_id).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    usage: dict | None = None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        update = (event.get("params") or {}).get("update")
+        if not isinstance(update, dict) or update.get("sessionUpdate") != "turn_completed":
+            continue
+        candidate = update.get("usage")
+        if isinstance(candidate, dict):
+            usage = candidate
+    if not usage:
+        return {}
+    return {
+        "input_tokens": int(usage.get("inputTokens") or 0),
+        "cached_input_tokens": int(usage.get("cachedReadTokens") or 0),
+        "output_tokens": int(usage.get("outputTokens") or 0),
+        "reasoning_output_tokens": int(usage.get("reasoningTokens") or 0),
+    }
 
 
 def _find_number(obj, key: str):
@@ -919,11 +1004,16 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
                     suffix=".md", delete=False) as handle:
                 handle.write(prompt)
                 prompt_file = handle.name
+        # Grok forbids reusing an id, więc świeży UUID zawsze nazywa NOWĄ
+        # konwersację (Forge nigdy nie wznawia sesji Groka) — po zakończeniu
+        # procesu ten sam id lokalizuje plik sesji z licznikami tokenów.
+        grok_session_id = str(uuid.uuid4()) if spec.name == "grok" else ""
         subs = {
             "prompt": prompt, "prompt_file": prompt_file or "",
             "system": system_prompt, "schema": json_schema,
             "model": model or "", "effort": effort or "",
             "project": project_dir, "output": out_file or "",
+            "session_id": grok_session_id,
         }
         argv = adapters.expand_template(spec.template, subs)
         if not argv:
@@ -945,7 +1035,13 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
                 os.unlink(prompt_file)
             except OSError:
                 pass
-    usage = extract_opencode_usage(stream) if spec.name == "opencode" else {}
+    if spec.name == "opencode":
+        usage = extract_opencode_usage(stream)
+    elif spec.name == "grok" and grok_session_id:
+        usage = extract_grok_usage(
+            process_env.get("GROK_HOME", ""), project_dir, grok_session_id)
+    else:
+        usage = {}
     if usage:
         log_usage(usage_dir or project_dir, cfg, {
             "agent": spec.name, "phase": _phase_from_log(log_path),
@@ -955,6 +1051,9 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
         if spec.name == "opencode" and stream.strip():
             log("  UWAGA: OpenCode zwrócił strumień bez liczników tokenów; "
                 "zapisuję usage_unavailable (sprawdź format zdarzeń CLI).")
+        elif spec.name == "grok" and grok_session_id and stream.strip():
+            log("  UWAGA: Grok nie zapisał liczników tokenów w pliku sesji; "
+                "zapisuję usage_unavailable (sprawdź --session-id i GROK_HOME).")
         _log_call_without_tokens(usage_dir or project_dir, cfg, log_path,
                                  spec.name, model, effort)
     if out_file:

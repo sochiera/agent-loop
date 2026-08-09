@@ -361,6 +361,44 @@ def test_generic_opencode_extracts_text_without_thin_and_logs_usage(
     }
 
 
+def test_opencode_usage_reads_step_finish_cumulative_total() -> None:
+    def step(message_id: str, total_input: int) -> str:
+        return json.dumps({"type": "step_finish", "part": {
+            "messageID": message_id, "type": "step-finish",
+            "tokens": {"total": total_input + 10, "input": total_input,
+                       "output": 5, "reasoning": 1,
+                       "cache": {"read": 3, "write": 2}},
+        }})
+
+    # Kolejne zdarzenia niosą NARASTAJĄCY licznik całego wywołania — tylko
+    # ostatnie ma się liczyć, sumowanie zawyżyłoby rachunek.
+    usage = agents.extract_opencode_usage("\n".join((
+        step("msg-1", 100), step("msg-2", 250), step("msg-3", 400),
+    )))
+
+    assert usage == {
+        "input_tokens": 400, "cache_read_input_tokens": 3,
+        "cache_creation_input_tokens": 2, "output_tokens": 5,
+        "reasoning_output_tokens": 1,
+    }
+
+
+def test_opencode_usage_prefers_step_finish_over_legacy_format() -> None:
+    stream = "\n".join((
+        json.dumps({"type": "message.updated", "info": {
+            "id": "msg", "role": "assistant", "tokens": {"input": 999},
+        }}),
+        json.dumps({"type": "step_finish", "part": {
+            "tokens": {"input": 12, "output": 3, "reasoning": 0,
+                       "cache": {"read": 1, "write": 0}},
+        }}),
+    ))
+
+    usage = agents.extract_opencode_usage(stream)
+
+    assert usage["input_tokens"] == 12
+
+
 def test_generic_opencode_warns_when_stream_has_no_usage(tmp_path: Path) -> None:
     with patch("forge.agents._run_with_backoff", return_value='{"type":"future"}'), \
          patch("forge.agents.log") as warning:
@@ -369,6 +407,81 @@ def test_generic_opencode_warns_when_stream_has_no_usage(tmp_path: Path) -> None
 
     assert any("bez liczników tokenów" in str(call.args[0])
                for call in warning.call_args_list)
+
+
+def test_grok_usage_reads_last_turn_completed_from_session_file(
+        tmp_path: Path) -> None:
+    from urllib.parse import quote
+    cwd = str(tmp_path / "project")
+    Path(cwd).mkdir()
+    session_dir = (tmp_path / "grok-home" / "sessions"
+                   / quote(str(Path(cwd).resolve()), safe="") / "sess-1")
+    session_dir.mkdir(parents=True)
+    updates = [
+        {"params": {"update": {"sessionUpdate": "turn_completed", "usage": {
+            "inputTokens": 100, "outputTokens": 10, "cachedReadTokens": 20,
+            "reasoningTokens": 5,
+        }}}},
+        {"params": {"update": {"sessionUpdate": "turn_completed", "usage": {
+            "inputTokens": 300, "outputTokens": 30, "cachedReadTokens": 60,
+            "reasoningTokens": 15,
+        }}}},
+    ]
+    (session_dir / "updates.jsonl").write_text(
+        "\n".join(json.dumps(u) for u in updates), encoding="utf-8")
+
+    usage = agents.extract_grok_usage(str(tmp_path / "grok-home"), cwd, "sess-1")
+
+    assert usage == {
+        "input_tokens": 300, "cached_input_tokens": 60,
+        "output_tokens": 30, "reasoning_output_tokens": 15,
+    }
+
+
+def test_grok_usage_missing_session_file_returns_empty(tmp_path: Path) -> None:
+    assert agents.extract_grok_usage(str(tmp_path / "nope"), str(tmp_path), "x") == {}
+
+
+def test_grok_usage_without_home_or_session_id_returns_empty() -> None:
+    assert agents.extract_grok_usage("", "/tmp", "sess") == {}
+    assert agents.extract_grok_usage("/tmp/home", "/tmp", "") == {}
+
+
+def test_generic_grok_passes_session_id_and_logs_usage(tmp_path: Path) -> None:
+    from urllib.parse import quote
+    project = str(tmp_path / "project")
+    Path(project).mkdir()
+    grok_home = str(tmp_path / "grok-home")
+    captured = {}
+
+    def fake_backoff(argv, cwd, cfg_, log, stdin_text=None, env=None):
+        captured["argv"] = argv
+        session_id = argv[argv.index("--session-id") + 1]
+        session_dir = (Path(grok_home) / "sessions"
+                       / quote(str(Path(project).resolve()), safe="") / session_id)
+        session_dir.mkdir(parents=True)
+        (session_dir / "updates.jsonl").write_text(json.dumps({
+            "params": {"update": {"sessionUpdate": "turn_completed", "usage": {
+                "inputTokens": 50, "outputTokens": 4, "cachedReadTokens": 1,
+                "reasoningTokens": 0,
+            }}},
+        }), encoding="utf-8")
+        return "odpowiedź groka"
+
+    with patch("forge.agents._isolated_agent_env",
+               return_value={"GROK_HOME": grok_home}), \
+         patch("forge.agents._run_with_backoff", side_effect=fake_backoff):
+        out = run_agent("grok", "prompt", Config(), project, str(tmp_path / "log"))
+
+    assert out == "odpowiedź groka"
+    assert "--session-id" in captured["argv"]
+    records = [json.loads(line) for line in (
+        Path(project) / ".forge" / "usage.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["agent"] == "grok"
+    assert records[-1]["usage"] == {
+        "input_tokens": 50, "cached_input_tokens": 1,
+        "output_tokens": 4, "reasoning_output_tokens": 0,
+    }
 
 
 def test_prompt_file_is_cleaned_when_template_expands_to_empty_argv(
