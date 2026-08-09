@@ -549,6 +549,19 @@ def test_extract_json_repairs_invalid_escape_before_typographic_quote() -> None:
         "summary": "można „grać patrząc” na mapę", "replan": False}
 
 
+def test_extract_json_repairs_unfenced_nested_planner_verdict() -> None:
+    text = ('{"no_more_tasks":false,"tasks":[{"id":"task-001",'
+            '"title":"a „b" c"}]}')
+
+    detail = agents._extract_json_detail(text)
+
+    assert detail.repaired is True
+    assert detail.data == {
+        "no_more_tasks": False,
+        "tasks": [{"id": "task-001", "title": "a „b\" c"}],
+    }
+
+
 def test_extract_json_repair_keeps_valid_json_untouched() -> None:
     text = '{"summary":"wariant „pełny”","replan":false}'
 

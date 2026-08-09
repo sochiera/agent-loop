@@ -265,7 +265,8 @@ def _dump_phase_work(project, cfg, label, base_sha, paths) -> str:
 ```
 
 Wzorowany na `_fail_task` ([orchestrate.py:911](../forge/orchestrate.py#L911)),
-zawartość katalogu `.forge/failed/_steering/<YYYYmmdd-HHMMSS>/`:
+zawartość katalogu `.forge/failed/_<phase>/<YYYYmmdd-HHMMSS>/` (np.
+`_bootstrap` albo `_diff-bootstrap`):
 
 * `diff.patch` — `git diff --no-ext-diff <base_sha> -- <paths>`;
 * `changed.txt` — lista ścieżek z `_turn_changes`;

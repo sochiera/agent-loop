@@ -402,7 +402,10 @@ def _repair_json_text(raw: str) -> str:
     """Napraw dwa częste, lokalne błędy w wartościach stringowych JSON.
 
     Nie jest to tolerancyjny parser: niepewne przypadki pozostawia parserowi
-    JSON. Dzięki temu nie zwracamy wiarygodnie wyglądającego pół-wyniku.
+    JSON. Dzięki temu nie zwracamy wiarygodnie wyglądającego pół-wyniku. To
+    świadoma zmiana dawnej polityki odrzucania nieeskejpowanego cudzysłowu:
+    utrata gotowej pracy przez jeden zły werdykt kosztuje więcej niż retry,
+    a każde odzyskanie pozostaje widoczne w logu i ledgerze.
     """
     repaired: list[str] = []
     in_string = False
@@ -452,6 +455,35 @@ def _json_error_detail(raw: str, error: json.JSONDecodeError, *, fenced: bool) -
             f"(linia {error.lineno}, kolumna {error.colno}); kontekst: …{context}…")
 
 
+def _unfenced_repair_candidates(text: str) -> list[str]:
+    """Zwróć kandydatów najwyższego poziomu, od ostatniego do pierwszego.
+
+    Kandydat z uszkodzonym stringiem nie może być wybierany przez ``rfind('{')``:
+    w decyzji planisty ostatni nawias otwiera zwykle zagnieżdżone zadanie, nie
+    cały werdykt. Skanujemy starty tą samą strategią co ``_scan_json_objects``
+    i zachowujemy tylko obiekty, które nie są wartością większej struktury.
+    """
+    decoder = json.JSONDecoder()
+    starts: list[int] = []
+    index, length = 0, len(text)
+    while index < length:
+        start = text.find("{", index)
+        if start < 0:
+            break
+        if not _is_nested_value(text, start):
+            starts.append(start)
+        try:
+            _obj, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError as exc:
+            index = max(exc.pos, start + 1)
+        else:
+            index = max(end, start + 1)
+    end = text.rfind("}")
+    if end < 0:
+        return []
+    return [text[start:end + 1] for start in reversed(starts) if start <= end]
+
+
 def _extract_json_detail(text: str) -> JsonExtraction:
     """Wydobądź JSON i zachowaj ostatnią użyteczną diagnozę dekodera."""
     if not text:
@@ -473,22 +505,24 @@ def _extract_json_detail(text: str) -> JsonExtraction:
 
     repair_candidates = list(reversed(fences))
     if not repair_candidates:
-        start, end = text.rfind("{"), text.rfind("}")
-        if start >= 0 and end >= start:
-            raw = text[start:end + 1]
+        repair_candidates = _unfenced_repair_candidates(text)
+        for raw in repair_candidates:
             try:
                 json.loads(raw)
             except json.JSONDecodeError as exc:
-                repair_candidates.append(raw)
                 last_error = (raw, exc, False)
+                break
+        else:
+            repair_candidates = []
     for raw in repair_candidates:
+        repaired_raw = _repair_json_text(raw)
         try:
-            obj = json.loads(_repair_json_text(raw))
+            obj = json.loads(repaired_raw)
             if isinstance(obj, dict):
                 return JsonExtraction(data=obj, repaired=True)
         except json.JSONDecodeError as exc:
             if last_error is None:
-                last_error = (raw, exc, bool(fences))
+                last_error = (repaired_raw, exc, bool(fences))
     if last_error:
         raw, exc, fenced = last_error
         return JsonExtraction(error=_json_error_detail(raw, exc, fenced=fenced))

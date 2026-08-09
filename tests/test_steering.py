@@ -769,7 +769,7 @@ def test_failed_steering_saves_work_before_revert(tmp_path: Path) -> None:
             cfg, str(project), state, lambda phase: phase, "cadence")
 
     assert (project / "BACKLOG.md").read_text(encoding="utf-8") == original
-    archives = list((project / ".forge" / "failed" / "_steering").glob("*/diff.patch"))
+    archives = list((project / ".forge" / "failed" / "_diff-bootstrap").glob("*/diff.patch"))
     assert len(archives) == 1
     assert "BACKLOG.md" in archives[0].read_text(encoding="utf-8")
 

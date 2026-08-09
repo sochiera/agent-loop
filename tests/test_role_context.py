@@ -8,7 +8,7 @@ def test_every_json_contract_template_carries_quote_rule() -> None:
     templates = Path(prompts.__file__).with_name("templates")
     for template in templates.glob("*.md"):
         text = template.read_text(encoding="utf-8")
-        if '{"' in text:
+        if template.name != "json-rules.md" and "JSON" in text:
             assert "{{JSON_RULES}}" in text, template.name
 
 

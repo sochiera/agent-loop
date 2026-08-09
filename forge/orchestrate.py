@@ -913,7 +913,8 @@ def _dump_phase_work(project: str, cfg: Config, label: str, base_sha: str,
                      paths: list[str], reason: Exception) -> str:
     """Zachowaj pracę fazy przed rewertem, nie zakłócając obsługi awarii."""
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    dest = Path(project, cfg.runtime_dir, "failed", "_steering", stamp)
+    phase = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "phase"
+    dest = Path(project, cfg.runtime_dir, "failed", f"_{phase}", stamp)
     try:
         dest.mkdir(parents=True, exist_ok=True)
         diff_args = ("diff", "--no-ext-diff", base_sha, "--", *paths) if base_sha else (
