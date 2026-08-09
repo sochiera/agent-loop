@@ -13,6 +13,7 @@ import os
 from dataclasses import dataclass, field
 
 from . import adapters
+from . import routing as routing_module
 
 
 TASK_DIFFICULTIES = ("simple", "standard", "complex")
@@ -70,14 +71,15 @@ MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
         "max": ("grok-4.5", "high"),
     },
     # Cienkie role na dwóch najniższych poziomach jadą Luną; GLM-5.2 zostaje
-    # dla cięższego testowania i recenzji. Oba modele wymagają prefiksu
-    # providera, bo OpenCode rozwiązuje modele w jego przestrzeni nazw.
+    # dla poziomu balanced. STRONG i MAX idą przez Token Plan do Qwen3.8 Max.
+    # Modele wymagają prefiksu providera, bo OpenCode rozwiązuje je w jego
+    # przestrzeni nazw.
     "opencode": {
         "economy": ("openai/gpt-5.6-luna", "medium"),
         "efficient": ("openai/gpt-5.6-luna", "high"),
         "balanced": ("zai-coding-plan/glm-5.2", "high"),
-        "strong": ("zai-coding-plan/glm-5.2", "high"),
-        "max": ("zai-coding-plan/glm-5.2", "max"),
+        "strong": ("qwencloud-token-plan/qwen3.8-max", "high"),
+        "max": ("qwencloud-token-plan/qwen3.8-max", "max"),
     },
     # Kiro użyje tych wartości tylko, gdy jego szablon CLI zawiera {model}/{effort}.
     "kiro": {
@@ -262,8 +264,15 @@ class Config:
     # Przed rollbackiem przy porażce: branch forge/failed/<id> na HEAD (+ residual commit).
     keep_failed_ref: bool = os.environ.get("FORGE_KEEP_FAILED_REF", "1") != "0"
 
+    # Nadpisania operatora (plik ~/.config/forge/routing.json — patrz routing.py).
+    # Wybór z GUI ma być trwały i wspólny z uruchomieniami z CLI, więc czyta go
+    # sama konfiguracja, a nie warstwa uruchamiająca.
+    routing: routing_module.Routing = field(
+        default_factory=lambda: routing_module.load_from_env(
+            difficulties=TASK_DIFFICULTIES))
+
     def __post_init__(self) -> None:
-        validate_master_agent(self.master_agent)
+        validate_master_agent(self.role("master")[0])
 
     def effective_verify_targets(self, declared: list[str]) -> list[str]:
         """Targety po nadpisaniu użytkownika ("" = deklaracja bootstrapu)."""
@@ -285,7 +294,52 @@ class Config:
     def role(
         self, name: str, difficulty: str = DEFAULT_TASK_DIFFICULTY
     ) -> tuple[str, str, str]:
-        """Zwróć ``(agent, model, effort)`` z polityki rola → poziom → provider.
+        """Zwróć ``(agent, model, effort)`` — pierwszy wybór dla roli.
+
+        To nadal polityka rola → poziom → provider; nadpisania operatora z
+        ``routing.json`` mają nad nią pierwszeństwo (patrz ``_role_primary``)."""
+        return self.role_chain(name, difficulty)[0]
+
+    def role_chain(
+        self, name: str, difficulty: str = DEFAULT_TASK_DIFFICULTY
+    ) -> list[tuple[str, str, str]]:
+        """Pierwszy wybór roli i jej łańcuch zapasowy, w kolejności prób.
+
+        Wpis zapasowy bez modelu oznacza „ten sam poziom, inne narzędzie” — jego
+        model wyznacza polityka poziomu dla wskazanego agenta. Duplikaty znikają:
+        zapas identyczny z poprzednikiem tylko powtórzyłby tę samą awarię."""
+        if difficulty not in TASK_DIFFICULTIES:
+            difficulty = DEFAULT_TASK_DIFFICULTY
+        primary = self._role_primary(name, difficulty)
+        chain = [primary]
+        for entry in self.routing.fallbacks(name):
+            agent = entry.agent or primary[0]
+            # Zapas jest tak samo wiążący jak pierwszy wybór, więc podlega tym
+            # samym zakazom — inaczej zakaz obowiązywałby tylko do pierwszej
+            # awarii, a mistrz cicho dostałby Codeksa z pełnym harnessem.
+            if not routing_module.agent_allowed(name, agent):
+                validate_master_agent(agent)
+            if entry.model:
+                candidate = (agent, entry.model, entry.effort)
+            else:
+                model, effort = self._level_route(agent, name, difficulty)
+                candidate = (agent, model, entry.effort or effort)
+            if candidate not in chain:
+                chain.append(candidate)
+        return chain
+
+    def _level_route(
+        self, agent: str, name: str, difficulty: str
+    ) -> tuple[str, str]:
+        """(model, effort) z tabeli poziomów; ("", "") = niech agent zdecyduje."""
+        fixed = MODEL_LEVEL_ROUTING.get(adapters.canonical_agent(agent), {}).get(
+            self.model_level(name, difficulty))
+        return fixed if fixed is not None else ("", "")
+
+    def _role_primary(
+        self, name: str, difficulty: str = DEFAULT_TASK_DIFFICULTY
+    ) -> tuple[str, str, str]:
+        """Rozwiązanie roli: nadpisania operatora, potem polityka projektu.
 
         Nieznane/customowe CLI zachowują zgodność wsteczną i korzystają z pól
         ``*_model``/``*_effort``. Brak profilu w starym STATE.json oznacza
@@ -324,22 +378,32 @@ class Config:
             raise ValueError(f"nieznana rola: {name}")
 
         agent, configured_model, configured_effort = configured[name]
+        override_agent = self.routing.agent(name)
+        if override_agent:
+            agent = override_agent
+            # Model z pól roli opisuje INNE narzędzie (np. "neuralwatt/…" dla
+            # OpenCode). Przeniesiony na wybranego agenta byłby nazwą, której on
+            # nie zna, więc wybór narzędzia zeruje model i wraca do polityki.
+            configured_model, configured_effort = "", ""
+
+        slot = self.routing.slot(name, difficulty)
+        if slot.model:
+            return (agent, slot.model, slot.effort)
+
         # Jawne ustawienie planisty jest intencją operatora; routing trudności
         # dotyczy wykonawców pojedynczego zadania.
         if (name in {"planner", "planner_escalation", "bootstrap",
                      "product_owner", "po_reviewer",
                      "bootstrap_reviewer"}
                 and configured_model):
-            return (agent, *self._role_model_effort(agent, configured_model, configured_effort))
-        canonical = adapters.canonical_agent(agent)
-        level = self.model_level(name, difficulty)
-        fixed = MODEL_LEVEL_ROUTING.get(canonical, {}).get(level)
-        if fixed is not None:
-            return (agent, *fixed)
-        return (
-            agent,
-            *self._role_model_effort(agent, configured_model, configured_effort),
-        )
+            model, effort = self._role_model_effort(
+                agent, configured_model, configured_effort)
+            return (agent, model, slot.effort or effort)
+        model, effort = self._level_route(agent, name, difficulty)
+        if not model:
+            model, effort = self._role_model_effort(
+                agent, configured_model, configured_effort)
+        return (agent, model, slot.effort or effort)
 
     def model_level(
         self, name: str, difficulty: str = DEFAULT_TASK_DIFFICULTY
@@ -366,13 +430,56 @@ class Config:
         Deduplikacja po nazwie KANONICZNEJ — 'gpt' i 'codex' to ta sama binarka,
         więc preflight nie sprawdza jej dwa razy (i nie dubluje komunikatu o
         braku). Zachowujemy pierwszą napotkaną nazwę wyświetlaną (dla logów)."""
-        names = [self.planner_agent, self.tester_agent, self.coder_agent,
-                 self.master_agent,
-                 self.role("verifier")[0], self.role("reviewer")[0]]
+        # Łańcuch zapasowy też trzeba sprawdzić: agent, który okaże się
+        # nieobecny dopiero w chwili awarii pierwszego wyboru, zamienia
+        # zabezpieczenie w drugą awarię.
+        names = [
+            agent
+            for definition in routing_module.ROLE_DEFS
+            for difficulty in TASK_DIFFICULTIES
+            for agent, _model, _effort in self.role_chain(
+                definition.name, difficulty)
+        ]
         seen: dict[str, str] = {}
         for name in names:
             seen.setdefault(adapters.canonical_agent(name), name)
         return list(seen.values())
+
+    def opencode_models_in_use(self) -> list[str]:
+        """Modele „provider/model", po które sięgnie OpenCode w tym trybie.
+
+        Podstawa preflightu poświadczeń: klucz jest potrzebny do providera,
+        którego routing NAPRAWDĘ wskazuje — łącznie z łańcuchem zapasowym, bo
+        zapas bez klucza zamienia jedną awarię w dwie."""
+        out: list[str] = []
+        for definition in routing_module.ROLE_DEFS:
+            for difficulty in TASK_DIFFICULTIES:
+                for agent, model, _effort in self.role_chain(
+                        definition.name, difficulty):
+                    if (adapters.canonical_agent(agent) == "opencode"
+                            and model and model not in out):
+                        out.append(model)
+        return out
+
+    def roles_blocked_by(self, providers: set[str]) -> list[str]:
+        """Etykiety „rola/trudność", dla których CAŁY łańcuch jest nieużywalny.
+
+        Sam brak klucza do jednego dostawcy nie jest jeszcze awarią przebiegu:
+        rola z działającym zapasem po prostu z niego skorzysta. Awarią jest
+        dopiero rola, która nie ma już czym wykonać zadania — i tylko taką warto
+        zgłosić, zanim pętla ruszy."""
+        if not providers:
+            return []
+        out: list[str] = []
+        for definition in routing_module.ROLE_DEFS:
+            for difficulty in TASK_DIFFICULTIES:
+                chain = self.role_chain(definition.name, difficulty)
+                if chain and all(
+                        adapters.canonical_agent(agent) == "opencode"
+                        and model.partition("/")[0] in providers
+                        for agent, model, _effort in chain):
+                    out.append(f"{definition.name}/{difficulty}")
+        return out
 
     # --- Komendy bazowe CLI (bez shella) ------------------------------------
     # Claude Code headless. Jeśli 'claude' nie jest na PATH, ustaw FORGE_CLAUDE_BIN.

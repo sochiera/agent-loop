@@ -85,7 +85,7 @@ def _run_po(project: Path, state: State, cfg: Config, *, trigger: str = "cadence
             write(Path(project_dir))
         return next(author)
 
-    with patch("forge.orchestrate.run_agent", side_effect=agent):
+    with patch("forge.agents.run_agent", side_effect=agent):
         orchestrate.phase_product_owner(
             cfg, str(project), state, lambda phase: phase, trigger)
     return seen
@@ -159,7 +159,7 @@ def test_po_reviewer_experiment_is_undone_without_losing_the_turn(
         write(Path(project_dir))
         return _decision()
 
-    with patch("forge.orchestrate.run_agent", side_effect=agent):
+    with patch("forge.agents.run_agent", side_effect=agent):
         orchestrate.phase_product_owner(
             cfg, str(project), state, lambda phase: phase, "cadence")
 
@@ -422,7 +422,7 @@ def test_rejected_bootstrap_is_rebuilt_with_the_review_notes(
         return '{"kind":"app","test_cmd":"true","build_cmd":""}'
 
     with patch("forge.orchestrate.run_planner", side_effect=planner), \
-         patch("forge.orchestrate.run_agent",
+         patch("forge.agents.run_agent",
                side_effect=lambda *_a, **_k: next(verdicts)), \
          patch("forge.orchestrate.build_then_test_result", return_value=(True, "")):
         orchestrate.phase_bootstrap(cfg, str(project), state, lambda p: p)

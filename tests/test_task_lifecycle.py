@@ -28,7 +28,7 @@ def test_role_call_does_not_inject_or_update_legacy_record(tmp_path: Path) -> No
         tester_session="stale-session",
     )
     with patch(
-            "forge.orchestrate.run_agent_session",
+            "forge.agents.run_agent_session",
             return_value=("new tester action", "ignored-session")) as call:
         orchestrate._call_role(Config(), str(tmp_path), state, "tester", "prompt", "log")
     assert call.call_args.args[1] == "prompt"

@@ -22,7 +22,7 @@ def test_green_evidence_and_verifier_complete_goal(tmp_path: Path) -> None:
     evidence = {"smoke": {"rc": 0, "output": "ok"}}
     with patch("forge.orchestrate.git") as git, \
          patch("forge.orchestrate.verify.collect_evidence", return_value=evidence), \
-         patch("forge.orchestrate.run_agent", return_value='{"verdict":"complete"}'):
+         patch("forge.agents.run_agent", return_value='{"verdict":"complete"}'):
         git.return_value.stdout = "abc123\n"
         assert not orchestrate.phase_verify_goal(
             Config(), str(tmp_path), state, lambda phase: phase)
@@ -38,7 +38,7 @@ def test_unparsable_verdict_degrades_to_replan_not_crash(tmp_path: Path) -> None
     evidence = {"smoke": {"rc": 0, "output": "ok"}}
     with patch("forge.orchestrate.git") as git, \
          patch("forge.orchestrate.verify.collect_evidence", return_value=evidence), \
-         patch("forge.orchestrate.run_agent", return_value="wciąż nie JSON"):
+         patch("forge.agents.run_agent", return_value="wciąż nie JSON"):
         git.return_value.stdout = "abc123\n"
         # Nie wolno rzucić InvalidDecision — weryfikacja celu jest tolerancyjna.
         assert orchestrate.phase_verify_goal(
@@ -56,7 +56,7 @@ def test_red_evidence_returns_to_planning_with_feedback(tmp_path: Path) -> None:
     evidence = {"smoke": {"rc": 1, "output": "boom"}}
     with patch("forge.orchestrate.git") as git, \
          patch("forge.orchestrate.verify.collect_evidence", return_value=evidence), \
-         patch("forge.orchestrate.run_agent") as verifier:
+         patch("forge.agents.run_agent") as verifier:
         git.return_value.stdout = "abc123\n"
         assert orchestrate.phase_verify_goal(
             Config(), str(tmp_path), state, lambda phase: phase)
@@ -84,7 +84,7 @@ def _story_repo(tmp_path: Path) -> tuple[Config, State]:
 def test_story_verifier_writes_fresh_report_and_marks_story_done(tmp_path: Path) -> None:
     cfg, state = _story_repo(tmp_path)
     with patch("forge.orchestrate.verify.collect_evidence", return_value={}), \
-         patch("forge.orchestrate.run_agent",
+         patch("forge.agents.run_agent",
                return_value='{"stories":[{"id":"US-001","status":"potwierdzona","evidence":"demo działa"}],"verdict":"complete","notes":[]}'):
         assert orchestrate.phase_verify_stories(
             cfg, str(tmp_path), state, lambda phase: phase)

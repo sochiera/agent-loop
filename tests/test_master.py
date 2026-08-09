@@ -146,7 +146,7 @@ def test_master_prompt_uses_vocabulary_the_ledger_actually_writes(
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}'):
+         patch("forge.agents.run_agent", return_value='{"verdict":"approve"}'):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     def labels(text: str) -> set[str]:
@@ -200,7 +200,7 @@ def test_master_notes_reach_tester_and_coder_prompts(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+         patch("forge.agents.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert "nie powtarzaj testu" in seen["tester"]
@@ -220,7 +220,7 @@ def test_master_sees_ledger_history(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+         patch("forge.agents.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert master_prompts
@@ -231,7 +231,7 @@ def test_master_receives_compact_ledger_view(tmp_path: Path) -> None:
     for index in range(30):
         ledger.append(str(tmp_path), f"task-{index:03d} " + "x" * 250)
 
-    with patch("forge.orchestrate.run_agent", return_value="{}") as run:
+    with patch("forge.agents.run_agent", return_value="{}") as run:
         orchestrate._master_notes(
             Config(), str(tmp_path), lambda phase: str(tmp_path / f"{phase}.log"))
 
@@ -251,7 +251,7 @@ def test_master_receives_round_limit_failures_it_cannot_see_in_the_window(
         ledger.append(str(tmp_path), f"task-002 r{index} tester→red pliki=bez_zmian: x")
     ledger.append(str(tmp_path), "task-002 PORZUCONE: round_limit: limit 10")
 
-    with patch("forge.orchestrate.run_agent", return_value="{}") as run:
+    with patch("forge.agents.run_agent", return_value="{}") as run:
         orchestrate._master_notes(
             Config(), str(tmp_path), lambda phase: str(tmp_path / f"{phase}.log"))
 
@@ -264,7 +264,7 @@ def test_master_learns_where_the_loop_stands(tmp_path: Path) -> None:
     """Mistrz jest pytany PRZED turą, więc dziennik zawsze kończy się na turze
     poprzedniej. Bez tej informacji brak wpisu tury, która dopiero ma ruszyć,
     czytał jako urwany cykl — i produkował fałszywy alarm w każdej rundzie."""
-    with patch("forge.orchestrate.run_agent", return_value="{}") as run:
+    with patch("forge.agents.run_agent", return_value="{}") as run:
         orchestrate._master_notes(
             Config(), str(tmp_path), lambda phase: str(tmp_path / f"{phase}.log"),
             task_id="task-466", next_role="tester")
@@ -330,7 +330,7 @@ def test_stale_master_note_never_reaches_the_role_prompt(tmp_path: Path) -> None
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+         patch("forge.agents.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert "task-999" not in seen["tester"]
@@ -338,7 +338,7 @@ def test_stale_master_note_never_reaches_the_role_prompt(tmp_path: Path) -> None
 
 
 def test_master_declares_thin_advisory_role(tmp_path: Path) -> None:
-    with patch("forge.orchestrate.run_agent", return_value="{}") as run:
+    with patch("forge.agents.run_agent", return_value="{}") as run:
         orchestrate._master_notes(
             Config(), str(tmp_path), lambda phase: str(tmp_path / f"{phase}.log"))
 
@@ -352,7 +352,7 @@ def test_round_decisions_are_recorded_in_ledger(tmp_path: Path) -> None:
     role_call, _seen = _one_round(tmp_path)
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}'):
+         patch("forge.agents.run_agent", return_value='{"verdict":"approve"}'):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     text = ledger.tail(str(tmp_path))
@@ -369,7 +369,7 @@ def test_ledger_records_whether_the_turn_changed_files(tmp_path: Path) -> None:
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}'):
+         patch("forge.agents.run_agent", return_value='{"verdict":"approve"}'):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     lines = ledger.tail(str(tmp_path)).splitlines()
@@ -480,7 +480,7 @@ def test_master_is_consulted_when_resuming_straight_into_coder(tmp_path: Path) -
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+         patch("forge.agents.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert "nie odbijaj bez wskazania linii" in seen["coder"]
@@ -500,7 +500,7 @@ def test_master_is_consulted_once_per_round(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+         patch("forge.agents.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     # Dwie tury testera = dwie rundy = dokładnie dwa wywołania mistrza.
@@ -519,7 +519,7 @@ def test_master_failure_leaves_pipeline_untouched(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+         patch("forge.agents.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert "MISTRZA" not in seen["tester"]
@@ -537,7 +537,7 @@ def test_master_limit_does_not_stop_the_run(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+         patch("forge.agents.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert _git(tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "feat: Zmiana wartości"
@@ -553,7 +553,7 @@ def test_master_garbage_answer_is_ignored(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+         patch("forge.agents.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert "MISTRZA" not in seen["tester"]
@@ -571,7 +571,7 @@ def test_master_unexpected_crash_is_swallowed(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+         patch("forge.agents.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert _git(tmp_path, "log", "-1", "--pretty=%s").stdout.strip() == "feat: Zmiana wartości"
@@ -590,7 +590,7 @@ def test_master_never_owns_the_backoff(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+         patch("forge.agents.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert retries and all(value == 0 for value in retries)
@@ -608,7 +608,7 @@ def test_master_cannot_change_the_worktree(tmp_path: Path) -> None:
         return '{"verdict":"approve"}'
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
-         patch("forge.orchestrate.run_agent", side_effect=agent_call):
+         patch("forge.agents.run_agent", side_effect=agent_call):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert not (tmp_path / "mistrz-zmiana.py").exists()
@@ -620,7 +620,7 @@ def test_master_gate_is_off_by_default(tmp_path) -> None:
     """Bramka oszczędza kilka procent rachunku, a jedna pominięta interwencja
     kosztuje rundy albo całe zadanie. Ten zakład jest asymetryczny w złą
     stronę, więc domyślnie mistrz jest wołany zawsze."""
-    with patch("forge.orchestrate.run_agent", return_value="{}") as run_agent:
+    with patch("forge.agents.run_agent", return_value="{}") as run_agent:
         orchestrate._master_notes(
             Config(), str(tmp_path),
             lambda phase: str(tmp_path / f"{phase}.log"),
@@ -645,7 +645,7 @@ def test_master_gate_on_silences_the_call_when_no_condition_fires(
         tmp_path) -> None:
     ledger.append(str(tmp_path), "task-001 r1 tester→red pliki=[tests/a.py]: bramka")
 
-    with patch("forge.orchestrate.run_agent") as run_agent:
+    with patch("forge.agents.run_agent") as run_agent:
         notes = orchestrate._master_notes(
             Config(master_gate="on"), str(tmp_path),
             lambda phase: str(tmp_path / f"{phase}.log"),
@@ -659,7 +659,7 @@ def test_master_gate_on_still_calls_the_master_when_a_condition_fires(
         tmp_path) -> None:
     ledger.append(str(tmp_path), "task-001 r1 koder→green pliki=[tests/a.py]: zielono")
 
-    with patch("forge.orchestrate.run_agent", return_value="{}") as run_agent:
+    with patch("forge.agents.run_agent", return_value="{}") as run_agent:
         orchestrate._master_notes(
             Config(master_gate="on"), str(tmp_path),
             lambda phase: str(tmp_path / f"{phase}.log"),
@@ -675,7 +675,7 @@ def test_shadow_mode_measures_the_gate_instead_of_trusting_it(tmp_path) -> None:
     messages: list[str] = []
     note = '{"tester":"zmień podejście albo zwróć blocked"}'
 
-    with patch("forge.orchestrate.run_agent", return_value=note) as run_agent, \
+    with patch("forge.agents.run_agent", return_value=note) as run_agent, \
          patch("forge.orchestrate.log", side_effect=messages.append):
         orchestrate._master_notes(
             Config(master_gate="shadow"), str(tmp_path),
@@ -689,7 +689,7 @@ def test_shadow_mode_measures_the_gate_instead_of_trusting_it(tmp_path) -> None:
 def test_master_gate_off_keeps_the_old_behaviour(tmp_path) -> None:
     messages: list[str] = []
 
-    with patch("forge.orchestrate.run_agent", return_value="{}") as run_agent, \
+    with patch("forge.agents.run_agent", return_value="{}") as run_agent, \
          patch("forge.orchestrate.log", side_effect=messages.append):
         orchestrate._master_notes(
             Config(master_gate="off"), str(tmp_path),
@@ -701,7 +701,7 @@ def test_master_gate_off_keeps_the_old_behaviour(tmp_path) -> None:
 
 
 def test_sift_streak_reaches_the_master_prompt(tmp_path) -> None:
-    with patch("forge.orchestrate.run_agent", return_value="{}") as run_agent:
+    with patch("forge.agents.run_agent", return_value="{}") as run_agent:
         orchestrate._master_notes(
             Config(), str(tmp_path),
             lambda phase: str(tmp_path / f"{phase}.log"),

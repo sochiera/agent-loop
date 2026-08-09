@@ -745,3 +745,73 @@ def test_extract_json_returns_none_without_any_object() -> None:
     assert agents.extract_json("bez JSON-a") is None
     assert agents.extract_json("") is None
     assert agents.extract_json('[{"verdict":"approve"}]') is None
+
+
+# --- Łańcuch zapasowy ról ---------------------------------------------------
+# Przełączenie ma zachodzić po WYCZERPANIU limitu (czyli po całym backoffie) i
+# po twardej awarii; jedno i drugie znaczy dla biegu to samo — tą drogą pracy
+# nie będzie.
+
+def _chain_config(**fallbacks) -> Config:
+    from forge import routing
+
+    return Config(routing=routing.parse({"roles": {"coder": {
+        "agent": "opencode",
+        "slots": {"standard": {"model": "pierwszy"}},
+        "fallbacks": list(fallbacks.get("entries", [])),
+    }}}, ("simple", "standard", "complex")))
+
+
+@pytest.mark.parametrize("failure", [
+    agents.LimitExhausted("limit"),
+    agents.AgentError("crash"),
+])
+def test_role_falls_back_after_limit_and_after_hard_failure(failure) -> None:
+    cfg = _chain_config(entries=[{"model": "zapasowy"}])
+    calls: list[str] = []
+
+    def run(_name, _prompt, _cfg, _project, _log, *, model="", **_kwargs):
+        calls.append(model)
+        if model == "pierwszy":
+            raise failure
+        return "ok"
+
+    with patch("forge.agents.run_agent", side_effect=run):
+        result = agents.run_role("coder", "prompt", cfg, "/tmp", "/tmp/log")
+
+    assert result == "ok"
+    assert calls == ["pierwszy", "zapasowy"]
+
+
+def test_exhausted_chain_reports_the_last_failure() -> None:
+    cfg = _chain_config(entries=[{"model": "zapasowy"}])
+
+    with patch("forge.agents.run_agent",
+               side_effect=agents.AgentError("ostatni")):
+        with pytest.raises(AgentError, match="ostatni"):
+            agents.run_role("coder", "prompt", cfg, "/tmp", "/tmp/log")
+
+
+def test_interruption_is_not_swallowed_by_the_chain() -> None:
+    # Fallback broni przed awarią dostawcy, a nie przed decyzją użytkownika.
+    cfg = _chain_config(entries=[{"model": "zapasowy"}])
+    calls: list[str] = []
+
+    def run(_name, _prompt, _cfg, _project, _log, *, model="", **_kwargs):
+        calls.append(model)
+        raise KeyboardInterrupt
+
+    with patch("forge.agents.run_agent", side_effect=run):
+        with pytest.raises(KeyboardInterrupt):
+            agents.run_role("coder", "prompt", cfg, "/tmp", "/tmp/log")
+
+    assert calls == ["pierwszy"]
+
+
+def test_role_without_a_chain_behaves_exactly_as_before() -> None:
+    cfg = _chain_config()
+
+    with patch("forge.agents.run_agent",
+               side_effect=agents.LimitExhausted("limit")):
+        with pytest.raises(agents.LimitExhausted):
+            agents.run_role("coder", "prompt", cfg, "/tmp", "/tmp/log")

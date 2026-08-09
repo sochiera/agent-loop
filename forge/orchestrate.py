@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .agents import (AgentError, LimitExhausted, _extract_json_detail, extract_json,
-                     log, run_agent, run_agent_session, run_planner)
+                     log, run_agent, run_planner, run_role, run_role_session)
 from .config import Config, DEFAULT_TASK_DIFFICULTY, TASK_DIFFICULTIES
 from . import brief
 from . import backlog
@@ -328,7 +328,6 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
     się jako jedyny wynik jego tury: cokolwiek zostawił w drzewie i w historii,
     wraca do stanu, który sam oglądał.
     """
-    reviewer, model, effort = cfg.role(reviewer_role)
     notes: list[str] = []
     for round_number in range(1, cfg.max_bootstrap_reviews + 1):
         data = attempt(notes)
@@ -338,9 +337,8 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
             "(świeży recenzent)…")
         verdict = _decision_with_retry(
             review_prompt(data),
-            lambda value: run_agent(
-                reviewer, value, cfg, project, logf(log_phase),
-                model=model, effort=effort),
+            lambda value: run_role(
+                reviewer_role, value, cfg, project, logf(log_phase)),
             lambda text: parse_review_decision(text, project=project))
         # Sam commit nie rusza plików, więc odcisk drzewa by go nie zauważył —
         # a przesunięty HEAD unieważnia bazę zarówno recenzji, jak i cofania.
@@ -572,11 +570,8 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
                 prompt += "\n\n" + prompts.po_parse_corrections_prompt(parser_corrections)
             data = _decision_with_retry(
                 prompt,
-                lambda value: run_agent(
-                    cfg.role("product_owner")[0], value, cfg, project,
-                    logf("product-owner"),
-                    model=cfg.role("product_owner")[1],
-                    effort=cfg.role("product_owner")[2]),
+                lambda value: run_role(
+                    "product_owner", value, cfg, project, logf("product-owner")),
                 lambda text: _parse_product_owner_decision(text, project=project),
             )
             _restore_head(project, base_sha, "Product Owner")
@@ -597,14 +592,12 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
                     f"{round_number}/{cfg.max_bootstrap_reviews}")
                 continue
 
-            reviewer, model, effort = cfg.role("po_reviewer")
             review_before = _tree_manifest(project)
             review_snapshot = _snapshot_tree(project)
             verdict = _decision_with_retry(
                 prompts.po_review_prompt(data, max_backlog=cfg.max_backlog_stories),
-                lambda value: run_agent(
-                    reviewer, value, cfg, project, logf("po-review"),
-                    model=model, effort=effort),
+                lambda value: run_role(
+                    "po_reviewer", value, cfg, project, logf("po-review")),
                 lambda text: parse_review_decision(text, project=project),
             )
             # Recenzentowi wolno eksperymentować w drzewie jak wszędzie indziej
@@ -819,14 +812,13 @@ def _checkpoint(project: str, state: State, phase: str) -> None:
 
 
 def _call_role(cfg: Config, project: str, state: State, role: str, prompt: str, log: str) -> str:
-    agent, model, effort = cfg.role(role, state.current_task.get("difficulty", DEFAULT_TASK_DIFFICULTY))
     attr = "tester_session" if role == "tester" else "coder_session"
     # Każda tura jest świeża. Kontrolowaną ciągłość zapewniają wyłącznie
     # Context Capsule i prywatny notatnik, również dla Codexa.
     setattr(state, attr, "")
-    output, _session = run_agent_session(
-        agent, prompt, cfg, project, log, session_id=None,
-        model=model, effort=effort)
+    output, _session = run_role_session(
+        role, prompt, cfg, project, log, session_id=None,
+        difficulty=state.current_task.get("difficulty", DEFAULT_TASK_DIFFICULTY))
     return output
 
 
@@ -883,16 +875,14 @@ def _scoped_master_notes(notes: dict[str, str], task_id: str) -> dict[str, str]:
 def _ask_master(cfg: Config, project: str, logf, prompt: str,
                 task_id: str) -> dict[str, str]:
     """Jedno wywołanie mistrza; każda jego awaria daje po prostu brak notatek."""
-    agent, model, effort = cfg.role("master")
     # Rola doradcza nie ma prawa przespać godzin backoffu przed realną pracą.
     advisory = replace(cfg, max_limit_retries=0)
     try:
         with tempfile.TemporaryDirectory(prefix="forge-master-") as sandbox:
             # Sandbox jest katalogiem roboczym, ale koszt roli wołanej co rundę
             # musi trafić do telemetrii projektu, a nie zniknąć razem z nim.
-            raw = run_agent(agent, prompt, advisory, sandbox, logf("master"),
-                            model=model, effort=effort, usage_dir=project,
-                            thin=True,
+            raw = run_role("master", prompt, advisory, sandbox, logf("master"),
+                            usage_dir=project, thin=True,
                             system_prompt=prompts.master_system_prompt(),
                             json_schema=prompts.master_json_schema())
         data = extract_json(raw)
@@ -1398,16 +1388,15 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             )
     if state.task_phase == "review":
         before_review = _tree_manifest(project)
-        reviewer, model, effort = cfg.role("reviewer", task["difficulty"])
         review_prompt = prompts.review_task_prompt_kiss(
             task["file"], start_tag=state.task_start_tag,
             changed=_changed(project, state.task_start_tag))
         log(f"Zadanie {task['id']}: recenzja (świeży kontekst)…")
         review = _decision_with_retry(
             review_prompt,
-            lambda value: run_agent(
-                reviewer, value, cfg, project, logf("review"),
-                model=model, effort=effort),
+            lambda value: run_role(
+                "reviewer", value, cfg, project, logf("review"),
+                difficulty=task["difficulty"]),
             lambda text: parse_review_decision(text, project=project))
         log(f"Zadanie {task['id']}: recenzja → {review.status}")
         review_changes = _describe_turn_changes(
@@ -1577,13 +1566,11 @@ def phase_verify_stories(cfg: Config, project: str, state: State, logf) -> bool:
     evidence_text = "\n".join(
         f"- {name}: rc={item.get('rc')}, log={item.get('log', '')}"
         for name, item in evidence.items()) or "(brak targetów mechanicznych)"
-    verifier, model, effort = cfg.role("verifier")
     try:
         data = _decision_with_retry(
             prompts.verify_stories_prompt(stories=stories_text, evidence=evidence_text),
-            lambda value: run_agent(
-                verifier, value, cfg, project, logf("verify-stories"),
-                model=model, effort=effort),
+            lambda value: run_role(
+                "verifier", value, cfg, project, logf("verify-stories")),
             lambda text: _parse_story_verification(text, project=project),
         )
     finally:
@@ -1644,16 +1631,14 @@ def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
         state.goal_confirmed = False
         log("Weryfikacja celu: czerwony dowód — wracam do planowania z feedbackiem.")
         return True
-    agent, model, effort = cfg.role("verifier", DEFAULT_TASK_DIFFICULTY)
     verify_prompt = prompts.verify_goal_prompt(
         state.verify_cycle, evidence, cycle_dir,
         story_report=_fresh_story_report(project, state))
     try:
         data = _decision_with_retry(
             verify_prompt,
-            lambda value: run_agent(
-                agent, value, cfg, project, logf("verify"),
-                model=model, effort=effort,
+            lambda value: run_role(
+                "verifier", value, cfg, project, logf("verify"),
                 mcp_config=cfg.verifier_mcp_config),
             lambda text: _parse_json_object(text, project=project))
     except InvalidDecision:

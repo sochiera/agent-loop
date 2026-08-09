@@ -12,8 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import backlog, ledger
-from .agents import AgentError
+from . import backlog, ledger, provider_env
+from .agents import AgentError, opencode_user_config
 
 if TYPE_CHECKING:
     from .config import Config
@@ -26,6 +26,7 @@ class PreflightResult:
     parked_paths: list[str] = field(default_factory=list)
     dropped_tags: list[str] = field(default_factory=list)
     legacy_backlog: bool = False
+    loaded_env_vars: list[str] = field(default_factory=list)
 
 
 def git(project: str, *args: str, check: bool = True,
@@ -181,8 +182,52 @@ def detect_legacy_backlog(project: str, state: State) -> bool:
     return legacy
 
 
+def ensure_provider_credentials(project: str, cfg: Config) -> list[str]:
+    """Dobierz brakujące klucze providerów OpenCode; przerwij, jeśli się nie da.
+
+    Odpowiedź ``401 No API-key provided`` przychodzi w środku pracy roli, więc
+    kosztuje pełną turę agenta i przerywa przebieg. Ten sam błąd wykryty tutaj
+    kosztuje odczyt jednego JSON-a.
+
+    Brak klucza sam w sobie nie zatrzymuje przebiegu — dopiero rola, której CAŁY
+    łańcuch (wybór i zapasy) prowadzi do dostawcy bez klucza, jest niewykonalna
+    i tylko ona uzasadnia przerwanie."""
+    models = cfg.opencode_models_in_use()
+    if not models:
+        return []
+    loaded, absent = provider_env.resolve(models, opencode_user_config())
+    if loaded:
+        ledger.append(
+            project,
+            "preflight: uzupełniono klucze providerów ze środowiska plikowego: "
+            + ", ".join(loaded))
+    if not absent:
+        return loaded
+    detail = "; ".join(f"{provider} wymaga {name}" for provider, name in absent)
+    hint = (f"Ustaw te zmienne w środowisku albo w pliku *.env w "
+            f"{provider_env.config_dir()}.")
+    blocked = cfg.roles_blocked_by({provider for provider, _name in absent})
+    if blocked:
+        # Pełna lista potrafi mieć kilkadziesiąt pozycji i zasłonić samą
+        # przyczynę; do decyzji operatora wystarczy próbka i skala problemu.
+        shown = ", ".join(blocked[:5])
+        if len(blocked) > 5:
+            shown += f" (+{len(blocked) - 5} innych)"
+        raise AgentError(
+            "preflight: brak kluczy API providerów OpenCode "
+            f"({detail}); bez nich nie ma czym wykonać {len(blocked)} "
+            f"kombinacji rola/trudność: {shown}. " + hint)
+    ledger.append(
+        project,
+        f"preflight: brak kluczy API ({detail}) — role mają działające zapasy, "
+        "ale wybrany dostawca odpadnie. " + hint)
+    return loaded
+
+
 def run(project: str, cfg: Config, state: State) -> PreflightResult:
     parked_branch, parked_paths = park_dirty_tree(project, cfg, state)
     dropped_tags = drop_stale_task_tags(project, state)
     legacy = detect_legacy_backlog(project, state)
-    return PreflightResult(parked_branch, parked_paths, dropped_tags, legacy)
+    loaded = ensure_provider_credentials(project, cfg)
+    return PreflightResult(
+        parked_branch, parked_paths, dropped_tags, legacy, loaded)

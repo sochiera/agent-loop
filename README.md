@@ -19,6 +19,23 @@ product owner → planner → tester ↔ coder → reviewer
 
 See [docs/PIPELINE.md](docs/PIPELINE.md) for details.
 
+## Choosing models per role
+
+Each role has a default policy (role → level → provider). Per-machine choices —
+which tool, which concrete model per task difficulty, and a fallback chain used
+when a provider hits its limit or fails hard — live in `~/.config/forge/routing.json`
+and can be clicked together in the GUI (`python3 -m forge.gui`), so switching
+providers needs no commit. See [docs/ROUTING-I-FALLBACK.md](docs/ROUTING-I-FALLBACK.md).
+
+Providers configured in `opencode.json` take their keys from `{env:NAME}`, which
+resolves against the environment of the Forge process — so a shell started before
+the key was exported, a desktop launcher or a systemd unit would otherwise fail
+with `401 No API-key provided` in the middle of a role. Preflight closes that gap:
+it reads the `*.env` files next to `opencode.json`, fills in whatever the routed
+providers need, and aborts up front if a role has no usable endpoint left.
+Explicit environment always wins over those files; `FORGE_ENV_FILES` overrides the
+search (`none` disables it).
+
 ## Research direction
 
 The project explores:

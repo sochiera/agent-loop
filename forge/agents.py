@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 from . import adapters
 from . import ledger
-from .config import Config, RATE_LIMIT_PATTERNS
+from .config import Config, DEFAULT_TASK_DIFFICULTY, RATE_LIMIT_PATTERNS
 
 _LIMIT_RE = re.compile("|".join(RATE_LIMIT_PATTERNS), re.IGNORECASE)
 
@@ -1086,7 +1086,7 @@ _OPENCODE_TOOLS = (
 )
 
 
-def _opencode_user_config() -> dict:
+def opencode_user_config() -> dict:
     """Konfiguracja użytkownika, którą tryb cienki ROZSZERZA, nie zastępuje.
 
     ``OPENCODE_CONFIG_CONTENT`` podstawia całą konfigurację, więc wysłanie
@@ -1113,7 +1113,7 @@ def _opencode_user_config() -> dict:
 def _opencode_thin_env(
         system_prompt: str, base_env: dict[str, str] | None = None
         ) -> dict[str, str]:
-    config = _opencode_user_config()
+    config = opencode_user_config()
     agents = dict(config.get("agent") or {})
     agents["forge-thin"] = {
         "description": "Forge tool-free advisory role",
@@ -1223,9 +1223,62 @@ def agent_supports_resume(name: str) -> bool:
     return adapters.supports_resume(name)
 
 
+def describe_endpoint(agent: str, model: str) -> str:
+    return f"{agent}/{model}" if model else agent
+
+
+def with_fallback(chain, role: str, call):
+    """Wywołaj kolejne punkty łańcucha, aż któryś zwróci wynik.
+
+    Przełączamy się po WYCZERPANIU limitu (po całym backoffie) i po twardej
+    awarii — bo obie znaczą to samo dla biegu: tą drogą pracy nie będzie.
+    Ostatni punkt łańcucha rzuca oryginalny wyjątek, więc bieg kończy się dokładnie
+    tak, jak bez łańcucha; zmienia się tylko to, ile dróg spróbowano najpierw.
+    Wyjątki spoza tej dwójki (np. przerwanie użytkownika) idą wyżej od razu."""
+    for index, (agent, model, effort) in enumerate(chain):
+        try:
+            return call(agent, model, effort)
+        except (LimitExhausted, AgentError) as exc:
+            remaining = chain[index + 1:]
+            if not remaining:
+                raise
+            reason = "limit" if isinstance(exc, LimitExhausted) else "błąd"
+            log(f"  rola[{role}]: {describe_endpoint(agent, model)} — {reason}; "
+                f"przełączam na zapas {describe_endpoint(*remaining[0][:2])} "
+                f"({index + 1}/{len(chain) - 1}).")
+    raise AgentError(f"pusty łańcuch routingu dla roli '{role}'")
+
+
+def run_role(role: str, prompt: str, cfg: Config, project_dir: str,
+             log_path: str, *, difficulty: str = DEFAULT_TASK_DIFFICULTY,
+             **kwargs) -> str:
+    """Wywołaj rolę jej własnym routingiem, z łańcuchem zapasowym.
+
+    Jedyne miejsce, w którym rola zamienia się w konkretne (agent, model,
+    effort) — dzięki temu każdy punkt wywołania dostaje fallback za darmo."""
+    chain = cfg.role_chain(role, difficulty)
+    return with_fallback(
+        chain, role,
+        lambda agent, model, effort: run_agent(
+            agent, prompt, cfg, project_dir, log_path,
+            model=model, effort=effort, **kwargs),
+    )
+
+
+def run_role_session(role: str, prompt: str, cfg: Config, project_dir: str,
+                     log_path: str, *, difficulty: str = DEFAULT_TASK_DIFFICULTY,
+                     session_id: str | None = None) -> tuple[str, str | None]:
+    """Wariant sesyjny ``run_role`` (dla ról z ciągłością u codeksa)."""
+    chain = cfg.role_chain(role, difficulty)
+    return with_fallback(
+        chain, role,
+        lambda agent, model, effort: run_agent_session(
+            agent, prompt, cfg, project_dir, log_path,
+            session_id=session_id, model=model, effort=effort),
+    )
+
+
 def run_planner(prompt: str, cfg: Config, project_dir: str, log_path: str,
                 *, role: str = "planner") -> str:
     """Uruchom rolę planisty/bootstrapu z jej modelem i effort."""
-    agent, model, effort = cfg.role(role)
-    return run_agent(agent, prompt, cfg, project_dir, log_path,
-                     model=model, effort=effort)
+    return run_role(role, prompt, cfg, project_dir, log_path)

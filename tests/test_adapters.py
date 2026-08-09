@@ -276,7 +276,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
             ("opencode", "reviewer", "standard",
              ("zai-coding-plan/glm-5.2", "high")),
             ("opencode", "reviewer", "complex",
-             ("zai-coding-plan/glm-5.2", "high")),
+             ("qwencloud-token-plan/qwen3.8-max", "high")),
             ("opencode", "coder", "simple",
              ("openai/gpt-5.6-luna", "medium")),
         ):

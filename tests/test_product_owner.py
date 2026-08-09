@@ -77,7 +77,7 @@ def test_product_owner_repair_happens_before_reviewer(tmp_path: Path) -> None:
             (project / "BACKLOG.md").write_text(valid, encoding="utf-8")
         return _decision()
 
-    with patch("forge.orchestrate.run_agent", side_effect=agent):
+    with patch("forge.agents.run_agent", side_effect=agent):
         orchestrate.phase_product_owner(cfg, str(project), state, lambda phase: phase)
     assert "US-002" in (project / "BACKLOG.md").read_text(encoding="utf-8")
     assert len([item for item in calls if "świeża" in item]) == 1
@@ -97,7 +97,7 @@ def test_structural_failure_never_calls_reviewer_and_reverts(tmp_path: Path) -> 
             encoding="utf-8")
         return _decision()
 
-    with patch("forge.orchestrate.run_agent", side_effect=agent):
+    with patch("forge.agents.run_agent", side_effect=agent):
         with pytest.raises(AgentError, match="budżet"):
             orchestrate.phase_product_owner(
                 cfg, str(project), state, lambda phase: phase)

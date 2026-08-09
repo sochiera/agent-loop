@@ -2,6 +2,12 @@
 
 Uruchomienie:
     python3 -m forge.gui
+
+Panel konfiguracji jest edytorem pliku ``routing.json`` (patrz routing.py):
+dla każdej roli wybierasz narzędzie, model (a dla ról czułych na zakres zadania
+— model osobno dla simple/standard/complex) i łańcuch zapasowy. Wybór zapisuje
+się poza repozytorium, więc obowiązuje też uruchomienia z CLI i nie wymaga
+commita przy każdej zmianie dostawcy.
 """
 from __future__ import annotations
 
@@ -14,7 +20,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import gi
 
@@ -22,8 +28,12 @@ gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from .config import Config, ROLE_MODEL_LEVELS, validate_master_agent
+from .config import (Config, MODEL_LEVEL_ROUTING, ROLE_MODEL_LEVELS,
+                     TASK_DIFFICULTIES, validate_master_agent)
+from . import catalog
 from . import report
+from . import routing as routing_module
+from .adapters import canonical_agent
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,24 +44,21 @@ MAX_LOG_LINES = 5_000
 STOP_TERM_DELAY_S = 8
 STOP_KILL_DELAY_S = 5
 SESSION_LOG_NAME = "gui_run.log"
-AGENTS = ("claude", "codex", "opencode", "grok", "kiro")
-MASTER_AGENTS = tuple(agent for agent in AGENTS if agent != "codex")
-ROLE_DEFS = (
-    ("planner", "Planista", "Tworzy plan i dzieli pracę na zadania"),
-    ("tester", "Tester", "Pisze testy i pilnuje czerwonej bramki"),
-    ("coder", "Koder", "Implementuje rozwiązanie i zazielenia testy"),
-    ("reviewer", "Recenzent", "Sprawdza ukończone zadanie w świeżym kontekście"),
-    ("verifier", "Weryfikator", "Ocenia, czy cały cel został osiągnięty"),
-    ("master", "Mistrz", "Pilnuje procesu i wykrywa pętle; tylko doradza"),
-)
-LEVEL_LABELS = {
-    "economy": "economy", "efficient": "efficient", "balanced": "balanced",
-    "strong": "strong", "max": "max",
+AGENTS = catalog.AGENTS
+MASTER_AGENTS = tuple(agent for agent in AGENTS if canonical_agent(agent) != "codex")
+ROLE_DEFS = routing_module.ROLE_DEFS
+
+DIFFICULTY_LABELS = {
+    "simple": "proste",
+    "standard": "standardowe",
+    "complex": "złożone",
+    routing_module.ANY_DIFFICULTY: "wszystkie zadania",
 }
-ENV_FIELDS = {
-    role: {"agent": f"FORGE_{role.upper()}_AGENT"}
-    for role, _title, _description in ROLE_DEFS
-}
+# Pozycje sztuczne w liście modeli: wybór polityki i wpis własny.
+DEFAULT_MODEL_LABEL = "— domyślny wg poziomu —"
+CUSTOM_MODEL_LABEL = "— wpisz własny… —"
+DEFAULT_EFFORT_LABEL = "— domyślny —"
+INHERIT_AGENT_LABEL = "— jak w roli —"
 
 
 def load_settings(path: Path = SETTINGS_PATH) -> dict[str, Any]:
@@ -73,6 +80,18 @@ def save_settings(settings: dict[str, Any], path: Path = SETTINGS_PATH) -> None:
     os.replace(temporary, path)
 
 
+def routing_path(environ: dict[str, str] | None = None) -> Path:
+    """Plik routingu, który GUI edytuje — ten sam, który czyta orkiestrator.
+
+    Gdy operator wyłączył warstwę (``FORGE_ROUTING_FILE=none``), panel nadal
+    musi mieć co edytować i co przekazać uruchamianemu procesowi — inaczej
+    wyklikany wybór po cichu nie miałby żadnego skutku. Sięgamy więc po ścieżkę
+    domyślną; wyłączenie zostaje w mocy dla uruchomień spoza GUI."""
+    environ = os.environ if environ is None else environ
+    return (routing_module.configured_path(environ)
+            or routing_module.default_path(environ))
+
+
 def resolve_project(project: str) -> Path:
     """Ta sama reguła co w orkiestratorze: proces ma cwd=ROOT, więc ścieżka
     względna projektu jest względna do ROOT, nie do bieżącego katalogu GUI."""
@@ -80,27 +99,41 @@ def resolve_project(project: str) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def validate_routing(routing: routing_module.Routing) -> None:
+    """Odrzuć wybór, którego orkiestrator i tak nie wykona.
+
+    Mistrz bez trybu cienkiego traci sens (patrz config.validate_master_agent),
+    a wpis zapasowy jest tu równie wiążący jak pierwszy wybór — inaczej zakaz
+    obowiązywałby tylko do pierwszej awarii."""
+    for definition in ROLE_DEFS:
+        entry = routing.roles.get(definition.name)
+        if entry is None or definition.allows_codex:
+            continue
+        for agent in (entry.agent, *(item.agent for item in entry.fallbacks)):
+            if agent:
+                validate_master_agent(agent)
+
+
 def build_launch(
-    brief: str, project: str, roles: dict[str, dict[str, str]]
+    brief: str, project: str, routing: routing_module.Routing,
+    routing_file: Path | None = None,
 ) -> tuple[list[str], dict[str, str]]:
-    """Zbuduj bezpieczne argv i środowisko procesu orkiestratora."""
+    """Zbuduj bezpieczne argv i środowisko procesu orkiestratora.
+
+    Konfiguracja ról jedzie JEDNYM kanałem — plikiem routingu. Stare zmienne
+    ``FORGE_<ROLA>_AGENT/MODEL/EFFORT`` z powłoki są tu czyszczone, żeby wybór
+    z GUI nie przegrywał po cichu z zapomnianym exportem."""
     if not brief.strip():
         raise ValueError("Wskaż plik z briefem.")
     if not project.strip():
         raise ValueError("Wskaż katalog projektu.")
+    validate_routing(routing)
 
     env = os.environ.copy()
-    for role, _title, _description in ROLE_DEFS:
-        values = roles[role]
-        value = values["agent"].strip()
-        if "\0" in value or "\n" in value or len(value) > 300:
-            raise ValueError(f"Niepoprawna wartość pola {role}.agent.")
-        if role == "master":
-            validate_master_agent(value)
-        env[ENV_FIELDS[role]["agent"]] = value
-        # Stare ustawienia powłoki/GUI nie mogą po cichu obejść nowej polityki.
-        env.pop(f"FORGE_{role.upper()}_MODEL", None)
-        env.pop(f"FORGE_{role.upper()}_EFFORT", None)
+    for definition in ROLE_DEFS:
+        for suffix in ("AGENT", "MODEL", "EFFORT"):
+            env.pop(f"FORGE_{definition.name.upper()}_{suffix}", None)
+    env["FORGE_ROUTING_FILE"] = str(routing_file or routing_path())
 
     command = [
         sys.executable,
@@ -122,7 +155,7 @@ def line_kind(line: str) -> str:
         return "error"
     if any(word in upper for word in ("UKOŃCZONE", "ZWERYFIKOWANY", "ZIELON", "PREFLIGHT OK", "PUSH →")):
         return "success"
-    if any(word in upper for word in ("UWAGA", "LIMIT", "WZNAWIAM")):
+    if any(word in upper for word in ("UWAGA", "LIMIT", "WZNAWIAM", "PRZEŁĄCZAM")):
         return "warning"
     if "===" in line or "##########" in line or re.search(r"\b(PLAN|TESTER|KODER|RECENZJA)\b", upper):
         return "phase"
@@ -139,63 +172,358 @@ def trim_log_buffer(buffer: Gtk.TextBuffer, max_lines: int = MAX_LOG_LINES) -> N
     buffer.delete(buffer.get_start_iter(), cutoff)
 
 
-def _string_list(values: tuple[str, ...], empty_label: str = "Domyślny") -> Gtk.StringList:
-    return Gtk.StringList.new([empty_label if value == "" else value for value in values])
+def level_hint(role: str, difficulty: str, agent: str) -> str:
+    """Co zrobi polityka, jeśli nie wybierzesz modelu ręcznie."""
+    levels = ROLE_MODEL_LEVELS.get(role, {})
+    level = levels.get(difficulty) or levels.get("standard", "")
+    fixed = MODEL_LEVEL_ROUTING.get(canonical_agent(agent), {}).get(level)
+    if not level:
+        return "polityka projektu"
+    if fixed is None:
+        return f"poziom {level} — {agent} decyduje sam"
+    model, effort = fixed
+    return f"poziom {level} → {model}" + (f" ({effort})" if effort else "")
 
 
-class RoleCard(Gtk.Box):
-    def __init__(
-        self, role: str, title: str, description: str, default_agent: str,
-        agents: tuple[str, ...] = AGENTS,
-    ):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+def _string_list(values: list[str]) -> Gtk.StringList:
+    return Gtk.StringList.new(values)
+
+
+class ModelChooser(Gtk.Box):
+    """Wybór modelu i effortu dla jednego slotu (rola × trudność albo zapas).
+
+    Lista jest podpowiedzią z katalogu, nie zamknięciem: ostatnia pozycja
+    odsłania pole tekstowe, bo nowy model u dostawcy pojawia się wcześniej niż
+    w naszym katalogu."""
+
+    def __init__(self, on_change: Callable[[], None] | None = None):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._on_change = on_change
+        self._agent = AGENTS[0]
+        self._models: list[str] = []
+        self._efforts: list[str] = []
+        self._hint = ""
+        self._muted = False
+
+        self.model = Gtk.DropDown(model=_string_list([DEFAULT_MODEL_LABEL]))
+        self.model.set_hexpand(True)
+        self.model.connect("notify::selected", self._model_changed)
+        self.custom = Gtk.Entry(placeholder_text="provider/model")
+        self.custom.set_hexpand(True)
+        self.custom.set_visible(False)
+        self.custom.connect("changed", lambda _entry: self._changed())
+        self.effort = Gtk.DropDown(model=_string_list([DEFAULT_EFFORT_LABEL]))
+        self.effort.set_tooltip_text("Poziom namysłu przekazywany do CLI")
+        self.effort.connect("notify::selected", lambda *_a: self._changed())
+
+        self.append(self.model)
+        self.append(self.custom)
+        self.append(self.effort)
+
+    # --- stan -------------------------------------------------------------
+    def set_agent(self, agent: str, hint: str = "") -> None:
+        """Przebuduj listy pod nowe narzędzie, zachowując dotychczasowy wybór."""
+        model, effort = self.value()
+        self._agent = agent
+        self._hint = hint
+        self._models = catalog.models(agent)
+        self._efforts = list(catalog.efforts(agent))
+        default_label = f"{DEFAULT_MODEL_LABEL[:-2]}: {hint} —" if hint else DEFAULT_MODEL_LABEL
+        self._muted = True
+        self.model.set_model(_string_list(
+            [default_label, *self._models, CUSTOM_MODEL_LABEL]))
+        self.effort.set_model(_string_list(
+            [DEFAULT_EFFORT_LABEL if value == "" else value
+             for value in self._efforts]))
+        self._muted = False
+        self.set_value(model, effort)
+
+    def set_value(self, model: str, effort: str) -> None:
+        self._muted = True
+        if not model:
+            self.model.set_selected(0)
+            self.custom.set_visible(False)
+        elif model in self._models:
+            self.model.set_selected(self._models.index(model) + 1)
+            self.custom.set_visible(False)
+        else:
+            self.model.set_selected(len(self._models) + 1)
+            self.custom.set_text(model)
+            self.custom.set_visible(True)
+        self.effort.set_selected(
+            self._efforts.index(effort) if effort in self._efforts else 0)
+        self._muted = False
+
+    def value(self) -> tuple[str, str]:
+        index = self.model.get_selected()
+        if index == 0 or index == Gtk.INVALID_LIST_POSITION:
+            model = ""
+        elif index == len(self._models) + 1:
+            model = self.custom.get_text().strip()
+        else:
+            model = self._models[index - 1]
+        effort_index = self.effort.get_selected()
+        effort = (self._efforts[effort_index]
+                  if 0 <= effort_index < len(self._efforts) else "")
+        return model, effort
+
+    def set_sensitive_fields(self, enabled: bool) -> None:
+        self.model.set_sensitive(enabled)
+        self.custom.set_sensitive(enabled)
+        self.effort.set_sensitive(enabled)
+
+    # --- zdarzenia --------------------------------------------------------
+    def _model_changed(self, *_args: Any) -> None:
+        self.custom.set_visible(
+            self.model.get_selected() == len(self._models) + 1)
+        self._changed()
+
+    def _changed(self) -> None:
+        if not self._muted and self._on_change is not None:
+            self._on_change()
+
+
+class FallbackRow(Gtk.Box):
+    """Jeden wpis łańcucha zapasowego: narzędzie + model + usunięcie."""
+
+    def __init__(self, role: str, agents: tuple[str, ...],
+                 on_change: Callable[[], None], on_remove: Callable[["FallbackRow"], None]):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.role = role
-        self.agents = agents
-        self.add_css_class("role-card")
+        self.agents = ("", *agents)
+        self._on_change = on_change
 
-        heading = Gtk.Label(xalign=0)
-        heading.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
-        heading.add_css_class("role-title")
-        subtitle = Gtk.Label(label=description, xalign=0, wrap=True)
-        subtitle.add_css_class("dim-label")
-        self.append(heading)
-        self.append(subtitle)
+        self.agent = Gtk.DropDown(model=_string_list(
+            [INHERIT_AGENT_LABEL, *agents]))
+        self.agent.set_tooltip_text("Narzędzie zapasowe (puste = to samo, co w roli)")
+        self.agent.connect("notify::selected", self._agent_changed)
+        self.model = ModelChooser(on_change)
+        self.model.set_hexpand(True)
+        remove = Gtk.Button(icon_name="user-trash-symbolic",
+                            tooltip_text="Usuń ten zapas")
+        remove.add_css_class("flat")
+        remove.connect("clicked", lambda _button: on_remove(self))
 
-        levels = ROLE_MODEL_LEVELS[role]
-        routing = Gtk.Label(
-            label=("Poziom modelu  •  simple: " + LEVEL_LABELS[levels["simple"]]
-                   + "  |  standard: " + LEVEL_LABELS[levels["standard"]]
-                   + "  |  complex: " + LEVEL_LABELS[levels["complex"]]),
-            xalign=0,
-            wrap=True,
-        )
-        routing.add_css_class("caption")
-        routing.add_css_class("dim-label")
-        self.append(routing)
+        self.append(self.agent)
+        self.append(self.model)
+        self.append(remove)
+        self.remove_button = remove
+        self._role_agent = agents[0]
+        self.refresh_hint(agents[0])
 
-        self.agent = Gtk.DropDown(model=_string_list(self.agents, "Agent"))
-        self.agent.set_hexpand(True)
-        selected = default_agent if default_agent in self.agents else self.agents[0]
-        self.agent.set_selected(self.agents.index(selected))
+    def refresh_hint(self, role_agent: str) -> None:
+        """Zapas bez własnego narzędzia dziedziczy agenta roli — także w podpowiedzi."""
+        self._role_agent = role_agent
+        agent = self.values()[0] or role_agent
+        self.model.set_agent(agent, level_hint(self.role, "standard", agent))
 
-        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        caption = Gtk.Label(label="Agent", xalign=0)
-        caption.add_css_class("field-label")
-        row.append(caption)
-        row.append(self.agent)
-        self.append(row)
+    def _agent_changed(self, *_args: Any) -> None:
+        self.refresh_hint(self._role_agent)
+        self._on_change()
 
-    def values(self) -> dict[str, str]:
-        return {"agent": self.agents[self.agent.get_selected()]}
+    def values(self) -> tuple[str, str, str]:
+        index = self.agent.get_selected()
+        agent = self.agents[index] if 0 <= index < len(self.agents) else ""
+        model, effort = self.model.value()
+        return agent, model, effort
+
+    def set_values(self, agent: str, model: str, effort: str) -> None:
+        self.agent.set_selected(
+            self.agents.index(agent) if agent in self.agents else 0)
+        self.refresh_hint(self._role_agent)
+        self.model.set_value(model, effort)
+
+    def endpoint(self) -> routing_module.Endpoint:
+        agent, model, effort = self.values()
+        return routing_module.Endpoint(agent=agent, model=model, effort=effort)
 
     def set_sensitive_fields(self, enabled: bool) -> None:
         self.agent.set_sensitive(enabled)
+        self.model.set_sensitive_fields(enabled)
+        self.remove_button.set_sensitive(enabled)
+
+
+class RoleCard(Gtk.Expander):
+    """Karta jednej roli: narzędzie, modele per trudność i łańcuch zapasowy."""
+
+    def __init__(self, definition: routing_module.RoleDef,
+                 default_agent: str, on_change: Callable[[], None]):
+        super().__init__()
+        self.definition = definition
+        self.role = definition.name
+        self.agents = AGENTS if definition.allows_codex else MASTER_AGENTS
+        self._on_change = on_change
+        self._muted = True
+        self.add_css_class("role-card")
+
+        self.summary = Gtk.Label(xalign=0)
+        self.summary.set_use_markup(True)
+        self.set_label_widget(self.summary)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        body.set_margin_top(10)
+        body.set_margin_start(6)
+        body.set_margin_bottom(4)
+
+        subtitle = Gtk.Label(label=definition.description, xalign=0, wrap=True)
+        subtitle.add_css_class("dim-label")
+        subtitle.add_css_class("caption")
+        body.append(subtitle)
+
+        agent_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        agent_caption = Gtk.Label(label="Narzędzie", xalign=0)
+        agent_caption.add_css_class("field-label")
+        agent_caption.set_size_request(120, -1)
+        self.agent = Gtk.DropDown(model=_string_list(list(self.agents)))
+        self.agent.set_hexpand(True)
+        selected = default_agent if default_agent in self.agents else self.agents[0]
+        # Wartość, którą pokrętło pokazuje, dopóki operator niczego nie wybrał.
+        # Zapis tej wartości jako nadpisania ZAMROZIŁBY politykę: rola przestaje
+        # dziedziczyć agenta (np. weryfikator po planiście) i przestaje słuchać
+        # FORGE_<ROLA>_AGENT, mimo że nikt nic nie kliknął.
+        self.default_agent = selected
+        self.agent.set_selected(self.agents.index(selected))
+        self.agent.connect("notify::selected", self._agent_changed)
+        agent_row.append(agent_caption)
+        agent_row.append(self.agent)
+        body.append(agent_row)
+
+        self.slots: dict[str, ModelChooser] = {}
+        slot_keys = (TASK_DIFFICULTIES if definition.difficulty_aware
+                     else (routing_module.ANY_DIFFICULTY,))
+        for key in slot_keys:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            caption = Gtk.Label(label=DIFFICULTY_LABELS.get(key, key), xalign=0)
+            caption.add_css_class("field-label")
+            caption.set_size_request(120, -1)
+            chooser = ModelChooser(self._changed)
+            chooser.set_hexpand(True)
+            row.append(caption)
+            row.append(chooser)
+            body.append(row)
+            self.slots[key] = chooser
+
+        fallback_caption = Gtk.Label(
+            label="Łańcuch zapasowy — próbowany po wyczerpaniu limitu albo "
+                  "twardej awarii poprzednika",
+            xalign=0, wrap=True)
+        fallback_caption.add_css_class("field-label")
+        body.append(fallback_caption)
+        self.fallback_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        body.append(self.fallback_box)
+        self.add_fallback_button = Gtk.Button(label="+  Dodaj zapas")
+        self.add_fallback_button.add_css_class("flat")
+        self.add_fallback_button.connect(
+            "clicked", lambda _button: self._add_fallback())
+        body.append(self.add_fallback_button)
+
+        self.fallbacks: list[FallbackRow] = []
+        self.set_child(body)
+        self._muted = False
+        self._refresh_hints()
+
+    # --- stan -------------------------------------------------------------
+    def selected_agent(self) -> str:
+        index = self.agent.get_selected()
+        return self.agents[index] if 0 <= index < len(self.agents) else self.agents[0]
+
+    def apply(self, entry: routing_module.RoleRouting) -> None:
+        self._muted = True
+        if entry.agent in self.agents:
+            self.agent.set_selected(self.agents.index(entry.agent))
+        self._refresh_hints()
+        for key, chooser in self.slots.items():
+            slot = entry.slots.get(key, routing_module.Endpoint())
+            chooser.set_value(slot.model, slot.effort)
+        for row in list(self.fallbacks):
+            self._remove_fallback(row, notify=False)
+        for endpoint in entry.fallbacks:
+            row = self._add_fallback(notify=False)
+            row.set_values(endpoint.agent, endpoint.model, endpoint.effort)
+        self._muted = False
+        self._update_summary()
+
+    def routing_entry(self) -> routing_module.RoleRouting:
+        slots: dict[str, routing_module.Endpoint] = {}
+        for key, chooser in self.slots.items():
+            model, effort = chooser.value()
+            if model or effort:
+                slots[key] = routing_module.Endpoint(model=model, effort=effort)
+        fallbacks = tuple(row.endpoint() for row in self.fallbacks
+                          if not row.endpoint().empty)
+        agent = self.selected_agent()
+        return routing_module.RoleRouting(
+            agent="" if agent == self.default_agent else agent,
+            slots=slots, fallbacks=fallbacks)
+
+    def set_sensitive_fields(self, enabled: bool) -> None:
+        self.agent.set_sensitive(enabled)
+        self.add_fallback_button.set_sensitive(enabled)
+        for chooser in self.slots.values():
+            chooser.set_sensitive_fields(enabled)
+        for row in self.fallbacks:
+            row.set_sensitive_fields(enabled)
+
+    # --- zdarzenia --------------------------------------------------------
+    def _add_fallback(self, notify: bool = True) -> FallbackRow:
+        row = FallbackRow(self.role, self.agents, self._changed,
+                          self._remove_fallback)
+        row.refresh_hint(self.selected_agent())
+        self.fallbacks.append(row)
+        self.fallback_box.append(row)
+        if notify:
+            self._changed()
+        return row
+
+    def _remove_fallback(self, row: FallbackRow, notify: bool = True) -> None:
+        if row not in self.fallbacks:
+            return
+        self.fallbacks.remove(row)
+        self.fallback_box.remove(row)
+        if notify:
+            self._changed()
+
+    def _agent_changed(self, *_args: Any) -> None:
+        self._refresh_hints()
+        self._changed()
+
+    def _refresh_hints(self) -> None:
+        agent = self.selected_agent()
+        for key, chooser in self.slots.items():
+            difficulty = "standard" if key == routing_module.ANY_DIFFICULTY else key
+            chooser.set_agent(agent, level_hint(self.role, difficulty, agent))
+        for row in self.fallbacks:
+            row.refresh_hint(agent)
+
+    def _changed(self) -> None:
+        self._update_summary()
+        if not self._muted:
+            self._on_change()
+
+    def _update_summary(self) -> None:
+        entry = self.routing_entry()
+        chosen = [endpoint.model for endpoint in entry.slots.values()
+                  if endpoint.model]
+        if not chosen:
+            detail = "modele wg polityki"
+        elif len(set(chosen)) == 1 and len(chosen) == len(self.slots):
+            detail = chosen[0]
+        else:
+            detail = f"{len(chosen)}/{len(self.slots)} modeli wybranych"
+        if entry.fallbacks:
+            detail += f"  •  zapas ×{len(entry.fallbacks)}"
+        self.summary.set_markup(
+            f"<b>{GLib.markup_escape_text(self.definition.title)}</b>  "
+            f"<span alpha='65%'>{GLib.markup_escape_text(self.selected_agent())}  •  "
+            f"{GLib.markup_escape_text(detail)}</span>")
 
 
 class ForgeWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application):
         super().__init__(application=app, title="Forge — panel sterowania")
         self.settings = load_settings()
+        self.routing_file = routing_path()
+        self.routing = routing_module.load(self.routing_file, TASK_DIFFICULTIES)
         window_settings = self.settings.get("window", {})
         if not isinstance(window_settings, dict):
             window_settings = {}
@@ -212,6 +540,7 @@ class ForgeWindow(Adw.ApplicationWindow):
         self.stop_requested = False
         self._chooser: Gtk.FileChooserNative | None = None
         self._session_log_fh: Any = None
+        self._ready = False
 
         header = Adw.HeaderBar()
         title = Adw.WindowTitle(title="Forge", subtitle="Orkiestrator agentów")
@@ -239,6 +568,7 @@ class ForgeWindow(Adw.ApplicationWindow):
         toolbar.set_content(self._build_content())
         self.set_content(toolbar)
         self.connect("close-request", self._close_requested)
+        self._ready = True
         self._load_previous_run()
 
     def _build_content(self) -> Gtk.Widget:
@@ -255,7 +585,7 @@ class ForgeWindow(Adw.ApplicationWindow):
 
         config_scroll = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
         config_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        config = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        config = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         config.set_margin_top(24)
         config.set_margin_bottom(24)
         config.set_margin_start(24)
@@ -264,24 +594,16 @@ class ForgeWindow(Adw.ApplicationWindow):
         heading = Gtk.Label(xalign=0)
         heading.set_markup("<span size='x-large' weight='bold'>Konfiguracja biegu</span>")
         info = Gtk.Label(
-            label=("Trudność zadania (simple / standard / complex) i poziom modelu "
-                   "(economy / efficient / balanced / strong / max) są niezależne. Wybierz agenta; "
-                   "provider przełoży poziom na konkretny model i effort."),
+            label=("Dla każdej roli wybierz narzędzie i model. Puste pole modelu "
+                   "oznacza politykę projektu (rola → poziom → provider). Wybór "
+                   "zapisuje się w " + str(self.routing_file) + " i obowiązuje "
+                   "także uruchomienia z linii poleceń."),
             xalign=0,
             wrap=True,
         )
         info.add_css_class("dim-label")
         config.append(heading)
         config.append(info)
-
-        policy = Gtk.Label(
-            label=("Polityka: Bootstrap = max; Planista = strong (eskalacja: max). "
-                   "Pozostałe role dobierają poziom zależnie od trudności zadania."),
-            xalign=0,
-            wrap=True,
-        )
-        policy.add_css_class("dim-label")
-        config.append(policy)
 
         paths = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         saved_brief = self.settings.get("brief", "game.md")
@@ -315,32 +637,20 @@ class ForgeWindow(Adw.ApplicationWindow):
             paths.append(box)
         config.append(paths)
 
-        defaults = Config()
-        roles_box = Gtk.FlowBox()
-        roles_box.set_selection_mode(Gtk.SelectionMode.NONE)
-        roles_box.set_column_spacing(14)
-        roles_box.set_row_spacing(14)
-        roles_box.set_min_children_per_line(1)
-        roles_box.set_max_children_per_line(2)
+        roles_heading = Gtk.Label(xalign=0)
+        roles_heading.set_markup("<span size='large' weight='bold'>Role</span>")
+        config.append(roles_heading)
+
+        defaults = Config(routing=routing_module.Routing())
         self.role_cards: dict[str, RoleCard] = {}
-        saved_roles = self.settings.get("roles", {})
-        if not isinstance(saved_roles, dict):
-            saved_roles = {}
-        for role, title, description in ROLE_DEFS:
-            default_agent = defaults.role(role)[0]
-            saved_role = saved_roles.get(role, {})
-            if isinstance(saved_role, dict):
-                saved_agent = saved_role.get("agent")
-                if isinstance(saved_agent, str):
-                    default_agent = saved_agent
-            card = RoleCard(
-                role, title, description, default_agent,
-                MASTER_AGENTS if role == "master" else AGENTS,
-            )
-            card.set_size_request(270, -1)
-            self.role_cards[role] = card
-            roles_box.append(card)
-        config.append(roles_box)
+        for definition in ROLE_DEFS:
+            card = RoleCard(definition, defaults.role(definition.name)[0],
+                            self._save_settings)
+            saved = self.routing.roles.get(definition.name)
+            if saved is not None:
+                card.apply(saved)
+            self.role_cards[definition.name] = card
+            config.append(card)
         config_scroll.set_child(config)
 
         log_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -519,10 +829,18 @@ class ForgeWindow(Adw.ApplicationWindow):
         self.status.remove_css_class("status-running")
         self.status.add_css_class("status-error")
 
+    def current_routing(self) -> routing_module.Routing:
+        return routing_module.Routing(roles={
+            role: card.routing_entry()
+            for role, card in self.role_cards.items()
+        })
+
     def _start(self, _button: Gtk.Button) -> None:
-        roles = {role: card.values() for role, card in self.role_cards.items()}
         try:
-            command, env = build_launch(self.brief.get_text(), self.project.get_text(), roles)
+            routing = self.current_routing()
+            command, env = build_launch(
+                self.brief.get_text(), self.project.get_text(), routing,
+                self.routing_file)
             self._save_settings()
             self.process = subprocess.Popen(
                 command,
@@ -630,10 +948,6 @@ class ForgeWindow(Adw.ApplicationWindow):
         return {
             "brief": self.brief.get_text(),
             "project": self.project.get_text(),
-            "roles": {
-                role: card.values()
-                for role, card in self.role_cards.items()
-            },
             "window": {
                 "width": self.get_width(),
                 "height": self.get_height(),
@@ -642,10 +956,20 @@ class ForgeWindow(Adw.ApplicationWindow):
         }
 
     def _save_settings(self) -> None:
+        """Zapisz ścieżki, geometrię i routing ról.
+
+        Wołane przy KAŻDEJ zmianie pokrętła, nie tylko przy starcie — inaczej
+        „to ma się zapamiętać" trzymałoby się wyłącznie udanych uruchomień."""
+        if not self._ready:
+            return
         try:
             save_settings(self._settings_payload())
         except OSError as exc:
             self._append_log(f"UWAGA: nie udało się zapisać ustawień GUI: {exc}")
+        try:
+            routing_module.save(self.current_routing(), self.routing_file)
+        except OSError as exc:
+            self._append_log(f"UWAGA: nie udało się zapisać routingu ról: {exc}")
 
     def _close_requested(self, _window: Gtk.Window) -> bool:
         self._save_settings()
@@ -663,7 +987,7 @@ headerbar { background: #151c26; border-bottom: 1px solid rgba(255,255,255,.08);
   background: #18212d;
   border: 1px solid rgba(255,255,255,.08);
   border-radius: 14px;
-  padding: 16px;
+  padding: 12px 16px;
 }
 .role-title { font-size: 16px; }
 .field-label { color: #aebdce; font-size: 12px; font-weight: 600; }
@@ -684,7 +1008,7 @@ textview, textview text { background: #0b1017; color: #c8d3e0; }
 .status-error { background: #4a2025; color: #ff9ca0; }
 .start-button { padding-left: 18px; padding-right: 18px; }
 dropdown, entry {
-  min-height: 38px;
+  min-height: 34px;
   border-radius: 9px;
 }
 """

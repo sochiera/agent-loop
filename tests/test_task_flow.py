@@ -70,7 +70,7 @@ def test_full_happy_path_reaches_commit(tmp_path: Path) -> None:
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}') as reviewer:
+         patch("forge.agents.run_agent", return_value='{"verdict":"approve"}') as reviewer:
         assert orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert roles == ["tester", "coder", "tester"]
@@ -106,7 +106,7 @@ def test_review_request_changes_starts_a_new_tdd_cycle_then_commit(
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", side_effect=reviewer_answers):
+         patch("forge.agents.run_agent", side_effect=reviewer_answers):
         # Pierwsza recenzja nie uruchamia specjalnej tury kodera.
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
         assert state.task_phase == "tester"
@@ -152,7 +152,7 @@ def test_notebook_lines_are_persisted_and_return_in_the_next_round(
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent",
+         patch("forge.agents.run_agent",
                return_value='{"verdict":"approve"}'):
         assert orchestrate.run_task(
             cfg, str(tmp_path), state, lambda phase: phase)
@@ -186,7 +186,7 @@ def test_oversized_notebook_announces_itself_in_the_log(
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate.log", side_effect=messages.append), \
-         patch("forge.orchestrate.run_agent",
+         patch("forge.agents.run_agent",
                return_value='{"verdict":"approve"}'):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -221,7 +221,7 @@ def test_tester_receives_task_scoped_context_in_every_prompt(tmp_path: Path) -> 
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}'):
+         patch("forge.agents.run_agent", return_value='{"verdict":"approve"}'):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     confirmation = tester_prompts[-1]
@@ -247,7 +247,7 @@ def test_independent_task_receives_failed_batch_handoff(tmp_path: Path) -> None:
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}'):
+         patch("forge.agents.run_agent", return_value='{"verdict":"approve"}'):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert "task-000 z tego wsadu został porzucony" in seen[0]
@@ -258,7 +258,7 @@ def test_review_runs_full_suite_boundary_before_commit(tmp_path: Path) -> None:
     with patch("forge.orchestrate._call_role", return_value='{"status":"review"}'), \
          patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate.run_shellfree", return_value=(0, "ok")) as boundary, \
-         patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}') as reviewer:
+         patch("forge.agents.run_agent", return_value='{"verdict":"approve"}') as reviewer:
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     reviewer.assert_called_once()
@@ -274,7 +274,7 @@ def test_full_suite_failure_after_review_returns_to_tester_without_commit(
     with patch("forge.orchestrate._call_role",
                return_value='{"status":"review"}'), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent",
+         patch("forge.agents.run_agent",
                return_value='{"verdict":"approve"}'), \
          patch("forge.orchestrate.build_then_test_result",
                return_value=(False, "FAIL integration_test\ntrace tail")) as gate:
@@ -320,7 +320,7 @@ def test_red_commit_gate_announces_itself_in_log_and_ledger(
                return_value='{"status":"review"}'), \
          patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate.log", side_effect=lines.append), \
-         patch("forge.orchestrate.run_agent",
+         patch("forge.agents.run_agent",
                return_value='{"verdict":"approve"}'), \
          patch("forge.orchestrate.build_then_test_result",
                return_value=(False, "FAIL integration_test\ntrace tail")):
@@ -348,7 +348,7 @@ def test_reviewer_write_announces_itself_in_log_and_ledger(
                return_value='{"status":"review"}'), \
          patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate.log", side_effect=lines.append), \
-         patch("forge.orchestrate.run_agent", side_effect=modifying_review):
+         patch("forge.agents.run_agent", side_effect=modifying_review):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert any("read-only" in line and "reviewer-change.py" in line
@@ -376,7 +376,7 @@ def test_tester_works_on_full_suite_after_gate_regression(
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent",
+         patch("forge.agents.run_agent",
                return_value='{"verdict":"approve"}'), \
          patch("forge.orchestrate.build_then_test_result",
                side_effect=((False, "FAIL integration_test"), (True, "ok"))):
@@ -407,7 +407,7 @@ def test_tester_chooses_command_and_commit_gate_uses_full_suite(
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent",
+         patch("forge.agents.run_agent",
                return_value='{"verdict":"approve"}'), \
          patch("forge.orchestrate.build_then_test_result",
                return_value=(True, "ok")) as gate:
@@ -447,7 +447,7 @@ def test_confirmation_reuses_tester_command_without_requiring_full_suite(
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent",
+         patch("forge.agents.run_agent",
                return_value='{"verdict":"approve"}'), \
          patch("forge.orchestrate.build_then_test_result",
                return_value=(True, "ok")):
@@ -482,7 +482,7 @@ def test_legacy_coder_checkpoint_without_command_falls_back_to_full_suite(
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent",
+         patch("forge.agents.run_agent",
                return_value='{"verdict":"approve"}'), \
          patch("forge.orchestrate.build_then_test_result",
                return_value=(True, "ok")):
@@ -509,7 +509,7 @@ def test_review_suggestions_can_be_rejected_and_finalized_without_rereview(
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", return_value=(
+         patch("forge.agents.run_agent", return_value=(
              '{"verdict":"suggestions","notes":'
              '["rozważ krótszą nazwę helpera"]}')) as reviewer, \
          patch("forge.orchestrate.build_then_test_result",
@@ -539,7 +539,7 @@ def test_nits_do_not_reopen_tdd_loop(tmp_path: Path) -> None:
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", return_value=(
+         patch("forge.agents.run_agent", return_value=(
              '{"verdict":"approve","notes":[],"nits":["skrót docstringa"]}')), \
          patch("forge.orchestrate.build_then_test_result", return_value=(True, "ok")):
         assert orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
@@ -578,7 +578,7 @@ def test_interrupt_after_finalize_resumes_at_commit(
             "forge.orchestrate._call_role",
             side_effect=lambda *_args: next(tester_answers)), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", return_value=(
+         patch("forge.agents.run_agent", return_value=(
              '{"verdict":"suggestions","notes":["rozważ krótszą nazwę"]}'
          )):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
@@ -623,7 +623,7 @@ def test_review_suggestions_can_be_applied_by_coder_without_rereview(
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", return_value=(
+         patch("forge.agents.run_agent", return_value=(
              '{"verdict":"suggestions","notes":["uprość VALUE do 1"]}'
          )) as reviewer, \
          patch("forge.orchestrate.build_then_test_result",
@@ -655,7 +655,7 @@ def test_tester_can_escalate_suggestions_to_a_second_review(
             side_effect=lambda *_args: next(tester_answers)), \
          patch("forge.orchestrate._master_notes", return_value={}), \
          patch(
-             "forge.orchestrate.run_agent",
+             "forge.agents.run_agent",
              side_effect=reviewer_answers) as reviewer, \
          patch("forge.orchestrate.build_then_test_result",
                return_value=(True, "ok")):
@@ -673,7 +673,7 @@ def test_request_changes_notes_do_not_enter_backlog_before_fix(
     with patch("forge.orchestrate._call_role",
                return_value='{"status":"review"}'), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", return_value=(
+         patch("forge.agents.run_agent", return_value=(
              '{"verdict":"request_changes","notes":["napraw kontrakt"]}')):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
@@ -694,8 +694,8 @@ def test_reviewer_is_fresh_and_never_receives_author_records(tmp_path: Path) -> 
     state.coder_record = "CODER-RECORD"
     _git(tmp_path, "tag", state.task_start_tag)
 
-    with patch("forge.orchestrate.run_agent", return_value='{"verdict":"approve"}') as reviewer, \
-         patch("forge.orchestrate.run_agent_session") as session_call:
+    with patch("forge.agents.run_agent", return_value='{"verdict":"approve"}') as reviewer, \
+         patch("forge.agents.run_agent_session") as session_call:
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     review_prompt = reviewer.call_args.args[1]
@@ -715,7 +715,7 @@ def test_reviewer_tree_change_returns_to_tester_without_rollback(tmp_path: Path)
 
     with patch("forge.orchestrate._call_role", return_value='{"status":"review"}'), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent", side_effect=modifying_review):
+         patch("forge.agents.run_agent", side_effect=modifying_review):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
     assert (tmp_path / "reviewer-change.py").read_text(encoding="utf-8") == "bad = True\n"
@@ -834,7 +834,7 @@ def test_finalize_outside_suggestions_gets_format_retry(
 
     with patch("forge.orchestrate._call_role", side_effect=role_call), \
          patch("forge.orchestrate._master_notes", return_value={}), \
-         patch("forge.orchestrate.run_agent",
+         patch("forge.agents.run_agent",
                return_value='{"verdict":"approve"}'):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
