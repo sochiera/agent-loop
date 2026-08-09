@@ -11,7 +11,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
-from .agents import (AgentError, LimitExhausted, extract_json,
+from .agents import (AgentError, LimitExhausted, _extract_json_detail, extract_json,
                      log, run_agent, run_agent_session, run_planner)
 from .config import Config, DEFAULT_TASK_DIFFICULTY, TASK_DIFFICULTIES
 from . import brief
@@ -28,6 +28,8 @@ from .task_pipeline import (InvalidDecision, parse_coder_decision, parse_review_
 _JSON_RETRY = """
 
 Poprzednia odpowiedź nie spełniła kontraktu. Nie wykonuj dalszych zmian.
+W wartościach JSON nie używaj cudzysłowów: ani typograficznych („ ” « »), ani
+prostego ". Cytuj apostrofami albo pisz bez cudzysłowu.
 Zwróć teraz wyłącznie jeden poprawny obiekt JSON w formacie podanym wyżej.
 """
 
@@ -173,7 +175,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     data = _decision_with_retry(
         plan_prompt,
         lambda value: run_planner(value, cfg, project, logf("plan")),
-        _parse_json_object)
+        lambda text: _parse_json_object(text, project=project))
     tasks = []
     # Odsiew musi być POLICZALNY, nie tylko widoczny w logu: to jedyny sygnał,
     # że pokrętło `batch_size` przekroczyło zdolność planisty do domykania
@@ -274,7 +276,7 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
             lambda value: run_agent(
                 reviewer, value, cfg, project, logf(log_phase),
                 model=model, effort=effort),
-            parse_review_decision)
+            lambda text: parse_review_decision(text, project=project))
         # Sam commit nie rusza plików, więc odcisk drzewa by go nie zauważył —
         # a przesunięty HEAD unieważnia bazę zarówno recenzji, jak i cofania.
         _restore_head(project, base_sha, f"{label} (recenzent)")
@@ -299,6 +301,8 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
 def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     log("Bootstrap: analiza briefu i budowa szkieletu projektu…")
     brief_text = Path(cfg.brief_path).read_text(encoding="utf-8")
+    base_sha = git(project, "rev-parse", "HEAD", check=False).stdout.strip()
+    before = _tree_manifest(project)
 
     def attempt(notes: list[str]) -> dict:
         if notes:
@@ -307,7 +311,7 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
             prompts.bootstrap_prompt(brief_text, review_notes=notes),
             lambda value: run_planner(
                 value, cfg, project, logf("bootstrap"), role="bootstrap"),
-            _parse_json_object)
+            lambda text: _parse_json_object(text, project=project))
         if not data.get("test_cmd"):
             raise AgentError("bootstrap nie zwrócił poprawnego JSON-a")
         if not Path(project, brief.PROJECT_DOC_PATH).is_file():
@@ -326,11 +330,21 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
         log("Bootstrap: testy początkowe zielone.")
         return data
 
-    data = _reviewed_bootstrap(
-        cfg, project, logf, label="Bootstrap", attempt=attempt,
-        review_prompt=lambda result: prompts.bootstrap_architecture_review_prompt(
-            cfg.brief_path, result["test_cmd"]),
-        log_phase="bootstrap-review")
+    try:
+        data = _reviewed_bootstrap(
+            cfg, project, logf, label="Bootstrap", attempt=attempt,
+            review_prompt=lambda result: prompts.bootstrap_architecture_review_prompt(
+                cfg.brief_path, result["test_cmd"]),
+            log_phase="bootstrap-review", base_sha=base_sha)
+    except Exception as exc:  # noqa: BLE001 — bootstrap nie może zostawić pół-szkieletu
+        changed = _turn_changes(before, _tree_manifest(project))
+        dest = _dump_phase_work(project, cfg, "Bootstrap", base_sha, changed, exc)
+        if dest:
+            log(f"Bootstrap: praca przed rewertem zachowana w {dest}")
+            ledger.append(project, f"bootstrap: praca zachowana w {dest}")
+        _restore_head(project, base_sha, "Bootstrap")
+        _revert_paths(project, base_sha, changed)
+        raise
     state.test_cmd = data["test_cmd"]
     state.build_cmd = data.get("build_cmd", "")
     state.project_kind = data.get("kind", "app")
@@ -491,7 +505,7 @@ def phase_diff_bootstrap(cfg: Config, project: str, state: State, logf,
             lambda value: run_agent(
                 agent, value, cfg, project, logf("diff-bootstrap"),
                 model=model, effort=effort),
-            _parse_steering_decision)
+            lambda text: _parse_steering_decision(text, project=project))
         # Zakres pilnujemy po KAŻDEJ próbie, także poprawkowej: recenzent ma
         # oceniać kierunek, a nie sprzątać po zapisie poza uprawnieniami.
         # Najpierw HEAD, bo własny commit roli unieważniłby bazę porównania.
@@ -512,15 +526,19 @@ def phase_diff_bootstrap(cfg: Config, project: str, state: State, logf,
                 base_sha or "HEAD", summary=result["summary"],
                 goal_reached=result["goal_reached"]),
             log_phase="diff-bootstrap-review", base_sha=base_sha)
-    except Exception:  # noqa: BLE001 — awaria zawsze zostawia czyste drzewo
+    except Exception as exc:  # noqa: BLE001 — awaria zawsze zostawia czyste drzewo
         # Niezaakceptowany kierunek nie ma prawa zostać w drzewie: następne
         # wznowienie zaczyna od stanu sprzed przeglądu, brief pozostaje
         # nierozliczony, a kolejna iteracja nie wywraca się na brudnym drzewie.
         # Sprzątamy WSZYSTKO, co ruszyło się w tej fazie — także eksperymenty
         # recenzenta, gdyby awaria wypadła przed ich cofnięciem.
+        changed = _turn_changes(before, _tree_manifest(project))
+        dest = _dump_phase_work(project, cfg, "Diff-bootstrap", base_sha, changed, exc)
+        if dest:
+            log(f"Diff-bootstrap: praca przed rewertem zachowana w {dest}")
+            ledger.append(project, f"diff-bootstrap: praca zachowana w {dest}")
         _restore_head(project, base_sha, "Diff-bootstrap")
-        _revert_paths(project, base_sha,
-                      _turn_changes(before, _tree_manifest(project)))
+        _revert_paths(project, base_sha, changed)
         raise
     replan = data["replan"]
     dropped = state.task_queue if replan else []
@@ -829,7 +847,7 @@ def _decision_with_retry(prompt: str, invoke, parser):
     try:
         return parser(first_raw)
     except InvalidDecision as exc:
-        reason = str(exc)[:500]
+        reason = str(exc)[:800]
         retry_prompt = (
             prompt + _JSON_RETRY + f"\nPowód odrzucenia: {reason}\n"
         )
@@ -868,14 +886,46 @@ def _dump_invalid_decision(project: str, cfg: Config, state: State, exc: Invalid
     log(f"  Surowe wyjście agenta zapisane w {dest}/{stamp}.txt")
 
 
-def _parse_json_object(text: str) -> dict:
-    data = extract_json(text)
-    if not isinstance(data, dict):
-        raise InvalidDecision("agent nie zwrócił obiektu JSON")
-    return data
+def _dump_phase_work(project: str, cfg: Config, label: str, base_sha: str,
+                     paths: list[str], reason: Exception) -> str:
+    """Zachowaj pracę fazy przed rewertem, nie zakłócając obsługi awarii."""
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = Path(project, cfg.runtime_dir, "failed", "_steering", stamp)
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        diff_args = ("diff", "--no-ext-diff", base_sha, "--", *paths) if base_sha else (
+            "diff", "--no-ext-diff", "--", *paths)
+        dest.joinpath("diff.patch").write_text(
+            git(project, *diff_args, check=False).stdout, encoding="utf-8")
+        dest.joinpath("changed.txt").write_text(
+            "\n".join(paths) + ("\n" if paths else ""), encoding="utf-8")
+        dest.joinpath("reason.txt").write_text(str(reason) + "\n", encoding="utf-8")
+        untracked = set(_untracked(project))
+        for rel in paths:
+            source = Path(project, rel)
+            if rel in untracked and source.is_file():
+                target = dest / "untracked" / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.read_bytes())
+    except OSError as exc:
+        log(f"  UWAGA: nie zachowano pracy {label} przed rewertem ({exc})")
+        return ""
+    return str(dest)
 
 
-def _parse_steering_decision(text: str) -> dict:
+def _parse_json_object(text: str, *, project: str = "") -> dict:
+    found = _extract_json_detail(text)
+    if found.repaired:
+        log("  UWAGA: werdykt odzyskany po naprawie cudzysłowów — rola pisze niepoprawny JSON")
+        if project:
+            ledger.append(project, "json: werdykt odzyskany warstwą naprawczą")
+    if not isinstance(found.data, dict):
+        suffix = f" — {found.error}" if found.error else ""
+        raise InvalidDecision("agent nie zwrócił obiektu JSON" + suffix)
+    return found.data
+
+
+def _parse_steering_decision(text: str, *, project: str = "") -> dict:
     """Werdykt przeglądu kierunku o sprawdzonych typach pól sterujących.
 
     Te pola sterują pętlą, a nie tylko treścią promptu: `"false"` jako tekst
@@ -883,7 +933,7 @@ def _parse_steering_decision(text: str) -> dict:
     `changes` podane stringiem rozsypałoby się w notatce na pojedyncze znaki.
     Niezgodność typu wraca do agenta przez jedną tanią prośbę o korektę.
     """
-    data = _parse_json_object(text)
+    data = _parse_json_object(text, project=project)
     for key, default in (("replan", True), ("goal_reached", False)):
         value = data.get(key, default)
         if not isinstance(value, bool):
@@ -1087,7 +1137,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             using_suite_regression = state.suite_regression
 
             def parse_for_current_review_cycle(text: str):
-                parsed = parse_tester_decision(text)
+                parsed = parse_tester_decision(text, project=project)
                 if (parsed.status == "finalize"
                         and not state.review_suggestions_pending):
                     raise InvalidDecision(
@@ -1137,7 +1187,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 task["file"], test_cmd,
                 decision=decision.data,
                 capsule=capsule),
-                parse_coder_decision)
+                lambda text: parse_coder_decision(text, project=project))
             # Zapis notatki kanałem, którym decyzja i tak wraca. Tura
             # narzędziowa kosztowałaby tu dziesiątki tysięcy tokenów wejścia i
             # — jak pokazuje historia pustych notatników — bywa pomijana.
@@ -1197,7 +1247,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             lambda value: run_agent(
                 reviewer, value, cfg, project, logf("review"),
                 model=model, effort=effort),
-            parse_review_decision)
+            lambda text: parse_review_decision(text, project=project))
         log(f"Zadanie {task['id']}: recenzja → {review.status}")
         review_changes = _describe_turn_changes(
             _turn_changes(before_review, _tree_manifest(project)))
@@ -1322,7 +1372,7 @@ def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
                 agent, value, cfg, project, logf("verify"),
                 model=model, effort=effort,
                 mcp_config=cfg.verifier_mcp_config),
-            _parse_json_object)
+            lambda text: _parse_json_object(text, project=project))
     except InvalidDecision:
         # Weryfikacja celu jest tolerancyjna: nieparsowalny werdykt po korekcie
         # nie ubija całej pętli, tylko wraca do planowania jak zwykłe "changes".

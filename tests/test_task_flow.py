@@ -749,6 +749,23 @@ def test_invalid_decision_gets_exactly_one_format_retry() -> None:
     assert "Powód odrzucenia: agent nie zwrócił poprawnego JSON-a" in prompts[1]
 
 
+def test_json_retry_prompt_carries_decoder_position() -> None:
+    answers = iter((
+        '```json\n{"summary":"wariant „zaplanowany". dalej","replan":}\n```',
+        '{"status":"review"}',
+    ))
+    prompts_seen = []
+
+    result = orchestrate._decision_with_retry(
+        "base",
+        lambda prompt: prompts_seen.append(prompt) or next(answers),
+        orchestrate.parse_tester_decision)
+
+    assert result.status == "review"
+    assert "kolumna" in prompts_seen[1]
+    assert "zaplanowany" in prompts_seen[1]
+
+
 def test_invalid_tester_decision_retry_explains_missing_command() -> None:
     answers = iter((
         '{"status":"red"}',

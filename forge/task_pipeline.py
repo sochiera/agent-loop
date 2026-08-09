@@ -4,7 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from .agents import extract_json
+from .agents import _extract_json_detail, log
+from . import ledger
 
 
 class InvalidDecision(ValueError):
@@ -23,15 +24,20 @@ class PhaseResult:
     data: dict
 
 
-def _decision(text: str) -> dict:
-    data = extract_json(text)
-    if not isinstance(data, dict):
-        raise InvalidDecision("agent nie zwrócił poprawnego JSON-a")
-    return data
+def _decision(text: str, *, project: str = "") -> dict:
+    found = _extract_json_detail(text)
+    if found.repaired:
+        log("  UWAGA: werdykt odzyskany po naprawie cudzysłowów — rola pisze niepoprawny JSON")
+        if project:
+            ledger.append(project, "json: werdykt odzyskany warstwą naprawczą")
+    if not isinstance(found.data, dict):
+        reason = f" — {found.error}" if found.error else ""
+        raise InvalidDecision("agent nie zwrócił poprawnego JSON-a" + reason)
+    return found.data
 
 
-def parse_tester_decision(text: str) -> PhaseResult:
-    data = _decision(text)
+def parse_tester_decision(text: str, *, project: str = "") -> PhaseResult:
+    data = _decision(text, project=project)
     status = data.get("status")
     if status not in TESTER_STATUSES:
         raise InvalidDecision(f"niedozwolona decyzja testera: {status!r}")
@@ -50,21 +56,23 @@ def parse_tester_decision(text: str) -> PhaseResult:
     return PhaseResult(status, data)
 
 
-def parse_coder_decision(text: str) -> PhaseResult:
-    data = _decision(text)
+def parse_coder_decision(text: str, *, project: str = "") -> PhaseResult:
+    data = _decision(text, project=project)
     status = data.get("status")
     if status not in CODER_STATUSES:
         raise InvalidDecision(f"niedozwolona decyzja kodera: {status!r}")
     return PhaseResult(status, data)
 
 
-def parse_review_decision(text: str) -> PhaseResult:
-    data = _decision(text)
+def parse_review_decision(text: str, *, project: str = "") -> PhaseResult:
+    data = _decision(text, project=project)
     verdict = data.get("verdict")
     if verdict not in REVIEW_VERDICTS:
         raise InvalidDecision(f"niedozwolony werdykt review: {verdict!r}")
     notes = _as_strings(data.get("notes"))
+    nits = _as_strings(data.get("nits"))
     data["notes"] = notes
+    data["nits"] = nits
     if verdict == "approve" and notes:
         raise InvalidDecision("werdykt 'approve' wymaga pustego `notes`")
     if verdict in {"suggestions", "request_changes"} and not notes:

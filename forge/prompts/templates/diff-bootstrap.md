@@ -44,6 +44,7 @@ prawdopodobne etapy oraz rzeczy świadomie odłożone. Utrzymuj jawną różnic�
 między wymaganiem, preferencją i pomysłem opcjonalnym.
 {{CORRECTIONS}}
 Zwróć tylko JSON
+{{JSON_RULES}}
 {"summary":"...","changes":["konkretna zmiana"],"replan":true,"goal_reached":false}.
 `replan` = true, gdy niezaczęte zadania w kolejce powinny wrócić do planisty,
 bo zmienił się kierunek; false, gdy kolejka pozostaje sensowna.

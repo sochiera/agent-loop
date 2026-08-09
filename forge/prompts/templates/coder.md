@@ -27,6 +27,7 @@ zmienionych plików — to już tam jest. Pusty string, gdy nic takiego nie był
 Notatnika nie zapisujesz sama i nie czytasz z dysku; robi to Forge.
 
 JSON:
+{{JSON_RULES}}
 {"status":"green","summary":"...","refactor":"done|not_needed","notebook":"..."}
 albo
 {"status":"test_changes_needed|tester_input_needed","reason":"...","notebook":"..."}.

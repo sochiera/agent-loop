@@ -269,7 +269,7 @@ def master_prompt(
 
 
 def master_system_prompt() -> str:
-    return read_template("master-system.md")
+    return render("master-system.md")
 
 
 def master_position(task_id: str = "", next_role: str = "") -> str:

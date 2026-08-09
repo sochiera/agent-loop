@@ -446,10 +446,48 @@ def test_extract_json_rejects_malformed_object_instead_of_nested_value() -> None
         '{"verdict":"request_changes","notes":["a",],"meta":{"x":1}}') is None
 
 
-def test_extract_json_rejects_json_broken_by_unescaped_quote_in_value() -> None:
-    """Ten sam nawyk typograficzny WEWNĄTRZ wartości to już realnie zepsuty
-    JSON — nie wolno go ratować, bo retry ma dostać prawdziwy powód."""
-    assert agents.extract_json('{"verdict":"approve","notes":["a („b") c"]}') is None
+def test_extract_json_repairs_ascii_quote_closing_polish_opener() -> None:
+    text = ('```json\n'
+            '{"summary":"K117 w ramieniu „zaplanowany". Kolejka",'
+            '"replan":false}\n```')
+
+    assert agents.extract_json(text) == {
+        "summary": "K117 w ramieniu „zaplanowany\". Kolejka",
+        "replan": False,
+    }
+    assert agents._extract_json_detail(text).repaired is True
+
+
+def test_extract_json_repairs_invalid_escape_before_typographic_quote() -> None:
+    text = '{"summary":"można „grać patrząc\\” na mapę","replan":false}'
+
+    assert agents.extract_json(text) == {
+        "summary": "można „grać patrząc” na mapę", "replan": False}
+
+
+def test_extract_json_repair_keeps_valid_json_untouched() -> None:
+    text = '{"summary":"wariant „pełny”","replan":false}'
+
+    detail = agents._extract_json_detail(text)
+
+    assert detail.data == {"summary": "wariant „pełny”", "replan": False}
+    assert detail.repaired is False
+
+
+def test_extract_json_repair_returns_none_when_ambiguous() -> None:
+    text = '{"summary":"wariant „zaplanowany", ale dalej","replan":false}'
+
+    assert agents.extract_json(text) is None
+
+
+def test_extract_json_detail_reports_position_and_context() -> None:
+    text = '```json\n{"summary":"wariant „zaplanowany". dalej","replan":}\n```'
+
+    detail = agents._extract_json_detail(text)
+
+    assert detail.data is None
+    assert "linia" in detail.error and "kolumna" in detail.error
+    assert "zaplanowany" in detail.error
 
 
 def test_extract_json_keeps_whole_batch_when_planner_output_is_valid() -> None:

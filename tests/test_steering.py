@@ -730,6 +730,26 @@ def test_rejected_bootstrap_is_rebuilt_with_the_review_notes(
     assert state.test_cmd == "true"
 
 
+def test_failed_steering_saves_work_before_revert(tmp_path: Path) -> None:
+    project, state, cfg = _steered_repo(tmp_path)
+    original = (project / "BACKLOG.md").read_text(encoding="utf-8")
+    answers = iter(("bez JSON-a", "nadal bez JSON-a"))
+
+    def agent(_name, _prompt, _cfg, project_dir, _log, **_kwargs):
+        _write_in_scope(Path(project_dir))
+        return next(answers)
+
+    with patch("forge.orchestrate.run_agent", side_effect=agent), \
+         pytest.raises(InvalidDecision):
+        orchestrate.phase_diff_bootstrap(
+            cfg, str(project), state, lambda phase: phase, "cadence")
+
+    assert (project / "BACKLOG.md").read_text(encoding="utf-8") == original
+    archives = list((project / ".forge" / "failed" / "_steering").glob("*/diff.patch"))
+    assert len(archives) == 1
+    assert "BACKLOG.md" in archives[0].read_text(encoding="utf-8")
+
+
 # --- Prompty i routing -------------------------------------------------------
 
 def test_steering_prompt_states_its_narrow_write_scope() -> None:

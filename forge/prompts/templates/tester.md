@@ -23,4 +23,5 @@ to, co zostanie prawdą. Notatnika nie zapisujesz sama i nie czytasz z dysku;
 robi to Forge. Nie czytaj notatników innych ról.
 
 JSON:
+{{JSON_RULES}}
 {"status":"{{STATUSES}}","command":"...","test_files":[],"reason":"...","notebook":"..."}.

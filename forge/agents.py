@@ -15,6 +15,7 @@ import re
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import adapters
@@ -333,6 +334,112 @@ def _usage_delta(cumulative: dict, baseline: dict | None) -> dict | None:
     return delta
 
 
+@dataclass(frozen=True)
+class JsonExtraction:
+    """Wynik wydobywania werdyktu wraz z diagnozą dla pojedynczego retry."""
+
+    data: dict | None = None
+    repaired: bool = False
+    error: str = ""
+
+
+def _repair_json_text(raw: str) -> str:
+    """Napraw dwa częste, lokalne błędy w wartościach stringowych JSON.
+
+    Nie jest to tolerancyjny parser: niepewne przypadki pozostawia parserowi
+    JSON. Dzięki temu nie zwracamy wiarygodnie wyglądającego pół-wyniku.
+    """
+    repaired: list[str] = []
+    in_string = False
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if not in_string:
+            repaired.append(char)
+            if char == '"':
+                in_string = True
+            index += 1
+            continue
+        if char == "\\":
+            if index + 1 < len(raw):
+                escaped = raw[index + 1]
+                if escaped in '"\\/bfnrtu':
+                    repaired.extend((char, escaped))
+                else:
+                    repaired.append(escaped)
+                index += 2
+            else:
+                # Samotny backslash nadal jest błędem JSON; nie udajemy, że
+                # wiemy, jaką treść agent chciał nim zapisać.
+                repaired.append(char)
+                index += 1
+            continue
+        if char == '"':
+            lookahead = index + 1
+            while lookahead < len(raw) and raw[lookahead].isspace():
+                lookahead += 1
+            if lookahead == len(raw) or raw[lookahead] in ",}]:":
+                repaired.append(char)
+                in_string = False
+            else:
+                repaired.append('\\"')
+            index += 1
+            continue
+        repaired.append(char)
+        index += 1
+    return "".join(repaired)
+
+
+def _json_error_detail(raw: str, error: json.JSONDecodeError, *, fenced: bool) -> str:
+    context = raw[max(0, error.pos - 60):error.pos + 60].replace("\n", " ")
+    source = "blok ```json```" if fenced else "kandydat JSON"
+    return (f"{source} nie parsuje: {error.msg} "
+            f"(linia {error.lineno}, kolumna {error.colno}); kontekst: …{context}…")
+
+
+def _extract_json_detail(text: str) -> JsonExtraction:
+    """Wydobądź JSON i zachowaj ostatnią użyteczną diagnozę dekodera."""
+    if not text:
+        return JsonExtraction()
+    fences = re.findall(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    last_error: tuple[str, json.JSONDecodeError, bool] | None = None
+    for raw in reversed(fences):
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                return JsonExtraction(data=obj)
+        except json.JSONDecodeError as exc:
+            if last_error is None:
+                last_error = (raw, exc, True)
+
+    objects = _scan_json_objects(text)
+    if objects:
+        return JsonExtraction(data=objects[-1])
+
+    repair_candidates = list(reversed(fences))
+    if not repair_candidates:
+        start, end = text.rfind("{"), text.rfind("}")
+        if start >= 0 and end >= start:
+            raw = text[start:end + 1]
+            try:
+                json.loads(raw)
+            except json.JSONDecodeError as exc:
+                repair_candidates.append(raw)
+                last_error = (raw, exc, False)
+    for raw in repair_candidates:
+        try:
+            obj = json.loads(_repair_json_text(raw))
+            if isinstance(obj, dict):
+                return JsonExtraction(data=obj, repaired=True)
+        except json.JSONDecodeError as exc:
+            if last_error is None:
+                last_error = (raw, exc, bool(fences))
+    if last_error:
+        raw, exc, fenced = last_error
+        return JsonExtraction(error=_json_error_detail(raw, exc, fenced=fenced))
+    return JsonExtraction()
+
+
 def extract_json(text: str) -> dict | None:
     """Wyłuskaj OSTATNI poprawny blok JSON z odpowiedzi agenta.
 
@@ -340,18 +447,7 @@ def extract_json(text: str) -> dict | None:
     kończy werdyktem); dopiero gdy żadne nie da poprawnego obiektu, skanuje
     cały tekst — fence, który się nie sparsował, nie może ukryć poprawnego
     obiektu leżącego poza nim."""
-    if not text:
-        return None
-    fences = re.findall(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
-    for raw in reversed(fences):
-        try:
-            obj = json.loads(raw)
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            continue
-    objects = _scan_json_objects(text)
-    return objects[-1] if objects else None
+    return _extract_json_detail(text).data
 
 
 def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,

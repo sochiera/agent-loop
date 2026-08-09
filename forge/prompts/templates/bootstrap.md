@@ -32,4 +32,5 @@ To wyjaśnienie, nie zakaz.
 {{CORRECTIONS}}
 Ustal profil końcowej weryfikacji: targets z smoke/ci/hardware i odpowiadające
 komendy. Nie commituj. Zwróć tylko JSON
+{{JSON_RULES}}
 {"kind":"app|game","test_cmd":"...","build_cmd":"","verify":{"targets":["smoke"],"smoke_cmd":"...","flash_cmd":"","target_cmd":"","ci_status_cmd":"","ci_logs_cmd":""}}.

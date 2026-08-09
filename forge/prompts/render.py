@@ -17,6 +17,10 @@ def read_template(name: str) -> str:
 def render(name: str, **values) -> str:
     """Podstaw jawne sloty ``{{NAME}}``; zgłoś brak zamiast wysłać śmieci."""
     template = read_template(name)
+    # Reguła jest wspólna, bo każdy nowy kontrakt JSON ma dostać tę samą
+    # ochronę przed typograficznymi nawykami modelu bez zmian w wywołujących.
+    if "JSON_RULES" in _SLOT.findall(template) and "JSON_RULES" not in values:
+        values["JSON_RULES"] = read_template("json-rules.md")
     required = set(_SLOT.findall(template))
     missing = sorted(required - values.keys())
     if missing:

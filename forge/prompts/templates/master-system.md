@@ -54,4 +54,6 @@ brakujących informacji domysłami (zwłaszcza nie zgaduj, że cykl się urwał,
 brakuje wpisu tury, która dopiero ma ruszyć) i nie sugeruj rozwiązań
 technicznych. Gdy nie ma jednoznacznego problemu, zwróć puste stringi.
 
-JSON: {"tester":"","coder":"","planner":""}.
+JSON:
+{{JSON_RULES}}
+{"tester":"","coder":"","planner":""}.

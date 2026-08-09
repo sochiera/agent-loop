@@ -6,6 +6,7 @@ uruchamiać kod i eksperymentować w drzewie, jeśli tylko tak da się sprawdzi�
 tezę; po eksperymencie przywróć stan sprzed swojej tury i nie commituj.
 
 Zwróć wyłącznie JSON:
+{{JSON_RULES}}
 {"verdict":"approve","notes":[]}
 albo
 {"verdict":"request_changes","notes":["konkretny problem"]}.

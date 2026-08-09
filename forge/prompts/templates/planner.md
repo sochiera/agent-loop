@@ -38,4 +38,5 @@ podaj `depends_on` jako listę identyfikatorów wcześniejszych zadań, od któr
 naprawdę zależy.
 
 Nie commituj. JSON:
+{{JSON_RULES}}
 {"no_more_tasks":false,"tasks":[{"id":"task-{{START_INDEX}}","title":"...","file":".forge/tasks/task-{{START_INDEX}}.md","depends_on":[],"difficulty":"standard"}]}.

@@ -32,6 +32,7 @@ ograniczony oczekiwany rezultat. approve wymaga pustego `notes`; pozostałe
 werdykty wymagają co najmniej jednej notatki.
 
 Zwróć wyłącznie JSON:
+{{JSON_RULES}}
 {"verdict":"approve","notes":[]}
 albo
 {"verdict":"suggestions","notes":["konkretna opcjonalna poprawka"]}

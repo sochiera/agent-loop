@@ -33,6 +33,7 @@ Każda notatka ma wskazać konkretny problem, jego skutek dla kierunku projektu 
 ograniczony oczekiwany rezultat. approve wymaga pustego `notes`.
 
 Zwróć wyłącznie JSON:
+{{JSON_RULES}}
 {"verdict":"approve","notes":[]}
 albo
 {"verdict":"request_changes","notes":["konkretny problem kierunku"]}.

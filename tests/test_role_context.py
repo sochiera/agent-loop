@@ -4,6 +4,14 @@ from forge import prompts
 from forge.state import State
 
 
+def test_every_json_contract_template_carries_quote_rule() -> None:
+    templates = Path(prompts.__file__).with_name("templates")
+    for template in templates.glob("*.md"):
+        text = template.read_text(encoding="utf-8")
+        if '{"' in text:
+            assert "{{JSON_RULES}}" in text, template.name
+
+
 def _flat(text: str) -> str:
     """Prompt jest zawijany dla czytelności — asercje mają pilnować treści,
     nie miejsca łamania linii."""
