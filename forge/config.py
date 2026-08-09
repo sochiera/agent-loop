@@ -68,14 +68,12 @@ MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
         "strong": ("grok-4.5", "high"),
         "max": ("grok-4.5", "high"),
     },
-    # OpenCode jako most do dwóch dostawców: trzy niższe poziomy idą na tanią
-    # Lunę (reasoning_options: none/low/medium/high/xhigh/max), a dwa górne na
-    # GLM-5.2 z planu kodowego z.ai — ten model wystawia TYLKO dwa poziomy
-    # wysiłku, "high" i "max", więc nie ma tu czego zejść niżej.
+    # OpenCode używa GLM-5.2 z planu kodowego z.ai na każdym poziomie.
+    # Ten model wystawia dwa poziomy wysiłku, "high" i "max".
     "opencode": {
-        "economy": ("openai/gpt-5.6-luna", "medium"),
-        "efficient": ("openai/gpt-5.6-luna", "high"),
-        "balanced": ("openai/gpt-5.6-luna", "xhigh"),
+        "economy": ("zai-coding-plan/glm-5.2", "high"),
+        "efficient": ("zai-coding-plan/glm-5.2", "high"),
+        "balanced": ("zai-coding-plan/glm-5.2", "high"),
         "strong": ("zai-coding-plan/glm-5.2", "high"),
         "max": ("zai-coding-plan/glm-5.2", "max"),
     },
@@ -196,7 +194,7 @@ class Config:
     max_tdd_rounds: int = int(os.environ.get("FORGE_MAX_TDD_ROUNDS", "10"))
     # Agent CLI każdej roli nowego modelu. "claude"/"codex" mają wbudowaną
     # obsługę; dowolna inna nazwa → agent generyczny z FORGE_AGENT_<NAME>_CMD
-    # (patrz adapters.py). Domyślnie tester i koder to opencode (NeuralWatt).
+    # (patrz adapters.py). Domyślnie tester i koder to opencode (z.ai).
     tester_agent: str = os.environ.get("FORGE_TESTER_AGENT", "opencode")
     coder_agent: str = os.environ.get("FORGE_CODER_AGENT", "opencode")
     # Model/effort ról. Puste → agent użyje swojego domyślnego (codex: config.toml).

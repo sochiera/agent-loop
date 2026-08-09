@@ -272,11 +272,11 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         for agent, role, difficulty, expected in (
             ("grok", "coder", "complex", ("grok-4.5", "medium")),
             ("opencode", "reviewer", "standard",
-             ("openai/gpt-5.6-luna", "xhigh")),
+             ("zai-coding-plan/glm-5.2", "high")),
             ("opencode", "reviewer", "complex",
              ("zai-coding-plan/glm-5.2", "high")),
             ("opencode", "coder", "simple",
-             ("openai/gpt-5.6-luna", "medium")),
+             ("zai-coding-plan/glm-5.2", "high")),
         ):
             cfg = Config(**{f"{role}_agent": agent})
             _, model, effort = cfg.role(role, difficulty)
