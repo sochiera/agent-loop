@@ -36,6 +36,21 @@ def test_decision_contracts_are_small_and_strict() -> None:
         parse_review_decision('{"verdict":"request_changes"}')
 
 
+def test_approve_allows_nits_but_still_rejects_notes() -> None:
+    result = parse_review_decision(
+        '{"verdict":"approve","notes":[],"nits":["skrót docstringa"]}')
+
+    assert result.data["nits"] == ["skrót docstringa"]
+    with pytest.raises(InvalidDecision):
+        parse_review_decision('{"verdict":"approve","notes":["napraw kontrakt"]}')
+
+
+def test_suggestions_still_requires_notes_with_nits() -> None:
+    with pytest.raises(InvalidDecision):
+        parse_review_decision(
+            '{"verdict":"suggestions","notes":[],"nits":["kosmetyka"]}')
+
+
 def test_red_green_returns_to_same_tester() -> None:
     state = SimpleNamespace(task_phase="", tdd_round=0, tester_decision={})
     tester = iter(["red", "review"])

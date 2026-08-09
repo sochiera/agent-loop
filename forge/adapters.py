@@ -35,6 +35,9 @@ KONTRAKT generycznego agenta (nie wykryjemy tego za Ciebie — CLI bywają róż
 - finalną odpowiedź (blok ```json wymagany przez rolę) wypisz na STDOUT albo do
   pliku {output}; komunikaty diagnostyczne kieruj na STDERR,
 - nie znamy zużycia tokenów generyka — nie trafia do .forge/usage.jsonl.
+  Wyjątek: domyślny OpenCode działa z `--format json`, więc Forge rozumie jego
+  zdarzenia `message.updated` i zapisuje ich końcowe liczniki. Własny szablon
+  OpenCode powinien zachować tę flagę, aby telemetryka pozostała dostępna.
 """
 from __future__ import annotations
 
@@ -93,7 +96,10 @@ KNOWN_TEMPLATES: dict[str, str] = {
     # --dir {project} jest KONIECZNE: `opencode run` nie dziedziczy cwd procesu
     # (subprocess cwd=project to za mało) — bez tej flagi agent operuje na
     # jakimś swoim domyślnym/ostatnio używanym katalogu, nie na projekcie.
-    "opencode": "opencode run {prompt} -m {model} --variant {effort} --auto --dir {project}",
+    "opencode": (
+        "opencode run {prompt} -m {model} --variant {effort} --auto "
+        "--format json --dir {project}"
+    ),
 }
 
 # Tryb cienki jest potrzebą roli doradczej. Claude ma obsługę wbudowaną

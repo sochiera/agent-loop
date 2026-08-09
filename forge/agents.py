@@ -250,6 +250,60 @@ def extract_codex_usage(stream: str) -> dict:
     return turn_totals or fallback
 
 
+def extract_opencode_usage(stream: str) -> dict:
+    """Zsumuj końcowe liczniki wiadomości asystenta z JSONL OpenCode.
+
+    ``message.updated`` pojawia się wielokrotnie dla tej samej, narastającej
+    wiadomości. Dlatego ostatnia wersja każdego id zastępuje poprzednią; ich
+    sumowanie zawyżyłoby rachunek o wszystkie stany pośrednie.
+    """
+    messages: dict[str, dict] = {}
+    anonymous = 0
+    for line in (stream or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "message.updated":
+            continue
+        properties = event.get("properties")
+        candidates = (
+            event.get("info"), event.get("message"),
+            properties.get("info") if isinstance(properties, dict) else None,
+        )
+        info = next((item for item in candidates if isinstance(item, dict)), None)
+        if not info or info.get("role") != "assistant" or not isinstance(info.get("tokens"), dict):
+            continue
+        message_id = str(info.get("id") or event.get("id") or "")
+        if not message_id:
+            anonymous += 1
+            message_id = f"anonymous-{anonymous}"
+        messages[message_id] = info["tokens"]
+    if not messages:
+        return {}
+
+    totals = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
+    for tokens in messages.values():
+        cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+        fields = (
+            ("input_tokens", tokens.get("input")),
+            ("cached_input_tokens", cache.get("read")),
+            ("cache_creation_input_tokens", cache.get("write")),
+            ("output_tokens", tokens.get("output")),
+            ("reasoning_output_tokens", tokens.get("reasoning")),
+        )
+        for target, value in fields:
+            if isinstance(value, (int, float)):
+                totals[target] += int(value)
+    return totals
+
+
 def _find_number(obj, key: str):
     if isinstance(obj, dict):
         if isinstance(obj.get(key), (int, float)):
@@ -820,10 +874,7 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
                  *, model: str, effort: str, usage_dir: str = "",
                  thin: bool = False, system_prompt: str = "",
                  json_schema: str = "") -> str:
-    """Uruchom dowolny agent CLI wg szablonu (adapters.GenericSpec).
-
-    Obce CLI nie mają wspólnego formatu liczników, więc zapisujemy sam fakt
-    wywołania — inaczej domyślny mistrz (opencode) nie istniałby w raporcie."""
+    """Uruchom dowolny agent CLI wg szablonu (adapters.GenericSpec)."""
     out_file = _prepare_last_msg_file(project_dir, cfg) if spec.uses_output_file else None
     prompt_file = None
     try:
@@ -859,11 +910,18 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
                 os.unlink(prompt_file)
             except OSError:
                 pass
-    _log_call_without_tokens(usage_dir or project_dir, cfg, log_path,
-                             spec.name, model, effort)
+    usage = extract_opencode_usage(stream) if spec.name == "opencode" else {}
+    if usage:
+        log_usage(usage_dir or project_dir, cfg, {
+            "agent": spec.name, "phase": _phase_from_log(log_path),
+            "model": model, "effort": effort, "usage": usage,
+        })
+    else:
+        _log_call_without_tokens(usage_dir or project_dir, cfg, log_path,
+                                 spec.name, model, effort)
     if out_file:
         return _read_last_msg(out_file)
-    if thin and spec.name == "opencode":
+    if spec.name == "opencode":
         return _extract_opencode_text(stream)
     return stream
 

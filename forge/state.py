@@ -22,6 +22,9 @@ class State:
     steered_at_sha: str = ""
     # Wyczerpany backlog prosi o przegląd, zamiast kończyć projekt.
     steering_due: bool = False
+    # Krótki ostatni wsad oznacza drenaż backlogu. Nie ustawiamy tu
+    # ``steering_due``: ono nie ma strażnika pustej kolejki.
+    batch_drained: bool = False
     # Dopiero przegląd kierunku orzeka, że cel briefu jest osiągnięty.
     goal_confirmed: bool = False
     # Bezpiecznik przed jałową parą planista↔przegląd na najsilniejszym modelu.

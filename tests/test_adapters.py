@@ -108,7 +108,8 @@ class GenericSpecTest(unittest.TestCase):
              "project": "", "output": ""},
         )
         self.assertEqual(
-            argv, ["opencode", "run", "zrob X", "-m", "neuralwatt/glm-5.2", "--auto"])
+            argv, ["opencode", "run", "zrob X", "-m", "neuralwatt/glm-5.2",
+                   "--auto", "--format", "json"])
         # Model z effortem (GLM-5.2 wspiera --variant) — flaga zostaje.
         argv_effort = adapters.expand_template(
             spec.template,
@@ -118,7 +119,8 @@ class GenericSpecTest(unittest.TestCase):
         )
         self.assertEqual(
             argv_effort,
-            ["opencode", "run", "zrob X", "-m", "neuralwatt/glm-5.2", "--variant", "high", "--auto"])
+            ["opencode", "run", "zrob X", "-m", "neuralwatt/glm-5.2",
+             "--variant", "high", "--auto", "--format", "json"])
 
     def test_env_template_overrides_known_default(self) -> None:
         env = {"FORGE_AGENT_GROK_CMD": "moj-grok {prompt}"}
@@ -276,7 +278,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
             ("opencode", "reviewer", "complex",
              ("zai-coding-plan/glm-5.2", "high")),
             ("opencode", "coder", "simple",
-             ("zai-coding-plan/glm-5.2", "high")),
+             ("openai/gpt-5.6-luna", "medium")),
         ):
             cfg = Config(**{f"{role}_agent": agent})
             _, model, effort = cfg.role(role, difficulty)
@@ -295,6 +297,13 @@ class ConfigRoleResolutionTest(unittest.TestCase):
             else:
                 # Model bez wsparcia dla --variant nie może dostać wiszącej flagi.
                 self.assertNotIn("--variant", argv)
+
+    def test_opencode_economy_and_efficient_route_to_luna(self) -> None:
+        cfg = Config(master_agent="opencode", reviewer_agent="opencode")
+
+        assert cfg.role("master") == ("opencode", "openai/gpt-5.6-luna", "high")
+        assert cfg.role("reviewer") == (
+            "opencode", "zai-coding-plan/glm-5.2", "high")
 
 
 class RunGenericAgentTest(unittest.TestCase):

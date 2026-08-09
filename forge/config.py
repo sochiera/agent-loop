@@ -68,11 +68,12 @@ MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
         "strong": ("grok-4.5", "high"),
         "max": ("grok-4.5", "high"),
     },
-    # OpenCode używa GLM-5.2 z planu kodowego z.ai na każdym poziomie.
-    # Ten model wystawia dwa poziomy wysiłku, "high" i "max".
+    # Cienkie role na dwóch najniższych poziomach jadą Luną; GLM-5.2 zostaje
+    # dla cięższego testowania i recenzji. Oba modele wymagają prefiksu
+    # providera, bo OpenCode rozwiązuje modele w jego przestrzeni nazw.
     "opencode": {
-        "economy": ("zai-coding-plan/glm-5.2", "high"),
-        "efficient": ("zai-coding-plan/glm-5.2", "high"),
+        "economy": ("openai/gpt-5.6-luna", "medium"),
+        "efficient": ("openai/gpt-5.6-luna", "high"),
         "balanced": ("zai-coding-plan/glm-5.2", "high"),
         "strong": ("zai-coding-plan/glm-5.2", "high"),
         "max": ("zai-coding-plan/glm-5.2", "max"),

@@ -528,6 +528,29 @@ def test_review_suggestions_can_be_rejected_and_finalized_without_rereview(
     assert not (tmp_path / "BACKLOG.md").exists()
 
 
+def test_nits_do_not_reopen_tdd_loop(tmp_path: Path) -> None:
+    _task, state, cfg = _task_repo(tmp_path)
+    roles: list[str] = []
+
+    def role_call(_cfg, _project, _state, role, _prompt, _log):
+        roles.append(role)
+        assert role == "tester"
+        return '{"status":"review"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_agent", return_value=(
+             '{"verdict":"approve","notes":[],"nits":["skrót docstringa"]}')), \
+         patch("forge.orchestrate.build_then_test_result", return_value=(True, "ok")):
+        assert orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert roles == ["tester"]
+    assert not state.review_suggestions_pending
+    assert state.current_task == {}
+    assert "task-001: skrót docstringa" in (
+        tmp_path / ".forge" / "nits.md").read_text(encoding="utf-8")
+
+
 def test_interrupt_after_finalize_resumes_at_commit(
         tmp_path: Path) -> None:
     _task, state, cfg = _task_repo(tmp_path)

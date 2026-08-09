@@ -164,6 +164,30 @@ def test_mature_cadence_waits_for_an_empty_queue(tmp_path: Path) -> None:
     assert orchestrate._steering_trigger(cfg, str(project), state) == "cadence"
 
 
+def test_short_batch_triggers_cadence_on_next_empty_queue(tmp_path: Path) -> None:
+    project, state, cfg = _steered_repo(tmp_path)
+    state.plan_batches = 1
+    state.batch_drained = True
+
+    assert orchestrate._steering_trigger(cfg, str(project), state) == "cadence"
+
+
+def test_short_batch_does_not_trigger_while_queue_not_empty(tmp_path: Path) -> None:
+    project, state, cfg = _steered_repo(tmp_path)
+    state.batch_drained = True
+    state.task_queue = [{"id": "task-007", "title": "świeże zadanie"}]
+
+    assert orchestrate._steering_trigger(cfg, str(project), state) == ""
+
+
+def test_full_batch_keeps_existing_cadence(tmp_path: Path) -> None:
+    project, state, cfg = _steered_repo(tmp_path)
+    state.plan_batches = cfg.steering_batches - 1
+    state.batch_drained = False
+
+    assert orchestrate._steering_trigger(cfg, str(project), state) == ""
+
+
 def test_changed_brief_still_wins_over_a_full_queue(tmp_path: Path) -> None:
     """Regresja: zmiana briefu to najmocniejsze wejście przeglądu i ma wygrywać
     z kolejką. Ta gałąź celowo NIE dostaje warunku pustej kolejki."""

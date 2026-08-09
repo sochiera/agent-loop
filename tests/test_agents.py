@@ -287,6 +287,72 @@ def test_generic_grok_receives_isolated_environment(tmp_path: Path) -> None:
     assert run.call_args.kwargs["env"] == {"GROK_HOME": "/isolated/grok"}
 
 
+def test_opencode_usage_sums_last_version_of_each_message() -> None:
+    def event(message_id: str, input_tokens: int) -> str:
+        return json.dumps({"type": "message.updated", "properties": {"info": {
+            "id": message_id, "role": "assistant", "tokens": {
+                "input": input_tokens, "output": input_tokens // 10,
+                "reasoning": input_tokens // 20, "cache": {"read": 4, "write": 2},
+            },
+        }}})
+
+    usage = agents.extract_opencode_usage("\n".join((
+        event("first", 10), event("first", 30), event("first", 50), event("second", 7),
+    )))
+
+    assert usage == {
+        "input_tokens": 57, "cached_input_tokens": 8,
+        "cache_creation_input_tokens": 4, "output_tokens": 5,
+        "reasoning_output_tokens": 2,
+    }
+
+
+def test_opencode_usage_maps_cache_read_and_write() -> None:
+    stream = json.dumps({"type": "message.updated", "info": {
+        "id": "msg", "role": "assistant", "tokens": {
+            "input": 12, "output": 3, "reasoning": 2,
+            "cache": {"read": 9, "write": 5},
+        },
+    }})
+
+    assert agents.extract_opencode_usage(stream) == {
+        "input_tokens": 12, "cached_input_tokens": 9,
+        "cache_creation_input_tokens": 5, "output_tokens": 3,
+        "reasoning_output_tokens": 2,
+    }
+
+
+def test_opencode_usage_empty_stream_returns_empty() -> None:
+    assert agents.extract_opencode_usage("not json\n{}") == {}
+
+
+def test_generic_opencode_extracts_text_without_thin_and_logs_usage(
+        tmp_path: Path) -> None:
+    stream = "\n".join((
+        json.dumps({"part": {"id": "answer", "type": "text", "text": "część"}}),
+        json.dumps({"part": {"id": "answer", "type": "text", "text": "czysty werdykt"}}),
+        json.dumps({"type": "message.updated", "info": {
+            "id": "msg", "role": "assistant", "tokens": {
+                "input": 20, "output": 4, "reasoning": 1,
+                "cache": {"read": 15, "write": 3},
+            },
+        }}),
+    ))
+
+    with patch("forge.agents._run_with_backoff", return_value=stream):
+        result = run_agent("opencode", "prompt", Config(), str(tmp_path),
+                           str(tmp_path / "review.log"))
+
+    assert result == "czysty werdykt"
+    records = [json.loads(line) for line in (
+        tmp_path / ".forge" / "usage.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["usage"] == {
+        "input_tokens": 20, "cached_input_tokens": 15,
+        "cache_creation_input_tokens": 3, "output_tokens": 4,
+        "reasoning_output_tokens": 1,
+    }
+
+
 def test_prompt_file_is_cleaned_when_template_expands_to_empty_argv(
         tmp_path: Path) -> None:
     spec = GenericSpec("grok", ["{prompt_file}"], False, True)

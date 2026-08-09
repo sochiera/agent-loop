@@ -236,6 +236,9 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
         ledger.append(project, "plan: planista zgłosił brak dalszych zadań")
         state.empty_plans += 1
     state.task_queue = tasks
+    # Wsad wyraźnie krótszy od zamówionego jest jedynym sygnałem drenażu,
+    # który mamy bez czytania BACKLOG.md przed następnym planowaniem.
+    state.batch_drained = len(tasks) * 2 < cfg.batch_size
     # Notatka przeglądu kierunku jest jednorazowym wejściem do planowania. Gdyby
     # została, każdy kolejny wsad płaciłby za czytanie już rozliczonej treści.
     steering.unlink(missing_ok=True)
@@ -390,8 +393,9 @@ def _steering_trigger(cfg: Config, project: str, state: State) -> str:
     # sprawdzany PRZED blokiem planowania, więc z tym warunkiem przegląd trafia
     # dokładnie na granicę wsadów: `replan` nie ma wtedy czego zniszczyć, a
     # jednorazowa notatka przeglądu ląduje bezpośrednio przed planowaniem.
-    if (not state.task_queue
-            and state.plan_batches - state.steered_at_batch >= cfg.steering_batches):
+    if (not state.task_queue and (
+            state.plan_batches - state.steered_at_batch >= cfg.steering_batches
+            or state.batch_drained)):
         return "cadence"
     return ""
 
@@ -561,6 +565,7 @@ def phase_diff_bootstrap(cfg: Config, project: str, state: State, logf,
         state.brief_digest = brief.digest(current)
     state.steered_at_batch = state.plan_batches
     state.steering_due = False
+    state.batch_drained = False
     state.goal_confirmed = data["goal_reached"]
     if state.goal_confirmed:
         # Kontrakt promptu: zaakceptowany `goal_reached` idzie PROSTO do
@@ -582,6 +587,21 @@ def _write_current_task(project: str, task: dict) -> None:
     source, target = Path(project, task["file"]), Path(project, ".forge", "current_task.md")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def _append_review_nits(project: str, task_id: str, nits: list[str]) -> None:
+    """Zachowaj kosmetyczne uwagi poza pętlą TDD.
+
+    To celowo nie jest stan zadania ani handoff: ponowne podanie nita testerowi
+    lub koderowi wywołałoby kosztowną rundę, której ten kanał ma zapobiegać.
+    """
+    if not nits:
+        return
+    path = Path(project, ".forge", "nits.md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as target:
+        for nit in nits:
+            target.write(f"- {task_id}: {nit}\n")
 
 
 def _changed(project: str, tag: str) -> list[str]:
@@ -1255,6 +1275,11 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                                f"pliki={review_changes}: "
                                f"{'; '.join(review.data.get('notes', []))[:160]}")
         review_notes = list(review.data.get("notes", []))
+        nits = list(review.data.get("nits", []))
+        if nits:
+            _append_review_nits(project, task["id"], nits)
+            ledger.append(project, f"{task['id']} review-nits: "
+                                   f"{'; '.join(nits)[:160]}")
         if review.status == "request_changes":
             state.review_suggestions_pending = False
             state.review_notes = review_notes
