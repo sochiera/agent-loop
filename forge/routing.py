@@ -155,6 +155,9 @@ def _endpoint(data: Any) -> Endpoint:
 
 @dataclass(frozen=True)
 class RoleRouting:
+    # Narzędzie całej roli. Slot może je nadpisać dla swojej trudności, bo wybór
+    # modelu przesądza o narzędziu: koder na zadaniu prostym bywa modelem
+    # lokalnym przez OpenCode, a na złożonym Opusem przez Claude Code.
     agent: str = ""
     # Klucz: nazwa trudności albo ANY_DIFFICULTY.
     slots: dict[str, Endpoint] = field(default_factory=dict)
@@ -202,10 +205,12 @@ class Routing:
         return entry.fallbacks if entry else ()
 
     def agents_in_use(self) -> list[str]:
-        """Wszyscy agenci wymienieni w nadpisaniach — także w łańcuchach."""
+        """Wszyscy agenci wymienieni w nadpisaniach — także w slotach i łańcuchach."""
         names: list[str] = []
         for entry in self.roles.values():
-            for candidate in (entry.agent, *(item.agent for item in entry.fallbacks)):
+            for candidate in (entry.agent,
+                              *(item.agent for item in entry.slots.values()),
+                              *(item.agent for item in entry.fallbacks)):
                 if candidate and candidate not in names:
                     names.append(candidate)
         return names
@@ -237,9 +242,6 @@ def parse(data: Any, difficulties: tuple[str, ...] = ()) -> Routing:
                 if key not in allowed_slots:
                     continue
                 endpoint = _endpoint(value)
-                # Slot opisuje model roli, nie zmianę narzędzia — agenta zmienia
-                # pole `agent` roli albo wpis łańcucha zapasowego.
-                endpoint = Endpoint(model=endpoint.model, effort=endpoint.effort)
                 if not endpoint.empty:
                     slots[key] = endpoint
         fallbacks: list[Endpoint] = []

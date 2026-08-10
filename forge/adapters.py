@@ -97,7 +97,7 @@ KNOWN_TEMPLATES: dict[str, str] = {
     "kiro": "kiro-cli chat --no-interactive --trust-all-tools {prompt}",
     # OpenCode CLI (opencode.ai/docs/cli) jako most do dowolnego dostawcy
     # OpenAI-compatible skonfigurowanego w ~/.config/opencode/opencode.json —
-    # np. NeuralWatt (api.neuralwatt.com/v1): model = "neuralwatt/<id>".
+    # np. Qwen Token Plan: model = "qwencloud-token-plan/<id>".
     # --variant obsługuje tylko część modeli (capabilities.reasoning_effort,
     # np. rodzina glm-5.2); dla reszty zostaw effort pusty — {effort} sam
     # zniknie z komendy (patrz reguła pomijania pustych placeholderów wyżej).

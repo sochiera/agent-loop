@@ -25,10 +25,9 @@ wspólny dla GUI i uruchomień z CLI, więc zmiana dostawcy nie wymaga commita.
       "fallbacks": [{"agent": "opencode"}]
     },
     "coder": {
-      "agent": "opencode",
       "slots": {
-        "simple":  {"model": "llamacpp/qwen36-coder-fast"},
-        "complex": {"model": "neuralwatt/kimi-k2.7-code-flex", "effort": "high"}
+        "simple":  {"agent": "opencode", "model": "openai/gpt-5.6-luna"},
+        "complex": {"agent": "claude", "model": "opus", "effort": "high"}
       },
       "fallbacks": [{"model": "zai-coding-plan/glm-5.2"}, {"agent": "grok"}]
     }
@@ -45,9 +44,14 @@ Reguły:
   zadania (tester, koder, recenzent, mistrz) oraz `all` dla pozostałych —
   planista, Product Owner czy weryfikator nie oglądają „jednego zadania".
   Slot `all` działa też jako wartość wspólna dla trudności zostawionych pustych.
+- **`agent` w slocie** obowiązuje tylko tę trudność i ma pierwszeństwo przed
+  `agent` całej roli. Wybór modelu przesądza o narzędziu, a model wybiera się
+  per trudność: koder na zadaniu prostym bywa modelem tanim, a na złożonym
+  najmocniejszym dostępnym. `agent` roli zostaje wartością wspólną dla slotów,
+  które własnego nie mają.
 - **Sam `effort`**, bez modelu, dostraja model wybrany przez politykę.
 - **Zmiana narzędzia zeruje model** odziedziczony z pól `*_model`: nazwa
-  `neuralwatt/…` nic nie znaczy dla Claude'a, więc po przełączeniu roli na inne
+  `zai-coding-plan/…` nic nie znaczy dla Claude'a, więc po przełączeniu na inne
   CLI wraca polityka poziomu.
 - Plik jest czytany POBŁAŻLIWIE: nieznana rola, nieznana trudność i wartość
   nie do przekazania w argv są pomijane. Literówka w ręcznej edycji cofa cię do
@@ -84,14 +88,34 @@ rola[coder]: opencode/zai-coding-plan/glm-5.2 — limit; przełączam na zapas g
 
 ## GUI
 
-`python3 -m forge.gui` jest edytorem tego pliku. Każda rola ma kartę:
-narzędzie, model per trudność (albo jeden wspólny) i łańcuch zapasowy. Lista
-modeli to podpowiedź złożona z modeli znanych polityce oraz providerów
-znalezionych w `~/.config/opencode/opencode.json` — nowy model spoza katalogu
-wpisujesz ręcznie. Wybór zapisuje się przy każdej zmianie pokrętła, a nie
-dopiero przy starcie biegu.
+`python3 -m forge.gui` jest edytorem tego pliku. Każda rola ma kartę: model per
+trudność (albo jeden wspólny) i łańcuch zapasowy.
 
-Pole `agent` trafia do pliku dopiero wtedy, gdy realnie zmienisz narzędzie:
-pokrętło pokazujące domyślnego agenta polityki nie jest decyzją operatora,
-a zapisane jako nadpisanie odcięłoby rolę od dziedziczenia (np. weryfikator
-po planiście) i od `FORGE_<ROLA>_AGENT`.
+**Wybiera się MODEL, nie narzędzie.** Większość modeli ma dokładnie jedną drogę
+uruchomienia, więc osobne pytanie o nią byłoby pustym klikiem. Pokrętło dostawcy
+pojawia się tylko przy modelu, który tras ma więcej:
+
+| Model | Trasy |
+|---|---|
+| `gpt-5.6-luna` | `codex` • `opencode · openai` |
+| `sonnet` | `claude` • `kiro` |
+| `glm-5.2` | tyle, ilu dostawców OpenCode go serwuje |
+| `grok-4.5`, `haiku`, `qwen3.8-max`, … | jedna — pokrętła nie ma |
+
+Dostawcy OpenCode są tu osobnymi trasami, bo to oni różnią się ceną, limitem i
+opóźnieniem. Kolejność tras stawia natywne CLI przed mostem OpenCode: mają
+telemetrię zużycia, a Codex także wznawianie sesji.
+
+Lista modeli (z wyszukiwaniem) składa się z modeli znanych polityce i modeli
+znalezionych w `~/.config/opencode/opencode.json`; nowy model spoza katalogu
+wpisujesz ręcznie — wtedy pokrętło dostawcy jest widoczne zawsze, bo nazwy
+własnej nie da się przypisać do narzędzia. Pozycje `wg polityki: <narzędzie>`
+zapisują sam `agent`, czyli „ten sam poziom, inne CLI" — najczęściej przydatne
+we wpisie zapasowym. Pierwsza pozycja („domyślnie: …") nie nadpisuje niczego i
+pokazuje wprost, co pojedzie z samej polityki.
+
+Panel zapisuje narzędzie razem z modelem, w slocie, i nie dotyka pola `agent`
+całej roli — dopóki niczego nie wybierzesz, rola dziedziczy agenta (np.
+weryfikator po planiście) i słucha `FORGE_<ROLA>_AGENT`. Plik napisany ręcznie
+z `agent` na poziomie roli wczytuje się bez zmiany znaczenia. Wybór zapisuje się
+przy każdej zmianie pokrętła, a nie dopiero przy starcie biegu.

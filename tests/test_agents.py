@@ -158,7 +158,7 @@ def _run_thin_opencode(tmp_path: Path, monkeypatch, stream: str) -> tuple:
     config_home = tmp_path / "xdg"
     (config_home / "opencode").mkdir(parents=True)
     (config_home / "opencode" / "opencode.json").write_text(
-        json.dumps({"provider": {"neuralwatt": {"npm": "@ai-sdk/openai"}}}),
+        json.dumps({"provider": {"qwencloud-token-plan": {"npm": "@ai-sdk/openai"}}}),
         encoding="utf-8")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
@@ -198,13 +198,13 @@ def test_thin_opencode_injects_tool_free_agent_and_extracts_text_event(
 def test_thin_opencode_keeps_user_provider_config(
         tmp_path: Path, monkeypatch) -> None:
     """Podstawienie treści konfiguracji nie może skasować bloku ``provider`` —
-    bez niego ``-m neuralwatt/...`` nie rozwiąże się na dostawcę."""
+    bez niego ``-m qwencloud-token-plan/...`` nie rozwiąże się na dostawcę."""
     captured, _ = _run_thin_opencode(
         tmp_path, monkeypatch,
         json.dumps({"type": "text", "part": {"text": "{}"}}))
 
     inline = json.loads(captured["env"]["OPENCODE_CONFIG_CONTENT"])
-    assert inline["provider"] == {"neuralwatt": {"npm": "@ai-sdk/openai"}}
+    assert inline["provider"] == {"qwencloud-token-plan": {"npm": "@ai-sdk/openai"}}
     assert "forge-thin" in inline["agent"]
 
 

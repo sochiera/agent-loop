@@ -100,26 +100,26 @@ class GenericSpecTest(unittest.TestCase):
         spec = adapters.generic_spec("opencode", {})
         self.assertIsNotNone(spec)
         self.assertEqual(adapters.generic_bin(spec), "opencode")
-        # Model NeuralWatt bez --variant (effort pusty) — flaga znika w całości.
+        # Model bez --variant (effort pusty) — flaga znika w całości.
         argv = adapters.expand_template(
             spec.template,
             {"prompt": "zrob X", "prompt_file": "/tmp/prompt.md",
-             "model": "neuralwatt/glm-5.2", "effort": "",
+             "model": "zai-coding-plan/glm-5.2", "effort": "",
              "project": "", "output": ""},
         )
         self.assertEqual(
-            argv, ["opencode", "run", "zrob X", "-m", "neuralwatt/glm-5.2",
+            argv, ["opencode", "run", "zrob X", "-m", "zai-coding-plan/glm-5.2",
                    "--auto", "--format", "json"])
         # Model z effortem (GLM-5.2 wspiera --variant) — flaga zostaje.
         argv_effort = adapters.expand_template(
             spec.template,
             {"prompt": "zrob X", "prompt_file": "/tmp/prompt.md",
-             "model": "neuralwatt/glm-5.2", "effort": "high",
+             "model": "zai-coding-plan/glm-5.2", "effort": "high",
              "project": "", "output": ""},
         )
         self.assertEqual(
             argv_effort,
-            ["opencode", "run", "zrob X", "-m", "neuralwatt/glm-5.2",
+            ["opencode", "run", "zrob X", "-m", "zai-coding-plan/glm-5.2",
              "--variant", "high", "--auto", "--format", "json"])
 
     def test_env_template_overrides_known_default(self) -> None:

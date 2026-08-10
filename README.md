@@ -22,10 +22,13 @@ See [docs/PIPELINE.md](docs/PIPELINE.md) for details.
 ## Choosing models per role
 
 Each role has a default policy (role → level → provider). Per-machine choices —
-which tool, which concrete model per task difficulty, and a fallback chain used
-when a provider hits its limit or fails hard — live in `~/.config/forge/routing.json`
+which concrete model per task difficulty, and a fallback chain used when a
+provider hits its limit or fails hard — live in `~/.config/forge/routing.json`
 and can be clicked together in the GUI (`python3 -m forge.gui`), so switching
-providers needs no commit. See [docs/ROUTING-I-FALLBACK.md](docs/ROUTING-I-FALLBACK.md).
+providers needs no commit. The GUI asks for a **model**; the CLI tool follows
+from it, and a provider dropdown appears only for models reachable more than one
+way (`gpt-5.6-luna` via Codex or the OpenCode bridge, `glm-5.2` via two OpenCode
+providers). See [docs/ROUTING-I-FALLBACK.md](docs/ROUTING-I-FALLBACK.md).
 
 Providers configured in `opencode.json` take their keys from `{env:NAME}`, which
 resolves against the environment of the Forge process — so a shell started before

@@ -205,17 +205,18 @@ class Config:
     # (patrz adapters.py). Domyślnie tester i koder to opencode (z.ai).
     tester_agent: str = os.environ.get("FORGE_TESTER_AGENT", "opencode")
     coder_agent: str = os.environ.get("FORGE_CODER_AGENT", "opencode")
-    # Model/effort ról. Puste → agent użyje swojego domyślnego (codex: config.toml).
-    tester_model: str = os.environ.get("FORGE_TESTER_MODEL", "neuralwatt/glm-5.2-short-fast-flex")
+    # Model/effort ról. Puste → decyduje polityka poziomu dla danego agenta
+    # (MODEL_LEVEL_ROUTING), a gdy jej nie ma — sam agent (codex: config.toml).
+    tester_model: str = os.environ.get("FORGE_TESTER_MODEL", "")
     tester_effort: str = os.environ.get("FORGE_TESTER_EFFORT", "")
-    coder_model: str = os.environ.get("FORGE_CODER_MODEL", "neuralwatt/kimi-k2.7-code-flex")
+    coder_model: str = os.environ.get("FORGE_CODER_MODEL", "")
     coder_effort: str = os.environ.get("FORGE_CODER_EFFORT", "")
 
     # --- Weryfikacja celu (PLAN-3) -------------------------------------------
     # Weryfikator-QA: pusty agent = rola planisty (ocena całości to zadanie
     # mocnego modelu). Jawny agent konfiguruje się jak tester/koder.
     verifier_agent: str = os.environ.get("FORGE_VERIFIER_AGENT", "opencode")
-    verifier_model: str = os.environ.get("FORGE_VERIFIER_MODEL", "neuralwatt/qwen3.5-397b")
+    verifier_model: str = os.environ.get("FORGE_VERIFIER_MODEL", "")
     verifier_effort: str = os.environ.get("FORGE_VERIFIER_EFFORT", "")
     # Nadpisanie targetów z bootstrapu: "" = decyduje bootstrap, "none" =
     # weryfikacja wyłączona, "ci,hardware" = dokładnie te targety.
@@ -259,7 +260,7 @@ class Config:
     # Recenzent zadania: pusty agent = agent testera, ale ZAWSZE świeży
     # kontekst (bez sesji i dziennika) — autor nie recenzuje własnej pracy.
     reviewer_agent: str = os.environ.get("FORGE_REVIEWER_AGENT", "opencode")
-    reviewer_model: str = os.environ.get("FORGE_REVIEWER_MODEL", "neuralwatt/glm-5.2-flex")
+    reviewer_model: str = os.environ.get("FORGE_REVIEWER_MODEL", "")
     reviewer_effort: str = os.environ.get("FORGE_REVIEWER_EFFORT", "")
     # Przed rollbackiem przy porażce: branch forge/failed/<id> na HEAD (+ residual commit).
     keep_failed_ref: bool = os.environ.get("FORGE_KEEP_FAILED_REF", "1") != "0"
@@ -272,7 +273,11 @@ class Config:
             difficulties=TASK_DIFFICULTIES))
 
     def __post_init__(self) -> None:
-        validate_master_agent(self.role("master")[0])
+        # Każda trudność osobno: narzędzie mistrza bywa dziś ustawione per slot,
+        # więc sprawdzenie samego „standard" przepuściłoby Codeksa na zadaniach
+        # prostych albo złożonych.
+        for difficulty in TASK_DIFFICULTIES:
+            validate_master_agent(self.role("master", difficulty)[0])
 
     def effective_verify_targets(self, declared: list[str]) -> list[str]:
         """Targety po nadpisaniu użytkownika ("" = deklaracja bootstrapu)."""
@@ -378,15 +383,17 @@ class Config:
             raise ValueError(f"nieznana rola: {name}")
 
         agent, configured_model, configured_effort = configured[name]
-        override_agent = self.routing.agent(name)
+        slot = self.routing.slot(name, difficulty)
+        # Slot ma pierwszeństwo przed narzędziem całej roli: wybór modelu
+        # przesądza o narzędziu, a model wybiera się per trudność.
+        override_agent = slot.agent or self.routing.agent(name)
         if override_agent:
             agent = override_agent
-            # Model z pól roli opisuje INNE narzędzie (np. "neuralwatt/…" dla
+            # Model z pól roli opisuje INNE narzędzie (np. "zai-coding-plan/…" dla
             # OpenCode). Przeniesiony na wybranego agenta byłby nazwą, której on
             # nie zna, więc wybór narzędzia zeruje model i wraca do polityki.
             configured_model, configured_effort = "", ""
 
-        slot = self.routing.slot(name, difficulty)
         if slot.model:
             return (agent, slot.model, slot.effort)
 

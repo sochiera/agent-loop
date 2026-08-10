@@ -70,17 +70,53 @@ class TestSlots:
         assert parsed.slot("coder", "simple").model == "tani"
         assert parsed.slot("coder", "complex").model == "mocny"
 
+    def test_slot_carries_its_own_tool(self) -> None:
+        # Wybór modelu przesądza o narzędziu, a model wybiera się per trudność:
+        # zadanie proste bywa modelem lokalnym, złożone — najmocniejszym.
+        parsed = _routing({"roles": {"coder": {"slots": {
+            "simple": {"agent": "opencode", "model": "openai/gpt-5.6-luna"},
+            "complex": {"agent": "claude", "model": "opus"},
+        }}}})
+
+        assert parsed.slot("coder", "simple").agent == "opencode"
+        assert parsed.slot("coder", "complex").agent == "claude"
+
 
 class TestConfigIntegration:
+    def test_tool_of_the_slot_wins_over_the_tool_of_the_role(self) -> None:
+        cfg = Config(routing=_routing({"roles": {"coder": {
+            "agent": "opencode",
+            "slots": {"complex": {"agent": "claude", "model": "opus",
+                                  "effort": "high"}},
+        }}}))
+
+        assert cfg.role("coder", "complex") == ("claude", "opus", "high")
+        # Trudności bez własnego slotu zostają przy narzędziu roli.
+        assert cfg.role("coder", "simple")[0] == "opencode"
+
+    def test_tool_chosen_in_the_slot_falls_back_to_its_own_level_policy(self) -> None:
+        # Sam agent w slocie = „ten sam poziom, inne narzędzie": model ma
+        # wyznaczyć polityka poziomu WYBRANEGO narzędzia, a nie pole roli
+        # opisujące przestrzeń nazw innego CLI.
+        cfg = Config(routing=_routing({"roles": {"tester": {
+            "slots": {"standard": {"agent": "claude"}}}}}))
+
+        assert cfg.role("tester", "standard") == ("claude", "sonnet", "medium")
+
+    def test_master_refuses_codex_smuggled_into_a_slot(self) -> None:
+        with pytest.raises(ValueError, match="Codex nie jest dostępny"):
+            Config(routing=_routing({"roles": {"master": {
+                "slots": {"complex": {"agent": "codex", "model": "gpt-5.6-sol"}}}}}))
+
     def test_chosen_model_wins_over_level_policy(self) -> None:
         cfg = Config(routing=_routing({"roles": {"coder": {
             "agent": "opencode",
-            "slots": {"simple": {"model": "llamacpp/qwen36-coder",
+            "slots": {"simple": {"model": "openai/gpt-5.6-luna",
                                  "effort": "low"}},
         }}}))
 
         assert cfg.role("coder", "simple") == (
-            "opencode", "llamacpp/qwen36-coder", "low")
+            "opencode", "openai/gpt-5.6-luna", "low")
         # Trudność bez wyboru zostaje przy polityce projektu.
         assert cfg.role("coder", "complex")[1] == "zai-coding-plan/glm-5.2"
 
@@ -120,13 +156,13 @@ class TestFallbackChain:
     def test_fallback_may_switch_only_the_model(self) -> None:
         cfg = Config(routing=_routing({"roles": {"tester": {
             "agent": "opencode",
-            "slots": {"standard": {"model": "neuralwatt/glm-5.2"}},
-            "fallbacks": [{"model": "llamacpp/qwen36-coder"}],
+            "slots": {"standard": {"model": "zai-coding-plan/glm-5.2"}},
+            "fallbacks": [{"model": "qwencloud-token-plan/qwen3.8-max"}],
         }}}))
 
         assert cfg.role_chain("tester", "standard") == [
-            ("opencode", "neuralwatt/glm-5.2", ""),
-            ("opencode", "llamacpp/qwen36-coder", ""),
+            ("opencode", "zai-coding-plan/glm-5.2", ""),
+            ("opencode", "qwencloud-token-plan/qwen3.8-max", ""),
         ]
 
     def test_duplicate_entries_are_dropped(self) -> None:

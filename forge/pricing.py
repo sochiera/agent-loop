@@ -43,10 +43,6 @@ CODEX_CACHE_READ_FACTOR = 0.1
 # danych, więc jako jedyne wolno mu wejść do sumy.
 LOCAL_PREFIXES = ("llamacpp/",)
 
-# Hosting neuralwatt — stawek nie znamy, więc pusto. Zostawiamy słownik, żeby
-# uzupełnienie było jedną linią, a nie nową gałęzią w ``rates``.
-NEURALWATT_RATES: dict[str, Rates] = {}
-
 # Cennik KATALOGOWY API (models.dev) dla modeli wołanych przez opencode,
 # kluczowany pełnym ``provider/model``.
 #
@@ -106,12 +102,7 @@ def rates(agent: str, model: str) -> Rates | None:
                 anchor_out * multiplier)
     if model.startswith(LOCAL_PREFIXES):
         return (0.0, 0.0, 0.0, 0.0)
-    listed = API_LIST_RATES.get(model.lower())
-    if listed is not None:
-        return listed
-    if model.startswith("neuralwatt/"):
-        return NEURALWATT_RATES.get(model)
-    return None
+    return API_LIST_RATES.get(model.lower())
 
 
 def cost_usd(agent: str, model: str,
