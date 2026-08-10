@@ -31,3 +31,5 @@ JSON:
 {"status":"green","summary":"...","refactor":"done|not_needed","notebook":"..."}
 albo
 {"status":"test_changes_needed|tester_input_needed","reason":"...","notebook":"..."}.
+
+{{VERDICT}}

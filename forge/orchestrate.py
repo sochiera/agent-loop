@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import os
 import re
 import shutil
@@ -22,10 +23,11 @@ from . import notebooks
 from . import prompts
 from . import preflight
 from . import verify
+from . import verdict as verdict_contract
 from .shellrun import run_shellfree
 from .state import State
 from .task_pipeline import (InvalidDecision, parse_coder_decision, parse_review_decision,
-                            parse_tester_decision, run_tdd_loop)
+                            parse_tester_decision, run_tdd_loop, select_decision)
 
 _JSON_RETRY = """
 
@@ -811,15 +813,44 @@ def _checkpoint(project: str, state: State, phase: str) -> None:
     state.save(str(Path(project, ".forge", "STATE.json")))
 
 
+def _tester_statuses(state: State) -> tuple[str, ...]:
+    """Statusy legalne w TEJ turze testera — dokładnie jak w jego promptcie."""
+    if state.review_suggestions_pending:
+        return verdict_contract.TESTER_STATUSES
+    return tuple(name for name in verdict_contract.TESTER_STATUSES
+                 if name != "finalize")
+
+
+def _verdict_turn(cfg: Config, project: str, role: str, call, *, statuses=None) -> str:
+    """Tura roli z walidacją werdyktu w czasie rzeczywistym.
+
+    Werdykt zatwierdzony skryptem WYGRYWA z tekstem tury: przeszedł ten sam
+    kontrakt, a rola dostała szansę poprawić go bez powtarzania tury. Brak
+    pliku znaczy „rola nie użyła skryptu" — wtedy jedziemy tekstem, jak dotąd."""
+    verdict_contract.prepare(project, cfg.runtime_dir, role, statuses=statuses)
+    output = call()
+    committed = verdict_contract.read(project, cfg.runtime_dir, role)
+    if committed is None:
+        return output
+    log(f"  rola[{role}]: werdykt zatwierdzony przez "
+        f"{cfg.runtime_dir}/verdict.py")
+    return json.dumps(committed, ensure_ascii=False)
+
+
 def _call_role(cfg: Config, project: str, state: State, role: str, prompt: str, log: str) -> str:
     attr = "tester_session" if role == "tester" else "coder_session"
     # Każda tura jest świeża. Kontrolowaną ciągłość zapewniają wyłącznie
     # Context Capsule i prywatny notatnik, również dla Codexa.
     setattr(state, attr, "")
-    output, _session = run_role_session(
-        role, prompt, cfg, project, log, session_id=None,
-        difficulty=state.current_task.get("difficulty", DEFAULT_TASK_DIFFICULTY))
-    return output
+    statuses = (_tester_statuses(state) if role == "tester"
+                else verdict_contract.CODER_STATUSES)
+    return _verdict_turn(
+        cfg, project, role,
+        lambda: run_role_session(
+            role, prompt, cfg, project, log, session_id=None,
+            difficulty=state.current_task.get(
+                "difficulty", DEFAULT_TASK_DIFFICULTY))[0],
+        statuses=statuses)
 
 
 # Notatek nie przycinamy — sygnalizujemy tylko, że kontrakt „jedna linia”
@@ -959,13 +990,23 @@ def _master_notes(cfg: Config, project: str, logf, *, task_id: str = "",
     return notes
 
 
-def _decision_with_retry(prompt: str, invoke, parser):
-    """Jedna tania korekta formatu, potem jawny błąd zamiast ukrytej pętli."""
+def _decision_with_retry(prompt: str, invoke, parser, *, on_reject=None):
+    """Jedna tania korekta formatu, potem jawny błąd zamiast ukrytej pętli.
+
+    Powtórzenie tury jest OSTATNIĄ deską ratunku, nie normalnym kanałem korekty
+    — role zatwierdzają werdykt skryptem i poprawiają się w trakcie sesji
+    (patrz forge/verdict.py). Dlatego odrzucenie zostawia ślad w logu od razu:
+    bez niego drugi start roli wyglądał w logu na niewyjaśniony, a gdy retry
+    padał z innego powodu (timeout), surowe wyjście pierwszej próby ginęło."""
     first_raw = invoke(prompt)
     try:
         return parser(first_raw)
     except InvalidDecision as exc:
         reason = str(exc)[:800]
+        log(f"  UWAGA: werdykt odrzucony ({reason[:300]}) — ponawiam całą turę")
+        if on_reject is not None:
+            exc.raw_attempts = [first_raw]
+            on_reject(exc)
         retry_prompt = (
             prompt + _JSON_RETRY + f"\nPowód odrzucenia: {reason}\n"
         )
@@ -1032,16 +1073,18 @@ def _dump_phase_work(project: str, cfg: Config, label: str, base_sha: str,
     return str(dest)
 
 
-def _parse_json_object(text: str, *, project: str = "") -> dict:
-    found = _extract_json_detail(text)
-    if found.repaired:
-        log("  UWAGA: werdykt odzyskany po naprawie cudzysłowów — rola pisze niepoprawny JSON")
-        if project:
-            ledger.append(project, "json: werdykt odzyskany warstwą naprawczą")
-    if not isinstance(found.data, dict):
-        suffix = f" — {found.error}" if found.error else ""
-        raise InvalidDecision("agent nie zwrócił obiektu JSON" + suffix)
-    return found.data
+def _parse_json_object(text: str, *, project: str = "", require=None) -> dict:
+    """Werdykt roli spoza pętli TDD, wybrany tym samym selektorem co decyzje.
+
+    ``require`` niesie kontrakt roli, jeśli jakiś ma: dopiero on odróżnia
+    werdykt od obiektu doklejonego po nim. Bez niego wygrywa pierwszy
+    kandydat, czyli dokładnie to, co ta funkcja robiła zawsze."""
+    def validate(data: dict) -> dict:
+        if require is not None:
+            require(data)
+        return data
+
+    return select_decision(text, validate, project=project)
 
 
 def _parse_steering_decision(text: str, *, project: str = "") -> dict:
@@ -1052,7 +1095,10 @@ def _parse_steering_decision(text: str, *, project: str = "") -> dict:
     `changes` podane stringiem rozsypałoby się w notatce na pojedyncze znaki.
     Niezgodność typu wraca do agenta przez jedną tanią prośbę o korektę.
     """
-    data = _parse_json_object(text, project=project)
+    return _parse_json_object(text, project=project, require=_require_steering)
+
+
+def _require_steering(data: dict) -> None:
     for key, default in (("replan", True), ("goal_reached", False)):
         value = data.get(key, default)
         if not isinstance(value, bool):
@@ -1068,12 +1114,15 @@ def _parse_steering_decision(text: str, *, project: str = "") -> dict:
     if not isinstance(summary, str) or not summary.strip():
         raise InvalidDecision("pole `summary` musi być niepustym tekstem")
     data["summary"] = summary.strip()
-    return data
 
 
 def _parse_product_owner_decision(text: str, *, project: str = "") -> dict:
     """Parsuj kontrakt PO, nie nadając statusom znaczenia modelowego."""
-    data = _parse_steering_decision(text, project=project)
+    return _parse_json_object(text, project=project, require=_require_product_owner)
+
+
+def _require_product_owner(data: dict) -> None:
+    _require_steering(data)
     added = data.get("stories_added", [])
     dropped = data.get("stories_dropped", [])
     if isinstance(added, str) or not isinstance(added, (list, tuple)):
@@ -1095,7 +1144,6 @@ def _parse_product_owner_decision(text: str, *, project: str = "") -> dict:
     data["stories_added"] = [str(item).strip() for item in added if str(item).strip()]
     data["stories_dropped"] = normalized_dropped
     data["notebook"] = notebook.strip()
-    return data
 
 
 def _clear_task_state(state: State) -> None:
@@ -1263,7 +1311,9 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 prompt,
                 lambda value: _call_role(
                     cfg, project, state, role, value, logf(role)),
-                parser)
+                parser,
+                on_reject=lambda exc: _dump_invalid_decision(
+                    project, cfg, state, exc))
             # Nazwy plików pozwalają Mistrzowi zauważyć np. zmianę testu przez
             # kodera i poprosić testera o ocenę bez mechanicznego blokowania.
             changed_paths = _turn_changes(before, _tree_manifest(project))
@@ -1287,15 +1337,6 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 state.tester_decision.get("command", "")).strip()
             using_suite_regression = state.suite_regression
 
-            def parse_for_current_review_cycle(text: str):
-                parsed = parse_tester_decision(text, project=project)
-                if (parsed.status == "finalize"
-                        and not state.review_suggestions_pending):
-                    raise InvalidDecision(
-                        "`finalize` jest dozwolone tylko po werdykcie "
-                        "suggestions")
-                return parsed
-
             changed_files = _changed(project, state.task_start_tag)
             capsule = prompts.context_capsule(
                 state, "tester",
@@ -1313,8 +1354,11 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 confirmation=confirmation,
                 suite_regression=using_suite_regression,
                 review_suggestions=state.review_suggestions_pending,
-                review_notes=state.review_notes),
-                parse_for_current_review_cycle)
+                review_notes=state.review_notes,
+                verdict_cmd=verdict_contract.command(cfg.runtime_dir, "tester")),
+                lambda text: parse_tester_decision(
+                    text, project=project,
+                    allow_finalize=state.review_suggestions_pending))
             record_notebook("tester", result.data)
             # To jednorazowy sygnał kierujący najbliższą turę testera na pełną
             # bramkę. Czyścimy go dopiero po poprawnie sparsowanej odpowiedzi:
@@ -1337,7 +1381,8 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             result = run_turn("coder", prompts.coder_task_prompt(
                 task["file"], test_cmd,
                 decision=decision.data,
-                capsule=capsule),
+                capsule=capsule,
+                verdict_cmd=verdict_contract.command(cfg.runtime_dir, "coder")),
                 lambda text: parse_coder_decision(text, project=project))
             # Zapis notatki kanałem, którym decyzja i tak wraca. Tura
             # narzędziowa kosztowałaby tu dziesiątki tysięcy tokenów wejścia i
@@ -1390,14 +1435,18 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
         before_review = _tree_manifest(project)
         review_prompt = prompts.review_task_prompt_kiss(
             task["file"], start_tag=state.task_start_tag,
-            changed=_changed(project, state.task_start_tag))
+            changed=_changed(project, state.task_start_tag),
+            verdict_cmd=verdict_contract.command(cfg.runtime_dir, "review"))
         log(f"Zadanie {task['id']}: recenzja (świeży kontekst)…")
         review = _decision_with_retry(
             review_prompt,
-            lambda value: run_role(
-                "reviewer", value, cfg, project, logf("review"),
-                difficulty=task["difficulty"]),
-            lambda text: parse_review_decision(text, project=project))
+            lambda value: _verdict_turn(
+                cfg, project, "review",
+                lambda: run_role(
+                    "reviewer", value, cfg, project, logf("review"),
+                    difficulty=task["difficulty"])),
+            lambda text: parse_review_decision(text, project=project),
+            on_reject=lambda exc: _dump_invalid_decision(project, cfg, state, exc))
         log(f"Zadanie {task['id']}: recenzja → {review.status}")
         review_changes = _describe_turn_changes(
             _turn_changes(before_review, _tree_manifest(project)))
@@ -1519,7 +1568,10 @@ def _fresh_story_report(project: str, state: State) -> str:
 
 
 def _parse_story_verification(text: str, *, project: str = "") -> dict:
-    data = _parse_json_object(text, project=project)
+    return _parse_json_object(text, project=project, require=_require_story_verification)
+
+
+def _require_story_verification(data: dict) -> None:
     entries = data.get("stories")
     if not isinstance(entries, list):
         raise InvalidDecision("weryfikator historyjek musi zwrócić listę stories")
@@ -1535,7 +1587,6 @@ def _parse_story_verification(text: str, *, project: str = "") -> dict:
         })
     data["stories"] = normalized
     data["notes"] = [str(item) for item in data.get("notes", [])]
-    return data
 
 
 def phase_verify_stories(cfg: Config, project: str, state: State, logf) -> bool:
@@ -1761,6 +1812,10 @@ Twój prywatny notatnik też jest w kapsule — nie czytaj go z dysku i nie
 zapisuj sam; wpisy oddajesz polem `notebook` swojej decyzji, a plikiem
 zarządza Forge.
 
+Wyjątkiem jest `{runtime_dir}/verdict.py`: tym skryptem zatwierdzasz werdykt
+swojej tury i to jedyny plik runtime, który masz uruchamiać. Sprawdza kontrakt
+od razu, więc błąd poprawisz w tej samej turze zamiast tracić całą pracę.
+
 Zwłaszcza `{runtime_dir}/tasks/archive/` zawiera zamknięte zadania; czytanie
 tego archiwum zapycha kontekst i nic nie wnosi. To wyjaśnienie, nie zakaz.
 """
@@ -1781,6 +1836,19 @@ def _superseded_agent_notes(runtime_dir: str) -> tuple[str, ...]:
 poszukiwaniu ogólnego kontekstu: plik zadania i kapsułę dostajesz w promptcie.
 Wyjątkiem jest dokładnie jeden prywatny notatnik roli wskazany w kapsule —
 możesz go czytać i aktualizować. Nie czytaj notatników innych ról.
+
+Zwłaszcza `{runtime_dir}/tasks/archive/` zawiera zamknięte zadania; czytanie
+tego archiwum zapycha kontekst i nic nie wnosi. To wyjaśnienie, nie zakaz.
+""",
+        # Wersja sprzed skryptu werdyktu: zostawiona bez migracji kazałaby
+        # roli omijać jedyny plik runtime, który ma uruchamiać.
+        f"""# Notatka dla agentów
+
+`{runtime_dir}/` to runtime orkiestratora Forge. Nie przeglądaj go w
+poszukiwaniu ogólnego kontekstu: plik zadania i kapsułę dostajesz w promptcie.
+Twój prywatny notatnik też jest w kapsule — nie czytaj go z dysku i nie
+zapisuj sam; wpisy oddajesz polem `notebook` swojej decyzji, a plikiem
+zarządza Forge.
 
 Zwłaszcza `{runtime_dir}/tasks/archive/` zawiera zamknięte zadania; czytanie
 tego archiwum zapycha kontekst i nic nie wnosi. To wyjaśnienie, nie zakaz.

@@ -4,6 +4,14 @@ from __future__ import annotations
 from .render import read_template, render
 
 
+def verdict_commit(verdict_cmd: str) -> str:
+    """Instrukcja zatwierdzania werdyktu skryptem; pusta bez komendy.
+
+    Rola bez narzędzi (tryb cienki) nie ma jak uruchomić skryptu, więc dostaje
+    dotychczasowy kontrakt „ostatni blok ```json```" bez martwej instrukcji."""
+    return render("verdict-commit.md", VERDICT_CMD=verdict_cmd) if verdict_cmd else ""
+
+
 def _corrections(name: str, review_notes: list[str] | None) -> str:
     """Uwagi recenzenta doklejane do kolejnej próby; brak uwag nic nie zmienia."""
     notes = "; ".join(note for note in (review_notes or []) if str(note).strip())
@@ -197,7 +205,8 @@ def tester_task_prompt(
         capsule: str = "",
         confirmation: bool = False, suite_regression: bool = False,
         review_suggestions: bool = False,
-        review_notes: list[str] | None = None) -> str:
+        review_notes: list[str] | None = None,
+        verdict_cmd: str = "") -> str:
     # Potwierdzenie ma pierwszeństwo nad przyklejonym sygnałem regresji ze
     # starych checkpointów. W cyklu sugestii dostaje własny wariant.
     if confirmation and review_suggestions:
@@ -247,27 +256,31 @@ def tester_task_prompt(
         CAPSULE=capsule,
         INSTRUCTIONS=instructions,
         STATUSES=statuses,
+        VERDICT=verdict_commit(verdict_cmd),
     )
 
 
 def coder_task_prompt(
         task_file: str, test_cmd: str, *, decision: dict,
-        capsule: str = "") -> str:
+        capsule: str = "", verdict_cmd: str = "") -> str:
     return render(
         "coder.md",
         TASK_FILE=task_file,
         CAPSULE=capsule,
         TEST_CMD=test_cmd,
+        VERDICT=verdict_commit(verdict_cmd),
     )
 
 
 def review_task_prompt_kiss(
-        task_file: str, *, start_tag: str, changed: list[str]) -> str:
+        task_file: str, *, start_tag: str, changed: list[str],
+        verdict_cmd: str = "") -> str:
     return render(
         "reviewer.md",
         TASK_FILE=task_file,
         START_TAG=start_tag,
         CHANGED=", ".join(changed) or "(brak)",
+        VERDICT=verdict_commit(verdict_cmd),
     )
 
 

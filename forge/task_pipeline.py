@@ -6,16 +6,16 @@ from typing import Callable
 
 from .agents import _extract_json_detail, log
 from . import ledger
+from .verdict import (CODER_STATUSES, InvalidDecision, REVIEW_VERDICTS,
+                      TASK_PHASES, TESTER_STATUSES, validate_coder,
+                      validate_review, validate_tester)
 
-
-class InvalidDecision(ValueError):
-    """Agent nie zwrócił poprawnego kontraktu decyzji."""
-
-
-TASK_PHASES = ("tester", "coder", "review", "corrections", "commit")
-TESTER_STATUSES = ("red", "code", "review", "finalize", "blocked")
-CODER_STATUSES = ("green", "test_changes_needed", "tester_input_needed")
-REVIEW_VERDICTS = ("approve", "suggestions", "request_changes")
+__all__ = [
+    "CODER_STATUSES", "InvalidDecision", "PhaseResult", "REVIEW_VERDICTS",
+    "TASK_PHASES", "TESTER_STATUSES", "parse_coder_decision",
+    "parse_review_decision", "parse_tester_decision", "run_tdd_loop",
+    "select_decision",
+]
 
 
 @dataclass(frozen=True)
@@ -24,76 +24,62 @@ class PhaseResult:
     data: dict
 
 
-def _decision(text: str, *, project: str = "") -> dict:
+def select_decision(text: str, validate: Callable[[dict], dict], *,
+                    project: str = "") -> dict:
+    """Pierwszy kandydat JSON, który spełnia kontrakt roli.
+
+    Sam tekst nie rozstrzyga, który obiekt jest werdyktem, więc rozstrzyga
+    kontrakt. Bez tego jedno zdanie doklejone po werdykcie (poprawka notatnika
+    w drugim bloku ```json```) kasowało całą turę — a tura testera potrafi
+    kosztować 11 M tokenów i 40 minut."""
     found = _extract_json_detail(text)
-    if found.repaired:
-        log("  UWAGA: werdykt odzyskany po naprawie cudzysłowów — rola pisze niepoprawny JSON")
-        if project:
-            ledger.append(project, "json: werdykt odzyskany warstwą naprawczą")
-    if not isinstance(found.data, dict):
+    if not found.candidates:
         reason = f" — {found.error}" if found.error else ""
         raise InvalidDecision("agent nie zwrócił poprawnego JSON-a" + reason)
-    return found.data
+    rejected: list[str] = []
+    for index, candidate in enumerate(found.candidates):
+        try:
+            data = validate(candidate.data)
+        except InvalidDecision as exc:
+            rejected.append(str(exc))
+            continue
+        if candidate.repaired:
+            log("  UWAGA: werdykt odzyskany po naprawie cudzysłowów — rola pisze niepoprawny JSON")
+            if project:
+                ledger.append(project, "json: werdykt odzyskany warstwą naprawczą")
+        if index:
+            log(f"  UWAGA: werdykt wzięty z wcześniejszego bloku JSON — rola "
+                f"dokleiła po nim {index} obiekt(y) niebędące werdyktem")
+            if project:
+                ledger.append(project, "json: werdykt poprzedzał "
+                                       f"{index} obcy obiekt(y) w odpowiedzi")
+        return data
+    raise InvalidDecision(
+        rejected[0] if len(rejected) == 1 else
+        f"żaden z {len(rejected)} obiektów JSON nie jest werdyktem tej roli: "
+        + "; ".join(dict.fromkeys(rejected)))
 
 
-def parse_tester_decision(text: str, *, project: str = "") -> PhaseResult:
-    data = _decision(text, project=project)
-    status = data.get("status")
-    if status not in TESTER_STATUSES:
-        raise InvalidDecision(f"niedozwolona decyzja testera: {status!r}")
-    if status in {"red", "code"}:
-        command = data.get("command")
-        if not isinstance(command, str) or not command.strip():
-            raise InvalidDecision(
-                f"decyzja testera {status!r} wymaga niepustego `command`")
-        data["command"] = command.strip()
-    if status == "finalize":
-        reason = data.get("reason")
-        if not isinstance(reason, str) or not reason.strip():
-            raise InvalidDecision(
-                "decyzja testera 'finalize' wymaga niepustego `reason`")
-        data["reason"] = reason.strip()
-    return PhaseResult(status, data)
+def parse_tester_decision(text: str, *, project: str = "",
+                          allow_finalize: bool = True) -> PhaseResult:
+    """``allow_finalize`` odwzorowuje cykl sugestii: poza nim `finalize` jest
+    obejściem review, więc nie może wygrać wyboru kandydata."""
+    statuses = (TESTER_STATUSES if allow_finalize else
+                tuple(name for name in TESTER_STATUSES if name != "finalize"))
+    data = select_decision(
+        text, lambda item: validate_tester(item, statuses=statuses),
+        project=project)
+    return PhaseResult(data["status"], data)
 
 
 def parse_coder_decision(text: str, *, project: str = "") -> PhaseResult:
-    data = _decision(text, project=project)
-    status = data.get("status")
-    if status not in CODER_STATUSES:
-        raise InvalidDecision(f"niedozwolona decyzja kodera: {status!r}")
-    return PhaseResult(status, data)
+    data = select_decision(text, validate_coder, project=project)
+    return PhaseResult(data["status"], data)
 
 
 def parse_review_decision(text: str, *, project: str = "") -> PhaseResult:
-    data = _decision(text, project=project)
-    verdict = data.get("verdict")
-    if verdict not in REVIEW_VERDICTS:
-        raise InvalidDecision(f"niedozwolony werdykt review: {verdict!r}")
-    notes = _as_strings(data.get("notes"))
-    nits = _as_strings(data.get("nits"))
-    data["notes"] = notes
-    data["nits"] = nits
-    if verdict == "approve" and notes:
-        raise InvalidDecision("werdykt 'approve' wymaga pustego `notes`")
-    if verdict in {"suggestions", "request_changes"} and not notes:
-        raise InvalidDecision(
-            f"werdykt {verdict!r} wymaga co najmniej jednej notatki")
-    return PhaseResult(verdict, data)
-
-
-def _as_strings(value) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        value = [value]
-    elif not isinstance(value, (list, tuple)):
-        value = [value]
-    notes = []
-    for item in value:
-        text = item if isinstance(item, str) else str(item)
-        if text.strip():
-            notes.append(text.strip())
-    return notes
+    data = select_decision(text, validate_review, project=project)
+    return PhaseResult(data["verdict"], data)
 
 
 def _coder_request_handoff(status: str, reason: str) -> str:

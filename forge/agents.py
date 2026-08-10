@@ -490,12 +490,27 @@ def _usage_delta(cumulative: dict, baseline: dict | None) -> dict | None:
 
 
 @dataclass(frozen=True)
+class JsonCandidate:
+    """Jeden obiekt, który MOŻE być werdyktem roli, wraz z jego pochodzeniem."""
+
+    data: dict
+    repaired: bool = False
+
+
+@dataclass(frozen=True)
 class JsonExtraction:
-    """Wynik wydobywania werdyktu wraz z diagnozą dla pojedynczego retry."""
+    """Wynik wydobywania werdyktu wraz z diagnozą dla pojedynczego retry.
+
+    ``candidates`` niesie WSZYSTKICH kandydatów w kolejności preferencji, bo
+    sam tekst nie rozstrzyga, który obiekt jest werdyktem. Rola bywa gadatliwa
+    PO werdykcie: 2026-08-10 tester dokleił drugi blok ```json``` z samą
+    poprawką notatnika, a wybór „ostatni blok wygrywa" skasował 40-minutową,
+    poprawną turę. Dopiero walidacja kontraktem roli wie, który to werdykt."""
 
     data: dict | None = None
     repaired: bool = False
     error: str = ""
+    candidates: tuple[JsonCandidate, ...] = ()
 
 
 def _repair_json_text(raw: str) -> str:
@@ -584,45 +599,71 @@ def _unfenced_repair_candidates(text: str) -> list[str]:
     return [text[start:end + 1] for start in reversed(starts) if start <= end]
 
 
+def _add_candidate(candidates: list[JsonCandidate], seen: set[str],
+                   obj, *, repaired: bool) -> None:
+    """Dołóż kandydata, pomijając powtórzenia (blok ```json``` widzi też skan)."""
+    if not isinstance(obj, dict):
+        return
+    key = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+    if key in seen:
+        return
+    seen.add(key)
+    candidates.append(JsonCandidate(data=obj, repaired=repaired))
+
+
 def _extract_json_detail(text: str) -> JsonExtraction:
-    """Wydobądź JSON i zachowaj ostatnią użyteczną diagnozę dekodera."""
+    """Wydobądź kandydatów na werdykt i zachowaj diagnozę dekodera.
+
+    Kolejność preferencji jest ta sama, co w poprzedniej wersji zwracającej
+    jeden obiekt: ostatni poprawny blok ```json```, potem ostatni obiekt ze
+    skanu całego tekstu, na końcu wynik warstwy naprawczej. Nowe jest to, że
+    dalsi kandydaci nie znikają — walidator kontraktu roli może sięgnąć głębiej,
+    zamiast kasować turę przez przypadkowy obiekt doklejony po werdykcie."""
     if not text:
         return JsonExtraction()
     fences = re.findall(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
     last_error: tuple[str, json.JSONDecodeError, bool] | None = None
+    candidates: list[JsonCandidate] = []
+    seen: set[str] = set()
+    broken_fences: list[str] = []
     for raw in reversed(fences):
         try:
             obj = json.loads(raw)
-            if isinstance(obj, dict):
-                return JsonExtraction(data=obj)
         except json.JSONDecodeError as exc:
+            broken_fences.append(raw)
             if last_error is None:
                 last_error = (raw, exc, True)
+            continue
+        _add_candidate(candidates, seen, obj, repaired=False)
 
-    objects = _scan_json_objects(text)
-    if objects:
-        return JsonExtraction(data=objects[-1])
+    for obj in reversed(_scan_json_objects(text)):
+        _add_candidate(candidates, seen, obj, repaired=False)
 
-    repair_candidates = list(reversed(fences))
-    if not repair_candidates:
-        repair_candidates = _unfenced_repair_candidates(text)
-        for raw in repair_candidates:
+    repair_sources = broken_fences
+    if not repair_sources and not candidates:
+        repair_sources = _unfenced_repair_candidates(text)
+        for raw in repair_sources:
             try:
                 json.loads(raw)
             except json.JSONDecodeError as exc:
                 last_error = (raw, exc, False)
                 break
         else:
-            repair_candidates = []
-    for raw in repair_candidates:
+            repair_sources = []
+    for raw in repair_sources:
         repaired_raw = _repair_json_text(raw)
         try:
             obj = json.loads(repaired_raw)
-            if isinstance(obj, dict):
-                return JsonExtraction(data=obj, repaired=True)
         except json.JSONDecodeError as exc:
             if last_error is None:
                 last_error = (repaired_raw, exc, bool(fences))
+            continue
+        _add_candidate(candidates, seen, obj, repaired=True)
+
+    if candidates:
+        first = candidates[0]
+        return JsonExtraction(data=first.data, repaired=first.repaired,
+                              candidates=tuple(candidates))
     if last_error:
         raw, exc, fenced = last_error
         return JsonExtraction(error=_json_error_detail(raw, exc, fenced=fenced))

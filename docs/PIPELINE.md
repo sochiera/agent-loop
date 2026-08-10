@@ -199,9 +199,24 @@ Mistrz poleca testerowi zwrócić `blocked` z konkretnym powodem; wtedy
 standardowa obsługa porażki zapisuje artefakt, przywraca tag startowy i oddaje
 sterowanie planiście.
 
-Niepoprawna decyzja JSON dostaje dokładnie jedną prośbę o korektę samego
-formatu. Druga niepoprawna odpowiedź zatrzymuje przebieg z zapisanym
-checkpointem.
+Tester, koder i reviewer zatwierdzają werdykt skryptem `.forge/verdict.py`
+(kopia `forge/verdict.py`, wgrywana przed każdą turą razem z plikiem kontraktu
+tej tury). Skrypt sprawdza kontrakt natychmiast: błąd to exit 1 z powodem i
+oczekiwanym kształtem, więc rola poprawia werdykt **w tej samej sesji**, kosztem
+jednego kroku narzędziowego. Zatwierdzony werdykt wygrywa z tekstem tury; brak
+pliku znaczy „rola nie użyła skryptu" i wtedy werdykt czytamy jak dotąd, z
+ostatniego bloku ```` ```json ```` odpowiedzi.
+
+Z tekstu wybieramy kandydata **świadomie kontraktem roli**: rola bywa gadatliwa
+po werdykcie (2026-08-10 tester dokleił drugi blok z samą poprawką notatnika i
+skasował tym 40-minutową turę), więc wygrywa ostatni obiekt, który przechodzi
+walidację, a nie ostatni obiekt w ogóle.
+
+Dopiero gdy zawiodą obie drogi, niepoprawna decyzja dostaje jedną prośbę o
+korektę samego formatu — czyli powtórzenie całej tury; powód odrzucenia i
+surowe wyjście pierwszej próby lądują wtedy od razu w logu i w
+`.forge/failed/<zadanie>/invalid_json/`. Druga niepoprawna odpowiedź zatrzymuje
+przebieg z zapisanym checkpointem.
 
 ### Historyjki, statusy i raport
 

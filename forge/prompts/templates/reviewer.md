@@ -48,3 +48,5 @@ albo
 {"verdict":"suggestions","notes":["konkretna opcjonalna poprawka"]}
 albo
 {"verdict":"request_changes","notes":["konkretny problem wymagający poprawy"]}.
+
+{{VERDICT}}

@@ -4,12 +4,26 @@ from forge import prompts
 from forge.state import State
 
 
+# Fragmenty doklejane do szablonu roli, który regułę cudzysłowów już niesie —
+# powtórzenie jej tutaj byłoby drugim źródłem prawdy w tym samym promptcie.
+_EMBEDDED_FRAGMENTS = {"json-rules.md", "verdict-commit.md"}
+
+
 def test_every_json_contract_template_carries_quote_rule() -> None:
     templates = Path(prompts.__file__).with_name("templates")
     for template in templates.glob("*.md"):
         text = template.read_text(encoding="utf-8")
-        if template.name != "json-rules.md" and "JSON" in text:
+        if template.name not in _EMBEDDED_FRAGMENTS and "JSON" in text:
             assert "{{JSON_RULES}}" in text, template.name
+
+
+def test_verdict_fragment_reaches_every_role_that_commits_a_verdict() -> None:
+    """Fragment bez hosta byłby martwym plikiem, a host bez fragmentu — rolą
+    bez walidacji w czasie rzeczywistym."""
+    templates = Path(prompts.__file__).with_name("templates")
+    hosts = {name for name in ("tester.md", "coder.md", "reviewer.md")
+             if "{{VERDICT}}" in (templates / name).read_text(encoding="utf-8")}
+    assert hosts == {"tester.md", "coder.md", "reviewer.md"}
 
 
 def _flat(text: str) -> str:
