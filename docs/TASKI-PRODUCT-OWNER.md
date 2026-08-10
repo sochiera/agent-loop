@@ -219,23 +219,49 @@ opcjonalnych, blok śmieciowy trafia do drugiej listy zamiast wywracać parsowan
 **Kontrakt:**
 ```python
 def validate_hard(before: list[Story], after: list[Story],
-                  dropped: list[dict], orphans: list[str]) -> list[str]:
+                  dropped: list[dict], orphans: list[str],
+                  reopened: list[dict] | None = None) -> list[str]:
     """Lista naruszeń w języku naturalnym; pusta = wolno commitować."""
 ```
-Sprawdza dokładnie sześć rzeczy (§S3 planu):
+Sprawdza dokładnie pięć rzeczy (§S3 planu):
 1. format i unikalność `US-NNN`;
-2. status w `STATUSES`;
-3. niepuste `Sprawdzenie:` i `Dlaczego teraz:` w każdej historyjce;
-4. żadne ID z `before` nie zniknęło bez wpisu w `dropped`;
-5. status zmieniony między `before` a `after` wyłącznie na `porzucona`;
-6. `orphans` puste.
+2. niepuste `Sprawdzenie:` i `Dlaczego teraz:` w każdej historyjce;
+3. żadne ID z `before` nie zniknęło bez wpisu w `dropped`;
+4. każde ID z `reopened` istnieje w `after` i nie stoi zarazem w `dropped`;
+5. `orphans` puste.
 
 **Czego NIE sprawdza:** sufitu `FORGE_MAX_BACKLOG_STORIES` ani niczego
-semantycznego — to należy do recenzenta PO (task 10.2).
+semantycznego — to należy do recenzenta PO (task 10.2). **Ani statusów**:
+należą do `coerce_statuses` (task 2.2a), bo Forge umie je wymusić zapisem.
+Każde naruszenie stąd musi być dla PO wykonalne — reguła, której nie umie
+spełnić, kosztuje pełną turę modelu i nie kończy się niczym.
 
-**Gotowe gdy:** każde z sześciu naruszeń daje osobny, konkretny komunikat.
+**Gotowe gdy:** każde z pięciu naruszeń daje osobny, konkretny komunikat.
 
 **Testy:** po jednym teście na naruszenie + test „czysta tura → pusta lista".
+
+---
+
+### 2.2a Koercja statusów
+
+**Pliki:** `forge/backlog.py`
+
+**Kontrakt:**
+```python
+def coerce_statuses(text: str, before: list[Story]) -> tuple[str, list[str]]:
+    """Tekst z kolumną statusu przepisaną na prawdę Forge + lista korekt."""
+```
+Status sprzed tury wraca na miejsce; historyjka nieznana w `before` dostaje
+`nowa`; wartość spoza `STATUSES` — `do weryfikacji`. Zduplikowane ID pomija,
+zostawiając je walidatorowi.
+
+**Gotowe gdy:** funkcja jest idempotentna (`coerce(coerce(x)) == coerce(x)`) i
+jej wynik nigdy nie zawiera statusu spoza `STATUSES`. To jest właściwość, która
+zastępuje dwie reguły walidacji potrafiące zakleszczyć się na sobie.
+
+**Testy:** przywrócenie statusu zmienionego przez PO; wyleczenie statusu spoza
+kontraktu; nowa historyjka → `nowa`; zachowanie powodu porzucenia;
+idempotencja; duplikat ID nie wywraca funkcji.
 
 ---
 
@@ -360,6 +386,7 @@ Kontrakt wyjścia (bez `stories_closed` — statusy należą do Forge):
 ```json
 {"summary":"...","stories_added":["US-007"],
  "stories_dropped":[{"id":"US-005","reason":"..."}],
+ "stories_reopened":[{"id":"US-003","reason":"co dokładnie nie działa"}],
  "changes":["..."],"replan":false,"goal_reached":false,"notebook":"..."}
 ```
 

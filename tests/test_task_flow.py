@@ -228,9 +228,13 @@ def test_tester_receives_task_scoped_context_in_every_prompt(tmp_path: Path) -> 
     assert "brakuje VALUE=1" in confirmation
     assert "ustawiono VALUE na 1" in confirmation
     assert "app.py" in confirmation and "tests/test_app.py" in confirmation
-    assert "task-001 wcześniejszy wpis" not in tester_prompts[0]
-    assert "sekret innego zadania" not in tester_prompts[0]
-    assert "ostatnie wpisy dziennika" not in confirmation
+    # Dziennik procesu jest świadomie SZERSZY niż zadanie: tura roli widzi
+    # również cudze wpisy, bo to jedyny zapis tego, kto ruszył wspólne pliki i
+    # które zadania padły. Wąskie okno kosztowało już pełne tury przepalone na
+    # rekonstruowanie kontekstu, który stał w dzienniku dwie linie obok.
+    assert "task-001 wcześniejszy wpis" in tester_prompts[0]
+    assert "sekret innego zadania" in tester_prompts[0]
+    assert "DZIENNIK PROCESU" in confirmation
 
 
 def test_independent_task_receives_failed_batch_handoff(tmp_path: Path) -> None:

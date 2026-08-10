@@ -132,11 +132,51 @@ def parse(text: str) -> tuple[list[Story], list[str]]:
     return stories, orphans
 
 
+def coerce_statuses(text: str, before: list[Story]) -> tuple[str, list[str]]:
+    """Przepisz kolumnę statusu na prawdę Forge; zwróć tekst i listę korekt.
+
+    Status nie jest opinią Product Ownera, tylko stanem cyklu życia, który w
+    całości zna Forge. Regułę, którą Forge umie wymusić zapisem, wymuszamy
+    zapisem — zgłoszenie kosztuje pełną turę agenta i, w odróżnieniu od pary
+    reguł zastąpionych tą funkcją, potrafi postawić PO przed wyborem między
+    dwoma naruszeniami naraz (zostaw nielegalny status / nie zmieniaj statusu).
+    Ta pętla nie umie zakleszczyć się z definicji: zawsze kończy się plikiem
+    zgodnym z kontraktem, niezależnie od tego, co zastała.
+    """
+    known = {story.id: story for story in before}
+    changes: list[str] = []
+    result = text
+    for story in parse(text)[0]:
+        old = known.get(story.id)
+        target, reason = (old.status, old.drop_reason) if old else ("nowa", "")
+        if target not in STATUSES:
+            # Status spoza kontraktu (stary plik, ręczna edycja, tura roli
+            # zadaniowej) nie jest dowodem na nic — historyjka wraca do
+            # kolejki weryfikacji, jedynej fazy, która umie go rozstrzygnąć.
+            target, reason = "do weryfikacji", ""
+        if story.status == target and story.drop_reason == reason:
+            continue
+        try:
+            result = set_status(result, story.id, target, reason)
+        except (KeyError, ValueError):
+            # Zduplikowane albo nieparsowalne ID zgłasza walidator; tutaj nie
+            # ma czego jednoznacznie przepisać, a wywrócenie tury kosztowałoby
+            # znacznie więcej niż jedna pominięta korekta.
+            continue
+        changes.append(f"{story.id}: {story.status!r}→{target!r}")
+    return result, changes
+
+
 def validate_hard(
     before: list[Story], after: list[Story], dropped: list[dict],
-    orphans: list[str],
+    orphans: list[str], reopened: list[dict] | None = None,
 ) -> list[str]:
-    """Zwróć naruszenia sześciu twardych invariantów backlogu."""
+    """Zwróć naruszenia twardych invariantów, których Forge nie umie naprawić.
+
+    Świadomie nie ma tu żadnej reguły o statusach: należą do ``coerce_statuses``.
+    Zostaje wyłącznie to, czego nie da się wymusić zapisem, bo prawdę zna sam
+    Product Owner — a więc każde zgłoszenie stąd jest dla niego wykonalne.
+    """
     violations: list[str] = []
     ids: set[str] = set()
     for story in after:
@@ -145,8 +185,6 @@ def validate_hard(
         elif story.id in ids:
             violations.append(f"ID historyjki występuje więcej niż raz: {story.id}")
         ids.add(story.id)
-        if story.status not in STATUSES:
-            violations.append(f"{story.id}: niedozwolony status {story.status!r}")
         if not story.check.strip():
             violations.append(f"{story.id}: brak niepustego pola Sprawdzenie")
         if not story.why_now.strip():
@@ -156,24 +194,22 @@ def validate_hard(
         str(item.get("id", "")) for item in dropped
         if isinstance(item, dict)
     }
+    # Wznowienie każe Forge ogłosić fakt o historyjce i wysłać powód planiście,
+    # więc ID musi istnieć NAPRAWDĘ. Zmyślone przeszłoby przez `set_status`
+    # jako brak trafienia i zostawiło proces z wznowieniem bez historyjki.
+    for item in reopened or []:
+        story_id = str(item.get("id", "")) if isinstance(item, dict) else ""
+        if story_id not in ids:
+            violations.append(
+                f"stories_reopened wskazuje nieznane ID: {story_id!r}")
+        elif story_id in dropped_ids:
+            violations.append(
+                f"{story_id} jest jednocześnie w stories_dropped i "
+                "stories_reopened; wybierz jedno")
     for story in before:
         if story.id not in ids and story.id not in dropped_ids:
             violations.append(
                 f"historyjka {story.id} zniknęła bez wpisu w stories_dropped")
-
-    before_ids = {story.id for story in before}
-    after_by_id = {story.id: story for story in after}
-    for old in before:
-        new = after_by_id.get(old.id)
-        if new and new.status != old.status and new.status != "porzucona":
-            violations.append(
-                f"{old.id}: PO nie może zmienić statusu {old.status!r} "
-                f"na {new.status!r}; statusy należą do Forge")
-    for story in after:
-        if story.id not in before_ids and story.status not in ("nowa", "porzucona"):
-            violations.append(
-                f"{story.id}: nowa historyjka musi mieć status 'nowa', "
-                f"a ma {story.status!r}; statusy należą do Forge")
 
     if orphans:
         violations.append("backlog zawiera nieparsowalne bloki poza historyjkami")

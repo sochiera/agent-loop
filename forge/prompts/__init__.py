@@ -12,6 +12,18 @@ def verdict_commit(verdict_cmd: str) -> str:
     return render("verdict-commit.md", VERDICT_CMD=verdict_cmd) if verdict_cmd else ""
 
 
+def ledger_context(tail_text: str) -> str:
+    """Ogon dziennika doklejany na KOŃCU promptu roli; pusty nic nie zmienia.
+
+    Osobna funkcja zamiast slotu w każdym szablonie: dziennik jest treścią
+    zmienną, a szablony ról są stabilne — doklejenie na końcu zostawia
+    cache'owalny prefiks nienaruszony i pozwala dobrać szerokość okna w
+    miejscu wywołania, nie w szablonie.
+    """
+    return "\n\n" + render("ledger-context.md", LEDGER_TAIL=tail_text) \
+        if tail_text.strip() else ""
+
+
 def _corrections(name: str, review_notes: list[str] | None) -> str:
     """Uwagi recenzenta doklejane do kolejnej próby; brak uwag nic nie zmienia."""
     notes = "; ".join(note for note in (review_notes or []) if str(note).strip())
@@ -76,11 +88,27 @@ def product_owner_prompt(*, trigger: str, brief_diff: str = "",
     )
 
 
+def _story_reasons_block(items) -> str:
+    """Lista ``{id, reason}`` dla recenzentki; te deklaracje nie są jeszcze w pliku.
+
+    Forge wykonuje `stories_dropped` i `stories_reopened` dopiero po akceptacji,
+    więc na dysku ich w chwili recenzji nie ma. Bez wklejenia ich do promptu
+    recenzentka oceniałaby decyzje, których nie widzi.
+    """
+    lines = [
+        f"- {str(item.get('id', '?'))}: {str(item.get('reason', '')).strip()}"
+        for item in (items or []) if isinstance(item, dict)
+    ]
+    return "\n".join(lines) or "(brak)"
+
+
 def po_review_prompt(result: dict, *, max_backlog: int = 6) -> str:
     return render(
         "po-review.md",
         SUMMARY=str(result.get("summary", "(brak)")),
         GOAL_REACHED="tak" if result.get("goal_reached") else "nie",
+        DROPPED=_story_reasons_block(result.get("stories_dropped")),
+        REOPENED=_story_reasons_block(result.get("stories_reopened")),
         MAX_BACKLOG=max_backlog,
     )
 

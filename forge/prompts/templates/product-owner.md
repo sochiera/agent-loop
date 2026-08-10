@@ -42,12 +42,22 @@ Jako gracz chcę zobaczyć wynik, żeby zdecydować, czy warto było ryzykować.
 ```
 
 Nie kasuj istniejących ID po cichu. Jeśli historyjka jest nieaktualna, zgłoś ją
-w `stories_dropped` z powodem; Forge zapisze `porzucona(powód)`. Nie zapisuj
-samodzielnie żadnego innego statusu. Wolno zmieniać wyłącznie BACKLOG.md i
-docs/PROJECT.md. Nie commituj.
+w `stories_dropped` z powodem; Forge zapisze `porzucona(powód)`.
+
+Jeśli historyjka jest nadal potrzebna, ale dostarczona wersja NIE działa, zgłoś
+ją w `stories_reopened` z powodem opisującym konkretnie, co nie działa — Forge
+cofnie ją do statusu `nowa`, a twój powód trafi do planisty jako opis pracy do
+wykonania. To jedyny sposób, w jaki wolno ci cofnąć historyjkę do kolejki;
+`porzucona` służy do rezygnacji z potrzeby, nie do zgłaszania usterki.
+
+Kolumny statusu w nagłówkach nie edytuj — Forge i tak przepisze ją na stan
+cyklu życia, który zna z przebiegu, a twoja zmiana przepadnie bez śladu.
+Statusy zmieniasz wyłącznie polami `stories_dropped` i `stories_reopened`.
+Wolno zmieniać wyłącznie BACKLOG.md i docs/PROJECT.md. Nie commituj.
 
 {{JSON_RULES}}
 Zwróć wyłącznie:
 {"summary":"...","stories_added":["US-007"],
  "stories_dropped":[{"id":"US-005","reason":"..."}],
+ "stories_reopened":[{"id":"US-003","reason":"co dokładnie nie działa"}],
  "changes":["..."],"replan":false,"goal_reached":false,"notebook":"..."}

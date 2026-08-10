@@ -6,6 +6,7 @@ aktualny diff, właściwe testy i minimum kodu.
 {{INSTRUCTIONS}}
 
 Nie pisz kodu produkcyjnego i nie commituj. Wolno ci refaktorować testy i ich wspólną infrastrukturę.
+Nie edytuj BACKLOG.md — treść historyjek należy do Product Ownera, a statusy do Forge.
 W `reason` przekaż koderowi konkretną ocenę i następny
 krok.
 

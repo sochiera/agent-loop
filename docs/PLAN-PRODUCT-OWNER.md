@@ -186,6 +186,7 @@ wyłącznie te dwa pliki, walidowane manifestem drzewa i cofane
 ```json
 {"summary":"...","stories_added":["US-007"],
  "stories_dropped":[{"id":"US-005","reason":"..."}],
+ "stories_reopened":[{"id":"US-003","reason":"co dokładnie nie działa"}],
  "changes":["..."],"replan":false,"goal_reached":false,
  "notebook":"..."}
 ```
@@ -194,6 +195,15 @@ Nie ma tu `stories_closed`: **zamknięcie historyjki nie jest opinią PO, tylko
 faktem wyliczanym przez Forge** z ukończonych zadań i potwierdzenia
 weryfikatora (§S4a). PO jest jedynym właścicielem *treści* backlogu i jedyną
 rolą mogącą historyjkę **porzucić**; statusy cyklu życia należą do kodu.
+
+`stories_reopened` jest drugą stroną tej samej zasady i jedynym kanałem, którym
+PO może powiedzieć „dostarczone, ale nie działa". Forge cofa wskazaną historyjkę
+do statusu `nowa`, a `reason` — obowiązkowy, jak przy porzuceniu — trafia do
+dziennika i do notatki kierunku, więc planista dostaje opis usterki zamiast
+planować historyjkę od zera. Bez tego kanału jedynym sposobem zgłoszenia usterki
+było `stories_dropped`, czyli skasowanie wciąż potrzebnej historyjki: PO płacił
+za zgłoszenie utratą wymagania. Rozróżnienie jest ostre — `porzucona` znaczy
+„potrzeba zniknęła", `stories_reopened` znaczy „potrzeba została, wykonanie nie".
 
 **Właściciel `goal_reached`: PO proponuje, raport weryfikatora historyjek jest
 dowodem.** Bez tego zdania decyzja wpada w szczelinę między nowymi rolami.
@@ -264,21 +274,41 @@ turę mimo nich zaakceptować, a wtedy S5 i S7 dostają backlog, którego parser
 umie wiarygodnie zinterpretować — i awaria wychodzi dwa wsady później, w
 zupełnie innym miejscu.
 
+**Poziom 0 — koercja statusów.** `backlog.coerce_statuses` przepisuje kolumnę
+statusu na stan cyklu życia znany Forge, **zanim** cokolwiek jest walidowane:
+status sprzed tury wraca na miejsce, nowa historyjka dostaje `nowa`, a wartość
+spoza zbioru (§S4a) — `do weryfikacji`. Nic tu nie wraca do PO i nic nie kosztuje
+tury.
+
+Podział jest celowy: **regułę, którą Forge umie wymusić zapisem, wymuszamy
+zapisem; do PO wraca wyłącznie to, czego naprawić nie umiemy.** Poprzednia
+wersja walidowała statusy i para reguł („status musi być legalny" + „PO nie może
+zmienić statusu") zakleszczała się na sobie, gdy w pliku stał status spoza
+kontraktu: zostawienie go było naruszeniem, a poprawienie — drugim. Kosztowało
+to cały budżet korekt na najdroższym modelu, bez żadnego wyjścia dla PO.
+Koercja nie umie zakleszczyć się z definicji, bo jest idempotentna: jej wynik
+zawsze spełnia kontrakt. Leczy przy okazji skażenie spoza tej fazy (status
+wpisany ręcznie albo przez turę roli zadaniowej), więc BACKLOG.md nie potrzebuje
+osobnego strażnika przy każdej turze.
+
 **Poziom 1 — twarde invarianty strukturalne.** Sprawdza parser
-`forge/backlog.py`, **przed** recenzentem:
+`forge/backlog.py`, **przed** recenzentem, i świadomie nie mówi nic o statusach:
 
 - format i unikalność `US-NNN`;
-- status należy do dozwolonego zbioru (§S4a);
 - każda historyjka ma niepuste `Sprawdzenie:` i `Dlaczego teraz:`;
 - żadne ID obecne przed turą nie zniknęło bez wpisu w `stories_dropped`;
-- PO nie zmienił statusu inaczej niż na `porzucona` (statusy należą do Forge);
+- każde ID z `stories_reopened` istnieje w backlogu i nie stoi jednocześnie w
+  `stories_dropped` — wznowienie jest ogłaszane planiście jako fakt, więc
+  zmyślone ID dałoby pracę do wykonania na historyjce, której nie ma;
 - backlog parsuje się w całości — żadnych sierocych bloków.
 
 Naruszenie **wymusza korektę**: treść naruszenia wraca do PO jako uwagi, w tym
-samym budżecie prób co recenzje (`FORGE_MAX_BOOTSTRAP_REVIEWS`). Wyczerpanie
-budżetu cofa fazę i zatrzymuje przebieg z checkpointem — dokładnie tak, jak dziś
-zachowuje się wyczerpany budżet recenzji kierunku. Lepiej stanąć, niż wpuścić
-nieparsowalny backlog do trzech kolejnych ról.
+samym budżecie prób co recenzje (`FORGE_MAX_BOOTSTRAP_REVIEWS`). Identyczny
+zestaw naruszeń dwa razy z rzędu kończy fazę natychmiast: pełna tura z tymi
+uwagami już się nie powiodła, więc kolejne nie wniosą nic poza rachunkiem.
+Wyczerpanie budżetu cofa fazę i zatrzymuje przebieg z checkpointem — dokładnie
+tak, jak dziś zachowuje się wyczerpany budżet recenzji kierunku. Lepiej stanąć,
+niż wpuścić nieparsowalny backlog do trzech kolejnych ról.
 
 Parser stojący przed recenzentem oszczędza przy okazji wywołania: źle
 sformatowana tura nigdy nie dociera do modelu recenzenta.

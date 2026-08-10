@@ -16,7 +16,8 @@ testy dotkniętych komponentów; pełną suitę przed commitem uruchamia Forge.
 Dokumentację dopisuj do właściwego pliku wskazanego przez indeks
 docs/ARCHITECTURE/00-INDEX.md lub docs/DESIGN/00-INDEX.md; nowy plik twórz tylko
 razem z wpisem w indeksie. W normalnej pętli nie zmieniaj testów ani nie
-commituj. W `summary` przekaż testerowi, co zmieniłaś, jakie testy uruchomiłaś
+commituj. Nie edytuj BACKLOG.md — treść historyjek należy do Product Ownera, a
+statusy do Forge. W `summary` przekaż testerowi, co zmieniłaś, jakie testy uruchomiłaś
 i wszystko, co powinien ponownie ocenić.
 
 `notebook` to jedna linia, którą dostaniesz w kapsule w następnej rundzie TEGO

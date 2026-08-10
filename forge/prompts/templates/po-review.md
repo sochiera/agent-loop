@@ -10,9 +10,18 @@ nie powtarzaj tej walidacji. Oceń wyłącznie semantykę:
 6. Czy `goal_reached` jest uczciwe wobec raportu?
 7. Czy przyrost jest najcieńszym sensownym plasterkiem?
 8. Czy miękki sufit {{MAX_BACKLOG}} nie został przekroczony bez powodu?
+9. Czy każdy wpis `stories_reopened` nazywa konkretną usterkę, a nie ogólne
+   niezadowolenie — i czy nie jest przebranym `stories_dropped`?
 
 Podsumowanie PO: {{SUMMARY}}
 Deklaracja celu: {{GOAL_REACHED}}
+
+Zgłoszone porzucenia (`stories_dropped`) — Forge wykona je dopiero po twojej
+akceptacji, więc w BACKLOG.md ich jeszcze nie zobaczysz:
+{{DROPPED}}
+
+Zgłoszone wznowienia (`stories_reopened`) — jak wyżej, jeszcze nie ma ich w pliku:
+{{REOPENED}}
 {{JSON_RULES}}
 Zwróć wyłącznie {"verdict":"approve","notes":[]}
 albo {"verdict":"request_changes","notes":["konkretna uwaga"]}.

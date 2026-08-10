@@ -35,8 +35,20 @@ TASK_ID_BODY = r"task-\d+"
 KEEP_LINES = 1000
 MAX_ENTRY = 300
 # Okno mistrza. TO jest parametr kosztu: idzie do promptu przy każdym wywołaniu
-# roli wołanej co rundę. Rośnie tylko z bardzo dobrego powodu.
+# roli wołanej co rundę. Rośnie tylko z bardzo dobrego powodu. Zostaje wąskie
+# także po dołożeniu okien niżej: zadaniem mistrza jest rozpoznanie wzorca w
+# świeżym wycinku, a nie rekonstrukcja historii — szersze okno zmieniłoby jego
+# rolę, nie tylko rachunek.
 MASTER_LINES = 20
+# Okna pozostałych ról. Mierzone na realnym dzienniku (609 wpisów, 100 kB,
+# średnio 165 znaków na wpis): 200 linii to ~31 kB (~10k tokenów), 400 linii to
+# ~62 kB (~20k tokenów). Wobec tury, w której sam wynik narzędzi potrafi mieć
+# 0.3 MB, to kilka procent wejścia — a niesie jedyny zapis tego, co robiły inne
+# role: kto ruszył BACKLOG.md, które zadania padły na limit rund, co orzekła
+# weryfikacja. Role fazowe wołamy rzadko i decydują o kierunku, więc dostają
+# szersze okno niż role zadaniowe wołane co rundę.
+PHASE_LINES = 400
+TASK_LINES = 200
 # Horyzont wzorca „planista tnie za grubo". Trzymany osobno od KEEP_LINES
 # świadomie: ten warunek ma opisywać porażki ŚWIEŻE. Gdyby jechał na całej
 # pamięci dziennika, po jej powiększeniu mistrz wypominałby planiście zadania

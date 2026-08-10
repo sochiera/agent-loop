@@ -46,31 +46,94 @@ def test_validate_hard_reports_each_structural_violation() -> None:
     missing = backlog.Story(
         "US-999", "x", "nieznany", "", "", "", "", "", 1)
     violations = backlog.validate_hard(before, [missing], [], [])
-    assert any("niedozwolony status" in item for item in violations)
     assert any("brak niepustego pola Sprawdzenie" in item for item in violations)
     assert any("brak niepustego pola Dlaczego teraz" in item for item in violations)
     assert any("US-007 zniknęła" in item for item in violations)
 
 
-def test_validate_hard_rejects_status_change_and_accepts_drop() -> None:
+def test_validate_hard_never_reports_status_because_forge_rewrites_it() -> None:
+    """Statusy nie są opinią; walidator nie ma o nich nic do powiedzenia.
+
+    Ta para reguł zakleszczała się na sobie: nielegalny status w pliku był
+    naruszeniem, a naprawienie go — drugim naruszeniem. Właścicielem jest
+    teraz ``coerce_statuses``, więc walidator ma o nich milczeć.
+    """
     before, _ = backlog.parse(EXAMPLE)
     changed = backlog.Story(**{**before[0].__dict__, "status": "w toku"})
-    assert any("statusy należą do Forge" in item
-               for item in backlog.validate_hard(before, [changed], [], []))
+    assert backlog.validate_hard(before, [changed], [], []) == []
+    illegal = backlog.Story(**{**before[0].__dict__, "status": "gotowe"})
+    assert backlog.validate_hard(before, [illegal], [], []) == []
+    smuggled = backlog.Story(
+        "US-008", "Druga", "zrobiona", "", "dowód", "ekran", "", "", 1)
+    assert backlog.validate_hard(before, [*before, smuggled], [], []) == []
     assert backlog.validate_hard(before, [], [{"id": "US-007"}], []) == []
 
 
-def test_validate_hard_rejects_new_story_born_with_forge_owned_status() -> None:
+def test_coerce_statuses_restores_forge_truth_and_heals_illegal_status() -> None:
     before, _ = backlog.parse(EXAMPLE)
-    smuggled = backlog.Story(
-        "US-008", "Druga", "zrobiona", "", "dowód", "ekran", "", "", 1)
-    violations = backlog.validate_hard(before, [*before, smuggled], [], [])
-    assert any("nowa historyjka musi mieć status" in item for item in violations)
+    forge_truth = [backlog.Story(**{**before[0].__dict__, "status": "w toku"})]
 
-    dropped_on_arrival = backlog.Story(
-        "US-009", "Trzecia", "porzucona", "z góry", "dowód", "ekran", "", "", 1)
+    text, changes = backlog.coerce_statuses(
+        EXAMPLE.replace("[nowa]", "[zrobiona]"), forge_truth)
+    assert "## US-007 — Gracz widzi wynik potyczki  [w toku]" in text
+    assert changes == ["US-007: 'zrobiona'→'w toku'"]
+
+    # Sedno awarii: status spoza kontraktu (tu wpisany przez turę kodera) nie
+    # ma jak zostać, ale i nie może zablokować tury — wraca do weryfikacji.
+    legacy = [backlog.Story(**{**before[0].__dict__, "status": "gotowe"})]
+    text, changes = backlog.coerce_statuses(
+        EXAMPLE.replace("[nowa]", "[gotowe]"), legacy)
+    assert "[do weryfikacji]" in text
+    assert changes == ["US-007: 'gotowe'→'do weryfikacji'"]
+
+    # Powtórzenie na własnym wyniku nic nie zmienia — dlatego ta pętla nie umie
+    # się zapętlić, niezależnie od tego, co zastała w pliku.
+    assert backlog.coerce_statuses(text, legacy) == (text, [])
+
+
+def test_coerce_statuses_forces_new_story_to_nowa_and_keeps_drop_reason() -> None:
+    before, _ = backlog.parse(EXAMPLE)
+    smuggled = EXAMPLE + (
+        "\n## US-008 — Druga  [zrobiona]\n\n"
+        "- Dlaczego teraz: dowód\n- Sprawdzenie: ekran\n")
+    text, changes = backlog.coerce_statuses(smuggled, before)
+    assert "## US-008 — Druga  [nowa]" in text
+    assert changes == ["US-008: 'zrobiona'→'nowa'"]
+
+    dropped = [backlog.Story(**{**before[0].__dict__,
+                                "status": "porzucona", "drop_reason": "brak popytu"})]
+    text, _ = backlog.coerce_statuses(EXAMPLE, dropped)
+    assert "[porzucona: brak popytu]" in text
+
+
+def test_validate_hard_rejects_reopened_ghost_id_and_conflict_with_dropped() -> None:
+    """Wznowienie jest ogłaszane procesowi jako fakt, więc ID musi istnieć.
+
+    `set_status` na nieznanym ID jest cichym brakiem trafienia — bez tej reguły
+    zmyślone US-999 nie zmieniłoby backlogu, ale planista dostałby pracę do
+    wykonania na historyjce, której nie ma.
+    """
+    before, _ = backlog.parse(EXAMPLE)
+    violations = backlog.validate_hard(
+        before, before, [], [], [{"id": "US-999", "reason": "nie działa"}])
+    assert any("nieznane ID" in item and "US-999" in item for item in violations)
+
+    violations = backlog.validate_hard(
+        before, before, [{"id": "US-007", "reason": "zbędna"}], [],
+        [{"id": "US-007", "reason": "nie działa"}])
+    assert any("jednocześnie w stories_dropped" in item for item in violations)
+
     assert backlog.validate_hard(
-        before, [*before, dropped_on_arrival], [], []) == []
+        before, before, [], [], [{"id": "US-007", "reason": "nie działa"}]) == []
+
+
+def test_coerce_statuses_leaves_duplicate_ids_to_the_validator() -> None:
+    before, _ = backlog.parse(EXAMPLE)
+    duplicated = EXAMPLE + EXAMPLE.split("# Kolejka", 1)[1].replace("[nowa]", "[zrobiona]")
+    text, changes = backlog.coerce_statuses(duplicated, before)
+    assert text == duplicated and changes == []
+    assert any("więcej niż raz" in item for item in backlog.validate_hard(
+        before, backlog.parse(duplicated)[0], [], []))
 
 
 def test_set_status_changes_only_one_header_line() -> None:

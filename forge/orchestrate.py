@@ -190,6 +190,29 @@ def _set_story_status(project: str, story_id: str, status: str,
     return False
 
 
+def _coerce_backlog_statuses(project: str, before: list[backlog.Story]) -> None:
+    """Przywróć kolumnę statusu do prawdy Forge po turze Product Ownera.
+
+    Leczy również skażenie spoza tej fazy — status wpisany ręcznie albo przez
+    turę roli zadaniowej znika przy najbliższym przeglądzie, bez osobnej
+    maszynerii pilnującej BACKLOG.md przy każdej turze.
+    """
+    path = Path(project, "BACKLOG.md")
+    if not path.is_file():
+        return
+    text, changes = backlog.coerce_statuses(
+        path.read_text(encoding="utf-8"), before)
+    if changes:
+        path.write_text(text, encoding="utf-8")
+        ledger.append(project, "po: statusy przywrócone przez Forge — "
+                      + "; ".join(changes)[:200])
+
+
+def _ledger_context(project: str, lines: int) -> str:
+    """Ogon dziennika doklejany na końcu promptu roli."""
+    return prompts.ledger_context(ledger.tail(project, lines))
+
+
 def _story_status(project: str, story_id: str) -> str:
     stories, _ = backlog.load(project)
     for story in stories:
@@ -224,6 +247,7 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
         failure_feedback_path=str(failures) if failures.exists() else "",
         steering_path=str(steering) if steering.exists() else "",
         require_debt=next_batch % 5 == 0)
+    plan_prompt += _ledger_context(project, ledger.PHASE_LINES)
     # Mistrz widzi w dzienniku również historię wsadów — serię zadań ginących
     # na round_limit potrafi skomentować zanim planista utnie kolejny za grubo.
     plan_prompt += prompts.master_note_suffix(
@@ -507,6 +531,13 @@ def _write_steering_note(cfg: Config, project: str, data: dict,
         lines.append("Zmiany przeniesione do backlogu i docs/PROJECT.md:")
         lines += [f"- {item}" for item in changes]
         lines.append("")
+    reopened = data.get("stories_reopened", [])
+    if reopened:
+        # Powód wznowienia jest jedyną treścią, którą PO wnosi do historyjki
+        # już raz zamkniętej — bez niego planista zaplanowałby ją od zera.
+        lines.append("Historyjki cofnięte do kolejki (co w nich nie działa):")
+        lines += [f"- {item['id']}: {item['reason']}" for item in reopened]
+        lines.append("")
     if dropped:
         lines.append("Zadania wycofane z kolejki do ponownego zaplanowania "
                      "(ich założenia zmienił przegląd kierunku):")
@@ -557,6 +588,7 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
     notebook_path = str(Path(cfg.runtime_dir, "notebooks", "product-owner.md"))
     migration = not state.backlog_migrated
     parser_corrections: list[str] = []
+    previous_violations: list[str] = []
     review_corrections: list[str] = []
     data: dict = {}
     approved = False
@@ -568,6 +600,7 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
                 queued_tasks=queued, parked=parked, migration=migration,
                 notebook_path=notebook_path, review_notes=review_corrections,
                 max_backlog=cfg.max_backlog_stories)
+            prompt += _ledger_context(project, ledger.PHASE_LINES)
             if parser_corrections:
                 prompt += "\n\n" + prompts.po_parse_corrections_prompt(parser_corrections)
             data = _decision_with_retry(
@@ -583,16 +616,32 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
                 ledger.append(project, "po: cofnięto zmiany poza zakresem "
                                + _describe_turn_changes(reverted))
 
+            _coerce_backlog_statuses(project, before_stories)
             after_stories, orphans = backlog.load(project)
             violations = backlog.validate_hard(
-                before_stories, after_stories, data["stories_dropped"], orphans)
+                before_stories, after_stories, data["stories_dropped"], orphans,
+                data["stories_reopened"])
             if violations:
+                if violations == previous_violations:
+                    # Ten sam zestaw naruszeń po pełnej turze z tymi uwagami
+                    # znaczy, że kolejna tura go nie usunie. Budżet korekt jest
+                    # tu wart tyle, co cztery tury najdroższego modelu.
+                    raise AgentError(
+                        "Product Owner: parser zgłasza te same naruszenia drugi "
+                        "raz z rzędu, więc kolejne tury ich nie usuną: "
+                        + "; ".join(violations)[:300])
+                previous_violations = violations
                 parser_corrections = violations
                 review_corrections = []
                 ledger.append(project, "po parser: " + "; ".join(violations)[:240])
                 log("Product Owner: korekta strukturalna "
                     f"{round_number}/{cfg.max_bootstrap_reviews}")
                 continue
+            # Poprawna struktura przerywa serię: to samo naruszenie po turze,
+            # która go NIE miała, jest nawrotem po cudzej uwadze, a nie dowodem
+            # na to, że PO nie umie go usunąć. Bez zerowania odsiew ucinałby
+            # przebieg mimo realnego postępu między jednym a drugim wystąpieniem.
+            previous_violations = []
 
             review_before = _tree_manifest(project)
             review_snapshot = _snapshot_tree(project)
@@ -651,6 +700,25 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
         except KeyError:
             ledger.append(project, f"po: ostrzeżenie — nieznane stories_dropped {item['id']}")
 
+    # Jedyna droga, którą PO może cofnąć historyjkę do kolejki: deklaracja z
+    # powodem, wykonywana przez Forge. Bez tego kanału jego jedynym sposobem na
+    # powiedzenie „to nie działa" było skasowanie historyjki jako porzuconej.
+    #
+    # Ogłaszamy wyłącznie wznowienia, które faktycznie trafiły do pliku. Wpis w
+    # dzienniku i linia w notatce kierunku są dla dalszego procesu faktem: ID
+    # bez pokrycia w backlogu (walidator już je odsiewa, ale to ostatnia
+    # instancja przed ogłoszeniem) dałoby planiście pracę bez historyjki.
+    applied_reopened: list[dict[str, str]] = []
+    for item in data["stories_reopened"]:
+        changed = _set_story_status(project, item["id"], "nowa")
+        if not changed and not _story_status(project, item["id"]):
+            ledger.append(
+                project, f"po: ostrzeżenie — nieznane stories_reopened {item['id']}")
+            continue
+        ledger.append(project, f"po: {item['id']} wraca do kolejki — {item['reason']}")
+        applied_reopened.append(item)
+    data["stories_reopened"] = applied_reopened
+
     _append_product_owner_note(project, data.get("notebook", ""))
     _write_steering_note(cfg, project, data, state.task_queue if data["replan"] else [])
     if data["replan"]:
@@ -674,6 +742,7 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
         project,
         f"po ({trigger}): +{len(data['stories_added'])} historyjek, "
         f"-{len(data['stories_dropped'])} porzuconych, "
+        f"~{len(data['stories_reopened'])} wznowionych, "
         f"replan={data['replan']}, goal={state.goal_confirmed}",
     )
     commit_all(project, "docs: przegląd Product Ownera", cfg)
@@ -1121,28 +1190,41 @@ def _parse_product_owner_decision(text: str, *, project: str = "") -> dict:
     return _parse_json_object(text, project=project, require=_require_product_owner)
 
 
-def _require_product_owner(data: dict) -> None:
-    _require_steering(data)
-    added = data.get("stories_added", [])
-    dropped = data.get("stories_dropped", [])
-    if isinstance(added, str) or not isinstance(added, (list, tuple)):
-        raise InvalidDecision("pole `stories_added` musi być listą ID")
-    if not isinstance(dropped, (list, tuple)):
-        raise InvalidDecision("pole `stories_dropped` musi być listą obiektów")
-    normalized_dropped: list[dict[str, str]] = []
-    for item in dropped:
+def _story_reasons(data: dict, key: str) -> list[dict[str, str]]:
+    """Znormalizuj listę ``{id, reason}``; brak powodu jest błędem kontraktu.
+
+    Wspólne dla `stories_dropped` i `stories_reopened`: obie deklaracje każą
+    Forge zmienić status historyjki, więc obie muszą nieść uzasadnienie, które
+    przeżyje w dzienniku i w notatce dla planisty.
+    """
+    items = data.get(key, [])
+    if not isinstance(items, (list, tuple)):
+        raise InvalidDecision(f"pole `{key}` musi być listą obiektów")
+    normalized: list[dict[str, str]] = []
+    for item in items:
         if not isinstance(item, dict):
-            raise InvalidDecision("element stories_dropped musi być obiektem")
+            raise InvalidDecision(f"element {key} musi być obiektem")
         story_id = str(item.get("id", "")).strip()
         reason = str(item.get("reason", "")).strip()
         if not story_id or not reason:
-            raise InvalidDecision("stories_dropped wymaga niepustego id i reason")
-        normalized_dropped.append({"id": story_id, "reason": reason})
+            raise InvalidDecision(f"{key} wymaga niepustego id i reason")
+        normalized.append({"id": story_id, "reason": reason})
+    return normalized
+
+
+def _require_product_owner(data: dict) -> None:
+    _require_steering(data)
+    added = data.get("stories_added", [])
+    if isinstance(added, str) or not isinstance(added, (list, tuple)):
+        raise InvalidDecision("pole `stories_added` musi być listą ID")
+    dropped = _story_reasons(data, "stories_dropped")
+    reopened = _story_reasons(data, "stories_reopened")
     notebook = data.get("notebook", "")
     if not isinstance(notebook, str):
         raise InvalidDecision("pole `notebook` musi być tekstem")
     data["stories_added"] = [str(item).strip() for item in added if str(item).strip()]
-    data["stories_dropped"] = normalized_dropped
+    data["stories_dropped"] = dropped
+    data["stories_reopened"] = reopened
     data["notebook"] = notebook.strip()
 
 
@@ -1355,7 +1437,8 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 suite_regression=using_suite_regression,
                 review_suggestions=state.review_suggestions_pending,
                 review_notes=state.review_notes,
-                verdict_cmd=verdict_contract.command(cfg.runtime_dir, "tester")),
+                verdict_cmd=verdict_contract.command(cfg.runtime_dir, "tester"))
+                + _ledger_context(project, ledger.TASK_LINES),
                 lambda text: parse_tester_decision(
                     text, project=project,
                     allow_finalize=state.review_suggestions_pending))
@@ -1382,7 +1465,8 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 task["file"], test_cmd,
                 decision=decision.data,
                 capsule=capsule,
-                verdict_cmd=verdict_contract.command(cfg.runtime_dir, "coder")),
+                verdict_cmd=verdict_contract.command(cfg.runtime_dir, "coder"))
+                + _ledger_context(project, ledger.TASK_LINES),
                 lambda text: parse_coder_decision(text, project=project))
             # Zapis notatki kanałem, którym decyzja i tak wraca. Tura
             # narzędziowa kosztowałaby tu dziesiątki tysięcy tokenów wejścia i
@@ -1619,7 +1703,8 @@ def phase_verify_stories(cfg: Config, project: str, state: State, logf) -> bool:
         for name, item in evidence.items()) or "(brak targetów mechanicznych)"
     try:
         data = _decision_with_retry(
-            prompts.verify_stories_prompt(stories=stories_text, evidence=evidence_text),
+            prompts.verify_stories_prompt(stories=stories_text, evidence=evidence_text)
+            + _ledger_context(project, ledger.PHASE_LINES),
             lambda value: run_role(
                 "verifier", value, cfg, project, logf("verify-stories")),
             lambda text: _parse_story_verification(text, project=project),
@@ -1685,6 +1770,7 @@ def phase_verify_goal(cfg: Config, project: str, state: State, logf) -> bool:
     verify_prompt = prompts.verify_goal_prompt(
         state.verify_cycle, evidence, cycle_dir,
         story_report=_fresh_story_report(project, state))
+    verify_prompt += _ledger_context(project, ledger.PHASE_LINES)
     try:
         data = _decision_with_retry(
             verify_prompt,
