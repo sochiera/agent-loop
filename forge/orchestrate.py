@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +24,8 @@ from . import master_gate
 from . import notebooks
 from . import prompts
 from . import preflight
+from . import runlock
+from . import snapshot
 from . import verify
 from . import verdict as verdict_contract
 from .shellrun import run_shellfree
@@ -1856,13 +1860,7 @@ def _transcript_log_path(project: str, iteration: int, phase: str) -> Path:
 
 
 def _transcript_log_dir(project: str) -> Path:
-    import hashlib
-    root = Path(project).resolve()
-    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:10]
-    project_key = f"{root.name or 'project'}-{digest}"
-    cache = Path(os.environ.get(
-        "XDG_CACHE_HOME", str(Path.home() / ".cache")))
-    return cache / "forge" / project_key / "logs"
+    return snapshot.cache_root() / snapshot.project_key(project) / "logs"
 
 
 def _prune_transcript_logs(log_dir: Path, current_iteration: int) -> None:
@@ -2108,6 +2106,55 @@ def discard_legacy_task(project: str, cfg: Config) -> Path:
     return modern
 
 
+SNAPSHOT_ENV = "FORGE_CODE_SNAPSHOT"
+_SNAPSHOT_REEXEC = "FORGE_CODE_SNAPSHOT_REEXEC"
+
+
+def _reexec_from_snapshot() -> None:
+    """Przenieś bieg na własną kopię kodu i wystartuj go od nowa.
+
+    Bez tego gwarancja z ``docs/AWARIE-2026-08-11.md`` kończyłaby się na GUI,
+    a awaria B dotyczyła procesu uruchomionego z linii poleceń: kod ``.py``
+    wczytuje się raz, przy starcie, a szablony promptów przy każdym renderze,
+    więc commit pod pracującą pętlą rozjeżdża jedno z drugim.
+
+    ``PYTHONSAFEPATH`` jest tu warunkiem poprawności, nie ozdobą: przy ``-m``
+    Python wkłada bieżący katalog na POCZĄTEK ``sys.path``, więc uruchomienie
+    z repozytorium wczytałoby pakiet stamtąd mimo ``PYTHONPATH`` — i zapętliło
+    przenosiny. Znacznik w środowisku jest drugim bezpiecznikiem tej samej
+    rzeczy. ``FORGE_CODE_SNAPSHOT=0`` wyłącza mechanizm (praca z debuggerem,
+    świadome łatanie kodu w trakcie biegu)."""
+    if (os.environ.get(SNAPSHOT_ENV) or "").strip().lower() in {
+            "0", "off", "none", "false", "nie"}:
+        return
+    if os.environ.get(_SNAPSHOT_REEXEC) == "1":
+        return
+    package = Path(__file__).resolve().parent
+    if snapshot.is_snapshot(package.parent):
+        return
+    try:
+        code = snapshot.create(package)
+    except OSError as exc:
+        log(f"UWAGA: nie udało się zrobić migawki kodu ({exc}); "
+            "bieg pracuje na drzewie roboczym.")
+        return
+    env = os.environ.copy()
+    env[_SNAPSHOT_REEXEC] = "1"
+    env["PYTHONSAFEPATH"] = "1"
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (f"{code.path}{os.pathsep}{existing}" if existing
+                         else str(code.path))
+    log(f"Bieg startuje z migawki kodu: {code.describe()} "
+        f"({SNAPSHOT_ENV}=0 wyłącza).")
+    try:
+        os.execve(sys.executable,
+                  [sys.executable, "-u", "-m", "forge.orchestrate",
+                   *sys.argv[1:]], env)
+    except OSError as exc:
+        log(f"UWAGA: nie udało się przejść na migawkę ({exc}); "
+            "bieg pracuje na drzewie roboczym.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Forge KISS: tester → coder → review; max_tdd_rounds chroni małe zadania.")
     parser.add_argument("--brief", default="game.md"); parser.add_argument("--project", default="game")
@@ -2116,6 +2163,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-iters", type=int, default=0); parser.add_argument("--batch-size", type=int); parser.add_argument("--max-tdd-rounds", type=int)
     parser.add_argument("--tester-agent"); parser.add_argument("--coder-agent"); parser.add_argument("--reviewer-agent"); parser.add_argument("--planner-agent")
     args = parser.parse_args(argv)
+    # Tylko dla PRAWDZIWEGO uruchomienia z powłoki: wywołanie programowe
+    # (testy, osadzenie) dostało argumenty w ``argv`` i nie ma czego ponawiać.
+    if argv is None:
+        _reexec_from_snapshot()
     try:
         cfg = Config(brief_path=args.brief)
     except ValueError as exc:
@@ -2123,6 +2174,37 @@ def main(argv: list[str] | None = None) -> int:
     for key in ("batch_size", "max_tdd_rounds", "tester_agent", "coder_agent", "reviewer_agent", "planner_agent"):
         value = getattr(args, key)
         if value is not None: setattr(cfg, key, value)
+    with contextlib.ExitStack() as stack:
+        # Dzierżawa migawki: dopóki bieg trwa, sprzątacz nie może wyjąć spod
+        # niego kodu, choćby pętla pracowała dłużej niż okres przechowywania.
+        lease = snapshot.hold()
+        if lease is not None:
+            stack.enter_context(lease)
+        # Zamek projektu bierzemy PRZED czymkolwiek, co dotyka drzewa — łącznie
+        # z porzuceniem starego zadania, bo ono również przepisuje STATE.json.
+        try:
+            stack.enter_context(runlock.acquire(args.project, cfg.runtime_dir))
+            # Sesja Claude Code w trybie plikowym jest zasobem GLOBALNYM, więc
+            # jej wyłączność rozstrzyga się tutaj, a nie w warstwie
+            # uruchamiającej: inaczej drugie okno GUI albo zwykłe wywołanie
+            # z powłoki nadal unieważniałoby sesję wszystkim.
+            session = preflight.claude_file_session_lock(cfg)
+        except runlock.RunLocked as exc:
+            print(str(exc), file=sys.stderr, flush=True)
+            return 4
+        except OSError as exc:
+            # Niezapisywalny cache nie jest powodem do wywrócenia biegu
+            # tracebackiem: zamek jest ochroną, a nie warunkiem poprawności.
+            log(f"UWAGA: nie udało się wziąć zamku sesji Claude Code ({exc}).")
+            session = None
+        if session is not None:
+            stack.enter_context(session)
+        return _run(args, cfg, parser)
+
+
+def _run(args: argparse.Namespace, cfg: Config,
+         parser: argparse.ArgumentParser) -> int:
+    """Bieg na projekcie, którego zamek trzyma już wołający."""
     if args.discard_legacy_task:
         try:
             discard_legacy_task(args.project, cfg)

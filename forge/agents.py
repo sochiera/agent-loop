@@ -158,7 +158,8 @@ def _isolated_agent_env(name: str) -> dict[str, str]:
         # ~/.claude/CLAUDE.md even when GROK_HOME is isolated. This config is
         # Forge-owned, entirely generated on every invocation, and intentionally
         # contains no personal rules; user edits to this file are overwritten.
-        (target / "config.toml").write_text(
+        _write_atomic(
+            target / "config.toml",
             "[compat.claude]\n"
             "skills = false\n"
             "rules = false\n"
@@ -166,10 +167,29 @@ def _isolated_agent_env(name: str) -> dict[str, str]:
             "mcps = false\n"
             "hooks = false\n"
             "sessions = false\n",
-            encoding="utf-8",
         )
         env["GROK_HOME"] = str(target)
     return env
+
+
+def _write_atomic(destination: Path, content: str) -> None:
+    """Zapis widoczny dla czytelnika w całości albo wcale.
+
+    Dwa równoległe biegi wołają ``_isolated_agent_env`` przy KAŻDEJ turze na tym
+    samym izolowanym domu, więc zwykły ``write_text`` daje drugiemu procesowi
+    szansę odczytać plik w połowie zapisu — czyli konfigurację, która nie jest
+    już żadną z dwóch prawidłowych wersji."""
+    temporary = destination.with_name(
+        f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, destination)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _prepare_isolated_home(

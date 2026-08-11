@@ -9,6 +9,20 @@ zadania — osobno dla simple/standard/complex) i łańcuch zapasowy. Model, eff
 i trasa są jedną pozycją; GPT i Grok zawsze biegną przez OpenCode. Wybór zapisuje się
 poza repozytorium, więc obowiązuje też
 uruchomienia z CLI i nie wymaga commita przy każdej zmianie dostawcy.
+
+Jedno okno prowadzi KILKA BIEGÓW naraz — każdy ma własny projekt, własny brief,
+własny proces i własną zakładkę logu. Routing ról jest wspólny (te same modele
+w obu projektach to typowy przypadek), ale każdy bieg dostaje jego MIGAWKĘ,
+więc późniejsze przekręcenie pokrętła nie sięga procesu, który już pracuje.
+Trzy rzeczy, których równoległość nie znosi, mają swoje zamki — wszystkie
+rozstrzyga sam orkiestrator, więc obowiązują tak samo drugie okno panelu, jak
+i uruchomienie z linii poleceń. Panel tylko w nie ZAGLĄDA, żeby operator dostał
+powód przed startem procesu, a nie po nim:
+
+- jeden bieg na katalog projektu (``runlock``),
+- kod z migawki (``snapshot``), żeby commit w repozytorium Forge nie wywrócił
+  pracującej pętli — patrz ``docs/AWARIE-2026-08-11.md``,
+- wyłączność na plikową sesję Claude Code, dopóki nie ma nierotującego tokenu.
 """
 from __future__ import annotations
 
@@ -20,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -32,8 +47,11 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from .config import Config, TASK_DIFFICULTIES, validate_master_agent
 from . import catalog
+from . import preflight
 from . import report
 from . import routing as routing_module
+from . import runlock
+from . import snapshot
 from .adapters import canonical_agent
 
 
@@ -45,6 +63,15 @@ MAX_LOG_LINES = 5_000
 STOP_TERM_DELAY_S = 8
 STOP_KILL_DELAY_S = 5
 SESSION_LOG_NAME = "gui_run.log"
+ROUTING_RUN_DIR = "routing"
+# Zapisy routingu kolejnych biegów tego projektu; starsze są tylko archiwum.
+KEEP_ROUTING_SNAPSHOTS = 5
+DEFAULT_BRIEF = "game.md"
+DEFAULT_PROJECT = "game"
+# Dwa biegi to już podwojony rachunek za tokeny i dwa razy szybciej osiągnięty
+# limit dostawcy. Sufit jest po to, żeby panel nie zachęcał do skali, której
+# ani maszyna, ani konto u dostawcy nie udźwigną.
+MAX_RUNS = 4
 AGENTS = catalog.AGENTS
 MASTER_AGENTS = AGENTS
 ROLE_DEFS = routing_module.ROLE_DEFS
@@ -88,11 +115,48 @@ def routing_path(environ: dict[str, str] | None = None) -> Path:
             or routing_module.default_path(environ))
 
 
-def resolve_project(project: str) -> Path:
-    """Ta sama reguła co w orkiestratorze: proces ma cwd=ROOT, więc ścieżka
-    względna projektu jest względna do ROOT, nie do bieżącego katalogu GUI."""
-    path = Path(project).expanduser()
+def resolve_path(value: str) -> Path:
+    """Ścieżka względna liczona od repozytorium Forge, nie od cwd GUI.
+
+    Historycznie wynikało to z ``cwd=ROOT`` procesu orkiestratora. Proces
+    startuje dziś z katalogu MIGAWKI kodu, więc reguła musi być zapisana tutaj
+    jawnie, a do orkiestratora idą już ścieżki absolutne — inaczej ``game``
+    oznaczałoby katalog wewnątrz migawki."""
+    path = Path(value).expanduser()
     return path if path.is_absolute() else ROOT / path
+
+
+def resolve_project(project: str) -> Path:
+    return resolve_path(project)
+
+
+def run_settings(settings: dict[str, Any]) -> list[dict[str, str]]:
+    """Lista biegów z pliku ustawień; zawsze co najmniej jeden.
+
+    Starszy plik opisywał jeden bieg płaskimi kluczami ``brief``/``project``.
+    Migrujemy go do jednoelementowej listy, bo inaczej pierwsze uruchomienie
+    nowej wersji wyrzuciłoby operatorowi jego ostatni wybór ścieżek."""
+    entries = settings.get("runs")
+    runs: list[dict[str, str]] = []
+    if isinstance(entries, list):
+        for entry in entries[:MAX_RUNS]:
+            if not isinstance(entry, dict):
+                continue
+            brief = entry.get("brief")
+            project = entry.get("project")
+            runs.append({
+                "brief": brief if isinstance(brief, str) else DEFAULT_BRIEF,
+                "project": project if isinstance(project, str) else DEFAULT_PROJECT,
+            })
+    if runs:
+        return runs
+    legacy_brief = settings.get("brief")
+    legacy_project = settings.get("project")
+    return [{
+        "brief": legacy_brief if isinstance(legacy_brief, str) else DEFAULT_BRIEF,
+        "project": (legacy_project if isinstance(legacy_project, str)
+                    else DEFAULT_PROJECT),
+    }]
 
 
 def validate_routing(routing: routing_module.Routing) -> None:
@@ -112,15 +176,29 @@ def validate_routing(routing: routing_module.Routing) -> None:
                 validate_master_agent(agent)
 
 
+@dataclass(frozen=True)
+class Launch:
+    """Wszystko, czego potrzebuje ``Popen``, w jednym miejscu."""
+
+    command: list[str]
+    env: dict[str, str]
+    cwd: Path
+
+
 def build_launch(
     brief: str, project: str, routing: routing_module.Routing,
     routing_file: Path | None = None,
-) -> tuple[list[str], dict[str, str]]:
-    """Zbuduj bezpieczne argv i środowisko procesu orkiestratora.
+    code_root: Path | None = None,
+) -> Launch:
+    """Zbuduj bezpieczne argv, środowisko i katalog startowy orkiestratora.
 
     Konfiguracja ról jedzie JEDNYM kanałem — plikiem routingu. Stare zmienne
     ``FORGE_<ROLA>_AGENT/MODEL/EFFORT`` z powłoki są tu czyszczone, żeby wybór
-    z GUI nie przegrywał po cichu z zapomnianym exportem."""
+    z GUI nie przegrywał po cichu z zapomnianym exportem.
+
+    ``code_root`` to katalog zawierający pakiet ``forge`` — migawka kodu na czas
+    tego biegu. Ścieżki briefu i projektu idą dalej ABSOLUTNE: proces nie
+    startuje już z repozytorium, więc ``game`` nie może znaczyć „obok kodu"."""
     if not brief.strip():
         raise ValueError("Wskaż plik z briefem.")
     if not project.strip():
@@ -133,6 +211,13 @@ def build_launch(
             env.pop(f"FORGE_{definition.name.upper()}_{suffix}", None)
     env["FORGE_ROUTING_FILE"] = str(routing_file or routing_path())
 
+    root = Path(code_root) if code_root is not None else ROOT
+    # cwd wystarczyłoby do zaimportowania pakietu, ale PYTHONPATH przeżywa też
+    # ewentualną zmianę katalogu przez sam proces.
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (f"{root}{os.pathsep}{existing}" if existing
+                         else str(root))
+
     command = [
         sys.executable,
         "-u",
@@ -140,11 +225,11 @@ def build_launch(
         "forge.orchestrate",
         "--non-interactive",
         "--brief",
-        brief.strip(),
+        str(resolve_path(brief.strip())),
         "--project",
-        project.strip(),
+        str(resolve_project(project.strip())),
     ]
-    return command, env
+    return Launch(command, env, root)
 
 
 def line_kind(line: str) -> str:
@@ -168,6 +253,36 @@ def trim_log_buffer(buffer: Gtk.TextBuffer, max_lines: int = MAX_LOG_LINES) -> N
     result = buffer.get_iter_at_line(overflow)
     cutoff = result[1] if isinstance(result, tuple) else result
     buffer.delete(buffer.get_start_iter(), cutoff)
+
+
+def prune_routing_snapshots(directory: Path, keep: int = KEEP_ROUTING_SNAPSHOTS,
+                            protect: Path | None = None) -> None:
+    """Zostaw ostatnie ``keep`` zapisów routingu; resztę usuń (best-effort).
+
+    Kolejność bierzemy z czasu modyfikacji, nie z nazwy: w obrębie jednej
+    sekundy nazwy różni już tylko losowy sufiks, więc sortowanie alfabetyczne
+    potrafiłoby uznać świeży plik za najstarszy. ``protect`` to plik, który
+    właśnie czyta startujący proces — jego nie ruszamy niezależnie od wszystkiego."""
+    try:
+        files = sorted(directory.glob("run-*.json"),
+                       key=lambda path: path.stat().st_mtime_ns)
+    except OSError:
+        return
+    doomed = files[:-keep] if keep else files
+    for path in doomed:
+        if protect is not None and path == protect:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+
+
+def format_elapsed(seconds: float) -> str:
+    total = int(seconds)
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def _string_list(values: list[str]) -> Gtk.StringList:
@@ -533,6 +648,378 @@ class RoleCard(Gtk.Expander):
             f"<span alpha='65%'>{GLib.markup_escape_text(detail)}</span>")
 
 
+class Run:
+    """Jeden bieg: własny projekt, własny proces, własny log.
+
+    Cały stan przebiegu (proces, czas startu, bufor logu, uchwyt pliku sesji)
+    należy do TEGO obiektu, a nie do okna — inaczej drugi bieg nadpisywałby
+    pierwszemu wszystko, od czasu startu po plik logu."""
+
+    def __init__(self, owner: "ForgeWindow", brief: str, project: str):
+        self.owner = owner
+        self.process: subprocess.Popen[str] | None = None
+        self.started_at = 0.0
+        self.stop_requested = False
+        self._session_log_fh: Any = None
+
+        self.brief = Gtk.Entry(text=brief, placeholder_text=DEFAULT_BRIEF)
+        self.project = Gtk.Entry(text=project, placeholder_text=DEFAULT_PROJECT)
+        self.path_buttons: list[Gtk.Button] = []
+        self.status = Gtk.Label(label="Gotowy")
+        self.status.add_css_class("status-pill")
+        self.status.add_css_class("status-idle")
+        self.elapsed = Gtk.Label(label="Jeszcze nie uruchomiono", xalign=0)
+        self.elapsed.add_css_class("dim-label")
+
+        self.log_buffer = Gtk.TextBuffer()
+        for name, color, weight in (
+            ("normal", "#c8d3e0", 400),
+            ("success", "#6fe7a7", 600),
+            ("error", "#ff8e91", 600),
+            ("warning", "#ffd37a", 500),
+            ("phase", "#82b7ff", 700),
+        ):
+            self.log_buffer.create_tag(name, foreground=color, weight=weight)
+        self.log_view = Gtk.TextView(buffer=self.log_buffer, editable=False,
+                                     cursor_visible=False)
+        self.log_view.set_monospace(True)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_view.set_top_margin(14)
+        self.log_view.set_bottom_margin(14)
+        self.log_view.set_left_margin(14)
+        self.log_view.set_right_margin(14)
+
+        self.panel = self._build_panel()
+        self.page = self._build_log_page()
+        self.tab_label = Gtk.Label(label=self.title())
+        self._load_previous_run()
+
+    # --- widgety ----------------------------------------------------------
+    def _build_panel(self) -> Gtk.Widget:
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        panel.add_css_class("run-card")
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.title_label = Gtk.Label(xalign=0)
+        self.title_label.set_hexpand(True)
+        self.title_label.set_use_markup(True)
+        head.append(self.title_label)
+        head.append(self.status)
+        self.start_button = Gtk.Button(label="▶  Start")
+        self.start_button.add_css_class("suggested-action")
+        self.start_button.connect("clicked", lambda _button: self.start())
+        self.stop_button = Gtk.Button(label="Zatrzymaj")
+        self.stop_button.add_css_class("destructive-action")
+        self.stop_button.set_sensitive(False)
+        self.stop_button.connect("clicked", lambda _button: self.stop())
+        self.remove_button = Gtk.Button(icon_name="user-trash-symbolic",
+                                        tooltip_text="Usuń ten bieg z panelu")
+        self.remove_button.add_css_class("flat")
+        self.remove_button.connect(
+            "clicked", lambda _button: self.owner.remove_run(self))
+        head.append(self.start_button)
+        head.append(self.stop_button)
+        head.append(self.remove_button)
+        panel.append(head)
+
+        paths = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        for label, entry, callback in (
+            ("Brief", self.brief, self._choose_brief),
+            ("Katalog projektu", self.project, self._choose_project),
+        ):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            caption = Gtk.Label(label=label, xalign=0)
+            caption.add_css_class("field-label")
+            box.append(caption)
+            controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            entry.set_hexpand(True)
+            entry.connect("changed", self._paths_changed)
+            controls.append(entry)
+            choose = Gtk.Button(icon_name="folder-open-symbolic",
+                                tooltip_text=f"Wybierz: {label}")
+            choose.connect("clicked", callback)
+            self.path_buttons.append(choose)
+            controls.append(choose)
+            box.append(controls)
+            box.set_hexpand(True)
+            paths.append(box)
+        panel.append(paths)
+        self._update_title()
+        return panel
+
+    def _build_log_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_margin_top(16)
+        page.set_margin_bottom(16)
+        page.set_margin_start(16)
+        page.set_margin_end(16)
+        page.append(self.elapsed)
+        log_scroll = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
+        log_scroll.add_css_class("log-surface")
+        log_scroll.set_child(self.log_view)
+        page.append(log_scroll)
+        return page
+
+    def title(self) -> str:
+        """Nazwa biegu w zakładce: katalog projektu mówi więcej niż numer."""
+        text = self.project.get_text().strip()
+        return Path(text).name if text else "Nowy bieg"
+
+    def _update_title(self) -> None:
+        self.title_label.set_markup(
+            f"<b>{GLib.markup_escape_text(self.title())}</b>")
+
+    def _paths_changed(self, _entry: Gtk.Entry) -> None:
+        self._update_title()
+        self.tab_label.set_label(self.title())
+        # Same ścieżki, bez routingu: zapis pliku ról przy każdym znaku byłby
+        # kilkoma kilobajtami na naciśnięcie klawisza.
+        self.owner.save_paths()
+
+    def _choose_brief(self, _button: Gtk.Button) -> None:
+        self.owner.open_chooser("Wybierz plik z briefem",
+                                Gtk.FileChooserAction.OPEN, self.brief)
+
+    def _choose_project(self, _button: Gtk.Button) -> None:
+        self.owner.open_chooser("Wybierz katalog projektu",
+                                Gtk.FileChooserAction.SELECT_FOLDER, self.project)
+
+    def settings(self) -> dict[str, str]:
+        return {"brief": self.brief.get_text(), "project": self.project.get_text()}
+
+    def project_path(self) -> Path:
+        return resolve_project(self.project.get_text())
+
+    # --- log --------------------------------------------------------------
+    def append_log(self, line: str) -> None:
+        end = self.log_buffer.get_end_iter()
+        self.log_buffer.insert_with_tags_by_name(
+            end, line.rstrip() + "\n", line_kind(line))
+        trim_log_buffer(self.log_buffer)
+        mark = self.log_buffer.create_mark(None, self.log_buffer.get_end_iter(), False)
+        self.log_view.scroll_to_mark(mark, 0.05, True, 0.0, 1.0)
+        self.log_buffer.delete_mark(mark)
+        if self._session_log_fh is not None:
+            try:
+                self._session_log_fh.write(line.rstrip() + "\n")
+                self._session_log_fh.flush()
+            except OSError:
+                pass
+
+    def _load_previous_run(self) -> None:
+        """Po (re)starcie GUI pokaż log i statystyki poprzedniego biegu forge,
+        zanim jeszcze cokolwiek uruchomimy — nawet jeśli poprzedni proces
+        zginął bez pożegnania (SIGKILL, awaria)."""
+        project = self.project_path()
+        log_path = project / ".forge" / SESSION_LOG_NAME
+        if not log_path.is_file():
+            return
+        try:
+            content = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        if not content.strip():
+            return
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S",
+                              time.localtime(log_path.stat().st_mtime))
+        self.append_log(
+            f"===== Log poprzedniego uruchomienia ({stamp}) — {project} =====")
+        for line in content.splitlines():
+            self.append_log(line)
+        try:
+            stats = report.usage_summary(str(project))
+        except OSError:
+            stats = ""
+        if stats:
+            self.append_log("")
+            self.append_log("===== Zużycie tokenów (łącznie w tym projekcie) =====")
+            for line in stats.splitlines():
+                self.append_log(line)
+        self.append_log("")
+        self.append_log("===== Gotowy do nowego uruchomienia =====")
+
+    def _open_session_log(self) -> None:
+        self._close_session_log()
+        try:
+            runtime = self.project_path() / ".forge"
+            runtime.mkdir(parents=True, exist_ok=True)
+            self._session_log_fh = open(
+                runtime / SESSION_LOG_NAME, "w", encoding="utf-8")
+        except OSError:
+            self._session_log_fh = None
+
+    def _close_session_log(self) -> None:
+        if self._session_log_fh is not None:
+            try:
+                self._session_log_fh.close()
+            except OSError:
+                pass
+            self._session_log_fh = None
+
+    def show_error(self, message: str) -> None:
+        self.append_log(f"BŁĄD: {message}")
+        self.status.set_label("Błąd")
+        self.status.remove_css_class("status-idle")
+        self.status.remove_css_class("status-running")
+        self.status.add_css_class("status-error")
+        self.owner.refresh_state()
+
+    # --- cykl życia -------------------------------------------------------
+    def is_running(self) -> bool:
+        return self.process is not None
+
+    def _set_running(self, running: bool, label: str | None = None) -> None:
+        self.start_button.set_sensitive(not running)
+        self.stop_button.set_sensitive(running)
+        self.brief.set_sensitive(not running)
+        self.project.set_sensitive(not running)
+        self.remove_button.set_sensitive(not running)
+        for button in self.path_buttons:
+            button.set_sensitive(not running)
+        self.status.set_label(label or ("Pracuje" if running else "Gotowy"))
+        self.status.remove_css_class("status-idle")
+        self.status.remove_css_class("status-running")
+        self.status.remove_css_class("status-error")
+        self.status.add_css_class("status-running" if running else "status-idle")
+        self.owner.refresh_state()
+
+    def routing_snapshot(self, routing: routing_module.Routing) -> Path:
+        """Zapisz routing, którym pracuje TEN bieg, obok jego stanu.
+
+        Wspólny plik ról jest edytowalny w trakcie pracy (drugi bieg trzeba
+        przecież skonfigurować), więc bieg dostaje własną kopię. Przy okazji
+        zostaje ślad, czym naprawdę pracował — inaczej porównanie kosztu dwóch
+        projektów opiera się na pamięci operatora.
+
+        Nazwa jest JEDNORAZOWA. Stała kolidowałaby przy dwóch startach tego
+        samego projektu z różnych okien: zapis wyprzedza zamek projektu (a
+        ``Config`` czyta plik jeszcze przed jego przejęciem), więc drugi start
+        podmieniłby plik pierwszemu i zwycięski proces wystartowałby z cudzym
+        routingiem."""
+        directory = self.project_path() / ".forge" / ROUTING_RUN_DIR
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = directory / f"run-{stamp}-{uuid.uuid4().hex[:8]}.json"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            routing_module.save(routing, path)
+        except OSError as exc:
+            self.append_log(
+                f"UWAGA: nie udało się zapisać routingu biegu ({exc}); "
+                "używam wspólnego pliku ról.")
+            return self.owner.routing_file
+        prune_routing_snapshots(directory, protect=path)
+        return path
+
+    def start(self) -> None:
+        if self.is_running():
+            return
+        problem = self.owner.blocking_problem(self)
+        if problem:
+            self.show_error(problem)
+            return
+        try:
+            routing = self.owner.current_routing()
+            code = snapshot.create()
+            launch = build_launch(
+                self.brief.get_text(), self.project.get_text(), routing,
+                self.routing_snapshot(routing), code.path)
+            self.owner.save_settings()
+            self.process = subprocess.Popen(
+                launch.command,
+                cwd=str(launch.cwd),
+                env=launch.env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as exc:
+            self.show_error(str(exc))
+            return
+
+        self.log_buffer.set_text("")
+        self._open_session_log()
+        self.started_at = time.monotonic()
+        self.stop_requested = False
+        self._set_running(True)
+        self.append_log(f"Uruchamiam forge — {code.describe()}")
+        threading.Thread(target=self._read_process, daemon=True).start()
+        GLib.timeout_add_seconds(1, self._update_elapsed)
+
+    def _read_process(self) -> None:
+        process = self.process
+        if process is None or process.stdout is None:
+            return
+        for line in process.stdout:
+            GLib.idle_add(self.append_log, line)
+        code = process.wait()
+        GLib.idle_add(self._process_finished, code)
+
+    def _process_finished(self, code: int) -> bool:
+        elapsed = max(0, time.monotonic() - self.started_at)
+        self.process = None
+        if self.stop_requested or code == 130:
+            self._set_running(False, "Zatrzymano")
+            self.append_log(
+                f"Proces zatrzymany (actual elapsed: {format_elapsed(elapsed)}).")
+        elif code == 0:
+            self._set_running(False, "Ukończono")
+            self.append_log(
+                f"Proces zakończony poprawnie (actual elapsed: {format_elapsed(elapsed)}).")
+        else:
+            self._set_running(False)
+            self.show_error(
+                f"Proces zakończył się kodem {code} "
+                f"(actual elapsed: {format_elapsed(elapsed)}).")
+        self._close_session_log()
+        self.owner.run_finished(self)
+        return GLib.SOURCE_REMOVE
+
+    def _update_elapsed(self) -> bool:
+        if self.process is None:
+            return GLib.SOURCE_REMOVE
+        self.elapsed.set_label(
+            f"Czas biegu  {format_elapsed(time.monotonic() - self.started_at)}")
+        return GLib.SOURCE_CONTINUE
+
+    def stop(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        self.stop_button.set_sensitive(False)
+        self.status.set_label("Zatrzymywanie…")
+        self.stop_requested = True
+        self.append_log("Wysyłam bezpieczne przerwanie — stan zostanie zapisany…")
+        try:
+            os.killpg(self.process.pid, signal.SIGINT)
+        except OSError:
+            pass
+        process = self.process
+        GLib.timeout_add_seconds(
+            STOP_TERM_DELAY_S, self._escalate_stop, process, signal.SIGTERM)
+
+    def _escalate_stop(
+        self, process: subprocess.Popen[str], next_signal: signal.Signals
+    ) -> bool:
+        if self.process is not process or process.poll() is not None:
+            return GLib.SOURCE_REMOVE
+        if next_signal == signal.SIGTERM:
+            self.append_log("Proces nie odpowiedział — wysyłam SIGTERM…")
+            following = signal.SIGKILL
+            delay = STOP_KILL_DELAY_S
+        else:
+            self.append_log("Proces nadal nie odpowiada — wymuszam zakończenie…")
+            following = None
+            delay = 0
+        try:
+            os.killpg(process.pid, next_signal)
+        except OSError:
+            return GLib.SOURCE_REMOVE
+        if following is not None:
+            GLib.timeout_add_seconds(delay, self._escalate_stop, process, following)
+        return GLib.SOURCE_REMOVE
+
+
 class ForgeWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application):
         super().__init__(application=app, title="Forge — panel sterowania")
@@ -549,12 +1036,9 @@ class ForgeWindow(Adw.ApplicationWindow):
             height if isinstance(height, int) and height >= 620 else 780,
         )
         self.set_size_request(860, 620)
-        self.process: subprocess.Popen[str] | None = None
-        self.started_at = 0.0
+        self.runs: list[Run] = []
         self._closing = False
-        self.stop_requested = False
         self._chooser: Gtk.FileChooserNative | None = None
-        self._session_log_fh: Any = None
         self._ready = False
 
         header = Adw.HeaderBar()
@@ -566,16 +1050,16 @@ class ForgeWindow(Adw.ApplicationWindow):
         self.status.add_css_class("status-idle")
         header.pack_start(self.status)
 
-        self.stop_button = Gtk.Button(label="Zatrzymaj")
+        self.stop_button = Gtk.Button(label="Zatrzymaj wszystkie")
         self.stop_button.add_css_class("destructive-action")
         self.stop_button.set_sensitive(False)
-        self.stop_button.connect("clicked", self._stop)
+        self.stop_button.connect("clicked", self._stop_all)
         header.pack_end(self.stop_button)
 
-        self.start_button = Gtk.Button(label="▶  Start")
+        self.start_button = Gtk.Button(label="▶  Start wszystkie")
         self.start_button.add_css_class("suggested-action")
         self.start_button.add_css_class("start-button")
-        self.start_button.connect("clicked", self._start)
+        self.start_button.connect("clicked", self._start_all)
         header.pack_end(self.start_button)
 
         toolbar = Adw.ToolbarView()
@@ -584,7 +1068,7 @@ class ForgeWindow(Adw.ApplicationWindow):
         self.set_content(toolbar)
         self.connect("close-request", self._close_requested)
         self._ready = True
-        self._load_previous_run()
+        self.refresh_state()
 
     def _build_content(self) -> Gtk.Widget:
         split = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -613,7 +1097,9 @@ class ForgeWindow(Adw.ApplicationWindow):
                    "Ostatni wybór jest przywracany przy kolejnym uruchomieniu. "
                    "Routing zapisuje się w "
                    + str(self.routing_file) + " i obowiązuje także uruchomienia "
-                   "z linii poleceń."),
+                   "z linii poleceń. Każdy bieg dostaje jego migawkę w chwili "
+                   "startu, więc zmiany w trakcie pracy nie dotykają biegu, "
+                   "który już ruszył."),
             xalign=0,
             wrap=True,
         )
@@ -621,37 +1107,20 @@ class ForgeWindow(Adw.ApplicationWindow):
         config.append(heading)
         config.append(info)
 
-        paths = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        saved_brief = self.settings.get("brief", "game.md")
-        saved_project = self.settings.get("project", "game")
-        self.brief = Gtk.Entry(
-            text=saved_brief if isinstance(saved_brief, str) else "game.md",
-            placeholder_text="game.md",
-        )
-        self.project = Gtk.Entry(
-            text=saved_project if isinstance(saved_project, str) else "game",
-            placeholder_text="game",
-        )
-        self.path_buttons: list[Gtk.Button] = []
-        for label, entry, callback in (
-            ("Brief", self.brief, self._choose_brief),
-            ("Katalog projektu", self.project, self._choose_project),
-        ):
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-            caption = Gtk.Label(label=label, xalign=0)
-            caption.add_css_class("field-label")
-            box.append(caption)
-            controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            entry.set_hexpand(True)
-            controls.append(entry)
-            choose = Gtk.Button(icon_name="folder-open-symbolic", tooltip_text=f"Wybierz: {label}")
-            choose.connect("clicked", callback)
-            self.path_buttons.append(choose)
-            controls.append(choose)
-            box.append(controls)
-            box.set_hexpand(True)
-            paths.append(box)
-        config.append(paths)
+        runs_heading = Gtk.Label(xalign=0)
+        runs_heading.set_markup("<span size='large' weight='bold'>Biegi</span>")
+        config.append(runs_heading)
+        self.runs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        config.append(self.runs_box)
+        self.logs = Gtk.Notebook()
+        self.logs.set_scrollable(True)
+        self.add_run_button = Gtk.Button(label="+  Dodaj bieg")
+        self.add_run_button.add_css_class("flat")
+        self.add_run_button.connect("clicked", lambda _button: self.add_run())
+        config.append(self.add_run_button)
+
+        for entry in run_settings(self.settings):
+            self.add_run(entry["brief"], entry["project"], notify=False)
 
         roles_heading = Gtk.Label(xalign=0)
         roles_heading.set_markup("<span size='large' weight='bold'>Role</span>")
@@ -663,7 +1132,7 @@ class ForgeWindow(Adw.ApplicationWindow):
         entries = catalog.index()
         self.role_cards: dict[str, RoleCard] = {}
         for definition in ROLE_DEFS:
-            card = RoleCard(definition, defaults, self._save_settings, entries)
+            card = RoleCard(definition, defaults, self._role_changed, entries)
             saved = self.routing.roles.get(definition.name)
             if saved is not None:
                 card.apply(saved)
@@ -678,31 +1147,10 @@ class ForgeWindow(Adw.ApplicationWindow):
         log_box.set_margin_end(20)
         log_heading = Gtk.Label(xalign=0)
         log_heading.set_markup("<span size='large' weight='bold'>Status pracy</span>")
-        self.elapsed = Gtk.Label(label="Jeszcze nie uruchomiono", xalign=0)
-        self.elapsed.add_css_class("dim-label")
         log_box.append(log_heading)
-        log_box.append(self.elapsed)
-
-        log_scroll = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
-        log_scroll.add_css_class("log-surface")
-        self.log_buffer = Gtk.TextBuffer()
-        for name, color, weight in (
-            ("normal", "#c8d3e0", 400),
-            ("success", "#6fe7a7", 600),
-            ("error", "#ff8e91", 600),
-            ("warning", "#ffd37a", 500),
-            ("phase", "#82b7ff", 700),
-        ):
-            self.log_buffer.create_tag(name, foreground=color, weight=weight)
-        self.log_view = Gtk.TextView(buffer=self.log_buffer, editable=False, cursor_visible=False)
-        self.log_view.set_monospace(True)
-        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.log_view.set_top_margin(14)
-        self.log_view.set_bottom_margin(14)
-        self.log_view.set_left_margin(14)
-        self.log_view.set_right_margin(14)
-        log_scroll.set_child(self.log_view)
-        log_box.append(log_scroll)
+        self.logs.set_vexpand(True)
+        self.logs.set_hexpand(True)
+        log_box.append(self.logs)
 
         split.set_start_child(config_scroll)
         split.set_end_child(log_box)
@@ -712,21 +1160,99 @@ class ForgeWindow(Adw.ApplicationWindow):
         split.set_shrink_end_child(False)
         return split
 
-    def _choose_brief(self, _button: Gtk.Button) -> None:
-        self._open_chooser(
-            "Wybierz plik z briefem",
-            Gtk.FileChooserAction.OPEN,
-            self.brief,
-        )
+    # --- biegi ------------------------------------------------------------
+    def add_run(self, brief: str = DEFAULT_BRIEF, project: str = DEFAULT_PROJECT,
+                notify: bool = True) -> Run | None:
+        if len(self.runs) >= MAX_RUNS:
+            return None
+        run = Run(self, brief, project)
+        self.runs.append(run)
+        self.runs_box.append(run.panel)
+        self.logs.append_page(run.page, run.tab_label)
+        if notify:
+            self.save_settings()
+        self.refresh_state()
+        return run
 
-    def _choose_project(self, _button: Gtk.Button) -> None:
-        self._open_chooser(
-            "Wybierz katalog projektu",
-            Gtk.FileChooserAction.SELECT_FOLDER,
-            self.project,
-        )
+    def remove_run(self, run: Run) -> None:
+        """Usuń wiersz biegu. Pracującego nie ruszamy — najpierw zatrzymanie."""
+        if run.is_running() or len(self.runs) <= 1 or run not in self.runs:
+            return
+        self.runs.remove(run)
+        self.runs_box.remove(run.panel)
+        page = self.logs.page_num(run.page)
+        if page >= 0:
+            self.logs.remove_page(page)
+        self.save_settings()
+        self.refresh_state()
 
-    def _open_chooser(
+    def running_runs(self) -> list[Run]:
+        return [run for run in self.runs if run.is_running()]
+
+    def blocking_problem(self, run: Run) -> str:
+        """Powód, dla którego TEN bieg nie powinien wystartować; ``""`` = wolna droga.
+
+        Wszystkie trzy sprawdzenia dotyczą zasobów współdzielonych między
+        biegami — katalogu projektu i sesji Claude Code. Odmawiamy TUTAJ, bo
+        każde z nich zauważone później kosztuje albo zniszczony stan projektu,
+        albo godziny pracy modelu."""
+        project = run.project_path()
+        # Porównanie po ``resolve``: ten sam katalog zapisany przez dowiązanie
+        # albo z ``..`` w ścieżce jest tym samym drzewem git i tym samym
+        # STATE.json, choć teksty w polach się różnią.
+        resolved = project.resolve()
+        for other in self.runs:
+            if other is not run and other.is_running() \
+                    and other.project_path().resolve() == resolved:
+                return ("Ten katalog projektu prowadzi już inny bieg w tym "
+                        "oknie. Dwa procesy na jednym drzewie nadpisują sobie "
+                        "STATE.json i commity.")
+        busy = runlock.busy_reason(str(project))
+        if busy:
+            return busy
+        try:
+            config = Config(routing=self.current_routing())
+        except ValueError as exc:
+            return str(exc)
+        # Pytamy ZAWSZE, nie tylko przy drugim biegu w tym oknie: plikowa sesja
+        # Claude Code jest zasobem całej maszyny, więc trzymać ją może równie
+        # dobrze drugie okno GUI albo bieg uruchomiony z powłoki.
+        return preflight.claude_file_session_busy(config)
+
+    def run_finished(self, _run: Run) -> None:
+        self.refresh_state()
+        if self._closing and not self.running_runs():
+            self.destroy()
+
+    def refresh_state(self) -> None:
+        """Nagłówek mówi o CAŁYM oknie; szczegóły są przy każdym biegu."""
+        if not hasattr(self, "runs_box"):
+            return
+        active = len(self.running_runs())
+        self.start_button.set_sensitive(active < len(self.runs))
+        self.stop_button.set_sensitive(active > 0)
+        self.add_run_button.set_sensitive(len(self.runs) < MAX_RUNS)
+        for run in self.runs:
+            run.remove_button.set_sensitive(
+                not run.is_running() and len(self.runs) > 1)
+        self.status.set_label(
+            "Gotowy" if not active else
+            "Pracuje" if active == 1 else f"Pracują {active} biegi")
+        self.status.remove_css_class("status-idle")
+        self.status.remove_css_class("status-running")
+        self.status.add_css_class("status-running" if active else "status-idle")
+
+    def _start_all(self, _button: Gtk.Button) -> None:
+        for run in self.runs:
+            if not run.is_running():
+                run.start()
+
+    def _stop_all(self, _button: Gtk.Button | None = None) -> None:
+        for run in self.running_runs():
+            run.stop()
+
+    # --- wspólne dla okna -------------------------------------------------
+    def open_chooser(
         self, title: str, action: Gtk.FileChooserAction, target: Gtk.Entry
     ) -> None:
         chooser = Gtk.FileChooserNative(
@@ -736,9 +1262,7 @@ class ForgeWindow(Adw.ApplicationWindow):
             accept_label="Wybierz",
             cancel_label="Anuluj",
         )
-        current = Path(target.get_text()).expanduser()
-        if not current.is_absolute():
-            current = ROOT / current
+        current = resolve_path(target.get_text())
         try:
             if action == Gtk.FileChooserAction.SELECT_FOLDER:
                 initial = current if current.is_dir() else current.parent
@@ -755,7 +1279,7 @@ class ForgeWindow(Adw.ApplicationWindow):
                 chosen = dialog.get_file()
                 if chosen is not None and chosen.get_path():
                     target.set_text(chosen.get_path())
-                    self._save_settings()
+                    self.save_settings()
             self._chooser = None
             dialog.destroy()
 
@@ -763,209 +1287,15 @@ class ForgeWindow(Adw.ApplicationWindow):
         self._chooser = chooser
         chooser.show()
 
-    def _append_log(self, line: str) -> None:
-        end = self.log_buffer.get_end_iter()
-        self.log_buffer.insert_with_tags_by_name(end, line.rstrip() + "\n", line_kind(line))
-        trim_log_buffer(self.log_buffer)
-        mark = self.log_buffer.create_mark(None, self.log_buffer.get_end_iter(), False)
-        self.log_view.scroll_to_mark(mark, 0.05, True, 0.0, 1.0)
-        self.log_buffer.delete_mark(mark)
-        if self._session_log_fh is not None:
-            try:
-                self._session_log_fh.write(line.rstrip() + "\n")
-                self._session_log_fh.flush()
-            except OSError:
-                pass
-
-    def _load_previous_run(self) -> None:
-        """Po (re)starcie GUI pokaż log i statystyki poprzedniego biegu forge,
-        zanim jeszcze cokolwiek uruchomimy — nawet jeśli poprzedni proces
-        zginął bez pożegnania (SIGKILL, awaria)."""
-        project = resolve_project(self.project.get_text())
-        log_path = project / ".forge" / SESSION_LOG_NAME
-        if not log_path.is_file():
-            return
-        try:
-            content = log_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return
-        if not content.strip():
-            return
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(log_path.stat().st_mtime))
-        self._append_log(f"===== Log poprzedniego uruchomienia ({stamp}) — {project} =====")
-        for line in content.splitlines():
-            self._append_log(line)
-        try:
-            stats = report.usage_summary(str(project))
-        except OSError:
-            stats = ""
-        if stats:
-            self._append_log("")
-            self._append_log("===== Zużycie tokenów (łącznie w tym projekcie) =====")
-            for line in stats.splitlines():
-                self._append_log(line)
-        self._append_log("")
-        self._append_log("===== Gotowy do nowego uruchomienia =====")
-
-    def _open_session_log(self) -> None:
-        self._close_session_log()
-        project = resolve_project(self.project.get_text())
-        try:
-            runtime = project / ".forge"
-            runtime.mkdir(parents=True, exist_ok=True)
-            self._session_log_fh = open(runtime / SESSION_LOG_NAME, "w", encoding="utf-8")
-        except OSError:
-            self._session_log_fh = None
-
-    def _close_session_log(self) -> None:
-        if self._session_log_fh is not None:
-            try:
-                self._session_log_fh.close()
-            except OSError:
-                pass
-            self._session_log_fh = None
-
-    def _set_running(self, running: bool, label: str | None = None) -> None:
-        self.start_button.set_sensitive(not running)
-        self.stop_button.set_sensitive(running)
-        self.brief.set_sensitive(not running)
-        self.project.set_sensitive(not running)
-        for button in self.path_buttons:
-            button.set_sensitive(not running)
-        for card in self.role_cards.values():
-            card.set_sensitive_fields(not running)
-        self.status.set_label(label or ("Pracuje" if running else "Gotowy"))
-        self.status.remove_css_class("status-idle")
-        self.status.remove_css_class("status-running")
-        self.status.remove_css_class("status-error")
-        self.status.add_css_class("status-running" if running else "status-idle")
-
-    def _show_error(self, message: str) -> None:
-        self._append_log(f"BŁĄD: {message}")
-        self.status.set_label("Błąd")
-        self.status.remove_css_class("status-idle")
-        self.status.remove_css_class("status-running")
-        self.status.add_css_class("status-error")
-
     def current_routing(self) -> routing_module.Routing:
         return routing_module.Routing(roles={
             role: card.routing_entry()
             for role, card in self.role_cards.items()
         })
 
-    def _start(self, _button: Gtk.Button) -> None:
-        try:
-            routing = self.current_routing()
-            command, env = build_launch(
-                self.brief.get_text(), self.project.get_text(), routing,
-                self.routing_file)
-            self._save_settings()
-            self.process = subprocess.Popen(
-                command,
-                cwd=ROOT,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                start_new_session=True,
-            )
-        except (OSError, ValueError) as exc:
-            self._show_error(str(exc))
-            return
-
-        self.log_buffer.set_text("")
-        self._open_session_log()
-        self.started_at = time.monotonic()
-        self.stop_requested = False
-        self._set_running(True)
-        self._append_log("Uruchamiam forge…")
-        threading.Thread(target=self._read_process, daemon=True).start()
-        GLib.timeout_add_seconds(1, self._update_elapsed)
-
-    def _read_process(self) -> None:
-        process = self.process
-        if process is None or process.stdout is None:
-            return
-        for line in process.stdout:
-            GLib.idle_add(self._append_log, line)
-        code = process.wait()
-        GLib.idle_add(self._process_finished, code)
-
-    def _process_finished(self, code: int) -> bool:
-        elapsed = max(0, time.monotonic() - self.started_at)
-        self.process = None
-        if self.stop_requested:
-            self._set_running(False, "Zatrzymano")
-            self._append_log(f"Proces zatrzymany (actual elapsed: {self._format_elapsed(elapsed)}).")
-        elif code == 0:
-            self._set_running(False, "Ukończono")
-            self._append_log(f"Proces zakończony poprawnie (actual elapsed: {self._format_elapsed(elapsed)}).")
-        elif code == 130:
-            self._set_running(False, "Zatrzymano")
-            self._append_log(f"Proces zatrzymany (actual elapsed: {self._format_elapsed(elapsed)}).")
-        else:
-            self._set_running(False)
-            self._show_error(
-                f"Proces zakończył się kodem {code} (actual elapsed: {self._format_elapsed(elapsed)})."
-            )
-        self._close_session_log()
-        if self._closing:
-            self.destroy()
-        return GLib.SOURCE_REMOVE
-
-    @staticmethod
-    def _format_elapsed(seconds: float) -> str:
-        total = int(seconds)
-        hours, rest = divmod(total, 3600)
-        minutes, secs = divmod(rest, 60)
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-    def _update_elapsed(self) -> bool:
-        if self.process is None:
-            return GLib.SOURCE_REMOVE
-        self.elapsed.set_label(f"Czas biegu  {self._format_elapsed(time.monotonic() - self.started_at)}")
-        return GLib.SOURCE_CONTINUE
-
-    def _stop(self, _button: Gtk.Button | None = None) -> None:
-        if self.process is None or self.process.poll() is not None:
-            return
-        self.stop_button.set_sensitive(False)
-        self.status.set_label("Zatrzymywanie…")
-        self.stop_requested = True
-        self._append_log("Wysyłam bezpieczne przerwanie — stan zostanie zapisany…")
-        try:
-            os.killpg(self.process.pid, signal.SIGINT)
-        except OSError:
-            pass
-        process = self.process
-        GLib.timeout_add_seconds(STOP_TERM_DELAY_S, self._escalate_stop, process, signal.SIGTERM)
-
-    def _escalate_stop(
-        self, process: subprocess.Popen[str], next_signal: signal.Signals
-    ) -> bool:
-        if self.process is not process or process.poll() is not None:
-            return GLib.SOURCE_REMOVE
-        if next_signal == signal.SIGTERM:
-            self._append_log("Proces nie odpowiedział — wysyłam SIGTERM…")
-            following = signal.SIGKILL
-            delay = STOP_KILL_DELAY_S
-        else:
-            self._append_log("Proces nadal nie odpowiada — wymuszam zakończenie…")
-            following = None
-            delay = 0
-        try:
-            os.killpg(process.pid, next_signal)
-        except OSError:
-            return GLib.SOURCE_REMOVE
-        if following is not None:
-            GLib.timeout_add_seconds(delay, self._escalate_stop, process, following)
-        return GLib.SOURCE_REMOVE
-
     def _settings_payload(self) -> dict[str, Any]:
         return {
-            "brief": self.brief.get_text(),
-            "project": self.project.get_text(),
+            "runs": [run.settings() for run in self.runs],
             "window": {
                 "width": self.get_width(),
                 "height": self.get_height(),
@@ -973,28 +1303,39 @@ class ForgeWindow(Adw.ApplicationWindow):
             },
         }
 
-    def _save_settings(self) -> None:
+    def save_paths(self) -> None:
+        """Sam plik ustawień GUI, bez przepisywania routingu ról."""
+        if not self._ready:
+            return
+        try:
+            save_settings(self._settings_payload())
+        except OSError as exc:
+            for run in self.runs:
+                run.append_log(f"UWAGA: nie udało się zapisać ustawień GUI: {exc}")
+
+    def _role_changed(self) -> None:
+        self.save_settings()
+
+    def save_settings(self) -> None:
         """Zapisz ścieżki, geometrię i routing ról.
 
         Wołane przy KAŻDEJ zmianie pokrętła, nie tylko przy starcie — inaczej
         „to ma się zapamiętać" trzymałoby się wyłącznie udanych uruchomień."""
         if not self._ready:
             return
-        try:
-            save_settings(self._settings_payload())
-        except OSError as exc:
-            self._append_log(f"UWAGA: nie udało się zapisać ustawień GUI: {exc}")
+        self.save_paths()
         try:
             routing_module.save(self.current_routing(), self.routing_file)
         except OSError as exc:
-            self._append_log(f"UWAGA: nie udało się zapisać routingu ról: {exc}")
+            for run in self.runs:
+                run.append_log(f"UWAGA: nie udało się zapisać routingu ról: {exc}")
 
     def _close_requested(self, _window: Gtk.Window) -> bool:
-        self._save_settings()
-        if self.process is None:
+        self.save_settings()
+        if not self.running_runs():
             return False
         self._closing = True
-        self._stop()
+        self._stop_all()
         return True
 
 
@@ -1004,6 +1345,12 @@ headerbar { background: #151c26; border-bottom: 1px solid rgba(255,255,255,.08);
 .role-card {
   background: #18212d;
   border: 1px solid rgba(255,255,255,.08);
+  border-radius: 14px;
+  padding: 12px 16px;
+}
+.run-card {
+  background: #1a2432;
+  border: 1px solid rgba(255,255,255,.10);
   border-radius: 14px;
   padding: 12px 16px;
 }

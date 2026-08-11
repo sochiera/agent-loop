@@ -49,6 +49,37 @@ picture entirely. Either way preflight reads the session state up front and
 refuses to start a run whose roles have no working endpoint left. See
 [docs/AWARIE-2026-08-11.md](docs/AWARIE-2026-08-11.md).
 
+## Two projects at once
+
+One panel drives several runs: each row is a separate project with its own
+brief, its own orchestrator process and its own log tab. Model routing stays
+shared — the same models in both projects is the normal case — but every run
+takes a snapshot of it at start, so configuring the second run cannot disturb
+the first.
+
+Three resources do not survive sharing. Each is guarded by a lock the
+orchestrator itself takes, so a run started from the command line participates
+on exactly the same terms as one started from the panel; the panel only peeks
+into those locks to explain a refusal before spending a process on it.
+
+- **The project directory.** One run per tree, enforced by an `flock` on
+  `<project>/.forge/run.lock`.
+- **The Forge source tree.** Every run moves itself onto a snapshot of the
+  `forge` package under `~/.cache/forge/code/` — the panel prepares one before
+  launching, and a bare `python3 -m forge.orchestrate` re-executes itself from a
+  fresh one. Committing to this repository under a working loop can therefore no
+  longer split the code held in memory from the prompt templates read off disk
+  (`docs/AWARIE-2026-08-11.md`). A running snapshot holds a shared lease, so
+  housekeeping cannot delete the code of a loop that has been working for weeks.
+  Two consequences worth knowing: a fix made mid-run applies only after that run
+  restarts, and `FORGE_CODE_SNAPSHOT=0` opts out when you deliberately want live
+  edits (a debugger, say).
+- **The Claude Code session.** While Forge authenticates from the shared
+  credentials file, one machine-wide lock admits a single run; the second is
+  refused up front rather than three hours later. Set the non-rotating token
+  described above and the lock is not taken at all — any number of runs can then
+  work in parallel.
+
 ## Research direction
 
 The project explores:

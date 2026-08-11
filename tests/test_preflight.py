@@ -1,10 +1,12 @@
+import os
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from forge import orchestrate, preflight
+from forge import orchestrate, preflight, runlock
 from forge.agents import AgentError
 from forge.config import Config
 from forge.state import State
@@ -154,6 +156,115 @@ def test_claude_session_is_not_checked_when_routing_avoids_claude(
             patch("forge.agents.claude_session_problem",
                   side_effect=AssertionError("nie wolno czytać sesji")):
         assert preflight.ensure_claude_session(str(project), cfg) == ""
+
+
+def _environ(tmp_path: Path) -> dict[str, str]:
+    """Bieg bez kluczy z plików operatora i z własnym katalogiem cache.
+
+    Zamek plikowej sesji Claude Code leży w cache, więc bez tej izolacji testy
+    walczyłyby o niego z prawdziwym biegiem na tej maszynie."""
+    return {"FORGE_ENV_FILES": "none", "XDG_CACHE_HOME": str(tmp_path / "cache")}
+
+
+def test_file_mode_claude_session_is_exclusive(tmp_path: Path) -> None:
+    """Sedno awarii A: drugi proces na jednym rotującym tokenie nie wsiada."""
+    cfg = Config(git_push=False)
+    assert any("claude" in name for name in cfg.agents_in_use()), \
+        "test ma sens tylko przy routingu sięgającym po Claude Code"
+    environ = _environ(tmp_path)
+
+    held = preflight.claude_file_session_lock(cfg, environ)
+
+    assert held is not None
+    with pytest.raises(runlock.RunLocked) as failure:
+        preflight.claude_file_session_lock(cfg, environ)
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in str(failure.value)
+    assert f"PID {os.getpid()}" in str(failure.value)
+    held.release()
+
+
+def test_the_lock_is_one_for_the_whole_machine(tmp_path: Path) -> None:
+    # Nie zależy od projektu ani od okna GUI — chroniony zasób jest globalny.
+    assert preflight.claude_file_session_lock_path(_environ(tmp_path)) == \
+        tmp_path / "cache" / "forge" / preflight.CLAUDE_SESSION_LOCK_NAME
+
+
+def test_token_lets_two_runs_share_claude(tmp_path: Path) -> None:
+    cfg = Config(git_push=False)
+    environ = _environ(tmp_path) | {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-x"}
+
+    assert preflight.claude_file_session_lock(cfg, environ) is None
+    assert preflight.claude_file_session_lock(cfg, environ) is None
+    assert not preflight.claude_file_session_lock_path(environ).exists()
+
+
+def test_forge_specific_token_also_counts(tmp_path: Path) -> None:
+    cfg = Config(git_push=False)
+    environ = _environ(tmp_path) | {"FORGE_CLAUDE_OAUTH_TOKEN": "sk-ant-oat-x"}
+    assert preflight.claude_file_session_lock(cfg, environ) is None
+
+
+def test_token_from_an_env_file_is_enough(tmp_path: Path) -> None:
+    """Powłoka bez eksportu nie jest powodem do odmowy — plik ``*.env`` też liczy."""
+    env_file = tmp_path / "keys.env"
+    env_file.write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-file\n", encoding="utf-8")
+    environ = _environ(tmp_path) | {"FORGE_ENV_FILES": str(env_file)}
+
+    assert preflight.claude_file_session_lock(
+        Config(git_push=False), environ) is None
+    assert environ["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-file"
+
+
+def test_runs_without_claude_are_unaffected(tmp_path: Path) -> None:
+    cfg = Config(git_push=False)
+    with patch.object(Config, "agents_in_use", return_value=["opencode"]):
+        assert preflight.claude_file_session_lock(cfg, _environ(tmp_path)) is None
+
+
+def test_operator_can_override_the_shared_session_guard(tmp_path: Path) -> None:
+    cfg = Config(git_push=False)
+    environ = _environ(tmp_path) | {preflight.SHARED_CLAUDE_OVERRIDE: "1"}
+    assert preflight.claude_file_session_lock(cfg, environ) is None
+
+
+def test_the_peek_reports_the_holder_without_taking_the_session(
+        tmp_path: Path) -> None:
+    cfg = Config(git_push=False)
+    environ = _environ(tmp_path)
+
+    assert preflight.claude_file_session_busy(cfg, environ) == ""
+
+    held = preflight.claude_file_session_lock(cfg, environ)
+    assert "Claude Code" in preflight.claude_file_session_busy(cfg, environ)
+    held.release()
+    assert preflight.claude_file_session_busy(cfg, environ) == ""
+
+
+def test_the_orchestrator_itself_refuses_a_shared_session(tmp_path: Path) -> None:
+    """Egzekwuje ORKIESTRATOR, więc dotyczy też uruchomień z linii poleceń."""
+    project = tmp_path / "projekt"
+    project.mkdir()
+    _repo(project)
+    brief = tmp_path / "brief.md"
+    brief.write_text("cel\n", encoding="utf-8")
+    environ = dict(os.environ) | _environ(tmp_path) | {"FORGE_ROUTING_FILE": "none"}
+    for name in ("CLAUDE_CODE_OAUTH_TOKEN", "FORGE_CLAUDE_OAUTH_TOKEN",
+                 preflight.SHARED_CLAUDE_OVERRIDE):
+        environ.pop(name, None)
+
+    held = preflight.claude_file_session_lock(Config(git_push=False), environ)
+    assert held is not None, "test wymaga trybu plikowego"
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "forge.orchestrate", "--non-interactive",
+             "--brief", str(brief), "--project", str(project)],
+            text=True, capture_output=True, env=environ,
+            cwd=str(Path(__file__).parents[1]), timeout=180)
+    finally:
+        held.release()
+
+    assert result.returncode == 4
+    assert "pliku sesji" in result.stderr
 
 
 def test_require_clean_identifies_preflight_invariant() -> None:

@@ -8,11 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from forge import catalog, routing
+from forge import catalog, gui, routing, runlock
 from forge.config import Config, TASK_DIFFICULTIES
 from forge.gui import (
     AGENTS,
+    DEFAULT_BRIEF,
+    DEFAULT_PROJECT,
     MASTER_AGENTS,
+    MAX_RUNS,
     ModelChooser,
     ROLE_DEFS,
     ROOT,
@@ -22,10 +25,11 @@ from forge.gui import (
     load_settings,
     resolve_project,
     routing_path,
+    run_settings,
     save_settings,
     trim_log_buffer,
 )
-from forge.gui import Gtk
+from forge.gui import Adw, Gtk
 
 # Widgety wymagają zainicjowanego GTK; bez sesji graficznej testy logiki
 # (ustawienia, argv, kolorowanie logu) nadal muszą się wykonać.
@@ -55,6 +59,34 @@ class GuiSettingsTest(unittest.TestCase):
             self.assertEqual(load_settings(path), {})
 
 
+class GuiRunSettingsTest(unittest.TestCase):
+    def test_a_single_run_is_migrated_from_the_flat_file(self) -> None:
+        # Stary plik opisywał jeden bieg; utrata tego wyboru przy pierwszym
+        # uruchomieniu nowej wersji byłaby regresją, nie „czystym startem".
+        self.assertEqual(
+            run_settings({"brief": "/tmp/b.md", "project": "/tmp/p"}),
+            [{"brief": "/tmp/b.md", "project": "/tmp/p"}])
+
+    def test_empty_settings_give_one_default_run(self) -> None:
+        self.assertEqual(run_settings({}),
+                         [{"brief": DEFAULT_BRIEF, "project": DEFAULT_PROJECT}])
+
+    def test_two_runs_survive_a_round_trip(self) -> None:
+        runs = [{"brief": "a.md", "project": "/tmp/a"},
+                {"brief": "b.md", "project": "/tmp/b"}]
+        self.assertEqual(run_settings({"runs": runs}), runs)
+
+    def test_more_runs_than_the_panel_allows_are_cut(self) -> None:
+        runs = [{"brief": f"{i}.md", "project": f"/tmp/{i}"}
+                for i in range(MAX_RUNS + 3)]
+        self.assertEqual(len(run_settings({"runs": runs})), MAX_RUNS)
+
+    def test_damaged_entries_fall_back_to_defaults(self) -> None:
+        self.assertEqual(
+            run_settings({"runs": [{"brief": 7}, "śmieć"]}),
+            [{"brief": DEFAULT_BRIEF, "project": DEFAULT_PROJECT}])
+
+
 class GuiRoutingPathTest(unittest.TestCase):
     def test_environment_overrides_the_default_file(self) -> None:
         environ = {"FORGE_ROUTING_FILE": "/tmp/moje-routing.json"}
@@ -70,24 +102,59 @@ class GuiRoutingPathTest(unittest.TestCase):
 
 class GuiLaunchTest(unittest.TestCase):
     def test_launch_points_the_orchestrator_at_the_routing_file(self) -> None:
-        command, env = build_launch(
+        launch = build_launch(
             "brief.md", "project", _routing({"roles": {"coder": {"agent": "codex"}}}),
             Path("/tmp/routing.json"))
 
-        self.assertIn("--non-interactive", command)
-        self.assertEqual(command[-4:], ["--brief", "brief.md", "--project", "project"])
-        self.assertEqual(env["FORGE_ROUTING_FILE"], "/tmp/routing.json")
+        self.assertIn("--non-interactive", launch.command)
+        self.assertEqual(launch.env["FORGE_ROUTING_FILE"], "/tmp/routing.json")
+
+    def test_paths_reach_the_orchestrator_absolute(self) -> None:
+        # Proces startuje z katalogu MIGAWKI kodu, więc „game" przekazane
+        # dosłownie wskazywałoby katalog wewnątrz migawki, a nie projekt.
+        launch = build_launch("brief.md", "project", _routing({"roles": {}}))
+
+        self.assertEqual(launch.command[-4:],
+                         ["--brief", str(ROOT / "brief.md"),
+                          "--project", str(ROOT / "project")])
+
+    def test_absolute_paths_are_passed_through(self) -> None:
+        launch = build_launch("/tmp/b.md", "/tmp/p", _routing({"roles": {}}))
+
+        self.assertEqual(launch.command[-4:],
+                         ["--brief", "/tmp/b.md", "--project", "/tmp/p"])
+
+    def test_run_starts_from_the_code_snapshot(self) -> None:
+        launch = build_launch("brief.md", "project", _routing({"roles": {}}),
+                              None, Path("/tmp/kod-biegu"))
+
+        self.assertEqual(launch.cwd, Path("/tmp/kod-biegu"))
+        self.assertEqual(launch.env["PYTHONPATH"].split(os.pathsep)[0],
+                         "/tmp/kod-biegu")
+
+    def test_snapshot_wins_over_an_inherited_pythonpath(self) -> None:
+        with patch.dict(os.environ, {"PYTHONPATH": "/opt/cudze"}):
+            launch = build_launch("brief.md", "project", _routing({"roles": {}}),
+                                  None, Path("/tmp/kod-biegu"))
+
+        self.assertEqual(launch.env["PYTHONPATH"],
+                         f"/tmp/kod-biegu{os.pathsep}/opt/cudze")
+
+    def test_without_a_snapshot_the_repository_is_used(self) -> None:
+        launch = build_launch("brief.md", "project", _routing({"roles": {}}))
+
+        self.assertEqual(launch.cwd, ROOT)
 
     def test_stale_role_variables_cannot_beat_the_gui(self) -> None:
         with patch.dict(
                 os.environ, {"FORGE_CODER_AGENT": "grok",
                              "FORGE_TESTER_MODEL": "coś-starego"}):
-            _command, env = build_launch(
+            launch = build_launch(
                 "brief.md", "project", _routing({"roles": {}}),
                 Path("/tmp/routing.json"))
 
-        self.assertNotIn("FORGE_CODER_AGENT", env)
-        self.assertNotIn("FORGE_TESTER_MODEL", env)
+        self.assertNotIn("FORGE_CODER_AGENT", launch.env)
+        self.assertNotIn("FORGE_TESTER_MODEL", launch.env)
 
     def test_codex_is_not_available_for_master(self) -> None:
         self.assertNotIn("codex", MASTER_AGENTS)
@@ -339,6 +406,170 @@ class RoleCardTest(unittest.TestCase):
         self.assertEqual(card.routing_entry().slots["standard"],
                          routing.Endpoint(agent="opencode",
                                           model="całkiem/nowy-model"))
+
+
+class _FakeProcess:
+    """Proces, który „pracuje" — tyle, ile widzi z niego panel."""
+
+    pid = -1
+
+    def poll(self) -> None:
+        return None
+
+
+@needs_gtk
+class ParallelRunsTest(unittest.TestCase):
+    """Dwa projekty w jednym oknie: własny log, własny stan, wspólne strażniki."""
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.root = Path(self._directory.name)
+        self.first = self.root / "alfa"
+        self.second = self.root / "beta"
+        for project in (self.first, self.second):
+            project.mkdir()
+        self.saved: list[dict] = []
+        self.settings = {"runs": [
+            {"brief": "a.md", "project": str(self.first)},
+            {"brief": "b.md", "project": str(self.second)},
+        ]}
+        patches = (
+            patch("forge.gui.load_settings", return_value=self.settings),
+            patch("forge.gui.save_settings",
+                  side_effect=lambda payload, *_a, **_k: self.saved.append(payload)),
+            patch("forge.gui.routing_path", return_value=self.root / "routing.json"),
+        )
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        self.addCleanup(self._directory.cleanup)
+        self.window = gui.ForgeWindow(Adw.Application(
+            application_id="pl.agentloop.ForgeTest"))
+        self.addCleanup(self.window.destroy)
+
+    @staticmethod
+    def _log(run: gui.Run) -> str:
+        buffer = run.log_buffer
+        return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
+
+    def test_the_panel_opens_both_saved_runs(self) -> None:
+        self.assertEqual([run.project.get_text() for run in self.window.runs],
+                         [str(self.first), str(self.second)])
+        self.assertEqual([run.title() for run in self.window.runs],
+                         ["alfa", "beta"])
+
+    def test_each_run_writes_to_its_own_log(self) -> None:
+        self.window.runs[0].append_log("tylko dla alfy")
+
+        self.assertIn("tylko dla alfy", self._log(self.window.runs[0]))
+        self.assertEqual(self._log(self.window.runs[1]), "")
+
+    def test_stopping_one_run_leaves_the_other_alone(self) -> None:
+        working, idle = self.window.runs
+        working.process = _FakeProcess()
+
+        idle.stop()
+
+        self.assertTrue(working.is_running())
+        self.assertFalse(working.stop_requested)
+
+    def test_the_same_project_twice_is_refused(self) -> None:
+        first, second = self.window.runs
+        first.process = _FakeProcess()
+        second.project.set_text(str(self.first))
+
+        self.assertIn("prowadzi już inny bieg",
+                      self.window.blocking_problem(second))
+
+    def test_a_project_locked_by_another_process_is_refused(self) -> None:
+        with runlock.acquire(str(self.second)):
+            problem = self.window.blocking_problem(self.window.runs[1])
+
+        self.assertIn("prowadzi już bieg Forge", problem)
+
+    def test_a_session_held_elsewhere_blocks_even_the_first_run(self) -> None:
+        # Plikową sesję Claude Code może trzymać drugie okno albo bieg
+        # z powłoki, więc pytamy zawsze — nie tylko o drugi bieg w tym oknie.
+        with patch("forge.gui.preflight.claude_file_session_busy",
+                   return_value="sesję trzyma inny bieg"):
+            problem = self.window.blocking_problem(self.window.runs[0])
+
+        self.assertEqual(problem, "sesję trzyma inny bieg")
+
+    def test_the_routing_snapshot_lands_next_to_the_project(self) -> None:
+        chosen = _routing({"roles": {"coder": {
+            "slots": {"standard": {"agent": "claude", "model": "opus"}}}}})
+
+        path = self.window.runs[0].routing_snapshot(chosen)
+
+        self.assertEqual(path.parent, self.first / ".forge" / "routing")
+        self.assertEqual(
+            routing.load(path, TASK_DIFFICULTIES).slot("coder", "standard"),
+            routing.Endpoint(agent="claude", model="opus"))
+
+    def test_two_starts_never_share_one_routing_file(self) -> None:
+        # Stała nazwa dawała wyścig: zapis wyprzedza zamek projektu, więc drugi
+        # start podmieniłby plik pierwszemu, zanim tamten zdążył go przeczytać.
+        run = self.window.runs[0]
+        empty = _routing({"roles": {}})
+
+        first = run.routing_snapshot(empty)
+        second = run.routing_snapshot(empty)
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.exists() and second.exists())
+
+    def test_old_routing_snapshots_do_not_pile_up(self) -> None:
+        run = self.window.runs[0]
+        empty = _routing({"roles": {}})
+
+        for _ in range(gui.KEEP_ROUTING_SNAPSHOTS + 4):
+            newest = run.routing_snapshot(empty)
+
+        kept = sorted((self.first / ".forge" / "routing").glob("run-*.json"))
+        self.assertEqual(len(kept), gui.KEEP_ROUTING_SNAPSHOTS)
+        self.assertIn(newest, kept)
+
+    def test_a_run_shows_only_its_own_previous_log(self) -> None:
+        for project, note in ((self.first, "poprzednio w alfie"),
+                              (self.second, "poprzednio w becie")):
+            runtime = project / ".forge"
+            runtime.mkdir(exist_ok=True)
+            (runtime / "gui_run.log").write_text(note + "\n", encoding="utf-8")
+
+        window = gui.ForgeWindow(Adw.Application(
+            application_id="pl.agentloop.ForgeTest2"))
+        self.addCleanup(window.destroy)
+
+        self.assertIn("poprzednio w alfie", self._log(window.runs[0]))
+        self.assertNotIn("poprzednio w becie", self._log(window.runs[0]))
+        self.assertIn("poprzednio w becie", self._log(window.runs[1]))
+
+    def test_runs_can_be_added_up_to_the_ceiling(self) -> None:
+        while len(self.window.runs) < MAX_RUNS:
+            self.assertIsNotNone(self.window.add_run())
+
+        self.assertIsNone(self.window.add_run())
+        self.assertFalse(self.window.add_run_button.get_sensitive())
+
+    def test_a_working_run_cannot_be_removed_from_the_panel(self) -> None:
+        working = self.window.runs[0]
+        working.process = _FakeProcess()
+
+        self.window.remove_run(working)
+
+        self.assertIn(working, self.window.runs)
+
+    def test_the_last_run_stays_in_the_panel(self) -> None:
+        self.window.remove_run(self.window.runs[1])
+        self.window.remove_run(self.window.runs[0])
+
+        self.assertEqual(len(self.window.runs), 1)
+
+    def test_saved_settings_describe_every_run(self) -> None:
+        self.window.save_paths()
+
+        self.assertEqual(self.saved[-1]["runs"], self.settings["runs"])
 
 
 if __name__ == "__main__":

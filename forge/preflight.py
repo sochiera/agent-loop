@@ -7,12 +7,13 @@ preflight, a preflight nie zależy od orkiestratora ani od jego faz.
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import adapters, agents, backlog, ledger, provider_env
+from . import adapters, agents, backlog, ledger, provider_env, runlock, snapshot
 from .agents import AgentError, opencode_user_config
 
 if TYPE_CHECKING:
@@ -263,6 +264,79 @@ def ensure_claude_session(project: str, cfg: Config) -> str:
         f"preflight: sesja Claude Code jest nieużywalna ({problem}) — role mają "
         "działające zapasy, ale Claude z nich wypadnie. " + CLAUDE_SESSION_HINT)
     return problem
+
+
+SHARED_CLAUDE_OVERRIDE = "FORGE_ALLOW_SHARED_CLAUDE"
+CLAUDE_SESSION_LOCK_NAME = "claude-file-session.lock"
+
+
+def claude_file_session_lock_path(
+    environ: dict[str, str] | None = None
+) -> Path:
+    """Jeden zamek na maszynę — plik sesji Claude Code jest zasobem globalnym."""
+    return snapshot.cache_root(environ) / CLAUDE_SESSION_LOCK_NAME
+
+
+def _claude_busy_message(holder: str) -> str:
+    detail = f" ({holder})" if holder else ""
+    return (
+        f"Inny bieg Forge{detail} pracuje już na WSPÓŁDZIELONYM pliku sesji "
+        "Claude Code. Refresh token jest jednorazowy, więc drugi proces "
+        "unieważni sesję obu biegów i interaktywną sesję operatora (patrz "
+        "docs/AWARIE-2026-08-11.md). Uruchom `claude setup-token` i ustaw "
+        "CLAUDE_CODE_OAUTH_TOKEN — nierotujący token znosi równoległość — albo "
+        "poczekaj na tamten bieg, albo wskaż modele innego narzędzia. "
+        f"Świadome ominięcie: {SHARED_CLAUDE_OVERRIDE}=1.")
+
+
+def claude_file_session_lock(
+    cfg: Config, environ: dict[str, str] | None = None
+) -> "runlock.RunLock | None":
+    """Wyłączność na PLIKOWY tryb sesji Claude Code; ``None`` = nie dotyczy.
+
+    W trybie plikowym wszystkie instancje trzymają ten sam JEDNORAZOWY refresh
+    token: pierwsze odświeżenie unieważnia kopie pozostałych, a użycie zużytego
+    tokenu kasuje sesję po stronie serwera — razem z interaktywną sesją
+    operatora (``docs/AWARIE-2026-08-11.md``, awaria A).
+
+    Zamek jest procesowy i leży poza projektem, bo chroniony zasób jest
+    globalny: obowiązuje tak samo drugie okno GUI, jak i uruchomienie z linii
+    poleceń. Nie dotyczy biegów z nierotującym tokenem — te mogą chodzić
+    równolegle w dowolnej liczbie i żadnego zamku nie biorą.
+
+    Podnosi ``runlock.RunLocked``, gdy sesję trzyma już inny proces."""
+    environ = os.environ if environ is None else environ
+    override = (environ.get(SHARED_CLAUDE_OVERRIDE) or "").strip().lower()
+    if override in {"1", "true", "yes", "tak"}:
+        return None
+    if not any(adapters.canonical_agent(name) == "claude"
+               for name in cfg.agents_in_use()):
+        return None
+    # Ta sama ścieżka, co w ``ensure_claude_session``: token bywa w pliku
+    # ``*.env``, więc powłoka bez eksportu nie jest jeszcze powodem do odmowy.
+    provider_env.load_missing(set(agents.CLAUDE_TOKEN_VARS), environ)
+    if agents.claude_oauth_token(environ):
+        return None
+    return runlock.RunLock(claude_file_session_lock_path(environ),
+                           _claude_busy_message).acquire()
+
+
+def claude_file_session_busy(
+    cfg: Config, environ: dict[str, str] | None = None
+) -> str:
+    """Podgląd dla warstwy uruchamiającej: ``""`` = można startować.
+
+    Rozstrzyga zamek brany przez sam orkiestrator — tutaj tylko zaglądamy, żeby
+    operator zobaczył powód przed startem procesu, a nie po nim."""
+    try:
+        lock = claude_file_session_lock(cfg, environ)
+    except runlock.RunLocked as exc:
+        return str(exc)
+    except OSError:
+        return ""
+    if lock is not None:
+        lock.release()
+    return ""
 
 
 def run(project: str, cfg: Config, state: State) -> PreflightResult:
