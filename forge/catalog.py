@@ -1,11 +1,12 @@
 """Katalog modeli i poziomów namysłu do wyboru w GUI.
 
-GUI wybiera MODEL, a nie narzędzie — bo tak wygląda decyzja operatora: „chcę
-glm-5.2", a nie „chcę opencode". Katalog musi więc odpowiadać na pytanie
+GUI wybiera MODEL RAZEM Z EFFORTEM, a nie narzędzie — bo tak wygląda decyzja
+operatora: „chcę glm-5.2/high", a nie „chcę opencode". Katalog odpowiada na pytanie
 odwrotne niż konfiguracja: czym da się uruchomić dany model. Jeden model bywa
 osiągalny kilkoma TRASAMI (``Route``) i dopiero wtedy GUI pyta o dostawcę:
 
-- ``gpt-5.6-luna`` → Codex CLI albo most OpenCode (``openai/gpt-5.6-luna``);
+- modele GPT → wyłącznie most OpenCode (np. ``openai/gpt-5.6-luna``);
+- modele Grok → wyłącznie most OpenCode (np. ``xai/grok-4.5``);
 - ``glm-5.2`` → OpenCode u każdego dostawcy, który go serwuje (dziś
   ``zai-coding-plan``, a po dopisaniu drugiego — obu naraz);
 - ``sonnet``, ``grok-4.5``, ``qwen3.8-max`` → dokładnie jedna trasa,
@@ -24,8 +25,8 @@ pozycje na liście, czyli degradację do dzisiejszego zachowania, nie błąd.
   bo to tam mieszkają jego prywatni providerzy (Qwen Token Plan, z.ai, …),
   o których Forge nie ma prawa nic wiedzieć z góry.
 
-Katalog jest PODPOWIEDZIĄ, nie zamkniętą listą: GUI zawsze pozwala wpisać nazwę
-modelu ręcznie, bo nowy model u dostawcy pojawia się wcześniej niż tutaj.
+Katalog jest zamkniętą listą wyboru GUI. Starszy routing z modelem spoza
+katalogu jest zachowywany, ale panel nie oferuje tworzenia nowych wpisów.
 """
 from __future__ import annotations
 
@@ -35,12 +36,10 @@ from .adapters import canonical_agent
 from .agents import opencode_user_config
 from .config import MODEL_LEVEL_ROUTING
 
-# Kolejność = kolejność tras w GUI. Codex ma alias "gpt", ale w wyborze
-# pokazujemy nazwę kanoniczną, żeby jedna binarka nie występowała jako dwa
-# narzędzia. Natywne CLI stoją przed mostem OpenCode: mają wbudowaną obsługę
-# (telemetria zużycia, wznawianie sesji u Codeksa), więc przy modelu osiągalnym
-# obiema drogami domyślna trasa ma być tą bogatszą.
-AGENTS: tuple[str, ...] = ("claude", "codex", "opencode", "grok", "kiro")
+# Adaptery Codex i Grok pozostają w repo dla zgodności wstecznej. GUI ich nie
+# oferuje: obie rodziny modeli są dostępne wyłącznie przez OpenCode.
+AGENTS: tuple[str, ...] = ("claude", "opencode", "kiro")
+DISABLED_NATIVE_AGENTS: tuple[str, ...] = ("codex", "grok")
 
 # Poziomy namysłu przyjmowane przez CLI danego agenta. Pusty string = „nie
 # przekazuj flagi", czyli decyduje sam agent (u OpenCode dotyczy to modeli bez
@@ -112,6 +111,25 @@ def efforts(agent: str) -> tuple[str, ...]:
     return EFFORTS.get(canonical_agent(agent), DEFAULT_EFFORTS)
 
 
+def configured_efforts(route: Route) -> tuple[str, ...]:
+    """Kuratorowane efforty używane z tym modelem, bez iloczynu możliwości CLI."""
+    candidates: list[str] = []
+    sources = [(route.agent, route.model)]
+    provider, bare = split_model(route.agent, route.model)
+    if canonical_agent(route.agent) == "opencode" and provider in {"openai", "xai"}:
+        sources.append(("codex" if provider == "openai" else "grok", bare))
+    for agent, model in sources:
+        for configured_model, effort in MODEL_LEVEL_ROUTING.get(agent, {}).values():
+            if configured_model != model:
+                continue
+            # Najwyższy wariant OpenCode nazywa się ``max``, nie ``xhigh``.
+            if canonical_agent(route.agent) == "opencode" and effort == "xhigh":
+                effort = "max"
+            if effort not in candidates:
+                candidates.append(effort)
+    return tuple(candidates or ("",))
+
+
 def split_model(agent: str, model: str) -> tuple[str, str]:
     """Rozdziel „provider/model" OpenCode na (dostawca, naga nazwa).
 
@@ -148,6 +166,12 @@ def _policy_candidates() -> list[tuple[str, str]]:
         for model, _effort in MODEL_LEVEL_ROUTING.get(agent, {}).values():
             if model and (agent, model) not in out:
                 out.append((agent, model))
+    bridges = {"codex": "openai", "grok": "xai"}
+    for native_agent, provider in bridges.items():
+        for model, _effort in MODEL_LEVEL_ROUTING.get(native_agent, {}).values():
+            candidate = ("opencode", f"{provider}/{model}")
+            if model and candidate not in out:
+                out.append(candidate)
     return out
 
 

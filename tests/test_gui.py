@@ -18,7 +18,6 @@ from forge.gui import (
     ROOT,
     RoleCard,
     build_launch,
-    level_hint,
     line_kind,
     load_settings,
     resolve_project,
@@ -145,14 +144,6 @@ class GuiStatusTest(unittest.TestCase):
         self.assertLessEqual(buffer.get_line_count(), 3)
 
 
-class GuiHintTest(unittest.TestCase):
-    def test_hint_shows_what_the_policy_would_pick(self) -> None:
-        self.assertIn("sonnet", level_hint("coder", "complex", "claude"))
-
-    def test_hint_admits_when_the_tool_decides_on_its_own(self) -> None:
-        self.assertIn("decyduje sam", level_hint("coder", "simple", "aider"))
-
-
 @needs_gtk
 class ModelChooserTest(unittest.TestCase):
     """Sedno panelu: wybiera się MODEL, a narzędzie z niego wynika."""
@@ -166,102 +157,77 @@ class ModelChooserTest(unittest.TestCase):
             index for index, choice in enumerate(chooser.choices())
             if choice.entry is not None and choice.entry.name == name))
 
-    def _pick_kind(self, chooser: ModelChooser, kind: str, agent: str = "") -> None:
-        chooser.model.set_selected(next(
-            index for index, choice in enumerate(chooser.choices())
-            if choice.kind == kind and (not agent or choice.agent == agent)))
-
-    def test_model_with_one_route_needs_no_provider_question(self) -> None:
+    def test_there_is_only_one_dropdown(self) -> None:
         chooser = self._chooser()
 
         self._pick(chooser, "haiku")
 
-        self.assertFalse(chooser.provider.get_visible())
         self.assertEqual(chooser.value(), ("claude", "haiku", ""))
+        self.assertFalse(hasattr(chooser, "provider"))
 
-    def test_model_with_several_routes_asks_which_provider(self) -> None:
+    def test_native_codex_and_grok_are_not_offered(self) -> None:
+        self.assertNotIn("codex", AGENTS)
+        self.assertNotIn("grok", AGENTS)
+
+    def test_gpt_uses_only_opencode(self) -> None:
         chooser = self._chooser()
 
         self._pick(chooser, "gpt-5.6-luna")
 
-        self.assertTrue(chooser.provider.get_visible())
-        # Natywne CLI przed mostem: telemetria i wznawianie sesji są tam darmowe.
-        self.assertEqual(chooser.value(), ("codex", "gpt-5.6-luna", ""))
+        self.assertEqual(chooser.value(),
+                         ("opencode", "openai/gpt-5.6-luna", "medium"))
 
-        chooser.provider.set_selected(1)
+    def test_model_and_effort_are_one_choice(self) -> None:
+        chooser = self._chooser()
+
+        chooser.set_value("opencode", "openai/gpt-5.6-luna", "max")
 
         self.assertEqual(chooser.value(),
-                         ("opencode", "openai/gpt-5.6-luna", ""))
+                         ("opencode", "openai/gpt-5.6-luna", "max"))
+        self.assertFalse(hasattr(chooser, "effort"))
 
-    def test_effort_list_follows_the_tool_of_the_chosen_route(self) -> None:
-        # xhigh istnieje tylko u Codeksa; przeniesione na Claude'a byłoby flagą,
-        # której jego CLI nie zna.
+    def test_only_concrete_model_effort_choices_are_offered(self) -> None:
         chooser = self._chooser()
 
-        chooser.set_value("codex", "gpt-5.6-luna", "xhigh")
-        self.assertEqual(chooser.value(), ("codex", "gpt-5.6-luna", "xhigh"))
+        self.assertEqual({choice.kind for choice in chooser.choices()}, {"model"})
+        self.assertTrue(all(choice.entry is not None for choice in chooser.choices()))
 
-        chooser.set_value("claude", "opus", "xhigh")
-        self.assertEqual(chooser.value(), ("claude", "opus", ""))
-
-    def test_tool_without_a_model_stays_reachable(self) -> None:
-        # „Ten sam poziom, inne CLI" to jedyny sens wpisu bez modelu — po
-        # usunięciu pokrętła narzędzia musi mieć swoją pozycję na liście.
+    def test_custom_entry_is_not_offered(self) -> None:
         chooser = self._chooser()
 
-        self._pick_kind(chooser, "policy", "grok")
-
-        self.assertEqual(chooser.value(), ("grok", "", ""))
-
-    def test_default_choice_overrides_nothing(self) -> None:
-        self.assertEqual(self._chooser().value(), ("", "", ""))
-
-    def test_custom_name_always_asks_for_the_tool(self) -> None:
-        # Nazwy spoza katalogu nie da się przypisać do narzędzia — musi wskazać
-        # je operator, a pierwsza pozycja zostawia wybór roli.
-        chooser = self._chooser()
-
-        self._pick_kind(chooser, "custom")
-        chooser.custom.set_text("calkiem/nowy-model")
-
-        self.assertTrue(chooser.provider.get_visible())
-        self.assertEqual(chooser.value(), ("", "calkiem/nowy-model", ""))
-
-        chooser.provider.set_selected(AGENTS.index("opencode") + 1)
-
-        self.assertEqual(chooser.value(),
-                         ("opencode", "calkiem/nowy-model", ""))
+        self.assertNotIn("custom", {choice.kind for choice in chooser.choices()})
+        self.assertNotIn("wpisz własny", " ".join(
+            choice.label for choice in chooser.choices()).lower())
 
     def test_saved_choices_survive_a_round_trip(self) -> None:
         chooser = self._chooser()
         for saved in (("claude", "opus", "high"),
                       ("opencode", "openai/gpt-5.6-luna", "max"),
-                      ("opencode", "calkiem/nowy-model", ""),
-                      ("grok", "", ""),
-                      ("", "", "low"),
-                      ("", "", "")):
+                      ("opencode", "calkiem/nowy-model", "")):
             with self.subTest(saved=saved):
                 chooser.set_value(*saved)
                 self.assertEqual(chooser.value(), saved)
-
-    def test_operator_own_cli_is_not_lost_on_save(self) -> None:
-        # Agent z szablonu FORGE_AGENT_<NAZWA>_CMD nie ma pozycji w katalogu.
-        chooser = self._chooser()
-
-        chooser.set_value("aider", "", "")
-
-        self.assertEqual(chooser.value(), ("aider", "", ""))
 
     def test_role_forbidding_codex_offers_only_the_bridge(self) -> None:
         chooser = self._chooser("master", MASTER_AGENTS)
 
         self._pick(chooser, "gpt-5.6-luna")
 
-        self.assertFalse(chooser.provider.get_visible())
         self.assertEqual(chooser.value()[0], "opencode")
-        self.assertNotIn("gpt-5.6-sol",
-                         [choice.entry.name for choice in chooser.choices()
-                          if choice.entry is not None])
+        self.assertIn("gpt-5.6-sol",
+                      [choice.entry.name for choice in chooser.choices()
+                       if choice.entry is not None])
+
+    def test_saved_native_routes_are_migrated_to_opencode(self) -> None:
+        chooser = self._chooser()
+
+        chooser.set_value("codex", "gpt-5.6-sol", "xhigh")
+        self.assertEqual(chooser.value(),
+                         ("opencode", "openai/gpt-5.6-sol", "max"))
+
+        chooser.set_value("grok", "grok-4.5", "high")
+        self.assertEqual(chooser.value(),
+                         ("opencode", "xai/grok-4.5", "high"))
 
 
 @needs_gtk
@@ -289,6 +255,28 @@ class RoleCardTest(unittest.TestCase):
         self.assertEqual(set(self._card("product_owner").slots),
                          {routing.ANY_DIFFICULTY})
 
+    def test_master_offers_exactly_one_slot(self) -> None:
+        self.assertEqual(set(self._card("master").slots),
+                         {routing.ANY_DIFFICULTY})
+
+    def test_master_migrates_old_three_level_selection(self) -> None:
+        card = self._card("master")
+        entry = _routing({"roles": {"master": {"slots": {
+            "simple": {"agent": "opencode", "model": "openai/gpt-5.6-luna",
+                       "effort": "medium"},
+            "standard": {"agent": "opencode", "model": "openai/gpt-5.6-sol",
+                         "effort": "high"},
+            "complex": {"agent": "opencode", "model": "zai-coding-plan/glm-5.2",
+                        "effort": "high"},
+        }}}}).roles["master"]
+
+        card.apply(entry)
+
+        self.assertEqual(card.routing_entry().slots[routing.ANY_DIFFICULTY],
+                         routing.Endpoint(agent="opencode",
+                                          model="openai/gpt-5.6-sol",
+                                          effort="high"))
+
     def test_choices_survive_a_round_trip(self) -> None:
         card = self._card("coder")
         entry = _routing({"roles": {"coder": {
@@ -302,7 +290,12 @@ class RoleCardTest(unittest.TestCase):
 
         card.apply(entry)
 
-        self.assertEqual(card.routing_entry(), entry)
+        restored = card.routing_entry()
+        self.assertEqual(restored.slots["simple"], entry.slots["simple"])
+        self.assertEqual(restored.slots["complex"], entry.slots["complex"])
+        self.assertEqual(restored.fallbacks, entry.fallbacks)
+        self.assertIn("standard", restored.slots)
+        self._resolves_alike("coder", entry, restored)
 
     def test_tool_of_the_whole_role_survives_as_slot_tools(self) -> None:
         # Starszy plik (i ręczna edycja) opisuje narzędzie raz dla całej roli.
@@ -316,11 +309,12 @@ class RoleCardTest(unittest.TestCase):
 
         self._resolves_alike("coder", entry, card.routing_entry())
 
-    def test_untouched_card_overrides_nothing(self) -> None:
-        # Panel pokazuje wybór polityki; zapisanie go jako nadpisania
-        # ZAMROZIŁOBY politykę mimo braku decyzji operatora.
-        self.assertEqual(self._card("coder").routing_entry(),
-                         routing.RoleRouting())
+    def test_new_card_starts_with_concrete_configured_models(self) -> None:
+        entry = self._card("coder").routing_entry()
+
+        self.assertEqual(entry.slots["simple"], routing.Endpoint(
+            agent="opencode", model="openai/gpt-5.6-luna", effort="medium"))
+        self.assertTrue(all(endpoint.model for endpoint in entry.slots.values()))
 
     def test_chosen_model_writes_its_tool_into_the_slot(self) -> None:
         card = self._card("coder")
@@ -330,7 +324,8 @@ class RoleCardTest(unittest.TestCase):
             if choice.entry is not None and choice.entry.name == "opus"))
 
         self.assertEqual(card.routing_entry().slots["simple"],
-                         routing.Endpoint(agent="claude", model="opus"))
+                         routing.Endpoint(agent="claude", model="opus",
+                                          effort="medium"))
 
     def test_model_outside_the_catalogue_is_kept(self) -> None:
         # Nowy model u dostawcy pojawia się wcześniej niż w naszym katalogu.

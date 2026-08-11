@@ -4,11 +4,10 @@ Uruchomienie:
     python3 -m forge.gui
 
 Panel konfiguracji jest edytorem pliku ``routing.json`` (patrz routing.py): dla
-każdej roli wybierasz MODEL (a dla ról czułych na zakres zadania — osobno dla
-simple/standard/complex) i łańcuch zapasowy. Narzędzia nie wybiera się osobno,
-bo wynika z modelu; pokrętło dostawcy budzi się tylko przy modelu osiągalnym
-więcej niż jedną drogą (GPT: Codex albo most OpenCode; GLM: dwaj dostawcy
-OpenCode). Wybór zapisuje się poza repozytorium, więc obowiązuje też
+każdej roli wybierasz MODEL RAZEM Z EFFORTEM (a dla ról czułych na zakres
+zadania — osobno dla simple/standard/complex) i łańcuch zapasowy. Model, effort
+i trasa są jedną pozycją; GPT i Grok zawsze biegną przez OpenCode. Wybór zapisuje się
+poza repozytorium, więc obowiązuje też
 uruchomienia z CLI i nie wymaga commita przy każdej zmianie dostawcy.
 """
 from __future__ import annotations
@@ -31,8 +30,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from .config import (Config, MODEL_LEVEL_ROUTING, ROLE_MODEL_LEVELS,
-                     TASK_DIFFICULTIES, validate_master_agent)
+from .config import Config, TASK_DIFFICULTIES, validate_master_agent
 from . import catalog
 from . import report
 from . import routing as routing_module
@@ -48,7 +46,7 @@ STOP_TERM_DELAY_S = 8
 STOP_KILL_DELAY_S = 5
 SESSION_LOG_NAME = "gui_run.log"
 AGENTS = catalog.AGENTS
-MASTER_AGENTS = tuple(agent for agent in AGENTS if canonical_agent(agent) != "codex")
+MASTER_AGENTS = AGENTS
 ROLE_DEFS = routing_module.ROLE_DEFS
 
 DIFFICULTY_LABELS = {
@@ -57,13 +55,6 @@ DIFFICULTY_LABELS = {
     "complex": "złożone",
     routing_module.ANY_DIFFICULTY: "wszystkie zadania",
 }
-# Pozycje sztuczne w liście modeli: wybór polityki i wpis własny.
-DEFAULT_MODEL_LABEL = "— domyślny wg polityki —"
-FALLBACK_EMPTY_LABEL = "— pusty wpis (bez zapasu) —"
-CUSTOM_MODEL_LABEL = "— wpisz własny… —"
-POLICY_PREFIX = "wg polityki: "
-DEFAULT_EFFORT_LABEL = "— domyślny —"
-INHERIT_AGENT_LABEL = "— jak w roli —"
 
 
 def load_settings(path: Path = SETTINGS_PATH) -> dict[str, Any]:
@@ -179,31 +170,6 @@ def trim_log_buffer(buffer: Gtk.TextBuffer, max_lines: int = MAX_LOG_LINES) -> N
     buffer.delete(buffer.get_start_iter(), cutoff)
 
 
-def level_hint(role: str, difficulty: str, agent: str) -> str:
-    """Co zrobi polityka, jeśli nie wybierzesz modelu ręcznie."""
-    levels = ROLE_MODEL_LEVELS.get(role, {})
-    level = levels.get(difficulty) or levels.get("standard", "")
-    fixed = MODEL_LEVEL_ROUTING.get(canonical_agent(agent), {}).get(level)
-    if not level:
-        return "polityka projektu"
-    if fixed is None:
-        return f"poziom {level} — {agent} decyduje sam"
-    model, effort = fixed
-    return f"poziom {level} → {model}" + (f" ({effort})" if effort else "")
-
-
-def default_model_label(defaults: Config, role: str, difficulty: str) -> str:
-    """Etykieta pozycji „nic nie nadpisuję" — z konkretem, nie z obietnicą.
-
-    Liczona z konfiguracji BEZ nadpisań operatora, więc pokazuje dokładnie to,
-    co pojedzie, jeśli operator niczego nie wybierze."""
-    agent, model, effort = defaults.role(role, difficulty)
-    detail = model or "model wybiera CLI"
-    if effort:
-        detail += f" ({effort})"
-    return f"— domyślnie: {agent} → {detail} —"
-
-
 def _string_list(values: list[str]) -> Gtk.StringList:
     return Gtk.StringList.new(values)
 
@@ -220,34 +186,32 @@ class Choice:
     """Jedna pozycja listy modeli.
 
     ``kind`` decyduje, co trafi do routingu:
-    - ``default`` — nic (obowiązuje polityka projektu);
-    - ``policy``  — samo narzędzie, model wybierze mu polityka poziomu;
-    - ``model``   — konkretny model, a wraz z nim narzędzie z wybranej trasy;
-    - ``custom``  — nazwa wpisana ręcznie; narzędzia nie da się z niej wywieść,
-      więc dla niej pokrętło dostawcy jest widoczne zawsze."""
+    - ``model`` — konkretny model, effort i narzędzie z wybranej trasy;
+    - ``saved``   — starszy model spoza katalogu, zachowany bez możliwości
+      tworzenia kolejnych ręcznych wpisów."""
 
     kind: str
     label: str
     agent: str = ""
     entry: catalog.ModelEntry | None = None
+    route: catalog.Route | None = None
+    effort: str = ""
+    model: str = ""
 
 
 class ModelChooser(Gtk.Box):
     """Wybór modelu dla jednego slotu (rola × trudność albo wpis zapasowy).
 
-    Operator wybiera MODEL; narzędzie wynika z modelu. Pokrętło dostawcy budzi
-    się tylko wtedy, gdy model naprawdę ma więcej niż jedną trasę (GPT: Codex
-    albo most OpenCode; GLM: dwaj dostawcy OpenCode) — przy jednej trasie
-    pytanie o dostawcę byłoby pustym klikiem.
+    Operator wybiera MODEL I EFFORT w jednym kroku; narzędzie wynika z modelu.
+    GPT i Grok mają tylko trasy OpenCode. Jeśli model ma kilka tras, każda jest
+    osobną pozycją tej samej listy — nie ma drugiego pokrętła.
 
-    Lista jest podpowiedzią z katalogu, nie zamknięciem: ostatnia pozycja
-    odsłania pole tekstowe, bo nowy model u dostawcy pojawia się wcześniej niż
-    w naszym katalogu."""
+    Lista pochodzi z katalogu. Model spoza katalogu może pojawić się wyłącznie
+    przy odtworzeniu istniejącego routingu, aby zapis nie utracił danych."""
 
     def __init__(self, role: str, difficulty: str, agents: tuple[str, ...],
                  entries: tuple[catalog.ModelEntry, ...],
-                 on_change: Callable[[], None] | None = None,
-                 default_label: str = DEFAULT_MODEL_LABEL):
+                 on_change: Callable[[], None] | None = None):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self._on_change = on_change
         self.role = role
@@ -257,10 +221,7 @@ class ModelChooser(Gtk.Box):
             restricted for restricted in
             (entry.restricted(self.agents) for entry in entries)
             if restricted is not None)
-        self._default_label = default_label
-        self._choices = self._build_choices(default_label)
-        self._providers: list[str] = []
-        self._efforts: list[str] = list(catalog.DEFAULT_EFFORTS)
+        self._choices = self._build_choices()
         self._muted = False
 
         self.model = Gtk.DropDown(model=_string_list(
@@ -268,43 +229,24 @@ class ModelChooser(Gtk.Box):
         self.model.set_hexpand(True)
         _searchable(self.model)
         self.model.connect("notify::selected", self._model_changed)
-        self.custom = Gtk.Entry(placeholder_text="nazwa modelu")
-        self.custom.set_hexpand(True)
-        self.custom.set_visible(False)
-        self.custom.connect("changed", lambda _entry: self._changed())
-        self.provider = Gtk.DropDown(model=_string_list([""]))
-        self.provider.set_tooltip_text("Czym uruchomić ten model")
-        self.provider.set_visible(False)
-        self.provider.connect("notify::selected", self._provider_changed)
-        # Lista musi od razu odpowiadać ``self._efforts`` — synchronizacja
-        # przebudowuje pokrętło tylko przy ZMIANIE zestawu poziomów.
-        self.effort = Gtk.DropDown(model=_string_list(self._effort_labels()))
-        self.effort.set_tooltip_text("Poziom namysłu przekazywany do CLI")
-        self.effort.connect("notify::selected", lambda *_a: self._changed())
-
         self.append(self.model)
-        self.append(self.custom)
-        self.append(self.provider)
-        self.append(self.effort)
-        self._sync_dependent_widgets()
 
     # --- budowa listy -----------------------------------------------------
-    def _build_choices(self, default_label: str) -> list[Choice]:
-        choices = [Choice("default", default_label)]
-        # „Narzędzie bez modelu" pozostaje osiągalne: to jedyny sposób powiedzieć
-        # „ten sam poziom, inne CLI" — najczęściej we wpisie zapasowym.
-        for agent in self.agents:
-            choices.append(Choice(
-                "policy",
-                f"{POLICY_PREFIX}{agent} — {level_hint(self.role, self.difficulty, agent)}",
-                agent=agent))
+    def _build_choices(self) -> list[Choice]:
+        choices: list[Choice] = []
         for entry in self._entries:
-            label = entry.name
-            if entry.ambiguous:
-                label += f"   ({len(entry.routes)} dostawców)"
-            choices.append(Choice("model", label, entry=entry))
-        choices.append(Choice("custom", CUSTOM_MODEL_LABEL))
+            for route in entry.routes:
+                for effort in catalog.configured_efforts(route):
+                    label = f"{entry.name}  ·  {self._effort_label(effort)}"
+                    if entry.ambiguous:
+                        label += f"  ·  {route.provider}"
+                    choices.append(Choice(
+                        "model", label, entry=entry, route=route, effort=effort))
         return choices
+
+    @staticmethod
+    def _effort_label(effort: str) -> str:
+        return "effort auto" if not effort else f"effort {effort}"
 
     def choices(self) -> tuple[Choice, ...]:
         """Pozycje listy w kolejności pokrętła (także dla testów interakcji)."""
@@ -316,65 +258,31 @@ class ModelChooser(Gtk.Box):
             return self._choices[0]
         return self._choices[index]
 
-    def _provider_labels(self, choice: Choice) -> list[str]:
-        if choice.kind == "model" and choice.entry is not None:
-            return [route.provider for route in choice.entry.routes]
-        if choice.kind == "custom":
-            # Nazwy własnej katalog nie zna, więc narzędzie musi podać operator.
-            # Pierwsza pozycja zostawia je roli — tak działa wpis zapasowy
-            # zmieniający wyłącznie model.
-            return [INHERIT_AGENT_LABEL, *self.agents]
-        return []
-
     def _selected_agent(self, choice: Choice) -> str:
-        if choice.kind == "policy":
+        if choice.kind == "model" and choice.route is not None:
+            return choice.route.agent
+        if choice.kind == "saved":
             return choice.agent
-        if choice.kind == "model" and choice.entry is not None:
-            return self._selected_route(choice).agent
-        if choice.kind == "custom":
-            index = self.provider.get_selected()
-            if 0 < index < len(self._providers):
-                return self._providers[index]
         return ""
-
-    def _selected_route(self, choice: Choice) -> catalog.Route:
-        assert choice.entry is not None
-        index = self.provider.get_selected()
-        if not 0 <= index < len(choice.entry.routes):
-            index = 0
-        return choice.entry.routes[index]
 
     # --- stan -------------------------------------------------------------
     def set_value(self, agent: str, model: str, effort: str) -> None:
         """Odtwórz wybór zapisany w routingu (agent, model, effort)."""
         self._muted = True
-        self._ensure_agent(agent)
-        index, provider_index, custom = self._locate(agent, model)
+        # Stare pliki mogły wskazywać natywne CLI. Panel migruje rodzinę
+        # modelu do mostu zamiast ponownie wystawiać wyłączoną trasę.
+        native = canonical_agent(agent)
+        if model and native in catalog.DISABLED_NATIVE_AGENTS:
+            provider = "openai" if native == "codex" else "xai"
+            agent, model = "opencode", f"{provider}/{model}"
+            if effort == "xhigh":
+                effort = "max"
+        index = self._locate(agent, model, effort)
         self.model.set_selected(index)
-        self._providers = self._provider_labels(self._choices[index])
-        self.provider.set_model(_string_list(self._providers or [""]))
-        if self._providers:
-            self.provider.set_selected(provider_index)
-        self.custom.set_text(custom)
-        self._sync_dependent_widgets(effort)
         self._muted = False
 
-    def _ensure_agent(self, agent: str) -> None:
-        """Dopisz do listy własne CLI operatora, którego katalog nie zna.
-
-        Bez tego wybór z ręcznie napisanego ``routing.json`` (szablon
-        ``FORGE_AGENT_<NAZWA>_CMD``) zniknąłby przy pierwszym zapisie z GUI."""
-        known = {canonical_agent(name) for name in self.agents}
-        if (not agent or canonical_agent(agent) in known
-                or not routing_module.agent_allowed(self.role, agent)):
-            return
-        self.agents = (*self.agents, agent)
-        self._choices = self._build_choices(self._default_label)
-        self.model.set_model(_string_list(
-            [choice.label for choice in self._choices]))
-
-    def _locate(self, agent: str, model: str) -> tuple[int, int, str]:
-        """(pozycja modelu, pozycja dostawcy, tekst wpisu własnego)."""
+    def _locate(self, agent: str, model: str, effort: str) -> int:
+        """Zwróć pozycję konkretnej trasy, zachowując starszy model."""
         if model:
             found = catalog.lookup(agent, model, self._entries) if agent else None
             if found is None and not agent:
@@ -382,17 +290,16 @@ class ModelChooser(Gtk.Box):
             if found is not None:
                 entry, route = found
                 for index, choice in enumerate(self._choices):
-                    if choice.kind == "model" and choice.entry is entry:
-                        return index, entry.routes.index(route), ""
-            custom_index = len(self._choices) - 1
-            labels = self._provider_labels(self._choices[custom_index])
-            provider = labels.index(agent) if agent in labels else 0
-            return custom_index, provider, model
-        for index, choice in enumerate(self._choices):
-            if (choice.kind == "policy"
-                    and canonical_agent(choice.agent) == canonical_agent(agent)):
-                return index, 0, ""
-        return 0, 0, ""
+                    if (choice.kind == "model" and choice.route is route
+                            and choice.effort == effort):
+                        return index
+            label = f"{catalog.identity(agent, model)}  ·  {self._effort_label(effort)}"
+            self._choices.append(Choice(
+                "saved", label, agent=agent, effort=effort, model=model))
+            self.model.set_model(_string_list(
+                [choice.label for choice in self._choices]))
+            return len(self._choices) - 1
+        return 0
 
     def _by_model_only(self, model: str) -> tuple[catalog.ModelEntry, catalog.Route] | None:
         """Model bez agenta (starszy plik): trasa jednoznaczna albo nic."""
@@ -403,16 +310,13 @@ class ModelChooser(Gtk.Box):
     def value(self) -> tuple[str, str, str]:
         choice = self._choice()
         agent = self._selected_agent(choice)
-        if choice.kind == "model" and choice.entry is not None:
-            model = self._selected_route(choice).model
-        elif choice.kind == "custom":
-            model = self.custom.get_text().strip()
+        if choice.kind == "model" and choice.route is not None:
+            model = choice.route.model
+        elif choice.kind == "saved":
+            model = choice.model
         else:
             model = ""
-        effort_index = self.effort.get_selected()
-        effort = (self._efforts[effort_index]
-                  if 0 <= effort_index < len(self._efforts) else "")
-        return agent, model, effort
+        return agent, model, choice.effort
 
     def endpoint(self) -> routing_module.Endpoint:
         agent, model, effort = self.value()
@@ -420,49 +324,14 @@ class ModelChooser(Gtk.Box):
 
     def set_sensitive_fields(self, enabled: bool) -> None:
         self.model.set_sensitive(enabled)
-        self.custom.set_sensitive(enabled)
-        self.provider.set_sensitive(enabled)
-        self.effort.set_sensitive(enabled)
 
     # --- zdarzenia --------------------------------------------------------
     def _model_changed(self, *_args: Any) -> None:
         was_muted = self._muted
         self._muted = True
         choice = self._choice()
-        self._providers = self._provider_labels(choice)
-        self.provider.set_model(_string_list(self._providers or [""]))
-        if self._providers:
-            self.provider.set_selected(0)
         self._muted = was_muted
-        self._sync_dependent_widgets()
         self._changed()
-
-    def _provider_changed(self, *_args: Any) -> None:
-        self._sync_dependent_widgets()
-        self._changed()
-
-    def _sync_dependent_widgets(self, effort: str | None = None) -> None:
-        """Widoczność pól i lista effortów zależą od wybranej trasy."""
-        choice = self._choice()
-        self.custom.set_visible(choice.kind == "custom")
-        # Przy jednej trasie pokrętło dostawcy nie ma czego wybierać.
-        self.provider.set_visible(len(self._providers) > 1)
-        agent = self._selected_agent(choice)
-        efforts = list(catalog.efforts(agent) if agent else catalog.DEFAULT_EFFORTS)
-        if effort is None:
-            effort = self.value()[2]
-        if efforts != self._efforts:
-            was_muted = self._muted
-            self._muted = True
-            self._efforts = efforts
-            self.effort.set_model(_string_list(self._effort_labels()))
-            self._muted = was_muted
-        self.effort.set_selected(
-            self._efforts.index(effort) if effort in self._efforts else 0)
-
-    def _effort_labels(self) -> list[str]:
-        return [DEFAULT_EFFORT_LABEL if value == "" else value
-                for value in self._efforts]
 
     def _changed(self) -> None:
         if not self._muted and self._on_change is not None:
@@ -479,8 +348,7 @@ class FallbackRow(Gtk.Box):
         self.role = role
         self._on_change = on_change
 
-        self.model = ModelChooser(role, "standard", agents, entries, on_change,
-                                  default_label=FALLBACK_EMPTY_LABEL)
+        self.model = ModelChooser(role, "standard", agents, entries, on_change)
         self.model.set_hexpand(True)
         remove = Gtk.Button(icon_name="user-trash-symbolic",
                             tooltip_text="Usuń ten zapas")
@@ -551,8 +419,8 @@ class RoleCard(Gtk.Expander):
             difficulty = ("standard" if key == routing_module.ANY_DIFFICULTY
                           else key)
             chooser = ModelChooser(
-                self.role, difficulty, self.agents, self.entries, self._changed,
-                default_label=default_model_label(defaults, self.role, difficulty))
+                self.role, difficulty, self.agents, self.entries, self._changed)
+            chooser.set_value(*defaults.role(self.role, difficulty))
             chooser.set_hexpand(True)
             row.append(caption)
             row.append(chooser)
@@ -581,12 +449,24 @@ class RoleCard(Gtk.Expander):
     # --- stan -------------------------------------------------------------
     def apply(self, entry: routing_module.RoleRouting) -> None:
         self._muted = True
+        # Starsze GUI zapisywało mistrza w trzech slotach. Po uproszczeniu
+        # zachowaj jego ostatnią typową (standardową) wartość jako jeden wybór.
+        if (not self.definition.difficulty_aware
+                and routing_module.ANY_DIFFICULTY not in entry.slots
+                and entry.slots):
+            legacy = (entry.slots.get("standard")
+                      or entry.slots.get("complex")
+                      or entry.slots.get("simple"))
+            entry = routing_module.RoleRouting(
+                agent=entry.agent,
+                slots={routing_module.ANY_DIFFICULTY: legacy},
+                fallbacks=entry.fallbacks)
+        resolved = Config(routing=routing_module.Routing(
+            roles={self.role: entry}))
         for key, chooser in self.slots.items():
-            slot = entry.slots.get(key, routing_module.Endpoint())
-            # Narzędzie zapisane dla CAŁEJ roli (starszy plik, ręczna edycja)
-            # obowiązuje slot, który nie ma własnego — inaczej wczytanie takiego
-            # pliku po cichu cofałoby wybór do polityki.
-            chooser.set_value(slot.agent or entry.agent, slot.model, slot.effort)
+            difficulty = ("standard" if key == routing_module.ANY_DIFFICULTY
+                          else key)
+            chooser.set_value(*resolved.role(self.role, difficulty))
         for row in list(self.fallbacks):
             self._remove_fallback(row, notify=False)
         for endpoint in entry.fallbacks:
@@ -637,11 +517,11 @@ class RoleCard(Gtk.Expander):
 
     def _update_summary(self) -> None:
         entry = self.routing_entry()
-        chosen = [endpoint.model or f"{endpoint.agent} wg polityki"
+        chosen = [endpoint.model
                   for endpoint in entry.slots.values()
-                  if endpoint.model or endpoint.agent]
+                  if endpoint.model]
         if not chosen:
-            detail = "wg polityki projektu"
+            detail = "brak modelu"
         elif len(set(chosen)) == 1 and len(chosen) == len(self.slots):
             detail = chosen[0]
         else:
@@ -729,10 +609,9 @@ class ForgeWindow(Adw.ApplicationWindow):
         heading = Gtk.Label(xalign=0)
         heading.set_markup("<span size='x-large' weight='bold'>Konfiguracja biegu</span>")
         info = Gtk.Label(
-            label=("Dla każdej roli wybierz model — narzędzie wynika z modelu, a "
-                   "o dostawcę panel pyta tylko wtedy, gdy model ma ich kilku. "
-                   "Pozycja domyślna zostawia decyzję polityce projektu "
-                   "(rola → poziom → provider). Wybór zapisuje się w "
+            label=("Dla każdej roli wybierz jedną pozycję model–effort. "
+                   "Ostatni wybór jest przywracany przy kolejnym uruchomieniu. "
+                   "Routing zapisuje się w "
                    + str(self.routing_file) + " i obowiązuje także uruchomienia "
                    "z linii poleceń."),
             xalign=0,

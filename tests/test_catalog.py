@@ -47,16 +47,28 @@ def test_unknown_agent_gets_an_empty_catalogue_not_an_error() -> None:
                for entry in catalog.index({}))
 
 
+def test_model_offers_only_curated_efforts_not_every_cli_variant() -> None:
+    entries = catalog.index({})
+    luna = _entry(entries, "gpt-5.6-luna")
+    sol = _entry(entries, "gpt-5.6-sol")
+
+    assert catalog.configured_efforts(luna.routes[0]) == ("medium", "high", "max")
+    assert catalog.configured_efforts(sol.routes[0]) == ("high",)
+
+
 class TestIndex:
-    def test_the_same_model_in_two_clis_becomes_one_entry(self) -> None:
-        # To jest cały powód istnienia indeksu: GPT jedzie Codeksem albo mostem
-        # OpenCode, a operator wybiera MODEL, nie narzędzie.
+    def test_gpt_is_exposed_only_through_opencode(self) -> None:
         entry = _entry(catalog.index({}), "gpt-5.6-luna")
 
-        assert entry.ambiguous
         assert [(route.agent, route.model) for route in entry.routes] == [
-            ("codex", "gpt-5.6-luna"),
             ("opencode", "openai/gpt-5.6-luna"),
+        ]
+
+    def test_grok_is_exposed_only_through_opencode(self) -> None:
+        entry = _entry(catalog.index({}), "grok-4.5")
+
+        assert [(route.agent, route.model) for route in entry.routes] == [
+            ("opencode", "xai/grok-4.5"),
         ]
 
     def test_two_opencode_providers_of_one_model_are_two_routes(self) -> None:
@@ -98,9 +110,8 @@ class TestLookup:
         assert entry.name == "gpt-5.6-luna"
         assert route.provider == "opencode · openai"
 
-    def test_alias_of_the_agent_resolves_too(self) -> None:
-        # "gpt" to ten sam Codex CLI — wybór nie może zniknąć przez nazwę.
-        assert catalog.lookup("gpt", "gpt-5.6-luna", catalog.index({})) is not None
+    def test_disabled_codex_route_is_not_resolved(self) -> None:
+        assert catalog.lookup("gpt", "gpt-5.6-luna", catalog.index({})) is None
 
     def test_model_outside_the_catalogue_is_not_invented(self) -> None:
         assert catalog.lookup("opencode", "calkiem/nowy", catalog.index({})) is None
@@ -121,7 +132,7 @@ class TestRestriction:
         assert [route.agent for route in restricted.routes] == ["opencode"]
         assert not restricted.ambiguous
 
-    def test_model_reachable_only_by_a_forbidden_tool_disappears(self) -> None:
+    def test_sol_is_reachable_through_opencode(self) -> None:
         entry = _entry(catalog.index({}), "gpt-5.6-sol")
 
-        assert entry.restricted(("claude", "opencode")) is None
+        assert entry.restricted(("claude", "opencode")) is not None

@@ -74,7 +74,7 @@ ROLE_DEFS: tuple[RoleDef, ...] = (
             "Ocenia, czy cały cel i historyjki zostały osiągnięte"),
     RoleDef("master", "Mistrz",
             "Pilnuje procesu i wykrywa pętle; tylko doradza",
-            difficulty_aware=True, allows_codex=False),
+            allows_codex=False),
 )
 
 ROLE_BY_NAME: dict[str, RoleDef] = {role.name: role for role in ROLE_DEFS}
@@ -194,7 +194,13 @@ class Routing:
             return Endpoint()
         definition = ROLE_BY_NAME.get(role)
         if definition is not None and not definition.difficulty_aware:
-            return entry.slots.get(ANY_DIFFICULTY, Endpoint())
+            # Zgodność ze starszym GUI, które zapisywało mistrza w trzech
+            # slotach: jeden poziom przyjmuje dawną wartość standardową.
+            return (entry.slots.get(ANY_DIFFICULTY)
+                    or entry.slots.get("standard")
+                    or entry.slots.get("complex")
+                    or entry.slots.get("simple")
+                    or Endpoint())
         specific = entry.slots.get(difficulty, Endpoint())
         if not specific.empty:
             return specific
