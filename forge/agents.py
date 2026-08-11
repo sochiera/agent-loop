@@ -35,6 +35,89 @@ class AgentError(RuntimeError):
     """Agent zawiódł z powodu innego niż limit (np. crash, timeout)."""
 
 
+# Zmienna czytana przez samo Claude Code. FORGE_* pozwala dać Forge INNY token
+# niż ten, którego operator używa we własnej powłoce, bez zmiany drugiej nazwy.
+CLAUDE_TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
+CLAUDE_TOKEN_VARS = ("FORGE_CLAUDE_OAUTH_TOKEN", CLAUDE_TOKEN_VAR)
+
+
+def claude_oauth_token(environ: dict[str, str] | None = None) -> str:
+    """Długożyciowy token OAuth dla Claude Code; pusty = tryb plikowy.
+
+    Token z ``claude setup-token`` nie rotuje, więc dowolnie wiele procesów może
+    używać go równolegle. Plik ``~/.claude/.credentials.json`` tego nie znosi:
+    refresh token jest jednorazowy, więc proces, który wygra wyścig o
+    odświeżenie, unieważnia sesję pozostałym — łącznie z interaktywnym CLI
+    operatora."""
+    environ = os.environ if environ is None else environ
+    for name in CLAUDE_TOKEN_VARS:
+        value = (environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def claude_credentials_path(environ: dict[str, str] | None = None) -> Path:
+    """Plik sesji CLI operatora — źródło dowiązania w trybie plikowym."""
+    environ = os.environ if environ is None else environ
+    explicit = (environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    home = Path(environ.get("HOME", str(Path.home())))
+    return Path(explicit or home / ".claude") / ".credentials.json"
+
+
+def claude_session_problem(environ: dict[str, str] | None = None) -> str:
+    """Powód, dla którego sesja Claude Code nie dożyje pierwszej roli; ``""`` = OK.
+
+    Sam wygasły ``accessToken`` nie jest problemem — CLI odnowi go w locie.
+    Rozpoznajemy tylko stany, z których nie ma wyjścia bez udziału operatora, bo
+    tylko one zamieniają start przebiegu w stracone godziny: brak pliku,
+    wyzerowane tokeny (tak CLI zapisuje NIEUDANE odświeżenie) i martwy refresh
+    token."""
+    environ = os.environ if environ is None else environ
+    if claude_oauth_token(environ):
+        return ""
+    path = claude_credentials_path(environ)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return f"brak pliku sesji {path}"
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return f"nieczytelny plik sesji {path}: {exc}"
+    session = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(session, dict):
+        return f"plik sesji {path} nie zawiera sesji claude.ai"
+    if not str(session.get("accessToken") or "").strip() \
+            or not str(session.get("refreshToken") or "").strip():
+        return f"sesja w {path} jest wyczyszczona (pusty token)"
+    expires = session.get("expiresAt")
+    if isinstance(expires, (int, float)) and not isinstance(expires, bool) \
+            and expires <= 0:
+        return f"sesja w {path} jest wyczyszczona (expiresAt=0)"
+    refresh_expiry = session.get("refreshTokenExpiresAt")
+    if isinstance(refresh_expiry, (int, float)) \
+            and not isinstance(refresh_expiry, bool) \
+            and 0 < refresh_expiry <= time.time() * 1000:
+        return f"refresh token w {path} wygasł"
+    return ""
+
+
+def _disable_shared_credentials(destination: Path) -> None:
+    """Odsuń plik sesji z izolowanego domu, gdy pracujemy na tokenie.
+
+    Zostawiony obok tokenu bywa STARSZY niż sesja operatora: CLI zapisuje
+    poświadczenia atomowo, więc każdy zapis podmienia dowiązanie na zwykły plik,
+    który dalej już nie widzi odświeżeń. Przenosimy, a nie kasujemy — plik bywa
+    jedynym nośnikiem tokenów OAuth serwerów MCP i należy do CLI, nie do Forge."""
+    try:
+        if not destination.is_symlink() and not destination.exists():
+            return
+        os.replace(destination, destination.with_name(destination.name + ".disabled"))
+    except OSError:
+        # Nieudane odsunięcie nie jest powodem do zatrzymania przebiegu: token
+        # ze środowiska i tak ma pierwszeństwo przed plikiem.
+        pass
+
+
 def _isolated_agent_env(name: str) -> dict[str, str]:
     """Środowisko CLI bez globalnych plików instrukcji użytkownika."""
     env = os.environ.copy()
@@ -52,10 +135,18 @@ def _isolated_agent_env(name: str) -> dict[str, str]:
         env["CODEX_HOME"] = str(target)
     elif name == "claude":
         target = config_root / "claude"
+        token = claude_oauth_token(env)
+        # W trybie tokenu pliku sesji NIE podpinamy: to jedyny sposób, żeby
+        # równoległe instancje Forge i CLI operatora przestały walczyć o ten sam
+        # rotujący refresh token.
         _prepare_isolated_home(
             target,
+            () if token else
             ((home / ".claude" / ".credentials.json", ".credentials.json"),),
         )
+        if token:
+            _disable_shared_credentials(target / ".credentials.json")
+            env[CLAUDE_TOKEN_VAR] = token
         env["CLAUDE_CONFIG_DIR"] = str(target)
     elif name == "grok":
         target = config_root / "grok"

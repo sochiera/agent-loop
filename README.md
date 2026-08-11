@@ -39,6 +39,16 @@ providers need, and aborts up front if a role has no usable endpoint left.
 Explicit environment always wins over those files; `FORGE_ENV_FILES` overrides the
 search (`none` disables it).
 
+Claude Code is authenticated the same way. By default Forge links the operator's
+`~/.claude/.credentials.json` into its isolated home, but that file carries a
+single-use refresh token: two Forge instances (or one instance plus the IDE
+extension) racing to refresh it kill the session for everyone. Set
+`CLAUDE_CODE_OAUTH_TOKEN` — or `FORGE_CLAUDE_OAUTH_TOKEN` to give Forge a token
+of its own — from `claude setup-token`, and the shared file is left out of the
+picture entirely. Either way preflight reads the session state up front and
+refuses to start a run whose roles have no working endpoint left. See
+[docs/AWARIE-2026-08-11.md](docs/AWARIE-2026-08-11.md).
+
 ## Research direction
 
 The project explores:

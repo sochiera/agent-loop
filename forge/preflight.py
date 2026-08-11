@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import backlog, ledger, provider_env
+from . import adapters, agents, backlog, ledger, provider_env
 from .agents import AgentError, opencode_user_config
 
 if TYPE_CHECKING:
@@ -27,6 +27,7 @@ class PreflightResult:
     dropped_tags: list[str] = field(default_factory=list)
     legacy_backlog: bool = False
     loaded_env_vars: list[str] = field(default_factory=list)
+    claude_session: str = ""
 
 
 def git(project: str, *args: str, check: bool = True,
@@ -224,10 +225,52 @@ def ensure_provider_credentials(project: str, cfg: Config) -> list[str]:
     return loaded
 
 
+CLAUDE_SESSION_HINT = (
+    "Ustaw CLAUDE_CODE_OAUTH_TOKEN (token z `claude setup-token` nie rotuje, "
+    "więc znosi równoległe instancje) albo zaloguj się ponownie w Claude Code.")
+
+
+def ensure_claude_session(project: str, cfg: Config) -> str:
+    """Sprawdź sesję Claude Code, zanim zapłacimy za pierwszą rolę.
+
+    ``OAuth session expired and could not be refreshed`` przychodzi w środku
+    tury: kosztuje pełne wywołanie agenta, przerywa przebieg i zostawia po sobie
+    checkpoint do ręcznego wznowienia. Ten sam stan widać tutaj po odczycie
+    jednego JSON-a.
+
+    Jak przy kluczach providerów: niesprawna sesja zatrzymuje przebieg tylko
+    wtedy, gdy jakaś rola nie ma już czym pracować."""
+    if not any(adapters.canonical_agent(name) == "claude"
+               for name in cfg.agents_in_use()):
+        return ""
+    # Token bywa w tym samym pliku *.env, co klucze providerów — proces
+    # uruchomiony z crona albo z launchera desktopowego nie ma go w środowisku.
+    provider_env.load_missing(set(agents.CLAUDE_TOKEN_VARS))
+    problem = agents.claude_session_problem()
+    if not problem:
+        return ""
+    blocked = cfg.roles_requiring_agent("claude")
+    if blocked:
+        shown = ", ".join(blocked[:5])
+        if len(blocked) > 5:
+            shown += f" (+{len(blocked) - 5} innych)"
+        raise AgentError(
+            f"preflight: sesja Claude Code jest nieużywalna ({problem}); bez "
+            f"niej nie ma czym wykonać {len(blocked)} kombinacji rola/trudność: "
+            f"{shown}. " + CLAUDE_SESSION_HINT)
+    ledger.append(
+        project,
+        f"preflight: sesja Claude Code jest nieużywalna ({problem}) — role mają "
+        "działające zapasy, ale Claude z nich wypadnie. " + CLAUDE_SESSION_HINT)
+    return problem
+
+
 def run(project: str, cfg: Config, state: State) -> PreflightResult:
     parked_branch, parked_paths = park_dirty_tree(project, cfg, state)
     dropped_tags = drop_stale_task_tags(project, state)
     legacy = detect_legacy_backlog(project, state)
     loaded = ensure_provider_credentials(project, cfg)
+    claude_session = ensure_claude_session(project, cfg)
     return PreflightResult(
-        parked_branch, parked_paths, dropped_tags, legacy, loaded)
+        parked_branch, parked_paths, dropped_tags, legacy, loaded,
+        claude_session)

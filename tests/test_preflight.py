@@ -25,7 +25,10 @@ def _repo(path: Path, *, commit: bool = True) -> Path:
 def test_clean_repo_has_no_preflight_side_effects(tmp_path: Path) -> None:
     project = _repo(tmp_path)
     state = State(backlog_migrated=False)
-    result = preflight.run(str(project), Config(git_push=False), state)
+    # Sesja CLI operatora jest stanem MASZYNY, nie polityką projektu: bez tej
+    # izolacji test padałby na maszynie wylogowanej z Claude Code.
+    with patch("forge.agents.claude_session_problem", return_value=""):
+        result = preflight.run(str(project), Config(git_push=False), state)
     assert result == preflight.PreflightResult()
     assert state.backlog_migrated is True
     assert not (project / ".forge" / "parked.md").exists()
@@ -116,6 +119,41 @@ def test_legacy_backlog_sets_migration_flag(tmp_path: Path) -> None:
     state = State()
     assert preflight.detect_legacy_backlog(str(project), state) is True
     assert state.backlog_migrated is False
+
+
+def test_broken_claude_session_stops_start_when_role_has_no_fallback(
+        tmp_path: Path) -> None:
+    project = _repo(tmp_path)
+    cfg = Config(git_push=False)
+    assert cfg.roles_requiring_agent("claude"), \
+        "test ma sens tylko przy roli bez zapasu poza Claude"
+    with patch("forge.agents.claude_session_problem",
+               return_value="sesja wyczyszczona (expiresAt=0)"):
+        with pytest.raises(AgentError, match="sesja Claude Code"):
+            preflight.ensure_claude_session(str(project), cfg)
+
+
+def test_broken_claude_session_with_fallback_only_notes_the_ledger(
+        tmp_path: Path) -> None:
+    project = _repo(tmp_path)
+    cfg = Config(git_push=False)
+    with patch("forge.agents.claude_session_problem",
+               return_value="brak pliku sesji"), \
+            patch.object(Config, "roles_requiring_agent", return_value=[]):
+        problem = preflight.ensure_claude_session(str(project), cfg)
+    assert problem == "brak pliku sesji"
+    assert "Claude Code" in (project / ".forge" / "ledger.md").read_text(
+        encoding="utf-8")
+
+
+def test_claude_session_is_not_checked_when_routing_avoids_claude(
+        tmp_path: Path) -> None:
+    project = _repo(tmp_path)
+    cfg = Config(git_push=False)
+    with patch.object(Config, "agents_in_use", return_value=["opencode"]), \
+            patch("forge.agents.claude_session_problem",
+                  side_effect=AssertionError("nie wolno czytać sesji")):
+        assert preflight.ensure_claude_session(str(project), cfg) == ""
 
 
 def test_require_clean_identifies_preflight_invariant() -> None:

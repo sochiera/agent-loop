@@ -488,6 +488,23 @@ class Config:
                     out.append(f"{definition.name}/{difficulty}")
         return out
 
+    def roles_requiring_agent(self, agent: str) -> list[str]:
+        """Etykiety „rola/trudność", których CAŁY łańcuch prowadzi do ``agent``.
+
+        Ta sama zasada, co w ``roles_blocked_by``, tylko kryterium jest samo
+        narzędzie, nie dostawca klucza: niesprawny agent z działającym zapasem
+        kosztuje jedno przełączenie, a nie przebieg."""
+        wanted = adapters.canonical_agent(agent)
+        out: list[str] = []
+        for definition in routing_module.ROLE_DEFS:
+            for difficulty in TASK_DIFFICULTIES:
+                chain = self.role_chain(definition.name, difficulty)
+                if chain and all(
+                        adapters.canonical_agent(name) == wanted
+                        for name, _model, _effort in chain):
+                    out.append(f"{definition.name}/{difficulty}")
+        return out
+
     # --- Komendy bazowe CLI (bez shella) ------------------------------------
     # Claude Code headless. Jeśli 'claude' nie jest na PATH, ustaw FORGE_CLAUDE_BIN.
     claude_bin: str = os.environ.get("FORGE_CLAUDE_BIN", "claude")

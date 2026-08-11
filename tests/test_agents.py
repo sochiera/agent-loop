@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 import json
 from pathlib import Path
@@ -12,6 +13,8 @@ from forge import agents
 from forge.adapters import GenericSpec
 from forge.agents import (
     AgentError,
+    claude_oauth_token,
+    claude_session_problem,
     _aggregated_output_chars,
     _append_log,
     _isolated_agent_env,
@@ -281,6 +284,88 @@ def test_isolated_claude_home_replaces_stale_credential_copy(
     assert destination.is_symlink()
     assert destination.resolve() == source
     assert destination.read_text(encoding="utf-8") == "fresh"
+
+
+def test_oauth_token_replaces_the_shared_credentials_file(
+        tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    config = tmp_path / "config"
+    source = home / ".claude" / ".credentials.json"
+    destination = config / "forge" / "claude" / ".credentials.json"
+    source.parent.mkdir(parents=True)
+    destination.parent.mkdir(parents=True)
+    source.write_text("shared", encoding="utf-8")
+    # Pozostałość po trybie plikowym: CLI podmienia dowiązanie zwykłym plikiem
+    # przy każdym atomowym zapisie poświadczeń.
+    destination.write_text("stale", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-token")
+
+    env = _isolated_agent_env("claude")
+
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-token"
+    # Brak dowiązania to cała istota poprawki: dwie instancje nie mają już
+    # wspólnego pliku, o którego rotujący refresh token mogłyby się bić.
+    assert not destination.exists() and not destination.is_symlink()
+    assert (destination.parent / ".credentials.json.disabled").read_text(
+        encoding="utf-8") == "stale"
+    assert source.read_text(encoding="utf-8") == "shared"
+
+
+def test_forge_specific_token_wins_over_the_operator_shell_token(
+        monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "shell")
+    monkeypatch.setenv("FORGE_CLAUDE_OAUTH_TOKEN", "forge")
+    assert claude_oauth_token() == "forge"
+    monkeypatch.setenv("FORGE_CLAUDE_OAUTH_TOKEN", "   ")
+    assert claude_oauth_token() == "shell"
+
+
+def _session_file(path: Path, **overrides) -> Path:
+    session = {
+        "accessToken": "access",
+        "refreshToken": "refresh",
+        "expiresAt": int(time.time() * 1000) + 3_600_000,
+        "refreshTokenExpiresAt": int(time.time() * 1000) + 30 * 86_400_000,
+    }
+    session.update(overrides)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"claudeAiOauth": session}), encoding="utf-8")
+    return path
+
+
+def test_healthy_and_merely_expired_sessions_do_not_block_the_start(
+        tmp_path: Path) -> None:
+    environ = {"HOME": str(tmp_path)}
+    _session_file(tmp_path / ".claude" / ".credentials.json")
+    assert claude_session_problem(environ) == ""
+    # Wygasły accessToken przy żywym refresh tokenie to stan NORMALNY — CLI
+    # odnowi go sam, a zatrzymanie przebiegu byłoby fałszywym alarmem.
+    _session_file(tmp_path / ".claude" / ".credentials.json",
+                  expiresAt=int(time.time() * 1000) - 1000)
+    assert claude_session_problem(environ) == ""
+
+
+def test_session_states_that_no_refresh_can_repair_are_reported(
+        tmp_path: Path) -> None:
+    environ = {"HOME": str(tmp_path)}
+    path = tmp_path / ".claude" / ".credentials.json"
+    assert "brak pliku sesji" in claude_session_problem(environ)
+    # Dokładnie to zapisuje CLI po nieudanym odświeżeniu (awaria z 11.08).
+    _session_file(path, accessToken="", refreshToken="", expiresAt=0)
+    assert "wyczyszczona" in claude_session_problem(environ)
+    _session_file(path, expiresAt=0)
+    assert "expiresAt=0" in claude_session_problem(environ)
+    _session_file(path, refreshTokenExpiresAt=int(time.time() * 1000) - 1000)
+    assert "refresh token" in claude_session_problem(environ)
+    path.write_text("{niepoprawny json", encoding="utf-8")
+    assert "nieczytelny" in claude_session_problem(environ)
+
+
+def test_token_makes_the_session_file_irrelevant(tmp_path: Path) -> None:
+    environ = {"HOME": str(tmp_path), "CLAUDE_CODE_OAUTH_TOKEN": "sk-token"}
+    assert claude_session_problem(environ) == ""
 
 
 def test_builtin_agents_receive_isolated_environment(tmp_path: Path) -> None:
