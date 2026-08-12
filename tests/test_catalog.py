@@ -49,11 +49,29 @@ def test_unknown_agent_gets_an_empty_catalogue_not_an_error() -> None:
 
 def test_model_offers_only_curated_efforts_not_every_cli_variant() -> None:
     entries = catalog.index({})
-    luna = _entry(entries, "gpt-5.6-luna")
-    sol = _entry(entries, "gpt-5.6-sol")
+    glm = _entry(entries, "glm-5.2")
+    qwen = _entry(entries, "qwen3.8-max")
 
-    assert catalog.configured_efforts(luna.routes[0]) == ("medium", "high", "max")
-    assert catalog.configured_efforts(sol.routes[0]) == ("high",)
+    # Model bez wpisu w CURATED_EFFORTS dostaje wyłącznie to, co tabela
+    # poziomów z nim zestawia — lista wyboru nie jest iloczynem flag CLI.
+    assert catalog.configured_efforts(glm.routes[0]) == ("high",)
+    assert catalog.configured_efforts(qwen.routes[0]) == ("high", "max")
+
+
+def test_every_gpt_model_offers_the_full_low_medium_high_range() -> None:
+    # Effort jest jedynym pokrętłem czasu tury, a terra i sol mają w tabeli
+    # poziomów po jednym punkcie pracy — bez CURATED_EFFORTS operator nie
+    # mógłby zejść z ich `high`.
+    entries = catalog.index({})
+
+    for name in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"):
+        route = _entry(entries, name).routes[0]
+        assert catalog.configured_efforts(route)[:3] == ("low", "medium", "high")
+
+    # Luna zachowuje najwyższy wariant, bo tabela poziomów nadal go używa.
+    luna = _entry(entries, "gpt-5.6-luna")
+    assert catalog.configured_efforts(luna.routes[0]) == (
+        "low", "medium", "high", "max")
 
 
 class TestIndex:

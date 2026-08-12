@@ -241,8 +241,10 @@ class ModelChooserTest(unittest.TestCase):
 
         self._pick(chooser, "gpt-5.6-luna")
 
+        # Pierwsza pozycja modelu to jego najtańszy effort — lista rośnie
+        # od `low`, tak samo jak dla rodziny Claude.
         self.assertEqual(chooser.value(),
-                         ("opencode", "openai/gpt-5.6-luna", "medium"))
+                         ("opencode", "openai/gpt-5.6-luna", "low"))
 
     def test_model_and_effort_are_one_choice(self) -> None:
         chooser = self._chooser()

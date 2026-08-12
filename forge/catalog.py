@@ -63,6 +63,21 @@ MODEL_ALIASES: dict[str, str] = {
     "opus-4.6": "opus",
 }
 
+# Efforty oferowane operatorowi PONAD te, które dla modelu wynikają z tabeli
+# poziomów. Tabela poziomów mówi, czego Forge użyje SAM na danym poziomie —
+# jeden model ma tam zwykle jeden punkt pracy (terra i sol tylko ``high``), więc
+# wyprowadzona z niej lista zabiera operatorowi wybór, którego CLI wcale nie
+# zabrania. Rodzina GPT dostaje pełne low/medium/high na każdym modelu, bo to
+# jedyne pokrętło, którym da się kupić czas: pomiary z sierpnia 2026 dają na
+# tym samym modelu ~127 s tury dla `high` i ~200 s dla najwyższego wariantu,
+# a rola recenzenta chodzi kilka razy na zadanie. Rozszerzenie NIE zmienia
+# routingu automatycznego — dokłada tylko pozycje na liście wyboru.
+CURATED_EFFORTS: dict[str, tuple[str, ...]] = {
+    "gpt-5.6-luna": ("low", "medium", "high"),
+    "gpt-5.6-terra": ("low", "medium", "high"),
+    "gpt-5.6-sol": ("low", "medium", "high"),
+}
+
 
 @dataclass(frozen=True)
 class Route:
@@ -112,10 +127,13 @@ def efforts(agent: str) -> tuple[str, ...]:
 
 
 def configured_efforts(route: Route) -> tuple[str, ...]:
-    """Kuratorowane efforty używane z tym modelem, bez iloczynu możliwości CLI."""
-    candidates: list[str] = []
-    sources = [(route.agent, route.model)]
+    """Kuratorowane efforty używane z tym modelem, bez iloczynu możliwości CLI.
+
+    Źródła są dwa: jawna lista ``CURATED_EFFORTS`` dla modelu i efforty, które
+    tabela poziomów realnie z nim zestawia."""
     provider, bare = split_model(route.agent, route.model)
+    candidates: list[str] = list(CURATED_EFFORTS.get(bare, ()))
+    sources = [(route.agent, route.model)]
     if canonical_agent(route.agent) == "opencode" and provider in {"openai", "xai"}:
         sources.append(("codex" if provider == "openai" else "grok", bare))
     for agent, model in sources:
