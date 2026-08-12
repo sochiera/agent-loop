@@ -9,6 +9,7 @@ Zadania już zaplanowane w kolejce (nie duplikuj ich):
 {{QUEUED}}
 
 {{PARKED}}
+{{HANDOFF}}
 {{MIGRATION}}
 {{NOTEBOOK}}
 {{CORRECTIONS}}

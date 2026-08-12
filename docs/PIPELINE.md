@@ -20,9 +20,14 @@ albo odrzucone.
 Projekt prowadzimy zwinnie: zakres nie jest ustalany z góry, tylko rośnie w
 kolejnych przeglądach kierunku.
 
-Bootstrap czyta cały brief raz i buduje szkielet z **najcieńszym pionowym
-plasterkiem** w `BACKLOG.md` — maksymalnie trzema wpisami prowadzącymi do
-uruchamialnego demo, nawet niepełnego. Cała reszta wizji trafia do
+Bootstrap czyta cały brief raz i buduje **chodzący szkielet**: jedną cienką
+ścieżkę end-to-end, która się uruchamia, plus jeden test sprawdzający dokładnie
+tę implementację, którą uruchamia użytkownik. Historyjek **nie pisze** —
+`BACKLOG.md` należy do Product Ownera, który zakłada go zaraz po bootstrapie
+(wyzwalacz `start`). Rozdział ról jest tu warunkiem, żeby recenzja szkieletu
+miała sens: dopóki bootstrap sam deklarował plasterek w backlogu, recenzent
+odrzucał go za niezrealizowanie własnej deklaracji, choć wykonanie jej było
+poza jego rolą. Cała wizja trafia do
 `docs/PROJECT.md`: opis i odbiorca, cel docelowy z kryterium sukcesu,
 ograniczenia i priorytety, klimat, sugestie autora, kolejne prawdopodobne etapy
 i rzeczy świadomie odłożone, z jawnym rozróżnieniem wymagań, preferencji i
@@ -40,6 +45,9 @@ zajdzie którykolwiek warunek:
 
 - **zmiana briefu** (skrót różny od snapshotu) — najmocniejsze wejście, wygrywa
   z pozostałymi powodami;
+- **start** — backlogu nie ma wcale i żaden refill jeszcze nie padł, czyli PO
+  zakłada pierwszą kolejkę po bootstrapie: maksymalnie 3 historyjki prowadzące
+  do uruchamialnego demo;
 - **kadencja** — minęły `FORGE_STEERING_BATCHES` (domyślnie 2) wsady planisty
   od ostatniego przeglądu, czyli co 2×`FORGE_BATCH_SIZE` = 16 zadań;
 - **refill** — otwartych historyjek jest mniej niż `FORGE_BACKLOG_LOW_WATER`
@@ -49,7 +57,8 @@ zajdzie którykolwiek warunek:
 
 Rola dostaje powód uruchomienia, diff briefu (tylko gdy się zmienił), raport
 weryfikatora historyjek przy kadencji, listę niezaczętych zadań, notatkę
-parkingu i ścieżkę notatnika; `docs/PROJECT.md`
+parkingu, nierozstrzygnięte uwagi recenzenta architektury (`.forge/po-handoff.md`
+— materiał, nie zobowiązanie) i ścieżkę notatnika; `docs/PROJECT.md`
 i `BACKLOG.md` czyta sama. Wolno jej zapisać wyłącznie te dwa pliki — każdą inną
 zmianę Forge wykrywa manifestem drzewa i cofa, zanim cokolwiek trafi do commita.
 Bramka kotwiczy się na SHA sprzed fazy, nie na bieżącym HEAD: własny commit roli
@@ -69,7 +78,30 @@ jest najcieńszym sensownym przyrostem, czy nic nie zniknęło po cichu i czy
 `goal_reached` jest uczciwe. `request_changes` wraca do roli przeglądu z uwagami;
 budżet to `FORGE_MAX_BOOTSTRAP_REVIEWS` (domyślnie 4) recenzji. Wyczerpanie
 budżetu cofa zmiany i zatrzymuje przebieg z checkpointem — dalej potrzebna jest
-decyzja użytkownika. Ta sama pętla obowiązuje recenzję architektury bootstrapu.
+decyzja użytkownika.
+
+Recenzja architektury bootstrapu chodzi tą samą pętlą, ale z własnym kontraktem
+zakresu, bo ocenia szkielet, a nie produkt. `request_changes` wolno postawić
+wyłącznie za wadę strukturalną: kierunek do przepisania, test mierzący inną
+implementację niż uruchamiana, `docs/PROJECT.md` bez kierunku dla planisty albo
+ścieżkę end-to-end, która nie działa. Brak funkcji, walidacji, przypadków
+brzegowych i historyjek jest jawnie poza zakresem — to praca kolejnych zadań i
+Product Ownera. Dla takich obserwacji recenzent ma werdykt `suggestions`:
+przyjmuje szkielet, a uwagi jadą do `.forge/po-handoff.md`.
+
+Recenzent widzi numer rundy i skumulowane uwagi z poprzednich rund, a
+budowniczy dostaje je wszystkie naraz. Bez tego świeży recenzent zaczynał każdą
+rundę od zera i wymieniał zarzut na nowy zamiast zbiegać do akceptacji, a
+budowniczy potrafił cofnąć starszą poprawkę. Wyczerpany budżet rozstrzyga się
+więc dwojako: seria **różnych** uwag oznacza recenzję bez dna, więc szkielet
+zostaje przyjęty, a nierozliczone uwagi trafiają do Product Ownera jako materiał
+na historyjki; uwaga **wracająca mimo poprawek** (podobieństwo słów treściowych
+≥ 0,5) dowodzi, że bootstrap nie umie jej rozliczyć, i dopiero ona zatrzymuje
+przebieg do decyzji człowieka. Pierwsze powtórzenie jeszcze nie kończy pracy —
+bywa parafrazą świeżego recenzenta, a fałszywy stop kosztuje cały bootstrap od
+nowa; przerywa dopiero drugie albo powtórzenie zastane na końcu budżetu.
+`.forge/po-handoff.md` jest jednorazowym wejściem — najbliższa tura PO czyta go
+i kasuje.
 
 Recenzentowi kierunku wolno uruchamiać kod i eksperymentować w drzewie — bez
 tego mocna teza o kierunku wymagałaby zgadywania. Jego jedynym wynikiem
@@ -220,7 +252,8 @@ przebieg z zapisanym checkpointem.
 
 ### Historyjki, statusy i raport
 
-`BACKLOG.md` jest parsowalną kolejką `US-NNN`. Każda historyjka ma
+`BACKLOG.md` jest parsowalną kolejką `US-NNN` i w całości należy do Product
+Ownera — zakłada go jego pierwsza tura (`start`), a nie bootstrap. Każda historyjka ma
 `Dlaczego teraz`, `Sprawdzenie` i `Poza zakresem`; parser przed recenzją egzekwuje
 format, unikalność ID, brak znikających wpisów i zakaz samodzielnej zmiany
 statusu przez PO. Recenzent ocenia dopiero semantykę.

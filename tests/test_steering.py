@@ -101,6 +101,59 @@ def test_brief_change_wins_over_every_other_reason(tmp_path: Path) -> None:
     assert orchestrate._po_trigger(cfg, str(project), state) == "brief"
 
 
+def test_first_backlog_after_bootstrap_fires_the_start_trigger(
+        tmp_path: Path) -> None:
+    """Bootstrap nie pisze historyjek, więc pierwszy backlog zakłada PO."""
+    project, state, cfg = _po_repo(tmp_path)
+    Path(project, "BACKLOG.md").unlink()
+
+    assert orchestrate._po_trigger(cfg, str(project), state) == "start"
+    # Ten sam wyzwalacz nie może paść drugi raz, nawet gdy PO nic nie dopisał.
+    state.po_refill_batch = state.plan_batches
+    assert orchestrate._po_trigger(cfg, str(project), state) == ""
+
+
+def test_start_prompt_asks_only_for_the_thinnest_demo_slice() -> None:
+    prompt = prompts.product_owner_prompt(trigger="start")
+
+    assert "Pierwszy backlog projektu" in prompt
+    assert "maksymalnie 3 historyjki" in prompt
+    assert "BACKLOG.md\nmoże nie istnieć" in prompt
+
+
+def test_start_turn_creates_the_backlog_from_scratch(tmp_path: Path) -> None:
+    """Po bootstrapie pliku nie ma wcale — tura `start` musi go założyć."""
+    project, state, cfg = _po_repo(tmp_path)
+    Path(project, "BACKLOG.md").unlink()
+    _git(project, "commit", "-qam", "backlog zakłada Product Owner")
+
+    assert orchestrate._po_trigger(cfg, str(project), state) == "start"
+    _run_po(project, state, cfg, trigger="start",
+            answers=(_decision(stories_added=["US-001"]),),
+            write=lambda dir_: Path(dir_, "BACKLOG.md").write_text(
+                BACKLOG, encoding="utf-8"))
+
+    # Założony backlog musi zostać scommitowany: brudne drzewo zatrzymałoby
+    # następną fazę na niezmienniku czystości.
+    assert Path(project, "BACKLOG.md").is_file()
+    assert not orchestrate.has_changes(str(project))
+    assert orchestrate._po_trigger(cfg, str(project), state) == ""
+
+
+def test_bootstrap_handoff_reaches_the_product_owner_once(tmp_path: Path) -> None:
+    project, state, cfg = _po_repo(tmp_path)
+    orchestrate._write_po_handoff(
+        cfg, str(project), ["lista GPU nie pokazuje dopasowania do zestawu"])
+
+    seen = _run_po(project, state, cfg, trigger="start")
+
+    assert "UWAGI RECENZENTA ARCHITEKTURY" in seen[0]
+    assert "lista GPU nie pokazuje dopasowania do zestawu" in seen[0]
+    # Rozliczone uwagi żyją dalej w backlogu; druga tura płaciłaby za ich
+    # ponowne przeczytanie.
+    assert not Path(project, ".forge", "po-handoff.md").exists()
+
+
 def test_refill_fires_when_backlog_runs_low(tmp_path: Path) -> None:
     project, state, cfg = _po_repo(tmp_path)
     cfg.backlog_low_water = 2
@@ -397,41 +450,170 @@ def test_planner_consumes_the_steering_note_exactly_once(
 
 # --- Bootstrap ------------------------------------------------------------------
 
-def test_bootstrap_plans_only_a_thin_demo_slice() -> None:
+def _reject(note: str) -> str:
+    import json
+    return json.dumps({"verdict": "request_changes", "notes": [note]})
+
+
+def _run_bootstrap(project: Path, cfg: Config, state: State,
+                   verdicts) -> tuple[list[str], list[str]]:
+    """Uruchom bootstrap, rozdzielając prompty budowniczego od recenzenta."""
+    built: list[str] = []
+    reviewed: list[str] = []
+    answers = iter(verdicts)
+
+    def planner(prompt, *_args, **_kwargs):
+        built.append(prompt)
+        Path(project, "docs", "PROJECT.md").write_text(
+            "# Projekt\n", encoding="utf-8")
+        return '{"kind":"app","test_cmd":"true","build_cmd":""}'
+
+    def reviewer(_name, prompt, *_args, **_kwargs):
+        reviewed.append(prompt)
+        return next(answers)
+
+    with patch("forge.orchestrate.run_planner", side_effect=planner), \
+         patch("forge.agents.run_agent", side_effect=reviewer), \
+         patch("forge.orchestrate.build_then_test_result", return_value=(True, "")):
+        orchestrate.phase_bootstrap(cfg, str(project), state, lambda p: p)
+    return built, reviewed
+
+
+def test_bootstrap_builds_a_skeleton_and_leaves_stories_to_the_product_owner() -> None:
     prompt = prompts.bootstrap_prompt("brief")
 
-    assert "NIE planuj całego produktu" in prompt
-    assert "najcieńszy pionowy plasterek" in prompt
-    assert "maksymalnie 3 wpisy" in prompt
+    assert "CHODZĄCY SZKIELET" in prompt
+    assert "Nie budujesz\nproduktu i nie planujesz go" in prompt
+    # Historyjki są własnością Product Ownera; bootstrap, który je pisze,
+    # zamienia plan na późniejszą pracę w zobowiązanie oceniane od razu.
+    assert "BACKLOG.md NIE należy do ciebie" in prompt
+    assert "Product Owner" in prompt
+    assert "Jedno źródło\nprawdy dla każdej reguły" in prompt
     assert "docs/PROJECT.md" in prompt
     assert "świadomie odłożone" in prompt
     assert "Jawnie odróżnij wymagania, preferencje i pomysły" in prompt
 
 
-def test_rejected_bootstrap_is_rebuilt_with_the_review_notes(
-        tmp_path: Path) -> None:
+def test_bootstrap_review_may_reject_only_structural_defects() -> None:
+    prompt = prompts.bootstrap_architecture_review_prompt(
+        "game.md", "make smoke", round_number=1, budget=4)
+
+    assert "runda 1 z 4" in prompt
+    assert "POZA ZAKRESEM recenzji" in prompt
+    assert "pisze je Product Owner po tobie, nie bootstrap" in prompt
+    assert "naprawiło jedno zadanie TDD" in prompt
+    assert "suggestions" in prompt
+    assert "(to pierwsza runda)" in prompt
+
+
+def test_review_notes_accumulate_across_rounds(tmp_path: Path) -> None:
     project, _seeded, cfg = _po_repo(tmp_path)
     state = State()
-    seen: list[str] = []
-    verdicts = iter((REJECT, APPROVE))
 
-    def planner(prompt, *_args, **_kwargs):
-        seen.append(prompt)
-        Path(project, "docs", "PROJECT.md").write_text(
-            "# Projekt\n", encoding="utf-8")
-        return '{"kind":"app","test_cmd":"true","build_cmd":""}'
+    built, reviewed = _run_bootstrap(
+        project, cfg, state,
+        (_reject("test mierzy inną implementację"),
+         _reject("PROJECT.md nie niesie celu"), APPROVE))
 
-    with patch("forge.orchestrate.run_planner", side_effect=planner), \
-         patch("forge.agents.run_agent",
-               side_effect=lambda *_a, **_k: next(verdicts)), \
-         patch("forge.orchestrate.build_then_test_result", return_value=(True, "")):
-        orchestrate.phase_bootstrap(cfg, str(project), state, lambda p: p)
-
-    assert len(seen) == 2
-    assert "POPRAWKI PO RECENZJI ARCHITEKTURY" in seen[1]
-    assert "za dużo naprzód" in seen[1]
+    # Recenzent widzi, w której rundzie jest i co zgłoszono wcześniej — bez tego
+    # każda tura zaczyna od zera i seria nigdy nie zbiega się do akceptacji.
+    assert "runda 2 z 4" in reviewed[1]
+    assert "test mierzy inną implementację" in reviewed[1]
+    assert "PROJECT.md nie niesie celu" in reviewed[2]
+    # Budowniczy dostaje uwagi skumulowane, więc nie cofnie starszej poprawki.
+    assert "POPRAWKI PO RECENZJI ARCHITEKTURY" in built[1]
+    assert "test mierzy inną implementację" in built[2]
+    assert "PROJECT.md nie niesie celu" in built[2]
     assert state.bootstrapped is True
     assert state.test_cmd == "true"
+
+
+def test_exhausted_review_budget_hands_the_notes_to_the_product_owner(
+        tmp_path: Path) -> None:
+    """Seria RÓŻNYCH uwag to recenzja bez dna, a nie zepsuty szkielet."""
+    project, _seeded, cfg = _po_repo(tmp_path)
+    state = State()
+
+    _built, reviewed = _run_bootstrap(
+        project, cfg, state,
+        (_reject("brakuje ekranu podsumowania"),
+         _reject("nieznane identyfikatory nie są walidowane"),
+         _reject("lista GPU nie pokazuje dopasowania"),
+         _reject("koszt zestawu nie jest zaokrąglany")))
+
+    assert len(reviewed) == 4
+    assert state.bootstrapped is True
+    handoff = Path(project, ".forge", "po-handoff.md").read_text(encoding="utf-8")
+    assert "brakuje ekranu podsumowania" in handoff
+    assert "koszt zestawu nie jest zaokrąglany" in handoff
+
+
+def test_suggestions_verdict_accepts_the_skeleton_at_once(tmp_path: Path) -> None:
+    project, _seeded, cfg = _po_repo(tmp_path)
+    state = State()
+
+    built, _reviewed = _run_bootstrap(
+        project, cfg, state,
+        ('{"verdict":"suggestions","notes":["demo warto rozszerzyć o zapis"]}',))
+
+    assert len(built) == 1
+    assert state.bootstrapped is True
+    handoff = Path(project, ".forge", "po-handoff.md").read_text(encoding="utf-8")
+    assert "demo warto rozszerzyć o zapis" in handoff
+
+
+def test_note_returning_despite_fixes_stops_the_run(tmp_path: Path) -> None:
+    """Wracająca uwaga to jedyny dowód, że bootstrap jej nie umie rozliczyć."""
+    project, _seeded, cfg = _po_repo(tmp_path)
+    state = State()
+
+    with pytest.raises(orchestrate.AgentError, match="dwa razy wrócił do uwagi"):
+        _run_bootstrap(
+            project, cfg, state,
+            (_reject("test mierzy inną implementację niż aplikacja"),
+             _reject("test wciąż mierzy inną implementację niż aplikacja"),
+             _reject("test nadal mierzy inną implementację niż aplikacja")))
+
+    assert state.bootstrapped is False
+    assert not Path(project, ".forge", "po-handoff.md").exists()
+
+
+def test_single_repeat_still_gets_another_round(tmp_path: Path) -> None:
+    """Jedno powtórzenie bywa parafrazą; stop kosztowałby cały bootstrap."""
+    project, _seeded, cfg = _po_repo(tmp_path)
+    state = State()
+
+    built, _reviewed = _run_bootstrap(
+        project, cfg, state,
+        (_reject("test mierzy inną implementację niż aplikacja"),
+         _reject("test wciąż mierzy inną implementację niż aplikacja"),
+         APPROVE))
+
+    assert len(built) == 3
+    assert state.bootstrapped is True
+
+
+def test_note_returning_at_the_budget_limit_stops_the_run(tmp_path: Path) -> None:
+    project, _seeded, cfg = _po_repo(tmp_path)
+    cfg.max_bootstrap_reviews = 2
+    state = State()
+
+    with pytest.raises(orchestrate.AgentError, match="uwaga wróciła mimo poprawek"):
+        _run_bootstrap(
+            project, cfg, state,
+            (_reject("test mierzy inną implementację niż aplikacja"),
+             _reject("test wciąż mierzy inną implementację niż aplikacja")))
+
+    assert state.bootstrapped is False
+
+
+def test_repeat_detector_sees_through_polish_inflection() -> None:
+    assert orchestrate._notes_repeat(
+        ["lista GPU nie odrzuca modeli wymagających złącza zasilacza"],
+        ["lista GPU wciąż nie odrzuca modelu wymagającego złączy zasilacza"])
+    assert not orchestrate._notes_repeat(
+        ["lista GPU nie odrzuca modeli wymagających złącza zasilacza"],
+        ["docs/PROJECT.md nie zawiera kryterium sukcesu"])
 
 
 # --- Prompty i routing ------------------------------------------------------------

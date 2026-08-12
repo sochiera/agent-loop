@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from dataclasses import replace
 from pathlib import Path
 
@@ -338,19 +339,76 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     return {"no_more_tasks": bool(data.get("no_more_tasks")) and not tasks}
 
 
+# Wyłącznie słowa dłuższe niż trzy znaki: krótsze („nie", „się", „czy") odsiewa
+# już filtr długości w `_note_words`, więc wpisane tutaj nie mogłyby się dopasować.
+_NOTE_STOPWORDS = frozenset({
+    "jest", "tego", "przez", "oraz", "albo", "ktora", "ktory", "ktore",
+    "tylko", "jako", "przy", "wiec", "moze",
+})
+
+
+def _note_words(note: str) -> set[str]:
+    """Znormalizowane słowa treściowe notatki: bez ogonków, odmiany i szumu."""
+    plain = unicodedata.normalize("NFKD", note.lower())
+    plain = "".join(sign for sign in plain if not unicodedata.combining(sign))
+    plain = plain.replace("ł", "l")
+    words = re.findall(r"[a-z0-9]+", plain)
+    # Ucięcie końcówki zbliża polskie formy fleksyjne tego samego słowa
+    # („modeli”/„modelu”, „złącza”/„złączy”), a rdzeń i tak niesie jego sens.
+    return {word[:5] for word in words
+            if len(word) > 3 and word not in _NOTE_STOPWORDS}
+
+
+def _notes_repeat(history: list[str], notes: list[str],
+                  threshold: float = 0.5) -> str:
+    """Zwróć wcześniejszą uwagę, którą powtarza któraś z nowych; inaczej "".
+
+    Powtórzona uwaga po pełnej rundzie poprawek jest jedynym sygnałem realnego
+    zakleszczenia: bootstrap dostał ją, próbował i nie umiał jej rozliczyć.
+    Seria samych NOWYCH zastrzeżeń mówi coś przeciwnego — każda runda była
+    rozliczona, a recenzja po prostu nie ma dna. Te dwa przypadki muszą kończyć
+    się inaczej, bo w pierwszym decyzja należy do człowieka, a w drugim
+    zatrzymanie przebiegu byłoby czystą stratą gotowej pracy.
+    """
+    for note in notes:
+        fresh = _note_words(note)
+        if not fresh:
+            continue
+        for old in history:
+            seen = _note_words(old)
+            if not seen:
+                continue
+            shared = len(fresh & seen) / len(fresh | seen)
+            if shared >= threshold:
+                return old
+    return ""
+
+
 def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
                         attempt, review_prompt, log_phase: str,
-                        base_sha: str = "", reviewer_role: str = "bootstrap_reviewer") -> dict:
-    """Buduj i recenzuj, aż recenzent zaakceptuje albo skończy się budżet.
+                        base_sha: str = "",
+                        reviewer_role: str = "bootstrap_reviewer") -> tuple[dict, list[str]]:
+    """Buduj i recenzuj, aż recenzent przyjmie szkielet albo skończy się budżet.
 
-    Bootstrap i przegląd kierunku wyznaczają kierunek całej dalszej pracy, więc
-    błąd propaguje się na każde kolejne zadanie. Jedna recenzja bez prawa do
-    poprawki marnowałaby całą pracę przy pierwszej drobnej uwadze, a nieskończona
-    pętla paliłaby najsilniejszy model. ``max_bootstrap_reviews`` godzi oba
-    ryzyka: po wyczerpaniu budżetu decyzja należy do użytkownika.
+    Bootstrap wyznacza kierunek całej dalszej pracy, więc błąd propaguje się na
+    każde kolejne zadanie. Jedna recenzja bez prawa do poprawki marnowałaby całą
+    pracę przy pierwszej drobnej uwadze, a nieskończona pętla paliłaby
+    najsilniejszy model — ``max_bootstrap_reviews`` godzi oba ryzyka.
 
     ``attempt(notes)`` wykonuje (kolejne) podejście i zwraca jego JSON;
-    ``review_prompt(data)`` buduje prompt recenzji dla tego wyniku.
+    ``review_prompt(data, round_number, history)`` buduje prompt recenzji.
+
+    Uwagi kumulują się między rundami. Świeży recenzent widzi tylko drzewo, więc
+    bez historii kolejna runda potrafi cofnąć poprawkę z poprzedniej: to samo
+    miejsce zostaje wtedy zgłoszone dwa razy, a budżet mija bez postępu.
+
+    Wyczerpany budżet nie znaczy jednego: seria RÓŻNYCH uwag to recenzja bez dna,
+    a nie zepsuty szkielet, więc szkielet zostaje przyjęty, a nierozliczone uwagi
+    jadą do Product Ownera jako materiał na historyjki. Dopiero uwaga wracająca
+    mimo poprawek dowodzi, że bootstrap jej nie umie rozliczyć — i tylko ona
+    uzasadnia zatrzymanie przebiegu do decyzji człowieka.
+
+    Zwraca wynik podejścia i uwagi do przekazania dalej.
 
     Recenzentowi wolno eksperymentować w drzewie — postawienie mocnej tezy o
     kierunku często wymaga uruchomienia kodu i podmiany jednej linii, a zakaz
@@ -358,15 +416,16 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
     się jako jedyny wynik jego tury: cokolwiek zostawił w drzewie i w historii,
     wraca do stanu, który sam oglądał.
     """
-    notes: list[str] = []
+    history: list[str] = []
+    stalled: list[str] = []
     for round_number in range(1, cfg.max_bootstrap_reviews + 1):
-        data = attempt(notes)
+        data = attempt(history)
         before = _tree_manifest(project)
         snapshot = _snapshot_tree(project)
         log(f"{label}: recenzja {round_number}/{cfg.max_bootstrap_reviews} "
             "(świeży recenzent)…")
         verdict = _decision_with_retry(
-            review_prompt(data),
+            review_prompt(data, round_number, history),
             lambda value: run_role(
                 reviewer_role, value, cfg, project, logf(log_phase)),
             lambda text: parse_review_decision(text, project=project))
@@ -384,11 +443,38 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
                                f"→{verdict.status}: {'; '.join(notes)[:160]}")
         if verdict.status == "approve":
             log(f"{label}: recenzja zaakceptowana.")
-            return data
+            return data, []
+        if verdict.status == "suggestions":
+            # Recenzent przyjmuje szkielet i oddaje uwagi właścicielowi zakresu.
+            log(f"{label}: szkielet przyjęty; uwagi dla Product Ownera: "
+                f"{'; '.join(notes)[:300]}")
+            return data, notes
+        repeated = _notes_repeat(history, notes)
+        if repeated:
+            stalled.append(repeated)
+            ledger.append(project, f"{label}: recenzent powtórzył uwagę "
+                                   f"({repeated[:120]})")
+            # Jedno powtórzenie bywa parafrazą świeżego recenzenta, więc samo w
+            # sobie nie kończy przebiegu: fałszywy stop kosztuje cały bootstrap
+            # od nowa i decyzję człowieka, a zbędna runda — jedno podejście.
+            # Drugie powtórzenie takiej wymówki już nie ma.
+            if len(stalled) >= 2:
+                raise AgentError(
+                    f"{label}: recenzent dwa razy wrócił do uwagi, której "
+                    f"poprawki nie rozliczyły ({repeated[:200]}). "
+                    "Potrzebna decyzja użytkownika.")
+        history += [note for note in notes if note not in history]
         log(f"{label}: recenzja wymaga zmian: {'; '.join(notes)[:300]}")
-    raise AgentError(
-        f"{label}: recenzent odrzucił wynik {cfg.max_bootstrap_reviews} razy "
-        f"({'; '.join(notes)[:300]}). Potrzebna decyzja użytkownika.")
+    if stalled:
+        raise AgentError(
+            f"{label}: budżet {cfg.max_bootstrap_reviews} recenzji wyczerpany, a "
+            f"uwaga wróciła mimo poprawek ({stalled[-1][:200]}). "
+            "Potrzebna decyzja użytkownika.")
+    log(f"{label}: budżet {cfg.max_bootstrap_reviews} recenzji wyczerpany bez "
+        "powtórzonej uwagi — przyjmuję szkielet, uwagi idą do Product Ownera.")
+    ledger.append(project, f"{label}: budżet recenzji wyczerpany, szkielet "
+                           f"przyjęty; {len(history)} uwag do Product Ownera")
+    return data, history
 
 
 def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
@@ -424,10 +510,13 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
         return data
 
     try:
-        data = _reviewed_bootstrap(
+        data, handoff = _reviewed_bootstrap(
             cfg, project, logf, label="Bootstrap", attempt=attempt,
-            review_prompt=lambda result: prompts.bootstrap_architecture_review_prompt(
-                cfg.brief_path, result["test_cmd"]),
+            review_prompt=lambda result, round_number, history:
+                prompts.bootstrap_architecture_review_prompt(
+                    cfg.brief_path, result["test_cmd"],
+                    round_number=round_number,
+                    budget=cfg.max_bootstrap_reviews, history=history),
             log_phase="bootstrap-review", base_sha=base_sha)
     except Exception as exc:  # noqa: BLE001 — bootstrap nie może zostawić pół-szkieletu
         changed = _turn_changes(before, _tree_manifest(project))
@@ -446,6 +535,12 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
     for key in ("smoke_cmd", "flash_cmd", "target_cmd", "ci_status_cmd", "ci_logs_cmd"):
         setattr(state, key, str(profile.get(key, "")))
     state.bootstrapped = True
+    if handoff:
+        _write_po_handoff(cfg, project, handoff)
+        log("Bootstrap: uwagi recenzenta przekazane Product Ownerowi: "
+            + "; ".join(handoff)[:300])
+        ledger.append(project, f"bootstrap: {len(handoff)} uwag recenzenta "
+                               "do rozstrzygnięcia przez Product Ownera")
     # Snapshot i skrót zapisujemy dopiero po zaakceptowanej recenzji: awaria
     # wcześniej ma zostawić brief jako niezsynchronizowany, nie jako rozliczony.
     brief.write_snapshot(project, brief_text)
@@ -461,8 +556,27 @@ def _steering_path(cfg: Config, project: str) -> Path:
     return Path(project, cfg.runtime_dir, "steering.md")
 
 
+def _po_handoff_path(cfg: Config, project: str) -> Path:
+    return Path(project, cfg.runtime_dir, "po-handoff.md")
+
+
+def _write_po_handoff(cfg: Config, project: str, notes: list[str]) -> None:
+    """Uwagi, których nie rozstrzyga bootstrap, czekają na właściciela zakresu.
+
+    Recenzent architektury regularnie widzi rzeczy prawdziwe, ale nie swoje:
+    brakującą funkcję, nieobsłużony przypadek, zbyt cienkie demo. Wyrzucone
+    kosztowałyby ponowne odkrycie, a wymuszone na bootstrapie zamieniałyby
+    szkielet w produkt. Jedyne miejsce, w którym mają sens, to backlog — a ten
+    pisze Product Owner.
+    """
+    path = _po_handoff_path(cfg, project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(f"- {note}" for note in notes) + "\n",
+                    encoding="utf-8")
+
+
 def _po_trigger(cfg: Config, project: str, state: State) -> str:
-    """Wyzwalacze Product Ownera: brief, refill, potem kadencja."""
+    """Wyzwalacze Product Ownera: start, brief, refill, potem kadencja."""
     if brief.changed(project, state.brief_digest, brief.read(cfg.brief_path)):
         return "brief"
     if state.current_task or state.task_queue:
@@ -470,6 +584,11 @@ def _po_trigger(cfg: Config, project: str, state: State) -> str:
     stories, _orphans = backlog.load(project)
     if not state.backlog_migrated:
         return "refill"
+    if not stories and state.po_refill_batch < 0:
+        # Bootstrap nie pisze historyjek, więc po nim backlogu nie ma wcale.
+        # Pierwszy przebieg PO nie jest uzupełnianiem kolejki, tylko jej
+        # założeniem — i to jego jedyna okazja, żeby dostać o tym prompt.
+        return "start"
     if (backlog.count_open(stories) < cfg.backlog_low_water
             and state.po_refill_batch != state.plan_batches):
         return "refill"
@@ -589,6 +708,8 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
               for task in state.task_queue]
     parked_path = Path(project, ".forge", "parked.md")
     parked = parked_path.read_text(encoding="utf-8") if parked_path.exists() else ""
+    handoff_path = _po_handoff_path(cfg, project)
+    handoff = handoff_path.read_text(encoding="utf-8") if handoff_path.exists() else ""
     notebook_path = str(Path(cfg.runtime_dir, "notebooks", "product-owner.md"))
     migration = not state.backlog_migrated
     parser_corrections: list[str] = []
@@ -603,7 +724,7 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
                 trigger=trigger, brief_diff=change, story_report=story_report,
                 queued_tasks=queued, parked=parked, migration=migration,
                 notebook_path=notebook_path, review_notes=review_corrections,
-                max_backlog=cfg.max_backlog_stories)
+                max_backlog=cfg.max_backlog_stories, handoff=handoff)
             prompt += _ledger_context(project, ledger.PHASE_LINES)
             if parser_corrections:
                 prompt += "\n\n" + prompts.po_parse_corrections_prompt(parser_corrections)
@@ -734,7 +855,7 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
     state.steered_at_batch = state.plan_batches
     state.steering_due = False
     state.batch_drained = False
-    if trigger == "refill":
+    if trigger in {"refill", "start"}:
         state.po_refill_batch = state.plan_batches
     state.backlog_migrated = True
     state.goal_confirmed = bool(data["goal_reached"])
@@ -742,6 +863,10 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
         state.task_queue = []
         state.task_phase = "verify_goal"
     parked_path.unlink(missing_ok=True)
+    # Uwagi recenzenta architektury są jednorazowym wejściem: rozstrzygnięte
+    # żyją dalej w backlogu albo w docs/PROJECT.md, więc kolejna tura płaciłaby
+    # wyłącznie za ponowne przeczytanie rozliczonej treści.
+    handoff_path.unlink(missing_ok=True)
     ledger.append(
         project,
         f"po ({trigger}): +{len(data['stories_added'])} historyjek, "

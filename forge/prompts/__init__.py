@@ -39,15 +39,27 @@ def bootstrap_prompt(brief: str, *, review_notes: list[str] | None = None) -> st
 
 
 def bootstrap_architecture_review_prompt(
-        brief_path: str, test_cmd: str) -> str:
+        brief_path: str, test_cmd: str, *, round_number: int = 1,
+        budget: int = 1, history: list[str] | None = None) -> str:
+    """Prompt recenzji szkieletu; numer rundy i uwagi są częścią kontraktu.
+
+    Świeży recenzent bez historii nie ma jak odróżnić pierwszego spojrzenia od
+    czwartego, więc każdą rundę zaczyna od zera i szuka nowego zarzutu. Wtedy
+    seria recenzji nie zbiega się do akceptacji, tylko wyczerpuje budżet na
+    coraz drobniejszych uwagach — a to kasuje całą pracę bootstrapu.
+    """
+    notes = [str(note).strip() for note in (history or []) if str(note).strip()]
     return render(
         "bootstrap-architecture-review.md",
         BRIEF_PATH=brief_path,
         TEST_CMD=test_cmd,
+        ROUND=round_number,
+        BUDGET=budget,
+        HISTORY="\n".join(f"- {note}" for note in notes) or "(to pierwsza runda)",
     )
 
 
-PO_TRIGGERS = ("refill", "brief", "cadence")
+PO_TRIGGERS = ("start", "refill", "brief", "cadence")
 
 
 def _po_trigger(trigger: str) -> str:
@@ -63,10 +75,11 @@ def product_owner_prompt(*, trigger: str, brief_diff: str = "",
                          story_report: str = "", queued_tasks=None,
                          parked: str = "", migration: bool = False,
                          notebook_path: str = "", review_notes=None,
-                         max_backlog: int = 6) -> str:
+                         max_backlog: int = 6, handoff: str = "") -> str:
     """Prompt PO niesie wyłącznie wejścia, których nie ma w jego plikach."""
     corrections = _corrections("po-corrections.md", review_notes)
     parked_text = render("po-parked.md", PARKED_TEXT=parked) if parked else ""
+    handoff_text = render("po-handoff.md", HANDOFF_TEXT=handoff) if handoff.strip() else ""
     migration_text = read_template("po-migration.md") if migration else ""
     notebook = (
         f"Twój notatnik roboczy: `{notebook_path}`. Zwróć wpis w polu `notebook`; "
@@ -81,6 +94,7 @@ def product_owner_prompt(*, trigger: str, brief_diff: str = "",
         STORY_REPORT="Raport weryfikatora historyjek:\n" + report,
         QUEUED="; ".join(str(item) for item in (queued_tasks or [])) or "(brak)",
         PARKED=parked_text,
+        HANDOFF=handoff_text,
         MIGRATION=migration_text,
         NOTEBOOK=notebook,
         CORRECTIONS=corrections,
