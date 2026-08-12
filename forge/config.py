@@ -541,6 +541,17 @@ class Config:
 
     # Timeout pojedynczego wywołania agenta (sekundy). Duże, bo TDD bywa długie.
     agent_timeout_s: int = int(os.environ.get("FORGE_AGENT_TIMEOUT", "3600"))
+    # Watchdog bezczynności: ile sekund bez JEDNEGO bajtu wyjścia uznajemy za
+    # zawis. Zegar ścienny wyżej jest zbyt tępy — CLI agenta potrafi w ciszy
+    # ponawiać zapytanie do dostawcy z podwajanym odstępem (zaobserwowane:
+    # opencode 1.18.15 przy „servers are currently overloaded" spał 2, 4, 8 …
+    # 1024 s BEZ sufitu, więc godzinny timeout mijał w trakcie kolejnej drzemki
+    # i kosztował pełną godzinę za informację dostępną po dziesięciu minutach).
+    # Stosowane TYLKO do agentów o strumieniowym wyjściu (patrz
+    # agents._idle_timeout_for) — 0 wyłącza watchdog.
+    agent_idle_timeout_s: int = int(os.environ.get("FORGE_AGENT_IDLE_TIMEOUT", "600"))
+    # Ile razy ubić i ponowić zawieszoną turę, zanim uznamy zawis za trwały.
+    max_stall_retries: int = int(os.environ.get("FORGE_MAX_STALL_RETRIES", "3"))
 
     # Katalog runtime orkiestratora wewnątrz projektu (logi, bieżące zadanie).
     runtime_dir: str = ".forge"

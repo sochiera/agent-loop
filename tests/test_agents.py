@@ -624,10 +624,8 @@ def test_aggregated_output_counter_walks_jsonl_events() -> None:
 def test_large_tool_output_is_reported_to_project_ledger(
         tmp_path: Path) -> None:
     stream = json.dumps({"aggregated_output": "x" * 210_000})
-    process = __import__("subprocess").CompletedProcess(
-        ["agent"], 0, stdout=stream, stderr="")
 
-    with patch("forge.agents.subprocess.run", return_value=process):
+    with patch("forge.agents._run_once", return_value=(0, stream, "")):
         returned = _run_with_backoff(
             ["agent"], str(tmp_path), Config(max_limit_retries=0),
             str(tmp_path / "agent.log"))

@@ -12,8 +12,11 @@ import datetime as _dt
 import json
 import os
 import re
+import selectors
+import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -791,69 +794,274 @@ def extract_json(text: str) -> dict | None:
     return _extract_json_detail(text).data
 
 
+# Flagi, po których poznajemy agenta wypisującego POSTĘP na bieżąco: codex
+# `exec --json` i opencode `run --format json` emitują zdarzenia linia po linii,
+# więc cisza na obu strumieniach naprawdę oznacza bezruch. Claude jedzie na
+# `--output-format json` (JEDEN obiekt na końcu) — tam cisza jest normalna przez
+# całą turę i watchdog bezczynności musi pozostać wyłączony, inaczej ubijałby
+# pracujących agentów. Porównanie jest po CAŁYM tokenie: "--output-format" to
+# świadomie NIE to samo co "--format".
+_STREAMING_FLAGS = frozenset({"--json", "--format"})
+
+
+def _idle_timeout_for(argv: list[str], cfg: Config) -> int:
+    """Ile sekund ciszy uznajemy za zawis TEGO wywołania (0 = watchdog off)."""
+    if not cfg.agent_idle_timeout_s:
+        return 0
+    if not _STREAMING_FLAGS.intersection(argv):
+        return 0
+    # Watchdog nigdy nie może wyprzedzić zegara ściennego — inaczej przy ciasnym
+    # FORGE_AGENT_TIMEOUT zgłaszałby zawis zamiast zwykłego timeoutu.
+    return min(cfg.agent_idle_timeout_s, cfg.agent_timeout_s)
+
+
+class AgentStalled(AgentError):
+    """Proces agenta żyje, ale przestał dawać znaki życia (cisza na wyjściu)."""
+
+    def __init__(self, message: str, output: str = "") -> None:
+        super().__init__(message)
+        self.output = output
+
+
+def _timeout_partial(exc: subprocess.TimeoutExpired) -> str:
+    """Sklej to, co agent zdążył wypisać przed timeoutem, do zapisu w logu."""
+    return (exc.output or "") + "\n" + (exc.stderr or "")
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Ubij CAŁE drzewo procesów agenta, nie tylko bezpośrednie dziecko.
+
+    Agenci CLI odpalają własne podprocesy (powłoka tool-a bash, watchery, LSP).
+    Zabicie samego rodzica zostawia je osierocone — i trzymające końce naszych
+    pipe'ów, przez co odczyt potrafi nie skończyć się nigdy. Proces startuje z
+    ``start_new_session=True``, więc jego pid jest pgid całej grupy.
+
+    Po odebraniu statusu dziecka wychodzi od razu: pid bywa poddany recyklingowi
+    przez system, więc killpg na zebranym procesie mógłby trafić w cudzą grupę."""
+    if proc.returncode is not None:
+        return
+    for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 2.0)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            break
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    # Grupa zniknęła sama albo nie daje się ubić — i tak odbierz status dziecka,
+    # inaczej zostaje zombie na cały bieg pętli.
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_once(argv: list[str], cwd: str, cfg: Config,
+              stdin_text: str | None = None,
+              env: dict[str, str] | None = None,
+              idle_timeout: int = 0) -> tuple[int, str, str]:
+    """Uruchom agenta, czytając jego wyjście STRUMIENIOWO; zwróć (rc, out, err).
+
+    Strumieniowo, bo tylko tak da się odróżnić agenta pracującego od śpiącego:
+    ``capture_output`` oddaje wszystko dopiero po wyjściu procesu, więc do
+    momentu zabicia po godzinie nie mieliśmy o turze ŻADNEJ informacji — ani
+    sygnału postępu, ani transkryptu do diagnozy.
+
+    Rzuca AgentStalled po ``idle_timeout`` sekundach bez jednego bajtu (0 =
+    watchdog wyłączony) i subprocess.TimeoutExpired po ``cfg.agent_timeout_s``.
+    W obu wypadkach ubija grupę procesów i niesie zebrane dotąd wyjście."""
+    popen_stdin = subprocess.PIPE if stdin_text is not None else None
+    proc = subprocess.Popen(
+        argv, cwd=cwd, env=env, stdin=popen_stdin,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True)
+
+    if stdin_text is not None:
+        # W wątku: duże wejście nie zmieści się w buforze pipe'u, a my musimy
+        # w tym czasie czytać wyjście, żeby nie zakleszczyć się z agentem.
+        threading.Thread(target=_feed_stdin, args=(proc, stdin_text),
+                         daemon=True).start()
+
+    # Deskryptory zapamiętane z góry: po zamknięciu pipe'ów `proc.stdout.fileno()`
+    # już nie odpowie, a zebrane wyjście musi przeżyć nawet ubicie procesu.
+    out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
+    chunks: dict[int, list[bytes]] = {out_fd: [], err_fd: []}
+    started = time.monotonic()
+    last_progress = started
+    deadline = started + cfg.agent_timeout_s
+
+    def collected() -> tuple[str, str]:
+        return (b"".join(chunks[out_fd]).decode("utf-8", "replace"),
+                b"".join(chunks[err_fd]).decode("utf-8", "replace"))
+
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    selector.register(proc.stderr, selectors.EVENT_READ)
+    try:
+        try:
+            while selector.get_map():
+                now = time.monotonic()
+                if now >= deadline:
+                    _kill_process_group(proc)
+                    out, err = collected()
+                    raise subprocess.TimeoutExpired(
+                        argv, cfg.agent_timeout_s, output=out, stderr=err)
+                idle_left = (last_progress + idle_timeout - now
+                             if idle_timeout else float("inf"))
+                if idle_left <= 0:
+                    _kill_process_group(proc)
+                    out, err = collected()
+                    raise AgentStalled(
+                        f"brak wyjścia przez {idle_timeout}s",
+                        output=out + "\n" + err)
+                for key, _ in selector.select(min(deadline - now, idle_left)):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:          # EOF na tym strumieniu
+                        selector.unregister(key.fileobj)
+                        continue
+                    chunks[key.fd].append(chunk)
+                    last_progress = time.monotonic()
+        finally:
+            selector.close()
+            proc.stdout.close()
+            proc.stderr.close()
+
+        # Oba strumienie zamknięte — proces właściwie już wyszedł, ale reszta
+        # budżetu czasu należy mu się na sprzątanie.
+        try:
+            proc.wait(timeout=max(1.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            out, err = collected()
+            raise subprocess.TimeoutExpired(
+                argv, cfg.agent_timeout_s, output=out, stderr=err) from None
+    except BaseException:
+        # Cokolwiek przerwie odczyt, NIE MOŻE zostawić działającego agenta.
+        # Dotyczy to przede wszystkim SIGINT-u ze „Stop" w GUI: agent ma teraz
+        # własną sesję, więc sygnał wysłany do grupy Forge'a już go nie dosięga,
+        # a stary ``subprocess.run`` ubijał dziecko przy każdym wyjątku. Bez
+        # tego po zatrzymaniu biegu w projekcie zostaje agent z
+        # ``--dangerously-skip-permissions`` edytujący pliki bez nadzoru.
+        # Ubicia z gałęzi wyżej są tu no-opem (dziecko już odebrane).
+        _kill_process_group(proc)
+        raise
+    out, err = collected()
+    return proc.returncode, out, err
+
+
+def _feed_stdin(proc: subprocess.Popen, text: str) -> None:
+    """Podaj wejście agentowi i zamknij pipe; zerwany pipe to nie jest błąd."""
+    try:
+        proc.stdin.write(text.encode("utf-8"))
+    except (ValueError, OSError):   # BrokenPipeError to podklasa OSError
+        pass
+    finally:
+        # Zamknięcie musi się wykonać TAKŻE po zerwanym pipie (ubity agent),
+        # inaczej deskryptor wisi do najbliższego GC — a tur w biegu są setki.
+        try:
+            proc.stdin.close()
+        except (ValueError, OSError):
+            pass
+
+
 def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
                       stdin_text: str | None = None,
                       env: dict[str, str] | None = None,
                       ledger_project: str = "") -> str:
     """Uruchom komendę; przy limicie backoff i ponów; zwróć (stdout+stderr)."""
     phase = _phase_from_log(log_path)
+    idle_timeout = _idle_timeout_for(argv, cfg)
     delay = cfg.backoff_start_s
     waited = 0
-    last_output = ""
-    for attempt in range(cfg.max_limit_retries + 1):
-        started = time.monotonic()
-        log(f"  agent[{phase}] start: {argv[0]} (próba {attempt + 1})")
-        try:
-            proc = subprocess.run(
-                argv, cwd=cwd, input=stdin_text, text=True,
-                capture_output=True, timeout=cfg.agent_timeout_s, env=env,
+    attempt = 0
+    limit_retries = 0
+    stalls = 0
+
+    def wait_before_retry(headline: str, retry_no: int, budget_label: str) -> None:
+        """Uśpij pętlę przed ponowieniem; wyczerpany budżet → grzeczny stop.
+
+        Budżet dotyczy SUMY oczekiwań, nie pojedynczego snu: bez niego
+        geometryczny wzrost potrafi ciągnąć martwy bieg wiele dni. Limit i
+        zawis dzielą jeden budżet — obie sytuacje to „dostawca nie odpowiada",
+        więc zawis po limicie nie ma prawa resetować odstępu."""
+        nonlocal delay, waited
+        delay = min(delay, cfg.backoff_total_s - waited)
+        if delay <= 0:
+            log(f"  agent[{phase}] {headline}: wyczerpany budżet czekania "
+                f"({cfg.backoff_total_s}s) — zatrzymuję.")
+            raise LimitExhausted(
+                f"{headline} nadal po {_format_duration(waited)} oczekiwania "
+                f"(budżet {_format_duration(cfg.backoff_total_s)}) — zatrzymuję."
             )
+        wake = _dt.datetime.now() + _dt.timedelta(seconds=delay)
+        log(f"  agent[{phase}] {headline}. Backoff {delay}s "
+            f"(przewidywane wznowienie ~{wake.strftime('%H:%M:%S')}), "
+            f"próba {retry_no}/{budget_label}, "
+            f"zużyty budżet {_format_duration(waited)}/{_format_duration(cfg.backoff_total_s)}.")
+        time.sleep(delay)
+        waited += delay
+        delay = min(int(delay * cfg.backoff_factor), cfg.backoff_max_s)
+
+    while True:
+        attempt += 1
+        started = time.monotonic()
+        log(f"  agent[{phase}] start: {argv[0]} (próba {attempt})")
+        try:
+            code, out, err = _run_once(
+                argv, cwd, cfg, stdin_text=stdin_text, env=env,
+                idle_timeout=idle_timeout)
+        except AgentStalled as exc:
+            # Proces żyje, ale od idle_timeout nie wydał ani bajtu. Sam się nie
+            # podda (patrz komentarz przy Config.agent_idle_timeout_s), więc to
+            # MY decydujemy, kiedy przestać płacić za jego drzemkę.
+            partial = exc.output
+            _append_log(log_path, argv, partial, -1)
+            stalls += 1
+            log(f"  agent[{phase}] ZAWIS: brak wyjścia przez {idle_timeout}s "
+                f"(łącznie {time.monotonic() - started:.0f}s), proces ubity.")
+            if stalls > cfg.max_stall_retries:
+                raise AgentError(
+                    f"agent zawiesił się {stalls} raz(y) pod rząd "
+                    f"(brak wyjścia przez {idle_timeout}s). Ogon:\n{partial[-1500:]}"
+                ) from exc
+            headline = ("ZAWIS (wyjście wygląda na limit dostawcy)"
+                        if _looks_like_limit(partial) else "ZAWIS")
+            wait_before_retry(headline, stalls, str(cfg.max_stall_retries))
+            continue
         except subprocess.TimeoutExpired as e:
+            # Zegar ścienny: tura realnie przepracowała cały budżet czasu.
+            # Ponowienie kosztowałoby drugie tyle, więc kończymy — ale z
+            # transkryptem, bo bez niego nie ma z czego postawić diagnozy.
+            _append_log(log_path, argv, _timeout_partial(e), -1)
             log(f"  agent[{phase}] TIMEOUT po {cfg.agent_timeout_s}s")
             raise AgentError(f"timeout po {cfg.agent_timeout_s}s: {' '.join(argv[:2])}") from e
 
-        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        last_output = output
-        _append_log(log_path, argv, output, proc.returncode)
+        output = out + "\n" + err
+        _append_log(log_path, argv, output, code)
         _record_large_tool_output(ledger_project or cwd, output)
         elapsed = time.monotonic() - started
 
-        if proc.returncode == 0:
+        if code == 0:
             log(f"  agent[{phase}] koniec: rc=0, {elapsed:.0f}s, wyjście {len(output)} znaków")
-            return proc.stdout or output
+            return out or output
 
         # Kod != 0 — limit czy realny błąd?
         if _looks_like_limit(output):
-            if attempt >= cfg.max_limit_retries:
-                log(f"  agent[{phase}] LIMIT wyczerpany po {attempt} ponowieniach.")
+            if limit_retries >= cfg.max_limit_retries:
+                log(f"  agent[{phase}] LIMIT wyczerpany po {limit_retries} ponowieniach.")
                 raise LimitExhausted(
-                    f"Limit nadal aktywny po {attempt} ponowieniach — zatrzymuję."
+                    f"Limit nadal aktywny po {limit_retries} ponowieniach — zatrzymuję."
                 )
-            # Budżet dotyczy SUMY oczekiwań, nie pojedynczego snu: bez niego
-            # geometryczny wzrost potrafi ciągnąć martwy bieg wiele dni.
-            delay = min(delay, cfg.backoff_total_s - waited)
-            if delay <= 0:
-                log(f"  agent[{phase}] LIMIT: wyczerpany budżet czekania "
-                    f"({cfg.backoff_total_s}s) — zatrzymuję.")
-                raise LimitExhausted(
-                    f"Limit aktywny po {_format_duration(waited)} oczekiwania "
-                    f"(budżet {_format_duration(cfg.backoff_total_s)}) — zatrzymuję."
-                )
-            wake = _dt.datetime.now() + _dt.timedelta(seconds=delay)
-            log(f"  agent[{phase}] LIMIT wykryty. Backoff {delay}s "
-                f"(przewidywane wznowienie ~{wake.strftime('%H:%M:%S')}), "
-                f"próba {attempt + 1}/{cfg.max_limit_retries}, "
-                f"zużyty budżet {_format_duration(waited)}/{_format_duration(cfg.backoff_total_s)}.")
-            time.sleep(delay)
-            waited += delay
-            delay = min(int(delay * cfg.backoff_factor), cfg.backoff_max_s)
+            limit_retries += 1
+            wait_before_retry("LIMIT wykryty", limit_retries,
+                              str(cfg.max_limit_retries))
             continue
 
         # Realny błąd — nie zapętlaj.
-        log(f"  agent[{phase}] BŁĄD: rc={proc.returncode}, {elapsed:.0f}s")
-        raise AgentError(f"agent zwrócił kod {proc.returncode}. Ogon:\n{output[-1500:]}")
-
-    raise LimitExhausted(f"Wyczerpano ponowienia. Ostatnie:\n{last_output[-800:]}")
+        log(f"  agent[{phase}] BŁĄD: rc={code}, {elapsed:.0f}s")
+        raise AgentError(f"agent zwrócił kod {code}. Ogon:\n{output[-1500:]}")
 
 
 def _phase_from_log(log_path: str) -> str:

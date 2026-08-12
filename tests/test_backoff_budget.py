@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -12,12 +12,8 @@ from forge.agents import LimitExhausted, run_claude
 from forge.config import Config
 
 
-def _limited(_argv, **_kwargs) -> Mock:
-    proc = Mock()
-    proc.returncode = 1
-    proc.stdout = "rate limit reached"
-    proc.stderr = ""
-    return proc
+def _limited(_argv, _cwd, _cfg, **_kwargs) -> tuple[int, str, str]:
+    return 1, "rate limit reached", ""
 
 
 def test_total_backoff_never_exceeds_the_budget() -> None:
@@ -27,7 +23,7 @@ def test_total_backoff_never_exceeds_the_budget() -> None:
     cfg = Config()
     slept: list[float] = []
 
-    with patch("forge.agents.subprocess.run", side_effect=_limited), \
+    with patch("forge.agents._run_once", side_effect=_limited), \
          patch("forge.agents.time.sleep", side_effect=slept.append), \
          patch("forge.agents._append_log"):
         with pytest.raises(LimitExhausted):
@@ -45,7 +41,7 @@ def test_backoff_still_grows_geometrically() -> None:
     cfg = Config()
     slept: list[float] = []
 
-    with patch("forge.agents.subprocess.run", side_effect=_limited), \
+    with patch("forge.agents._run_once", side_effect=_limited), \
          patch("forge.agents.time.sleep", side_effect=slept.append), \
          patch("forge.agents._append_log"):
         with pytest.raises(LimitExhausted):
