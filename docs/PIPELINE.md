@@ -103,6 +103,20 @@ nowa; przerywa dopiero drugie albo powtórzenie zastane na końcu budżetu.
 `.forge/po-handoff.md` jest jednorazowym wejściem — najbliższa tura PO czyta go
 i kasuje.
 
+Rundy tej samej pętli zużywa też sprawdzian samego podejścia: brak `test_cmd`,
+brak `docs/PROJECT.md` i czerwony build albo test po zielonej deklaracji autora.
+To pomyłki widoczne maszynowo, a nie spór o kierunek, więc wracają do autora
+razem z wyjściem sprawdzianu i wskazówką, że komendę wolno naprawić z obu stron
+— dorobić brakujący cel albo zadeklarować ten, który istnieje. Zatrzymanie
+przebiegu kosztowałoby tu cały bootstrap i decyzję człowieka za literówkę w
+jednym poleceniu. Uwagi te omijają recenzenta, bo jego prompt gwarantuje zieloną
+suitę i zaległy wpis o czerwonej kazałby mu sprawdzać rzecz sprawdzoną już przez
+Forge. Przebieg zatrzymuje dopiero to samo wyjście sprawdzianu dwa razy z rzędu
+(porównywane bez stałej instrukcji naprawy, która inaczej sama przeważyłaby
+próg) albo sprawdzian czerwony do końca budżetu: zielona suita jest warunkiem
+wejścia do dalszej pętli, nie opinią, więc takiego szkieletu nie przyjmujemy
+nigdy.
+
 Recenzentowi kierunku wolno uruchamiać kod i eksperymentować w drzewie — bez
 tego mocna teza o kierunku wymagałaby zgadywania. Jego jedynym wynikiem
 pozostaje werdykt: po turze drzewo i HEAD wracają do stanu, który sam oglądał

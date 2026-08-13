@@ -384,6 +384,25 @@ def _notes_repeat(history: list[str], notes: list[str],
     return ""
 
 
+class AttemptRejected(AgentError):
+    """Podejście obaliło własną deklarację — poprawia je autor, nie człowiek.
+
+    Zadeklarowana komenda, która nie istnieje, i czerwona suita po zielonej
+    deklaracji to nie awaria Forge ani spór o kierunek, tylko pomyłka autora
+    widoczna maszynowo. Zatrzymanie przebiegu kosztowałoby tu cały bootstrap i
+    decyzję człowieka za literówkę w jednym poleceniu, choć ta sama pętla obok
+    umie oddać uwagę autorowi i poprosić o poprawkę.
+    """
+
+    def __init__(self, note: str, signature: str = ""):
+        super().__init__(note)
+        # O zakleszczeniu rozstrzyga wyłącznie zmienna część, czyli wyjście
+        # sprawdzianu. Stała instrukcja naprawy jest wspólna dla wszystkich
+        # awarii i sama przeważyłaby próg podobieństwa, więc każda druga awaria
+        # — także zupełnie inna — wyglądałaby na powtórzoną.
+        self.signature = signature or note
+
+
 def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
                         attempt, review_prompt, log_phase: str,
                         base_sha: str = "",
@@ -408,6 +427,14 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
     mimo poprawek dowodzi, że bootstrap jej nie umie rozliczyć — i tylko ona
     uzasadnia zatrzymanie przebiegu do decyzji człowieka.
 
+    ``AttemptRejected`` z podejścia zużywa rundę i wraca do autora jako uwaga,
+    zamiast kończyć przebieg: wynik sprawdzianu jest maszynowy, więc runda
+    naprawcza albo go zazieleni, albo powtórzy ten sam błąd i sama się rozliczy.
+    Te uwagi omijają recenzenta — jego prompt gwarantuje zieloną suitę, a
+    zaległy wpis o czerwonej kazałby mu sprawdzać rzecz już sprawdzoną przez
+    Forge. Szkielet ze sprawdzianem czerwonym do końca budżetu nigdy nie zostaje
+    przyjęty: zielona suita jest warunkiem, nie opinią.
+
     Zwraca wynik podejścia i uwagi do przekazania dalej.
 
     Recenzentowi wolno eksperymentować w drzewie — postawienie mocnej tezy o
@@ -417,9 +444,31 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
     wraca do stanu, który sam oglądał.
     """
     history: list[str] = []
+    defects: list[str] = []
+    signatures: list[str] = []
     stalled: list[str] = []
+    data: dict = {}
     for round_number in range(1, cfg.max_bootstrap_reviews + 1):
-        data = attempt(history)
+        try:
+            data = attempt(history + defects)
+        except AttemptRejected as exc:
+            # Bez wyzerowania szkielet z poprzedniej, zielonej rundy przeszedłby
+            # jako wynik tej — a w drzewie leży już wersja obalona sprawdzianem.
+            data = {}
+            note = str(exc)
+            log(f"{label}: podejście {round_number}/{cfg.max_bootstrap_reviews} "
+                f"obaliło własną deklarację: {note[:300]}")
+            ledger.append(project, f"{label} podejście {round_number} odrzucone: "
+                                   f"{note[:160]}")
+            if _notes_repeat(signatures, [exc.signature]):
+                # Ten sam sprawdzian, ten sam wynik po pełnej rundzie naprawczej.
+                raise AgentError(
+                    f"{label}: sprawdzian dwa razy z rzędu obalił deklarację "
+                    f"autora ({note[:200]}). Potrzebna decyzja użytkownika."
+                ) from exc
+            defects.append(note)
+            signatures.append(exc.signature)
+            continue
         before = _tree_manifest(project)
         snapshot = _snapshot_tree(project)
         log(f"{label}: recenzja {round_number}/{cfg.max_bootstrap_reviews} "
@@ -465,6 +514,16 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
                     "Potrzebna decyzja użytkownika.")
         history += [note for note in notes if note not in history]
         log(f"{label}: recenzja wymaga zmian: {'; '.join(notes)[:300]}")
+    if not data:
+        # Ostatnia runda poszła na naprawę, która się nie udała. Zielona suita
+        # jest warunkiem wejścia do dalszej pętli, więc tego nie da się przyjąć.
+        # Pusta lista znaczy budżet, który nie dał ani jednego podejścia — bez
+        # tego rozgałęzienia komunikat byłby wyjątkiem z indeksowania.
+        cause = (f"sprawdzian wciąż obala deklarację autora ({defects[-1][:200]})"
+                 if defects else "budżet nie dopuścił ani jednego podejścia")
+        raise AgentError(
+            f"{label}: budżet {cfg.max_bootstrap_reviews} rund wyczerpany — "
+            f"{cause}. Potrzebna decyzja użytkownika.")
     if stalled:
         raise AgentError(
             f"{label}: budżet {cfg.max_bootstrap_reviews} recenzji wyczerpany, a "
@@ -485,27 +544,40 @@ def phase_bootstrap(cfg: Config, project: str, state: State, logf) -> None:
 
     def attempt(notes: list[str]) -> dict:
         if notes:
-            log("Bootstrap: poprawiam szkielet po uwagach recenzenta…")
+            log("Bootstrap: poprawiam szkielet po uwagach…")
         data = _decision_with_retry(
             prompts.bootstrap_prompt(brief_text, review_notes=notes),
             lambda value: run_planner(
                 value, cfg, project, logf("bootstrap"), role="bootstrap"),
             lambda text: _parse_json_object(text, project=project))
         if not data.get("test_cmd"):
-            raise AgentError("bootstrap nie zwrócił poprawnego JSON-a")
+            raise AttemptRejected(
+                "nie podałeś `test_cmd` — bez komendy testów nie ma jak "
+                "sprawdzić szkieletu.")
         if not Path(project, brief.PROJECT_DOC_PATH).is_file():
             # Bez tego pliku planista straciłby kierunek projektu razem z
             # briefem, a przegląd kierunku nie miałby czego aktualizować.
-            raise AgentError(f"bootstrap nie utworzył {brief.PROJECT_DOC_PATH}")
+            raise AttemptRejected(f"nie utworzyłeś {brief.PROJECT_DOC_PATH}")
         log(f"Bootstrap: test_cmd={data['test_cmd']!r} "
             f"build_cmd={data.get('build_cmd', '')!r} kind={data.get('kind', 'app')!r}")
+        build_cmd = data.get("build_cmd", "")
         suite_ok, suite_output = build_then_test_result(
-            project, data.get("build_cmd", ""), data["test_cmd"],
-            cfg.agent_timeout_s)
+            project, build_cmd, data["test_cmd"], cfg.agent_timeout_s)
         if not suite_ok:
             detail = (suite_output or "").strip()
-            suffix = f": {detail[-2000:]}" if detail else ""
-            raise AgentError(f"testy bootstrapu nie przeszły{suffix}")
+            suffix = f":\n{detail[-2000:]}" if detail else "."
+            # Komenda jest deklaracją autora, więc naprawa ma dwa równorzędne
+            # wyjścia — dorobić brakujący cel albo zadeklarować ten, który
+            # istnieje. Bez tego zdania model poprawia tylko kod.
+            raise AttemptRejected(
+                f"zadeklarowany sprawdzian nie przechodzi — build_cmd="
+                f"{build_cmd!r}, test_cmd={data['test_cmd']!r}. Popraw projekt "
+                "albo zadeklaruj komendy, które w nim naprawdę działają"
+                + suffix,
+                # Wyjście sprawdzianu odróżnia jedną awarię od drugiej; same
+                # komendy są znakiem rozpoznawczym dopiero wtedy, gdy nie ma
+                # żadnego wyjścia, a i wtedy powtórzona cisza jest zastojem.
+                signature=detail[-2000:] or f"{build_cmd} {data['test_cmd']}")
         log("Bootstrap: testy początkowe zielone.")
         return data
 

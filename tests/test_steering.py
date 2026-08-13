@@ -456,11 +456,15 @@ def _reject(note: str) -> str:
 
 
 def _run_bootstrap(project: Path, cfg: Config, state: State,
-                   verdicts) -> tuple[list[str], list[str]]:
-    """Uruchom bootstrap, rozdzielając prompty budowniczego od recenzenta."""
+                   verdicts, suites=None) -> tuple[list[str], list[str]]:
+    """Uruchom bootstrap, rozdzielając prompty budowniczego od recenzenta.
+
+    ``suites`` podmienia wynik sprawdzianu w kolejnych podejściach; domyślnie
+    każde jest zielone."""
     built: list[str] = []
     reviewed: list[str] = []
     answers = iter(verdicts)
+    checks = iter(suites or ())
 
     def planner(prompt, *_args, **_kwargs):
         built.append(prompt)
@@ -472,9 +476,12 @@ def _run_bootstrap(project: Path, cfg: Config, state: State,
         reviewed.append(prompt)
         return next(answers)
 
+    def suite(*_args, **_kwargs):
+        return next(checks, (True, ""))
+
     with patch("forge.orchestrate.run_planner", side_effect=planner), \
          patch("forge.agents.run_agent", side_effect=reviewer), \
-         patch("forge.orchestrate.build_then_test_result", return_value=(True, "")):
+         patch("forge.orchestrate.build_then_test_result", side_effect=suite):
         orchestrate.phase_bootstrap(cfg, str(project), state, lambda p: p)
     return built, reviewed
 
@@ -521,11 +528,64 @@ def test_review_notes_accumulate_across_rounds(tmp_path: Path) -> None:
     assert "test mierzy inną implementację" in reviewed[1]
     assert "PROJECT.md nie niesie celu" in reviewed[2]
     # Budowniczy dostaje uwagi skumulowane, więc nie cofnie starszej poprawki.
-    assert "POPRAWKI PO RECENZJI ARCHITEKTURY" in built[1]
+    assert "POPRAWKI PO ODRZUCONYM SZKIELECIE" in built[1]
     assert "test mierzy inną implementację" in built[2]
     assert "PROJECT.md nie niesie celu" in built[2]
     assert state.bootstrapped is True
     assert state.test_cmd == "true"
+
+
+MAKE_FAIL = (False, "make: *** No rule to make target 'build'.  Stop.")
+
+
+def test_red_suite_buys_a_repair_round_instead_of_stopping_the_run(
+        tmp_path: Path) -> None:
+    """Zadeklarowana komenda, która nie istnieje, to pomyłka autora.
+
+    Zatrzymanie przebiegu kosztowałoby tu cały bootstrap i decyzję człowieka za
+    literówkę w jednym poleceniu, choć autor umie ją poprawić sam.
+    """
+    project, _seeded, cfg = _po_repo(tmp_path)
+    state = State()
+
+    built, reviewed = _run_bootstrap(
+        project, cfg, state, (APPROVE,), suites=(MAKE_FAIL,))
+
+    assert len(built) == 2
+    # Autor musi zobaczyć wyjście sprawdzianu i obie drogi naprawy.
+    assert "No rule to make target 'build'" in built[1]
+    assert "zadeklaruj komendy, które w nim naprawdę działają" in built[1]
+    # Recenzent architektury dostaje gwarancję zielonej suity, więc zaległy wpis
+    # o czerwonej kazałby mu sprawdzać rzecz już sprawdzoną przez Forge.
+    assert "No rule to make target" not in reviewed[0]
+    assert state.bootstrapped is True
+
+
+def test_suite_red_to_the_last_round_never_passes_as_a_skeleton(
+        tmp_path: Path) -> None:
+    """Zielona suita jest warunkiem wejścia do dalszej pętli, nie opinią."""
+    project, _seeded, cfg = _po_repo(tmp_path)
+    cfg.max_bootstrap_reviews = 2
+    state = State()
+
+    with pytest.raises(orchestrate.AgentError, match="obala deklarację autora"):
+        _run_bootstrap(project, cfg, state, (APPROVE,), suites=(
+            MAKE_FAIL,
+            (False, "ModuleNotFoundError: No module named 'pytest'")))
+
+    assert state.bootstrapped is False
+
+
+def test_same_failing_check_twice_stops_the_run(tmp_path: Path) -> None:
+    """Ten sam wynik po pełnej rundzie naprawczej to realne zakleszczenie."""
+    project, _seeded, cfg = _po_repo(tmp_path)
+    state = State()
+
+    with pytest.raises(orchestrate.AgentError, match="dwa razy z rzędu"):
+        _run_bootstrap(project, cfg, state, (APPROVE,),
+                       suites=(MAKE_FAIL, MAKE_FAIL))
+
+    assert state.bootstrapped is False
 
 
 def test_exhausted_review_budget_hands_the_notes_to_the_product_owner(
