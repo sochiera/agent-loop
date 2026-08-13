@@ -194,8 +194,11 @@ class Config:
     backlog_low_water: int = int(os.environ.get("FORGE_BACKLOG_LOW_WATER", "2"))
     # Miękki sufit dla recenzenta PO; migracja może go legalnie przekroczyć.
     max_backlog_stories: int = int(os.environ.get("FORGE_MAX_BACKLOG_STORIES", "6"))
-    # Budżet recenzji bootstrapu i przeglądu kierunku. Wyczerpanie oznacza, że
-    # rozbieżności nie da się rozstrzygnąć bez decyzji użytkownika.
+    # Budżet rund bootstrapu i przeglądu kierunku. Wyczerpanie oznacza, że
+    # rozbieżności nie da się rozstrzygnąć bez decyzji użytkownika. Rundę zużywa
+    # zarówno recenzja, jak i podejście obalone własnym sprawdzianem (czerwony
+    # build albo test), więc przy domyślnych 4 trzy nieudane podejścia zostawiają
+    # jedną rundę na recenzję architektury.
     max_bootstrap_reviews: int = int(
         os.environ.get("FORGE_MAX_BOOTSTRAP_REVIEWS", "4"))
     # Mały bezpiecznik: większe zadanie ma zostać ponownie rozplanowane.

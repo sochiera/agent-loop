@@ -111,11 +111,22 @@ razem z wyjściem sprawdzianu i wskazówką, że komendę wolno naprawić z obu 
 przebiegu kosztowałoby tu cały bootstrap i decyzję człowieka za literówkę w
 jednym poleceniu. Uwagi te omijają recenzenta, bo jego prompt gwarantuje zieloną
 suitę i zaległy wpis o czerwonej kazałby mu sprawdzać rzecz sprawdzoną już przez
-Forge. Przebieg zatrzymuje dopiero to samo wyjście sprawdzianu dwa razy z rzędu
-(porównywane bez stałej instrukcji naprawy, która inaczej sama przeważyłaby
-próg) albo sprawdzian czerwony do końca budżetu: zielona suita jest warunkiem
-wejścia do dalszej pętli, nie opinią, więc takiego szkieletu nie przyjmujemy
-nigdy.
+Forge. Nie kumulują się też jak uwagi recenzenta: pierwsze zielone podejście
+kasuje je wszystkie, bo jako jedyne są odwoływalne dowodowo — Forge właśnie
+uruchomił te komendy. Niesione dalej kazałyby autorowi „naprawiać" działające
+polecenie, a regresję i tak złapie sprawdzian następnej rundy, bo chodzi za
+każdym razem.
+
+Przebieg zatrzymuje dopiero to samo wyjście sprawdzianu dwa razy z rzędu albo
+sprawdzian czerwony do końca budżetu: zielona suita jest warunkiem wejścia do
+dalszej pętli, nie opinią, więc takiego szkieletu nie przyjmujemy nigdy.
+Powtórzenie rozstrzyga tu **równość** znormalizowanego wyjścia (bez czasów,
+liczników, numerów linii i adresów), a nie próg podobieństwa od uwag recenzenta:
+log jest w większości wspólną ramką, więc pod tamtym progiem dwa przebiegi
+pytest różniące się liczbą czerwonych testów wychodzą identyczne i wyraźny
+postęp autora zatrzymywałby przebieg. Rundę zużywa zarówno recenzja, jak i
+obalone podejście, więc przy domyślnych czterech trzy nieudane podejścia
+zostawiają jedną rundę na recenzję architektury.
 
 Recenzentowi kierunku wolno uruchamiać kod i eksperymentować w drzewie — bez
 tego mocna teza o kierunku wymagałaby zgadywania. Jego jedynym wynikiem

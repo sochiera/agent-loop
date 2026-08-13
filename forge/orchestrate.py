@@ -384,6 +384,28 @@ def _notes_repeat(history: list[str], notes: list[str],
     return ""
 
 
+_VOLATILE_OUTPUT = re.compile(r"0x[0-9a-f]+|\d+")
+
+
+def _check_signature(output: str) -> str:
+    """Odcisk wyjścia sprawdzianu: ta sama awaria daje ten sam napis.
+
+    Zakleszczenie na sprawdzianie maszynowym to wyjście IDENTYCZNE, nie
+    podobne, więc rozstrzyga równość, a nie próg ``_notes_repeat``. Tamten próg
+    kalibrowaliśmy dla jednozdaniowych uwag recenzenta; log jest w większości
+    wspólną ramką, więc pod nim dwa przebiegi pytest różniące się liczbą
+    czerwonych testów wychodzą identyczne (zmierzone 1,00 dla 3→1 awarii) i
+    wyraźny postęp autora zatrzymywałby przebieg.
+
+    Znikają wyłącznie rzeczy zmienne między przebiegami tej samej awarii:
+    czasy, liczniki, numery linii, PID-y i adresy. Reszta zostaje, więc
+    ``target 'build'`` i ``target 'smoke'`` pozostają różne. Rozjazd w drugą
+    stronę — przeoczone powtórzenie — kosztuje jedną rundę z budżetu, podczas
+    gdy fałszywy stop kosztuje cały bootstrap i decyzję człowieka.
+    """
+    return " ".join(_VOLATILE_OUTPUT.sub("#", output.lower()).split())
+
+
 class AttemptRejected(AgentError):
     """Podejście obaliło własną deklarację — poprawia je autor, nie człowiek.
 
@@ -396,11 +418,10 @@ class AttemptRejected(AgentError):
 
     def __init__(self, note: str, signature: str = ""):
         super().__init__(note)
-        # O zakleszczeniu rozstrzyga wyłącznie zmienna część, czyli wyjście
-        # sprawdzianu. Stała instrukcja naprawy jest wspólna dla wszystkich
-        # awarii i sama przeważyłaby próg podobieństwa, więc każda druga awaria
-        # — także zupełnie inna — wyglądałaby na powtórzoną.
-        self.signature = signature or note
+        # O zakleszczeniu rozstrzyga wyłącznie to, co powiedziała maszyna.
+        # Instrukcja naprawy jest wspólna dla wszystkich awarii i stała między
+        # rundami, więc w porównaniu niesie zero informacji.
+        self.signature = _check_signature(signature or note)
 
 
 def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
@@ -432,8 +453,10 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
     naprawcza albo go zazieleni, albo powtórzy ten sam błąd i sama się rozliczy.
     Te uwagi omijają recenzenta — jego prompt gwarantuje zieloną suitę, a
     zaległy wpis o czerwonej kazałby mu sprawdzać rzecz już sprawdzoną przez
-    Forge. Szkielet ze sprawdzianem czerwonym do końca budżetu nigdy nie zostaje
-    przyjęty: zielona suita jest warunkiem, nie opinią.
+    Forge. Nie kumulują się też jak uwagi recenzenta: pierwsze zielone podejście
+    kasuje je wszystkie, bo jako jedyne są odwoływalne dowodowo. Szkielet ze
+    sprawdzianem czerwonym do końca budżetu nigdy nie zostaje przyjęty: zielona
+    suita jest warunkiem, nie opinią.
 
     Zwraca wynik podejścia i uwagi do przekazania dalej.
 
@@ -460,7 +483,7 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
                 f"obaliło własną deklarację: {note[:300]}")
             ledger.append(project, f"{label} podejście {round_number} odrzucone: "
                                    f"{note[:160]}")
-            if _notes_repeat(signatures, [exc.signature]):
+            if exc.signature in signatures:
                 # Ten sam sprawdzian, ten sam wynik po pełnej rundzie naprawczej.
                 raise AgentError(
                     f"{label}: sprawdzian dwa razy z rzędu obalił deklarację "
@@ -469,6 +492,15 @@ def _reviewed_bootstrap(cfg: Config, project: str, logf, *, label: str,
             defects.append(note)
             signatures.append(exc.signature)
             continue
+        # Zielone podejście rozlicza WSZYSTKIE uwagi sprawdzianu dowodowo:
+        # Forge przed chwilą uruchomił te komendy. Niesione dalej kazałyby
+        # autorowi „naprawiać" działające polecenie, bo szablon poprawek każe
+        # rozliczyć każdą uwagę, której nikt nie odwołał. Regresję i tak złapie
+        # sprawdzian następnej rundy — chodzi za każdym razem — a sygnatury
+        # znikają razem z nimi, bo powtórzenie po zielonej rundzie nie dowodzi
+        # już, że autor tej awarii nie umie usunąć.
+        defects.clear()
+        signatures.clear()
         before = _tree_manifest(project)
         snapshot = _snapshot_tree(project)
         log(f"{label}: recenzja {round_number}/{cfg.max_bootstrap_reviews} "

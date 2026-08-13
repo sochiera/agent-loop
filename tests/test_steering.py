@@ -537,6 +537,31 @@ def test_review_notes_accumulate_across_rounds(tmp_path: Path) -> None:
 
 MAKE_FAIL = (False, "make: *** No rule to make target 'build'.  Stop.")
 
+# Wyjście sprawdzianu jest w większości wspólną ramką, więc dwa przebiegi tej
+# samej suity są do siebie podobne nawet przy wyraźnym postępie autora.
+PYTEST_THREE_RED = (False, """============================= test session starts ==========
+collected 12 items
+
+tests/test_parts.py::test_socket_match FAILED                            [ 25%]
+tests/test_parts.py::test_psu_headroom FAILED                            [ 50%]
+tests/test_parts.py::test_price_total FAILED                             [ 75%]
+
+=================================== FAILURES ===================================
+E       AssertionError: assert 'AM4' == 'AM5'
+E       AssertionError: assert 450 >= 550
+E       AssertionError: assert 4210 == 4200
+========================= 3 failed, 1 passed in 0.42s ==========================""")
+PYTEST_ONE_RED = (False, """============================= test session starts ==========
+collected 12 items
+
+tests/test_parts.py::test_socket_match PASSED                            [ 25%]
+tests/test_parts.py::test_psu_headroom PASSED                            [ 50%]
+tests/test_parts.py::test_price_total FAILED                             [ 75%]
+
+=================================== FAILURES ===================================
+E       AssertionError: assert 4210 == 4200
+========================= 1 failed, 3 passed in 0.39s ==========================""")
+
 
 def test_red_suite_buys_a_repair_round_instead_of_stopping_the_run(
         tmp_path: Path) -> None:
@@ -559,6 +584,53 @@ def test_red_suite_buys_a_repair_round_instead_of_stopping_the_run(
     # o czerwonej kazałby mu sprawdzać rzecz już sprawdzoną przez Forge.
     assert "No rule to make target" not in reviewed[0]
     assert state.bootstrapped is True
+
+
+def test_green_attempt_drops_the_settled_check_note(tmp_path: Path) -> None:
+    """Uwagi sprawdzianu odwołuje dowód, a nie kolejna opinia.
+
+    Niesiona dalej po zielonym podejściu kazałaby autorowi „naprawiać" komendę,
+    którą Forge przed chwilą uruchomił — szablon poprawek każe przecież
+    rozliczyć każdą uwagę, której nikt nie odwołał.
+    """
+    project, _seeded, cfg = _po_repo(tmp_path)
+    state = State()
+
+    built, _reviewed = _run_bootstrap(
+        project, cfg, state,
+        (_reject("kierunek do przepisania"), APPROVE), suites=(MAKE_FAIL,))
+
+    assert len(built) == 3
+    assert "No rule to make target" in built[1]
+    assert "No rule to make target" not in built[2]
+    # Uwaga recenzenta nie jest odwoływalna dowodowo, więc zostaje.
+    assert "kierunek do przepisania" in built[2]
+
+
+def test_progress_between_two_red_suites_is_not_a_stall(tmp_path: Path) -> None:
+    """Mniej czerwonych testów to postęp autora, a nie powtórzony sprawdzian.
+
+    Próg podobieństwa `_notes_repeat` kalibrowaliśmy dla jednozdaniowych uwag
+    recenzenta; pod nim te dwa logi wychodzą identyczne (1,00) i przebieg
+    stawałby mimo naprawionych dwóch z trzech awarii.
+    """
+    project, _seeded, cfg = _po_repo(tmp_path)
+    state = State()
+
+    built, _reviewed = _run_bootstrap(
+        project, cfg, state, (APPROVE,),
+        suites=(PYTEST_THREE_RED, PYTEST_ONE_RED))
+
+    assert len(built) == 3
+    assert state.bootstrapped is True
+
+
+def test_check_signature_ignores_only_what_changes_between_runs() -> None:
+    same = orchestrate._check_signature("1 failed in 0.42s (pid 8811)")
+    assert same == orchestrate._check_signature("1 failed in 0.39s (pid 24)")
+    assert same != orchestrate._check_signature("1 error in 0.42s (pid 8811)")
+    assert (orchestrate._check_signature("No rule to make target 'build'")
+            != orchestrate._check_signature("No rule to make target 'smoke'"))
 
 
 def test_suite_red_to_the_last_round_never_passes_as_a_skeleton(
