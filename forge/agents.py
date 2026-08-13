@@ -858,6 +858,30 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         pass
 
 
+# Linux odrzuca POJEDYNCZY argument dłuższy niż MAX_ARG_STRLEN (32 strony,
+# czyli 128 kB) błędem E2BIG — jeszcze przed startem procesu, więc żaden
+# retry ani backoff tego nie ratuje. Prompt roli rośnie z rundami zadania i
+# jeden bieg umarł dokładnie tak: OSError [Errno 7] z Popen wywrócił pętlę
+# tracebackiem, po siedmiu godzinach pracy i bez checkpointu. Margines jest na
+# resztę argv (flagi, ścieżki), bo limit dotyczy każdego argumentu z osobna.
+_MAX_ARG_BYTES = 120_000
+
+
+def _check_argv_size(argv: list[str]) -> None:
+    """Zamień systemowy E2BIG na łapalny AgentError z konkretem.
+
+    AgentError kończy bieg zapisanym checkpointem, a nie tracebackiem — to
+    różnica między „wznów po naprawie" a „siedem godzin do kosza"."""
+    for index, arg in enumerate(argv):
+        size = len(arg.encode("utf-8", "replace"))
+        if size > _MAX_ARG_BYTES:
+            raise AgentError(
+                f"argument #{index} komendy '{argv[0]}' ma {size} B i przekracza "
+                f"limit {_MAX_ARG_BYTES} B na pojedynczy argument execve. "
+                "Podawaj prompt przez stdin (szablon bez {prompt}) albo przez "
+                "plik ({prompt_file}).")
+
+
 def _run_once(argv: list[str], cwd: str, cfg: Config,
               stdin_text: str | None = None,
               env: dict[str, str] | None = None,
@@ -872,6 +896,7 @@ def _run_once(argv: list[str], cwd: str, cfg: Config,
     Rzuca AgentStalled po ``idle_timeout`` sekundach bez jednego bajtu (0 =
     watchdog wyłączony) i subprocess.TimeoutExpired po ``cfg.agent_timeout_s``.
     W obu wypadkach ubija grupę procesów i niesie zebrane dotąd wyjście."""
+    _check_argv_size(argv)
     popen_stdin = subprocess.PIPE if stdin_text is not None else None
     proc = subprocess.Popen(
         argv, cwd=cwd, env=env, stdin=popen_stdin,
@@ -1017,7 +1042,7 @@ def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
             # podda (patrz komentarz przy Config.agent_idle_timeout_s), więc to
             # MY decydujemy, kiedy przestać płacić za jego drzemkę.
             partial = exc.output
-            _append_log(log_path, argv, partial, -1)
+            _append_log(log_path, argv, partial, -1, stdin_text)
             stalls += 1
             log(f"  agent[{phase}] ZAWIS: brak wyjścia przez {idle_timeout}s "
                 f"(łącznie {time.monotonic() - started:.0f}s), proces ubity.")
@@ -1034,12 +1059,12 @@ def _run_with_backoff(argv: list[str], cwd: str, cfg: Config, log_path: str,
             # Zegar ścienny: tura realnie przepracowała cały budżet czasu.
             # Ponowienie kosztowałoby drugie tyle, więc kończymy — ale z
             # transkryptem, bo bez niego nie ma z czego postawić diagnozy.
-            _append_log(log_path, argv, _timeout_partial(e), -1)
+            _append_log(log_path, argv, _timeout_partial(e), -1, stdin_text)
             log(f"  agent[{phase}] TIMEOUT po {cfg.agent_timeout_s}s")
             raise AgentError(f"timeout po {cfg.agent_timeout_s}s: {' '.join(argv[:2])}") from e
 
         output = out + "\n" + err
-        _append_log(log_path, argv, output, code)
+        _append_log(log_path, argv, output, code, stdin_text)
         _record_large_tool_output(ledger_project or cwd, output)
         elapsed = time.monotonic() - started
 
@@ -1076,10 +1101,17 @@ def _phase_from_log(log_path: str) -> str:
     return stem or "unknown"
 
 
-def _append_log(log_path: str, argv: list[str], output: str, code: int) -> None:
+def _append_log(log_path: str, argv: list[str], output: str, code: int,
+                stdin_text: str | None = None) -> None:
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"\n===== {_ts()} rc={code} :: {' '.join(argv)} =====\n")
+        # Prompt podany stdin-em nie jest widoczny w argv, a to on rozstrzyga
+        # „czemu rola tak zdecydowała". Transkrypt leży na dysku poza projektem
+        # i nie kosztuje ani jednego tokena, więc zapisujemy go w całości.
+        if stdin_text:
+            f.write(f"----- stdin ({len(stdin_text)} znaków) -----\n")
+            f.write(stdin_text.rstrip("\n") + "\n----- /stdin -----\n")
         f.write(_trim_log_stream(output))
 
 
@@ -1402,6 +1434,8 @@ def _run_generic(spec, prompt: str, cfg: Config, project_dir: str, log_path: str
         kwargs = {"env": process_env}
         if usage_dir:
             kwargs["ledger_project"] = usage_dir
+        if spec.uses_stdin_prompt:
+            kwargs["stdin_text"] = prompt
         stream = _run_with_backoff(
             argv, project_dir, cfg, log_path, **kwargs)
     finally:

@@ -107,8 +107,11 @@ class GenericSpecTest(unittest.TestCase):
              "model": "zai-coding-plan/glm-5.2", "effort": "",
              "project": "", "output": ""},
         )
+        # Prompt NIE jest argumentem: idzie stdin-em, bo execve odrzuca
+        # pojedynczy argument powyżej 128 kB, a prompt roli tyle osiąga.
+        self.assertTrue(spec.uses_stdin_prompt)
         self.assertEqual(
-            argv, ["opencode", "run", "zrob X", "-m", "zai-coding-plan/glm-5.2",
+            argv, ["opencode", "run", "-m", "zai-coding-plan/glm-5.2",
                    "--auto", "--format", "json"])
         # Model z effortem (GLM-5.2 wspiera --variant) — flaga zostaje.
         argv_effort = adapters.expand_template(
@@ -119,7 +122,7 @@ class GenericSpecTest(unittest.TestCase):
         )
         self.assertEqual(
             argv_effort,
-            ["opencode", "run", "zrob X", "-m", "zai-coding-plan/glm-5.2",
+            ["opencode", "run", "-m", "zai-coding-plan/glm-5.2",
              "--variant", "high", "--auto", "--format", "json"])
 
     def test_env_template_overrides_known_default(self) -> None:

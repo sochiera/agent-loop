@@ -177,6 +177,20 @@ def plan_batch_prompt(
     )
 
 
+# Ile ścieżek zmieszczą „Zmiany od startu zadania". Rola potrzebuje wiedzieć,
+# CO ruszyło zadanie, a nie mieć kompletny indeks drzewa: dłuższa lista i tak
+# nie jest czytana, za to wchodzi do KAŻDEJ kolejnej tury tego zadania. Bieg,
+# w którym ta lista rosła bez ograniczenia, dobił prompt testera do 130 kB.
+_CAPSULE_FILE_LIMIT = 30
+
+
+def _file_list(paths: list[str], limit: int = _CAPSULE_FILE_LIMIT) -> str:
+    if len(paths) <= limit:
+        return ", ".join(paths)
+    return (", ".join(paths[:limit])
+            + f" …i {len(paths) - limit} więcej")
+
+
 def context_capsule(
         state, role: str, *, notebook_text: str = "",
         changed_files: list[str] | None = None, handoff: str = "",
@@ -196,7 +210,10 @@ def context_capsule(
         elif suite_regression:
             turn = "tester / ponowna ocena po czerwonej pełnej bramce"
         elif review_suggestions:
-            turn = "tester / ocena sugestii review"
+            # Cykl domykający bez uwag bierze się z zapisu read-only reviewera,
+            # nie z sugestii — nazwa tury ma mówić, co rola ma zrobić.
+            turn = ("tester / ocena sugestii review" if state.review_notes
+                    else "tester / ocena diffu recenzenta i dostawa")
         elif state.review_notes:
             turn = "tester / nowy cykl po uwagach review"
         else:
@@ -230,7 +247,7 @@ def context_capsule(
         if command:
             lines.append(f"Bramka testera: {command}")
     if changed_files:
-        lines.append("Zmiany od startu zadania: " + ", ".join(changed_files))
+        lines.append("Zmiany od startu zadania: " + _file_list(changed_files))
     # Treść notatnika wklejamy zamiast kazać roli sięgnąć po nią narzędziem:
     # jedna tura narzędziowa kosztuje w tej pętli o dwa rzędy wielkości więcej
     # niż te kilkaset tokenów. Żadna rola nie dostaje ścieżki — obie oddają
@@ -283,13 +300,20 @@ def tester_task_prompt(
         instructions = render(
             "tester-suite-regression.md", FULL_TEST_CMD=full_test_cmd)
     elif review_suggestions:
-        instructions = render(
-            "tester-suggestions.md", FULL_TEST_CMD=full_test_cmd)
+        # Cykl domykający bez uwag to zapis read-only reviewera, nie sugestie.
+        # Prompt ma opisywać turę, którą rola faktycznie ma odbyć: obietnica
+        # „przejrzyj sugestie" bez jednej sugestii to sygnał do szukania czegoś,
+        # czego nie ma — a jedna zbędna tura kosztuje tu miliony tokenów.
+        template = ("tester-suggestions.md" if review_notes
+                    else "tester-review-writeback.md")
+        instructions = render(template, FULL_TEST_CMD=full_test_cmd)
     else:
         instructions = render(
             "tester-normal.md", FULL_TEST_CMD=full_test_cmd)
+    # `review` znika z cyklu domykającego: recenzja tego diffu już zapadła, a
+    # druga tura recenzji potrafi tylko odesłać pracę na kolejne okrążenie.
     statuses = (
-        "red|code|review|finalize|blocked"
+        "red|code|finalize|blocked"
         if review_suggestions else "red|code|review|blocked"
     )
     return render(

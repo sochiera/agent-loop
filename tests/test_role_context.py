@@ -245,7 +245,7 @@ def test_reviewer_prompt_is_plain_code_review() -> None:
     assert "umieść ją w `nits`" in prompt
 
 
-def test_suggestions_prompt_can_finalize_or_escalate() -> None:
+def test_suggestions_prompt_finalizes_without_a_second_review() -> None:
     prompt = prompts.tester_task_prompt(
         "task.md",
         "pytest -q",
@@ -263,7 +263,30 @@ def test_suggestions_prompt_can_finalize_or_escalate() -> None:
     assert "usuń duplikację; skróć nazwę" in prompt
     assert "finalize" in prompt
     assert "bez ponownego review" in prompt
-    assert "świadoma eskalacja" in prompt
+    # Kontrakt tury: bez `review`, bo cykl domykający kończy się dostawą.
+    assert "drugiej recenzji nie będzie" in prompt.lower()
+    assert '"status":"red|code|finalize|blocked"' in prompt
+
+
+def test_review_writeback_prompt_asks_only_about_the_reviewer_diff() -> None:
+    """Cykl domykający bez uwag to zapis read-only reviewera. Prompt o
+    „sugestiach", których nie ma, wysyła rolę na poszukiwanie widma."""
+    prompt = prompts.tester_task_prompt(
+        "task.md",
+        "pytest -q",
+        capsule=(
+            "KAPSUŁA KONTEKSTU\n"
+            "Handoff do testera: Reviewer mimo roli read-only zmienił pliki "
+            "[app/core.py]."
+        ),
+        review_suggestions=True,
+        review_notes=[],
+    )
+
+    assert "read-only" in prompt
+    assert "sugestii" not in prompt.split("JSON:")[0].lower()
+    assert "finalize" in prompt
+    assert "bez ponownego review" in prompt
 
 
 def test_agent_prompt_bodies_live_in_separate_files() -> None:
@@ -312,3 +335,18 @@ def test_every_fifth_batch_requires_one_technical_debt_task() -> None:
         not in normal
     assert "jedno zadanie w tym wsadzie ma być zadaniem długu technicznego" \
         in fifth
+
+
+def test_capsule_caps_the_change_list() -> None:
+    """Lista zmian wchodzi do KAŻDEJ kolejnej tury zadania. Rosnąca bez
+    ograniczenia dobiła prompt testera do 130 kB i wywróciła cały bieg."""
+    state = State(current_task={"id": "task-001", "file": "task.md"})
+    paths = [f"src/module_{index:03d}.py" for index in range(120)]
+
+    capsule = prompts.context_capsule(state, "tester", changed_files=paths)
+
+    line = [row for row in capsule.splitlines()
+            if row.startswith("Zmiany od startu zadania:")][0]
+    assert "src/module_029.py" in line
+    assert "src/module_030.py" not in line
+    assert "…i 90 więcej" in line

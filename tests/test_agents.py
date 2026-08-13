@@ -898,3 +898,45 @@ def test_role_without_a_chain_behaves_exactly_as_before() -> None:
                side_effect=agents.LimitExhausted("limit")):
         with pytest.raises(agents.LimitExhausted):
             agents.run_role("coder", "prompt", cfg, "/tmp", "/tmp/log")
+
+
+def test_prompt_longer_than_the_execve_limit_is_a_catchable_error() -> None:
+    """Linux odrzuca argument powyżej 128 kB błędem E2BIG, a `OSError` z Popen
+    nie jest łapany nigdzie w pętli: jeden bieg zginął tak po siedmiu godzinach
+    pracy, bez checkpointu. AgentError kończy bieg zapisanym stanem."""
+    argv = ["agent", "--exec", "x" * 200_000]
+
+    with pytest.raises(AgentError, match="limit .* na pojedynczy argument"):
+        agents._run_once(argv, "/tmp", Config())
+
+
+def test_opencode_receives_the_prompt_on_stdin_not_in_argv(
+        tmp_path: Path) -> None:
+    """Prompt roli rośnie z każdą rundą zadania i przekracza limit argumentu.
+    Stdin nie ma tego limitu — i to jedyny powód tej drogi."""
+    seen: dict[str, object] = {}
+
+    def backoff(argv, _cwd, _cfg, _log_path, **kwargs):
+        seen["argv"] = argv
+        seen["stdin"] = kwargs.get("stdin_text")
+        return json.dumps({"part": {"id": "a", "type": "text", "text": "ok"}})
+
+    prompt = "ROLA: TESTER. " + "x" * 200_000
+    with patch("forge.agents._run_with_backoff", side_effect=backoff):
+        result = run_agent("opencode", prompt, Config(), str(tmp_path),
+                           str(tmp_path / "tester.log"))
+
+    assert result == "ok"
+    assert seen["stdin"] == prompt
+    assert not any(len(arg) > 1000 for arg in seen["argv"])
+
+
+def test_stdin_prompt_lands_in_the_transcript(tmp_path: Path) -> None:
+    """Prompt podany stdin-em znika z argv, a z nim z transkryptu — a to on
+    tłumaczy decyzję roli. Log leży na dysku i nie kosztuje tokenów."""
+    log_path = str(tmp_path / "logs" / "tester.log")
+    _append_log(log_path, ["opencode", "run"], "wyjście", 0, "PROMPT ROLI")
+
+    saved = Path(log_path).read_text(encoding="utf-8")
+    assert "PROMPT ROLI" in saved
+    assert "----- stdin (11 znaków) -----" in saved

@@ -256,7 +256,7 @@ def test_task_declared_without_a_file_on_disk_is_sifted_visibly(
 def test_sift_streak_survives_batches_the_ledger_window_cannot_hold(
         tmp_path) -> None:
     """Jeden wsad ośmiu zadań to kilkadziesiąt wpisów, więc dwa kolejne odsiewy
-    nigdy nie zmieszczą się razem ani w oknie mistrza (20 linii), ani w całej
+    nigdy nie zmieszczą się razem ani w oknie mistrza (60 linii), ani w całej
     pamięci dziennika (80). Seria musi więc żyć w stanie, nie w dzienniku."""
     _plan_repo(tmp_path)
     sifted = ('{"tasks":[{"id":"task-001","title":"Nie zapisane",'
@@ -457,3 +457,55 @@ def test_fifth_planning_batch_requests_technical_debt_task(tmp_path) -> None:
 
     assert state.plan_batches == 5
     assert "zadaniem długu technicznego" in prompts_seen[0]
+
+
+def test_agent_runtime_dirs_are_excluded_from_the_repo(tmp_path) -> None:
+    """Katalogi sesji agentów CLI to nasz runtime, nie praca roli: wykluczenie
+    lokalne trzyma je poza commitami i poza listą zmian każdej tury."""
+    orchestrate.ensure_repo(str(tmp_path))
+    session = tmp_path / ".opencode" / "goals" / "state.json.sessions" / "abc"
+    session.mkdir(parents=True)
+    session.joinpath("state.json").write_text("{}", encoding="utf-8")
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=tmp_path, text=True,
+        capture_output=True, check=True).stdout
+
+    assert ".opencode" not in status
+    excluded = (tmp_path / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    assert ".forge/" in excluded.splitlines()
+    assert ".opencode/" in excluded.splitlines()
+
+
+def test_changed_list_ignores_agent_session_state(tmp_path) -> None:
+    """Ta lista wchodzi do kapsuły KAŻDEJ tury zadania. Wpuszczone raz ścieżki
+    sesji rosną z każdą rundą — jeden bieg dobił nimi prompt do 130 kB."""
+    project = str(tmp_path)
+    orchestrate.ensure_repo(project)
+    (tmp_path / "app.py").write_text("VALUE = 0\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "tag", "start"], cwd=tmp_path, check=True)
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    session = tmp_path / ".opencode" / "goals" / "abc"
+    session.mkdir(parents=True)
+    session.joinpath("state.json").write_text("{}", encoding="utf-8")
+    cache = tmp_path / "__pycache__"
+    cache.mkdir()
+    cache.joinpath("app.pyc").write_bytes(b"\x00")
+
+    assert orchestrate._changed(project, "start") == ["app.py"]
+
+
+def test_turn_change_list_leaves_room_for_the_reason() -> None:
+    """Wpis dziennika ma 300 znaków. Osiem długich ścieżek zjadało go w całości
+    i mistrz dostawał do okna same sumy SHA zamiast powodu decyzji."""
+    paths = [f".opencode/goals/state.json.sessions/{index:064x}/state.json"
+             for index in range(8)]
+
+    described = orchestrate._describe_turn_changes(paths)
+
+    assert len(described) <= orchestrate._CHANGE_LIST_BUDGET + 10
+    assert described.endswith("+7]")
+    assert orchestrate._describe_turn_changes([]) == "bez_zmian"
+    assert orchestrate._describe_turn_changes(["a.py", "b.py"]) == "[a.py, b.py]"

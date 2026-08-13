@@ -35,11 +35,14 @@ TASK_ID_BODY = r"task-\d+"
 KEEP_LINES = 1000
 MAX_ENTRY = 300
 # Okno mistrza. TO jest parametr kosztu: idzie do promptu przy każdym wywołaniu
-# roli wołanej co rundę. Rośnie tylko z bardzo dobrego powodu. Zostaje wąskie
-# także po dołożeniu okien niżej: zadaniem mistrza jest rozpoznanie wzorca w
-# świeżym wycinku, a nie rekonstrukcja historii — szersze okno zmieniłoby jego
-# rolę, nie tylko rachunek.
-MASTER_LINES = 20
+# roli wołanej co rundę. Rośnie tylko z bardzo dobrego powodu — i taki powód
+# padł: przy 20 liniach okno obejmowało siedem ostatnich rund, czyli mniej niż
+# jedno okrążenie pary tester↔recenzja. Mistrz miał przerwać pętlę, której
+# długości fizycznie nie widział; jeden bieg zrobił 108 takich okrążeń przez
+# siedem godzin, a każde wyglądało w tym okienku jak normalna praca. 60 linii
+# to kilkanaście kB na wywołanie wobec tury liczonej w setkach kB — i pierwszy
+# rozmiar, przy którym powtarzalność wzorca w ogóle daje się zobaczyć.
+MASTER_LINES = 60
 # Okna pozostałych ról. Mierzone na realnym dzienniku (609 wpisów, 100 kB,
 # średnio 165 znaków na wpis): 200 linii to ~31 kB (~10k tokenów), 400 linii to
 # ~62 kB (~20k tokenów). Wobec tury, w której sam wynik narzędzi potrafi mieć
@@ -54,8 +57,13 @@ TASK_LINES = 200
 # pamięci dziennika, po jej powiększeniu mistrz wypominałby planiście zadania
 # sprzed kilku przebiegów i reguła zmieniłaby się w stały fałszywy alarm.
 ROUND_LIMIT_LINES = 80
-MASTER_WIDTH = 120
-MASTER_FILES = 160
+MASTER_WIDTH = 160
+MASTER_FILES = 100
+# Miejsce ZAREZERWOWANE dla powodu decyzji, którego lista plików nie ma prawa
+# zjeść. Bez rezerwacji wpis z długimi ścieżkami wchodził do okna mistrza jako
+# same nazwy zakończone dwukropkiem: nadzorca dostawał sumy SHA katalogów sesji
+# i ani jednego zdania o tym, dlaczego rola tak zdecydowała.
+MASTER_REASON = 60
 _FILE = "ledger.md"
 
 
@@ -113,17 +121,26 @@ def tail_for_task(project: str, task_id: str, limit: int = 8,
 
 
 def _compact_line(line: str, width: int = MASTER_WIDTH) -> str:
-    """Przytnij POWÓD, nie listę plików.
+    """Przytnij POWÓD, nie listę plików — ale zostaw powodowi miejsce.
 
     Mistrz wykrywa wzorce po ``pliki=…`` (np. zmianę testu przez kodera),
     a ta lista stoi w linii przed powodem — cięcie na sztywnej szerokości
-    gubiło właśnie ją, gdy tura ruszyła kilka plików naraz.
+    gubiło właśnie ją, gdy tura ruszyła kilka plików naraz. Odwrotna skrajność
+    kosztowała jednak cały bieg: lista długich ścieżek zjadała wpis w całości i
+    do okna mistrza wchodziły same nazwy. Dlatego lista ustępuje, gdy inaczej
+    powód nie zmieściłby się wcale.
     """
     head, marker, rest = line.partition("pliki=")
     if not marker:
         return line[:width]
     files, colon, reason = rest.partition(": ")
-    kept = f"{head}{marker}{files[:MASTER_FILES]}{colon}"
+    # Rezerwacja ma sens tylko wtedy, gdy jest CO chronić. Rola bywa zwięzła i
+    # oddaje decyzję bez `reason` — wpis kończy się wtedy samym dwukropkiem, a
+    # sztywna rezerwa zabierałaby liście plików 60 znaków za nic.
+    reserved = MASTER_REASON if reason else 0
+    budget = min(MASTER_FILES, max(0, width - len(head) - len(marker)
+                                   - len(colon) - reserved))
+    kept = f"{head}{marker}{files[:budget]}{colon}"
     return kept + reason[:max(0, width - len(kept))]
 
 

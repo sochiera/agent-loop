@@ -203,6 +203,12 @@ class Config:
         os.environ.get("FORGE_MAX_BOOTSTRAP_REVIEWS", "4"))
     # Mały bezpiecznik: większe zadanie ma zostać ponownie rozplanowane.
     max_tdd_rounds: int = int(os.environ.get("FORGE_MAX_TDD_ROUNDS", "10"))
+    # Ile razy pod rząd recenzja może odesłać zadanie do testera, NIE zmieniwszy
+    # niczego w drzewie. Jałowe okrążenie znaczy, że kolejne też nic nie wniesie:
+    # obie role widzą ten sam kod i tę samą historię. Trzy okrążenia to zapas na
+    # uwagę rozliczoną argumentem zamiast diffem; czwarte kosztuje tyle samo, co
+    # trzy pierwsze, i nigdy nie kończy się inaczej.
+    max_review_cycles: int = int(os.environ.get("FORGE_MAX_REVIEW_CYCLES", "3"))
     # Agent CLI każdej roli nowego modelu. "claude"/"codex" mają wbudowaną
     # obsługę; dowolna inna nazwa → agent generyczny z FORGE_AGENT_<NAME>_CMD
     # (patrz adapters.py). Domyślnie tester i koder to opencode (z.ai).

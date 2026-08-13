@@ -103,7 +103,8 @@ def test_tail_for_task_does_not_match_longer_task_id(tmp_path: Path) -> None:
 
 
 def test_compact_tail_for_master_limits_lines_and_width(tmp_path: Path) -> None:
-    for index in range(30):
+    total = ledger.MASTER_LINES + 10
+    for index in range(total):
         ledger.append(
             str(tmp_path),
             f"task-{index:03d} wpis mistrza " + "x" * 250,
@@ -111,10 +112,10 @@ def test_compact_tail_for_master_limits_lines_and_width(tmp_path: Path) -> None:
 
     lines = ledger.compact_tail(str(tmp_path)).splitlines()
 
-    assert len(lines) == 20
-    assert all(len(line) <= 120 for line in lines)
-    assert "task-010" in lines[0]
-    assert "task-029" in lines[-1]
+    assert len(lines) == ledger.MASTER_LINES
+    assert all(len(line) <= ledger.MASTER_WIDTH for line in lines)
+    assert f"task-{total - ledger.MASTER_LINES:03d}" in lines[0]
+    assert f"task-{total - 1:03d}" in lines[-1]
 
 
 def test_compact_tail_keeps_file_list_and_cuts_the_reason(tmp_path: Path) -> None:
@@ -134,10 +135,11 @@ def test_compact_tail_keeps_file_list_and_cuts_the_reason(tmp_path: Path) -> Non
 
 def test_round_limit_tasks_are_visible_beyond_the_master_window(
         tmp_path: Path) -> None:
-    """Zadanie idące na limit rund zajmuje więcej linii niż całe okno mistrza,
+    """Dwie porażki na limicie rund dzieli więcej wpisów niż całe okno mistrza,
     więc bez osobnego licznika reguła o zbyt grubych zadaniach jest martwa."""
+    rounds = ledger.MASTER_LINES // 2 + 1
     for task in ("task-001", "task-002"):
-        for round_no in range(1, 11):
+        for round_no in range(1, rounds + 1):
             ledger.append(str(tmp_path), f"{task} r{round_no} tester→red pliki=bez_zmian: x")
             ledger.append(str(tmp_path), f"{task} r{round_no} koder→green pliki=[a.py]: x")
         ledger.append(
@@ -203,3 +205,36 @@ def test_append_never_raises_on_unwritable_project(tmp_path: Path) -> None:
     ledger.append(str(blocked), "cokolwiek")
 
     assert ledger.tail(str(blocked)) == ""
+
+
+def test_compact_line_reserves_room_for_the_reason(tmp_path: Path) -> None:
+    """Lista plików nie ma prawa zjeść wpisu w całości. Gdy zjadła, mistrz
+    dostawał do okna same ścieżki zakończone dwukropkiem — i nie miał na czym
+    rozpoznać pętli, którą miał przerwać."""
+    paths = ", ".join(
+        f".opencode/goals/state.json.sessions/{index:064x}/state.json"
+        for index in range(2))
+    ledger.append(
+        str(tmp_path),
+        f"task-001 recenzja→approve pliki=[{paths}]: bramka zielona, commit")
+
+    line = ledger.compact_tail(str(tmp_path)).splitlines()[0]
+
+    assert "pliki=[.opencode/goals" in line
+    assert "bramka zielona" in line
+    assert len(line) <= ledger.MASTER_WIDTH
+
+
+def test_compact_line_gives_the_whole_width_to_files_when_there_is_no_reason(
+        tmp_path: Path) -> None:
+    """Rola bywa zwięzła i oddaje decyzję bez `reason`. Rezerwa na powód, po
+    którym nic nie przychodzi, kosztowałaby mistrza 60 znaków listy plików —
+    czyli dokładnie ten sygnał, po którym rozpoznaje wzorzec tury."""
+    paths = ", ".join(f"src/module_{index:03d}.py" for index in range(9))
+    ledger.append(str(tmp_path), f"task-001 r1 koder→green pliki=[{paths}]: ")
+
+    line = ledger.compact_tail(str(tmp_path)).splitlines()[0]
+
+    # Z rezerwą na nieistniejący powód lista urywała się na module_002.
+    assert "src/module_004.py" in line
+    assert len(line) <= ledger.MASTER_WIDTH

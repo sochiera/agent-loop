@@ -642,16 +642,15 @@ def test_review_suggestions_can_be_applied_by_coder_without_rereview(
     assert state.current_task == {}
 
 
-def test_tester_can_escalate_suggestions_to_a_second_review(
+def test_suggestions_cycle_never_opens_a_second_review(
         tmp_path: Path) -> None:
+    """Drobne uwagi nie kupują drugiej recenzji. Recenzent zaakceptował diff,
+    więc kolejna tura recenzji nie ma czego rozstrzygnąć — a może odesłać pracę
+    na następne okrążenie. `review` ze starego checkpointu domyka zadanie."""
     _task, state, cfg = _task_repo(tmp_path)
     tester_answers = iter((
         '{"status":"review"}',
-        '{"status":"review","reason":"zmiana wykracza poza sugestię"}',
-    ))
-    reviewer_answers = iter((
-        '{"verdict":"suggestions","notes":["rozważ zmianę granicy modułu"]}',
-        '{"verdict":"approve","notes":[]}',
+        '{"status":"review","reason":"stary checkpoint sprzed zmiany kontraktu"}',
     ))
 
     with patch(
@@ -660,13 +659,15 @@ def test_tester_can_escalate_suggestions_to_a_second_review(
          patch("forge.orchestrate._master_notes", return_value={}), \
          patch(
              "forge.agents.run_agent",
-             side_effect=reviewer_answers) as reviewer, \
+             return_value=(
+                 '{"verdict":"suggestions",'
+                 '"notes":["rozważ zmianę granicy modułu"]}')) as reviewer, \
          patch("forge.orchestrate.build_then_test_result",
                return_value=(True, "ok")):
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
         orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
 
-    assert reviewer.call_count == 2
+    assert reviewer.call_count == 1
     assert state.current_task == {}
 
 
@@ -912,3 +913,115 @@ def test_dump_invalid_decision_survives_unwritable_target(
     orchestrate._dump_invalid_decision(str(tmp_path), Config(), state, exc)
 
     assert blocker.is_file()
+
+
+def test_agent_session_files_are_not_a_reviewer_edit(tmp_path: Path) -> None:
+    """Opencode zakłada w projekcie katalog sesji przy KAŻDYM wywołaniu. Bez
+    odsiania tych plików każda recenzja „zmieniała drzewo" i wracała do testera
+    mimo approve — jeden bieg zrobił tak 108 okrążeń i nie zacommitował nic."""
+    _task, state, cfg = _task_repo(tmp_path)
+    roles: list[str] = []
+
+    def session_writing_review(_agent, _prompt, _cfg, project, _log, **_kwargs):
+        session = Path(project, ".opencode", "goals", "state.json.sessions", "abc")
+        session.mkdir(parents=True, exist_ok=True)
+        session.joinpath("state.json").write_text("{}", encoding="utf-8")
+        return '{"verdict":"approve","notes":[]}'
+
+    def role_call(_cfg, _project, _state, role, _prompt, _log):
+        roles.append(role)
+        return '{"status":"review"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.agents.run_agent", side_effect=session_writing_review), \
+         patch("forge.orchestrate.build_then_test_result", return_value=(True, "ok")):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert roles == ["tester"]
+    assert state.current_task == {}
+    assert "review-zapis" not in ledger.tail(str(tmp_path))
+
+
+def test_reviewer_write_is_settled_by_the_tester_who_then_delivers(
+        tmp_path: Path) -> None:
+    """Zapis read-only reviewera ocenia tester i sam dostarcza. Mechaniczna
+    bramka odsyłała to na kolejną recenzję, która znów pisała po drzewie."""
+    _task, state, cfg = _task_repo(tmp_path)
+    tester_answers = iter((
+        '{"status":"review"}',
+        '{"status":"finalize","reason":"zmiana recenzenta zachowana"}',
+    ))
+    tester_prompts: list[str] = []
+
+    def modifying_review(_agent, _prompt, _cfg, project, _log, **_kwargs):
+        Path(project, "reviewer-change.py").write_text(
+            "VALUE = 1\n", encoding="utf-8")
+        return '{"verdict":"approve","notes":[]}'
+
+    def role_call(_cfg, _project, _state, role, prompt, _log):
+        assert role == "tester"
+        tester_prompts.append(prompt)
+        return next(tester_answers)
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.agents.run_agent", side_effect=modifying_review) as reviewer, \
+         patch("forge.orchestrate.build_then_test_result", return_value=(True, "ok")):
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+        assert state.review_suggestions_pending
+        orchestrate.run_task(cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert reviewer.call_count == 1
+    assert state.current_task == {}
+    assert "reviewer-change.py" in tester_prompts[1]
+    assert "read-only" in tester_prompts[1]
+    assert '"status":"red|code|finalize|blocked"' in tester_prompts[1]
+
+
+def test_idle_review_cycles_end_the_task_instead_of_looping(
+        tmp_path: Path) -> None:
+    """Powrót z recenzji, po którym drzewo wygląda identycznie, nie wnosi nic —
+    a powtórzony bez końca kosztuje tyle, co cały przebieg."""
+    cfg = Config(git_push=False, max_review_cycles=2)
+    _task, state, _cfg = _task_repo(tmp_path)
+
+    with patch("forge.orchestrate._call_role",
+               return_value='{"status":"review"}'), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.agents.run_agent", return_value=(
+             '{"verdict":"request_changes","notes":["napraw kontrakt"]}')), \
+         patch("forge.orchestrate.build_then_test_result", return_value=(True, "ok")):
+        for _ in range(cfg.max_review_cycles + 1):
+            assert orchestrate.run_task(
+                cfg, str(tmp_path), state, lambda phase: phase)
+
+    journal = ledger.tail(str(tmp_path))
+    assert "PORZUCONE: review_loop" in journal
+    assert state.current_task == {}
+    assert (tmp_path / ".forge" / "failed" / "task-001" / "reason.txt").exists()
+
+
+def test_real_progress_resets_the_review_cycle_counter(tmp_path: Path) -> None:
+    """Licznik pilnuje JAŁOWYCH okrążeń. Dopóki tester faktycznie poprawia kod,
+    kolejne rundy recenzji są normalną pracą i nie mają prawa zabić zadania."""
+    cfg = Config(git_push=False, max_review_cycles=2)
+    _task, state, _cfg = _task_repo(tmp_path)
+    edits = iter(range(1, 99))
+
+    def role_call(_cfg, project, _state, _role, _prompt, _log):
+        Path(project, "app.py").write_text(
+            f"VALUE = {next(edits)}\n", encoding="utf-8")
+        return '{"status":"review"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.agents.run_agent", return_value=(
+             '{"verdict":"request_changes","notes":["jeszcze raz"]}')), \
+         patch("forge.orchestrate.build_then_test_result", return_value=(True, "ok")):
+        for _ in range(cfg.max_review_cycles + 2):
+            assert orchestrate.run_task(
+                cfg, str(tmp_path), state, lambda phase: phase)
+
+    assert state.review_cycles == 1
+    assert "PORZUCONE" not in ledger.tail(str(tmp_path))

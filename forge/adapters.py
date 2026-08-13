@@ -12,6 +12,11 @@ Placeholdery szablonu: {prompt} {prompt_file} {system} {schema} {model} {effort}
 {project} {output}. {prompt_file} jest obsługiwany przez Forge dla CLI, które
 czytają prompt z pliku, i pozwala uniknąć ujawniania treści promptu w argv.
 - Jeśli szablon zawiera {output}, wynik czytamy z TEGO pliku; inaczej ze stdout.
+- Szablon BEZ {prompt} i BEZ {prompt_file} dostaje prompt na STDIN. To jedyna
+  droga bez limitu długości: Linux odrzuca pojedynczy argument dłuższy niż
+  MAX_ARG_STRLEN (128 kB) błędem E2BIG jeszcze przed startem procesu, a prompt
+  roli rośnie z każdą rundą zadania. Kto pisze własny szablon dla CLI czytającego
+  stdin, po prostu pomija {prompt}.
 - Token, który jest czystym placeholderem i rozwinie się do pustego stringa
   (np. {model} przy nieustawionym modelu), jest pomijany — nie zostawiamy pustych
   argumentów.
@@ -104,8 +109,12 @@ KNOWN_TEMPLATES: dict[str, str] = {
     # --dir {project} jest KONIECZNE: `opencode run` nie dziedziczy cwd procesu
     # (subprocess cwd=project to za mało) — bez tej flagi agent operuje na
     # jakimś swoim domyślnym/ostatnio używanym katalogu, nie na projekcie.
+    # Prompt idzie STDIN-em (brak {prompt} w szablonie): `opencode run` czyta
+    # całe wejście, gdy stdin nie jest terminalem, i traktuje je jak treść
+    # wiadomości. Argv odpadło razem z limitem 128 kB na argument — prompt
+    # testera po stu rundach zadania przekraczał go i zabijał cały bieg.
     "opencode": (
-        "opencode run {prompt} -m {model} --variant {effort} --auto "
+        "opencode run -m {model} --variant {effort} --auto "
         "--format json --dir {project}"
     ),
 }
@@ -123,7 +132,7 @@ THIN_TEMPLATES: dict[str, str] = {
         "--session-id {session_id}"
     ),
     "opencode": (
-        "opencode run {prompt} -m {model} --variant {effort} "
+        "opencode run -m {model} --variant {effort} "
         "--agent forge-thin --pure --format json --dir {project}"
     ),
 }
@@ -136,6 +145,16 @@ class GenericSpec:
     template: list[str]        # tokeny argv z placeholderami
     uses_output_file: bool     # True → wynik z pliku {output}; False → ze stdout
     uses_prompt_file: bool     # True → prompt z pliku {prompt_file}, nie argv
+
+    @property
+    def uses_stdin_prompt(self) -> bool:
+        """Szablon bez miejsca na prompt = prompt wchodzi na stdin.
+
+        Brak obu placeholderów nie może znaczyć „prompt przepada", więc jest
+        deklaracją, a nie błędem — i jedyną drogą bez limitu 128 kB na argument.
+        """
+        return not self.uses_prompt_file and not any(
+            "{prompt}" in token for token in self.template)
 
 
 def expand_template(template: list[str], subs: dict[str, str]) -> list[str]:

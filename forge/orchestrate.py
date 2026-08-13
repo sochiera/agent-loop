@@ -48,7 +48,7 @@ _TASK_STATE_FIELDS = (
     "coder_summary", "no_change_rounds", "round_changed", "suite_regression",
     "tester_record", "coder_record", "review_notes",
     "review_suggestions_pending", "corrections_done", "corrections_tree_hash",
-    "task_start_tag", "coder_tree_hash",
+    "task_start_tag", "coder_tree_hash", "review_cycles", "review_cycle_hash",
 )
 
 
@@ -67,10 +67,18 @@ def ensure_repo(project: str) -> None:
     existing = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
     if new_repo and ".forge/" not in existing.splitlines():
         ignore.write_text(existing.rstrip() + "\n.forge/\n", encoding="utf-8")
+    # Wykluczenia lokalne (.git/info/exclude), a nie .gitignore projektu: to
+    # runtime NASZYCH narzędzi, więc nie ma prawa wejść do pliku, który rola
+    # może commitować. Poza .forge/ lądują tu katalogi sesji agentów CLI —
+    # opencode zapisuje w projekcie nowy katalog przy każdym wywołaniu, a bez
+    # wykluczenia trafiał do każdego commita i do listy „zmian" każdej tury.
     exclude = Path(project, ".git", "info", "exclude")
     excluded = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-    if ".forge/" not in excluded.splitlines():
-        exclude.write_text(excluded.rstrip() + "\n.forge/\n", encoding="utf-8")
+    wanted = [".forge/"] + [f"{name}/" for name in sorted(_AGENT_RUNTIME_DIRS)]
+    missing = [line for line in wanted if line not in excluded.splitlines()]
+    if missing:
+        exclude.write_text(
+            excluded.rstrip() + "\n" + "\n".join(missing) + "\n", encoding="utf-8")
     if not git(project, "config", "user.email", check=False).stdout.strip():
         git(project, "config", "user.email", "forge@local")
     if not git(project, "config", "user.name", check=False).stdout.strip():
@@ -1011,7 +1019,8 @@ def _append_review_nits(cfg: Config, project: str, task_id: str,
 
 def _changed(project: str, tag: str) -> list[str]:
     tracked = git(project, "diff", "--name-only", tag).stdout.splitlines()
-    return sorted({*tracked, *_untracked(project)})
+    return sorted(name for name in {*tracked, *_untracked(project)}
+                  if not _is_volatile_artifact(name))
 
 
 def _untracked(project: str) -> list[str]:
@@ -1019,13 +1028,26 @@ def _untracked(project: str) -> list[str]:
     return [name for name in names if not name.startswith(".forge/")]
 
 
+# Katalogi, w których agent CLI trzyma WŁASNY stan sesji wewnątrz projektu.
+# To nie jest praca roli: opencode zakłada tu nowy katalog z sumą SHA-256 przy
+# KAŻDYM wywołaniu, więc bez tej listy każda tura recenzenta „zmieniała drzewo".
+# Jeden bieg utknął dokładnie na tym: 74 zaakceptowane recenzje pod rząd
+# wracały do testera po ocenę cudzych plików sesji, a lista ścieżek dopisywana
+# do kapsuły rosła aż prompt przekroczył limit argumentu execve.
+_AGENT_RUNTIME_DIRS = frozenset({
+    ".opencode", ".claude", ".codex", ".grok", ".kiro", ".aider",
+})
+
+
 def _is_volatile_artifact(name: str) -> bool:
-    """Cache narzędzi zmienia bajty między uruchomieniami testów, więc nie
-    świadczy o edycji drzewa przez read-only reviewera — niezależnie od tego,
-    czy bootstrap dopisał go do .gitignore."""
+    """Cache narzędzi i stan sesji agentów zmieniają bajty niezależnie od pracy
+    roli, więc nie świadczą o edycji drzewa przez read-only reviewera —
+    niezależnie od tego, czy bootstrap dopisał je do .gitignore."""
     parts = name.split("/")
     if any(part in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
                     ".tox", "node_modules", ".gradle", ".idea"} for part in parts):
+        return True
+    if parts[0] in _AGENT_RUNTIME_DIRS:
         return True
     base = parts[-1]
     return base.startswith(".coverage") or base.endswith((".pyc", ".pyo", ".orig"))
@@ -1102,12 +1124,28 @@ def _turn_changes(before: dict[str, str], after: dict[str, str]) -> list[str]:
                   if before.get(name) != after.get(name))
 
 
-def _describe_turn_changes(paths: list[str], limit: int = 8) -> str:
+# Budżet ZNAKÓW na listę plików we wpisie dziennika. Sam limit sztuk nie
+# wystarczy: osiem ścieżek po 120 znaków zjadało cały wpis (MAX_ENTRY=300) i
+# powód decyzji nie mieścił się już nigdzie — mistrz dostawał wtedy do okna
+# same sumy SHA i nie miał jak rozpoznać pętli, którą miał przerwać.
+_CHANGE_LIST_BUDGET = 140
+
+
+def _describe_turn_changes(paths: list[str], limit: int = 8,
+                           budget: int = _CHANGE_LIST_BUDGET) -> str:
     if not paths:
         return "bez_zmian"
-    visible = ", ".join(paths[:limit])
-    suffix = f", +{len(paths) - limit}" if len(paths) > limit else ""
-    return f"[{visible}{suffix}]"
+    visible: list[str] = []
+    used = 0
+    for name in paths[:limit]:
+        cost = len(name) + (2 if visible else 0)
+        if visible and used + cost > budget:
+            break
+        visible.append(name)
+        used += cost
+    hidden = len(paths) - len(visible)
+    suffix = f", +{hidden}" if hidden > 0 else ""
+    return f"[{', '.join(visible)}{suffix}]"
 
 
 def _checkpoint(project: str, state: State, phase: str) -> None:
@@ -1116,11 +1154,16 @@ def _checkpoint(project: str, state: State, phase: str) -> None:
 
 
 def _tester_statuses(state: State) -> tuple[str, ...]:
-    """Statusy legalne w TEJ turze testera — dokładnie jak w jego promptcie."""
-    if state.review_suggestions_pending:
-        return verdict_contract.TESTER_STATUSES
+    """Statusy legalne w TEJ turze testera — dokładnie jak w jego promptcie.
+
+    W cyklu domykającym po recenzji `review` znika, a `finalize` wchodzi na
+    jego miejsce: recenzja już się odbyła i zaakceptowała diff, więc druga tura
+    recenzji nie ma czego rozstrzygnąć — ma tylko szansę odesłać pracę na
+    następne okrążenie. Realny problem odkryty przy rozliczaniu uwag nadal ma
+    swoje wyjścia: red, code albo blocked."""
+    excluded = "review" if state.review_suggestions_pending else "finalize"
     return tuple(name for name in verdict_contract.TESTER_STATUSES
-                 if name != "finalize")
+                 if name != excluded)
 
 
 def _verdict_turn(cfg: Config, project: str, role: str, call, *, statuses=None) -> str:
@@ -1467,6 +1510,30 @@ def _clear_task_state(state: State) -> None:
         setattr(state, field, getattr(defaults, field))
 
 
+def _review_loop_exhausted(cfg: Config, project: str, state: State) -> bool:
+    """Policz JAŁOWE powroty z recenzji do testera; wyczerpany limit kończy zadanie.
+
+    Jałowy znaczy: drzewo po turze wygląda dokładnie tak samo jak przy
+    poprzednim powrocie. Tester nic nie poprawił, recenzent nic nie wniósł, a
+    obie role dostaną w następnej rundzie ten sam materiał — więc rozstrzygną
+    tak samo. Miarą jest fingerprint drzewa, nie liczba tur: dopóki praca
+    faktycznie postępuje, licznik wraca do zera i nikomu nie przeszkadza."""
+    fingerprint = _tree_fingerprint(project)
+    if fingerprint == state.review_cycle_hash:
+        state.review_cycles += 1
+    else:
+        state.review_cycle_hash = fingerprint
+        state.review_cycles = 1
+    if state.review_cycles <= cfg.max_review_cycles:
+        return False
+    _fail_task(cfg, project, state,
+               f"review_loop: {state.review_cycles} powrotów z recenzji do "
+               f"testera bez jednej zmiany w drzewie (limit "
+               f"{cfg.max_review_cycles}); zadanie wymaga decyzji człowieka "
+               "albo ponownego rozplanowania")
+    return True
+
+
 def _fail_task(cfg: Config, project: str, state: State, reason: str) -> None:
     task_id = state.current_task.get("id", "task")
     log(f"Zadanie {task_id} PORZUCONE: {reason}")
@@ -1484,7 +1551,7 @@ def _fail_task(cfg: Config, project: str, state: State, reason: str) -> None:
         project, cfg.runtime_dir, task_id, artifact)
     for rel in _untracked(project):
         source = Path(project, rel)
-        if source.is_file():
+        if source.is_file() and not _is_volatile_artifact(rel):
             target = artifact / "untracked" / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(source.read_bytes())
@@ -1709,6 +1776,7 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 0 if state.round_changed else state.no_change_rounds + 1)
             return result
 
+        closing_cycle = state.review_suggestions_pending
         outcome = run_tdd_loop(
             state=state, max_rounds=cfg.max_tdd_rounds,
             run_tester=run_tester,
@@ -1716,6 +1784,11 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             checkpoint=lambda phase: _checkpoint(project, state, phase),
             worktree_fingerprint=lambda: _tree_fingerprint(project),
         )
+        # Cykl domykający nie ma drugiej recenzji. `review` może tu dojść
+        # wyłącznie ze starego checkpointu sprzed tej zmiany kontraktu —
+        # traktujemy je jak `finalize`, bo recenzja tego diffu już zapadła.
+        if outcome == "review" and closing_cycle:
+            outcome = "finalize"
         if outcome == "finalize":
             # Najpierw ustaw następną legalną fazę. Jeśli SIGINT nadejdzie
             # podczas logowania poniżej, handler zapisze już wznawialny commit,
@@ -1786,29 +1859,39 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 state.tester_handoff += (
                     " Reviewer zmienił też pliki "
                     f"{review_changes}; oceń te zmiany, zachowaj, popraw albo przywróć.")
+            if _review_loop_exhausted(cfg, project, state):
+                return True
             _checkpoint(project, state, "tester")
             return True
-        if review_changes != "bez_zmian":
-            # Reviewer ma pozostać read-only, lecz przypadkowy zapis nie jest
-            # powodem do porzucenia całego zadania. Tester ocenia pozostawiony diff.
-            state.tester_handoff = (
-                "Reviewer mimo roli read-only zmienił pliki "
-                f"{review_changes}. Oceń pozostawiony diff; zachowaj, popraw albo "
-                "przywróć te zmiany, a następnie wybierz dalszy krok.")
-            state.review_suggestions_pending = False
-            log(f"Zadanie {task['id']}: reviewer mimo roli read-only zmienił pliki "
-                f"{review_changes} — wracam do testera po ocenę tego diffu.")
-            ledger.append(project, f"{task['id']} review-zapis {review_changes}: "
-                                   "powrót do testera po ocenę diffu recenzenta")
-            _checkpoint(project, state, "tester")
-            return True
-        if review.status == "suggestions":
+        if review.status == "suggestions" or review_changes != "bez_zmian":
+            # Jeden cykl domykający zamiast dwóch bramek. Uwagi drobne i
+            # przypadkowy zapis read-only reviewera rozstrzyga TESTER i on
+            # dostarcza — bez drugiej recenzji, bo to ona wcześniej odsyłała
+            # zaakceptowaną pracę na kolejne okrążenie, w nieskończoność.
             state.review_notes = review_notes
             state.review_suggestions_pending = True
-            state.tester_handoff = (
-                "Reviewer zaakceptował bieżący diff z opcjonalnymi sugestiami. "
-                "Oceń każdą aktywną uwagę review, zastosuj albo odrzuć z powodem."
-            )
+            if review.status == "suggestions":
+                state.tester_handoff = (
+                    "Reviewer zaakceptował bieżący diff z opcjonalnymi sugestiami. "
+                    "Oceń każdą aktywną uwagę review, zastosuj albo odrzuć z powodem, "
+                    "a potem dostarcz zadanie."
+                )
+            else:
+                state.tester_handoff = ""
+            if review_changes != "bez_zmian":
+                # Reviewer ma pozostać read-only, lecz przypadkowy zapis nie jest
+                # powodem do porzucenia zadania ani do kolejnej recenzji.
+                state.tester_handoff += (
+                    (" " if state.tester_handoff else "")
+                    + "Reviewer mimo roli read-only zmienił pliki "
+                    f"{review_changes}. Oceń pozostawiony diff; zachowaj, popraw "
+                    "albo przywróć te zmiany, a potem dostarcz zadanie.")
+                log(f"Zadanie {task['id']}: reviewer mimo roli read-only zmienił "
+                    f"pliki {review_changes} — tester ocenia ten diff i dostarcza.")
+                ledger.append(project, f"{task['id']} review-zapis {review_changes}: "
+                                       "tester ocenia diff recenzenta i dostarcza")
+            if _review_loop_exhausted(cfg, project, state):
+                return True
             _checkpoint(project, state, "tester")
             return True
         state.review_notes = []

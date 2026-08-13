@@ -40,7 +40,7 @@ class State:
     # Ile wsadów POD RZĄD planista zadeklarował szerzej, niż domknął plikami
     # opisu. Licznik żyje tutaj, a nie w dzienniku, bo jeden wsad ośmiu zadań
     # to kilkadziesiąt wpisów — dwa kolejne odsiewy nigdy nie zmieściłyby się
-    # razem ani w oknie mistrza (20 linii), ani w całej pamięci dziennika (80).
+    # razem ani w oknie mistrza (60 linii), ani w całej pamięci dziennika (80).
     plan_sift_streak: int = 0
     test_cmd: str = ""
     build_cmd: str = ""
@@ -61,6 +61,12 @@ class State:
     coder_record: str = ""
     review_notes: list[str] = field(default_factory=list)
     review_suggestions_pending: bool = False
+    # Ile razy pod rząd recenzja odesłała zadanie do testera, nie zmieniwszy
+    # niczego w drzewie. Bezpiecznik na livelock: jeden bieg zrobił tak 108
+    # okrążeń przez siedem godzin, bez ani jednego commita. Hash trzymamy obok
+    # licznika, bo dopiero on odróżnia jałowe okrążenie od realnej poprawki.
+    review_cycles: int = 0
+    review_cycle_hash: str = ""
     corrections_done: bool = False
     corrections_tree_hash: str = ""
     task_start_tag: str = ""

@@ -3,17 +3,23 @@
 Jedno zadanie przechodzi przez pętlę `tester ↔ coder`, następnie `review`.
 Reviewer zwraca `approve`, `suggestions` albo `request_changes`.
 `request_changes` wraca do testera i rozpoczyna nowy cykl TDD zakończony
-świeżym review. `suggestions` wraca do jednorazowej oceny testera i może
-zakończyć się `finalize` bez drugiego review. `approve` prowadzi bezpośrednio
-do `commit`.
+świeżym review. `suggestions` otwiera CYKL DOMYKAJĄCY: tester rozlicza uwagi i
+sam dostarcza zadanie — drugiego review już nie ma. `approve` prowadzi
+bezpośrednio do `commit`.
 
 Tester decyduje o dalszym kroku: `red`, `code`, `review` albo `blocked`. Po
 `red` lub `code` koder odpowiada `green`, `test_changes_needed` albo
 `tester_input_needed`. Oba niezielone wyniki wraz z powodem wracają do tej
 samej sesji testera. Limit `max_tdd_rounds` wynosi domyślnie 10 i oznacza
-potrzebę podziału zadania. Wyłącznie po `suggestions` tester może też zwrócić
-`finalize` z niepustym uzasadnieniem rozliczającym sugestie jako zastosowane
-albo odrzucone.
+potrzebę podziału zadania. W cyklu domykającym kontrakt testera zmienia się na
+`red|code|finalize|blocked`: `review` znika (recenzja tego diffu już zapadła),
+a `finalize` wymaga niepustego uzasadnienia rozliczającego uwagi jako
+zastosowane albo odrzucone.
+
+Jałowe okrążenia są liczone. Powrót z recenzji do testera, po którym
+fingerprint drzewa jest identyczny jak przy poprzednim powrocie, zwiększa
+licznik; `max_review_cycles` (domyślnie 3) przekroczony kończy zadanie jako
+`PORZUCONE: review_loop`. Realna zmiana w drzewie zeruje licznik.
 
 ## Bootstrap, preflight i Product Owner
 
@@ -191,14 +197,20 @@ podejrzenia. `approve` wymaga pustej listy uwag. `suggestions` jest dozwolone
 tylko wtedy, gdy diff można bezpiecznie commitować bez zastosowania uwag.
 Tester ocenia każdą sugestię, może sam poprawić testy albo przekazać
 zaakceptowaną zmianę koderowi, a następnie wybiera `finalize`. Jeśli poprawki
-wyjdą poza mały zakres, zmienią publiczne zachowanie albo wzbudzą wątpliwości,
-tester wybiera `review`, świadomie ponosząc koszt nowej recenzji.
+odsłonią rzeczywisty błąd, domyka go zwykłym cyklem TDD (`red`/`code`) i kończy
+tym samym `finalize` — drugiej recenzji ten cykl nie ma.
 
 Przy `request_changes` uwagi wracają przez kapsułę do świeżego wywołania
-testera, które rozpoczyna nowy cykl TDD. Jeśli reviewer mimo roli read-only zapisze pliki,
-Forge nie porzuca ani nie cofa zadania: podaje testerowi dokładne ścieżki do
-oceny i wymaga zwykłej ścieżki review. `approve`, a także poprawne `finalize`,
-przechodzą do pełnej bramki i commitu.
+testera, które rozpoczyna nowy cykl TDD. Jeśli reviewer mimo roli read-only
+zapisze pliki, Forge nie porzuca ani nie cofa zadania: otwiera cykl domykający,
+podaje testerowi dokładne ścieżki do oceny i pozwala mu dostarczyć zadanie po
+rozstrzygnięciu tego diffu. Mechanicznej bramki „zapis reviewera ⇒ jeszcze
+jedno review" nie ma — to ona zapętliła bieg z 2026-08-13
+(`docs/AWARIE-2026-08-13.md`), bo katalog sesji agenta CLI powstawał w projekcie
+przy każdym wywołaniu. Stan runtime agentów (`.opencode/`, `.claude/`,
+`.codex/`, `.grok/`, `.kiro/`, `.aider/`) jest odsiewany razem z cache'ami
+narzędzi i wykluczany lokalnie w `.git/info/exclude`. `approve`, a także
+poprawne `finalize`, przechodzą do pełnej bramki i commitu.
 
 ## Kapsuła kontekstu i notatniki ról
 

@@ -1,5 +1,7 @@
 REVIEWER ZAAKCEPTOWAŁ BIEŻĄCY DIFF Z SUGESTIAMI. Oryginalny wynik jest
-bezpieczny do commita bez tych sugestii. Przejrzyj każdą sugestię z handoffu i:
+bezpieczny do commita bez tych sugestii.
+To CYKL DOMYKAJĄCY: drugiej recenzji nie będzie, zadanie dostarczasz ty.
+Przejrzyj każdą sugestię z handoffu i:
 
 - zastosuj ją, jeśli jest trafna i pozostaje małą zmianą w jej zakresie;
 - albo odrzuć ją, podając konkretny powód w `reason`;
@@ -13,8 +15,7 @@ najwęższą wiarygodną bramkę i wybierz finalize. W `reason` rozlicz każdą
 sugestię jako zastosowaną lub odrzuconą. `finalize` prowadzi do pełnej bramki
 `{{FULL_TEST_CMD}}` i commita bez ponownego review.
 
-Jeśli praca wykroczyła poza sugestie, zmieniła publiczne zachowanie, ujawniła
-rzeczywisty błąd albo nie masz pewności co do bezpieczeństwa diffu, wybierz
-review — to świadoma eskalacja do nowej recenzji. Możesz też wybrać red, code
-albo blocked, jeśli faktycznie wymaga tego odkryty problem. Dla red/code zwróć
-używaną komendę w `command`.
+Jeśli praca ujawniła rzeczywisty błąd zachowania, wybierz red albo code i
+domknij go normalnym cyklem TDD — ten cykl kończy się finalize także po
+poprawce. Blocked zostaje na sytuację, w której nie da się iść dalej bez
+decyzji człowieka. Dla red/code zwróć używaną komendę w `command`.

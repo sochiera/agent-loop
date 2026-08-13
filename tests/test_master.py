@@ -228,7 +228,7 @@ def test_master_sees_ledger_history(tmp_path: Path) -> None:
 
 
 def test_master_receives_compact_ledger_view(tmp_path: Path) -> None:
-    for index in range(30):
+    for index in range(ledger.MASTER_LINES + 10):
         ledger.append(str(tmp_path), f"task-{index:03d} " + "x" * 250)
 
     with patch("forge.agents.run_agent", return_value="{}") as run:
@@ -238,8 +238,8 @@ def test_master_receives_compact_ledger_view(tmp_path: Path) -> None:
     prompt = run.call_args.args[1]
     journal = prompt.split("DZIENNIK (najstarsze u góry):\n", 1)[1]
     lines = journal.splitlines()
-    assert len(lines) == 20
-    assert all(len(line) <= 120 for line in lines)
+    assert len(lines) == ledger.MASTER_LINES
+    assert all(len(line) <= ledger.MASTER_WIDTH for line in lines)
 
 
 def test_master_receives_round_limit_failures_it_cannot_see_in_the_window(
@@ -247,7 +247,7 @@ def test_master_receives_round_limit_failures_it_cannot_see_in_the_window(
     """Reguła o zbyt grubych zadaniach potrzebuje dwóch porażek, a te nigdy
     nie mieszczą się razem w oknie dziennika."""
     ledger.append(str(tmp_path), "task-001 PORZUCONE: round_limit: limit 10")
-    for index in range(25):
+    for index in range(ledger.MASTER_LINES + 5):
         ledger.append(str(tmp_path), f"task-002 r{index} tester→red pliki=bez_zmian: x")
     ledger.append(str(tmp_path), "task-002 PORZUCONE: round_limit: limit 10")
 
