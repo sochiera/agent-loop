@@ -295,6 +295,17 @@ Ownera — zakłada go jego pierwsza tura (`start`), a nie bootstrap. Każda his
 format, unikalność ID, brak znikających wpisów i zakaz samodzielnej zmiany
 statusu przez PO. Recenzent ocenia dopiero semantykę.
 
+Recenzja tury PO kończy się tą samą asymetrią, co recenzja bootstrapu, i z tego
+samego powodu: strukturę orzekł już parser, więc dalej idzie sama opinia o
+kierunku. `suggestions` przyjmuje turę i odkłada uwagę do `.forge/po-handoff.md`
+na następną turę PO — to jest domyślne wyjście dla uwagi słusznej, ale
+niekrytycznej. Wyczerpany budżet `max_bootstrap_reviews` z serią **różnych**
+uwag oznacza recenzję bez dna: tura zostaje przyjęta, a ostatnie uwagi jadą do
+handoffu. Dopiero uwaga **wracająca mimo korekt** (drugie powtórzenie) albo
+tura, która nigdy nie przeszła parsera, zatrzymuje przebieg do decyzji
+człowieka. Twarde zatrzymanie za samą opinię kosztowało 2026-08-13 cały bieg z
+pięcioma zacommitowanymi zadaniami.
+
 Zadania niosą pole `story`, a Forge deterministycznie przeprowadza statusy
 `nowa → w toku → do weryfikacji → zrobiona` albo wraca do `w toku` po
 niepotwierdzeniu. Weryfikator historyjek wykonuje zewnętrzne `Sprawdzenie:` i

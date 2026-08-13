@@ -309,3 +309,85 @@ def test_po_triggers_have_priority_and_refill_guard(tmp_path: Path) -> None:
     assert orchestrate._po_trigger(cfg, str(project), state) == "cadence"
     state.task_queue = [{"id": "task-001"}]
     assert orchestrate._po_trigger(cfg, str(project), state) == ""
+
+
+def test_bottomless_review_never_throws_away_a_valid_backlog(
+        tmp_path: Path) -> None:
+    """Recenzja semantyczna nie ma prawa skasować przebiegu.
+
+    Awaria z 2026-08-13 (23:37): recenzentka cztery razy z rzędu zgłosiła INNĄ
+    uwagę o kierunku, budżet się skończył i Forge padł z kodem 1 — mimo pięciu
+    zacommitowanych zadań i backlogu, który parser właśnie uznał za poprawny.
+    Seria różnych uwag to recenzja bez dna, nie zepsuta tura.
+    """
+    project, cfg, state = _project(tmp_path)
+    cfg.max_bootstrap_reviews = 3
+    state.brief_digest = brief.digest(Path(cfg.brief_path).read_text(encoding="utf-8"))
+    fresh_notes = iter((
+        '{"verdict":"request_changes","notes":["brakuje dowodu raportu"]}',
+        '{"verdict":"request_changes","notes":["plasterek zbyt gruby"]}',
+        '{"verdict":"request_changes","notes":["priorytet PSU przed obudową"]}',
+    ))
+
+    def agent(_name, prompt, *_args, **_kwargs):
+        if "świeża recenzentka Product Ownera" in prompt:
+            return next(fresh_notes)
+        return _decision()
+
+    with patch("forge.agents.run_agent", side_effect=agent):
+        orchestrate.phase_product_owner(cfg, str(project), state, lambda phase: phase)
+
+    # Tura przyjęta, a nierozliczona uwaga czeka na PO z materiałem — zamiast
+    # zniknąć razem z przebiegiem.
+    assert state.steered_at_batch == state.plan_batches
+    handoff = (project / ".forge" / "po-handoff.md").read_text(encoding="utf-8")
+    assert "priorytet PSU przed obudową" in handoff
+
+
+def test_note_returning_after_corrections_still_stops_the_run(
+        tmp_path: Path) -> None:
+    """Odwrotny biegun: uwaga, która wraca mimo pełnej rundy korekt, dowodzi,
+    że PO jej nie umie rozliczyć — i tylko ona uzasadnia decyzję człowieka."""
+    project, cfg, state = _project(tmp_path)
+    cfg.max_bootstrap_reviews = 4
+    state.brief_digest = brief.digest(Path(cfg.brief_path).read_text(encoding="utf-8"))
+
+    def agent(_name, prompt, *_args, **_kwargs):
+        if "świeża recenzentka Product Ownera" in prompt:
+            return ('{"verdict":"request_changes",'
+                    '"notes":["brakuje dowodu raportu dla kierunku"]}')
+        return _decision()
+
+    with patch("forge.agents.run_agent", side_effect=agent):
+        with pytest.raises(AgentError, match="dwa razy wróciła do uwagi"):
+            orchestrate.phase_product_owner(
+                cfg, str(project), state, lambda phase: phase)
+
+
+def test_reviewer_can_accept_the_turn_and_hand_the_note_forward(
+        tmp_path: Path) -> None:
+    """`suggestions` kupuje uwagę za zero dodatkowych tur: backlog wchodzi w
+    życie, a uwaga czeka w handoffie na następną turę PO."""
+    project, cfg, state = _project(tmp_path)
+    state.brief_digest = brief.digest(Path(cfg.brief_path).read_text(encoding="utf-8"))
+    po_calls: list[str] = []
+
+    def agent(_name, prompt, *_args, **_kwargs):
+        if "świeża recenzentka Product Ownera" in prompt:
+            return ('{"verdict":"suggestions",'
+                    '"notes":["dopisz kryterium wydajności do US-001"]}')
+        po_calls.append(prompt)
+        return _decision()
+
+    with patch("forge.agents.run_agent", side_effect=agent):
+        orchestrate.phase_product_owner(cfg, str(project), state, lambda phase: phase)
+
+    assert len(po_calls) == 1
+    handoff = (project / ".forge" / "po-handoff.md").read_text(encoding="utf-8")
+    assert "dopisz kryterium wydajności do US-001" in handoff
+
+
+def test_po_reviewer_contract_offers_the_cheap_middle_verdict() -> None:
+    prompt = prompts.po_review_prompt({"summary": "przegląd"})
+    assert '"verdict":"suggestions"' in prompt
+    assert '"verdict":"request_changes"' in prompt

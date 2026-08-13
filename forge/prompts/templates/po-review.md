@@ -23,5 +23,12 @@ akceptacji, więc w BACKLOG.md ich jeszcze nie zobaczysz:
 Zgłoszone wznowienia (`stories_reopened`) — jak wyżej, jeszcze nie ma ich w pliku:
 {{REOPENED}}
 {{JSON_RULES}}
+`request_changes` kosztuje pełny obrót dwóch najdroższych ról, więc zostaw je
+dla backlogu, którego NIE WOLNO przyjąć w tej postaci. Uwagę słuszną, ale taką,
+którą równie dobrze rozstrzygnie następna tura — brakujący dowód kierunku, zbyt
+gruby plasterek, wątpliwy priorytet — oddaj jako `suggestions`: backlog wchodzi
+w życie, a uwaga czeka na PO z materiałem, żeby ją domknąć.
+
 Zwróć wyłącznie {"verdict":"approve","notes":[]}
+albo {"verdict":"suggestions","notes":["uwaga na następną turę"]}
 albo {"verdict":"request_changes","notes":["konkretna uwaga"]}.

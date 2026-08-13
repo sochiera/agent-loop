@@ -830,6 +830,15 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
     data: dict = {}
     approved = False
     last_notes: list[str] = []
+    # Te trzy rzeczy rozstrzygają, czym jest wyczerpany budżet recenzji —
+    # dokładnie jak w ``_reviewed_bootstrap``: ``settled`` niesie ostatnią turę,
+    # która przeszła twardą walidację parsera, ``review_history`` pozwala
+    # rozpoznać uwagę wracającą mimo korekt, a ``unsettled`` to uwagi oddawane
+    # następnej turze PO zamiast wyrzucane.
+    settled: dict = {}
+    review_history: list[str] = []
+    stalled: list[str] = []
+    unsettled: list[str] = []
     try:
         for round_number in range(1, cfg.max_bootstrap_reviews + 1):
             prompt = prompts.product_owner_prompt(
@@ -879,6 +888,10 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
             # na to, że PO nie umie go usunąć. Bez zerowania odsiew ucinałby
             # przebieg mimo realnego postępu między jednym a drugim wystąpieniem.
             previous_violations = []
+            # Ta tura przeszła twardą walidację, więc backlog jest STRUKTURALNIE
+            # poprawny niezależnie od tego, co powie recenzja. Dalej idzie już
+            # tylko semantyka, a ta nie ma prawa skasować gotowej pracy.
+            settled = data
 
             review_before = _tree_manifest(project)
             review_snapshot = _snapshot_tree(project)
@@ -902,6 +915,31 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
             if verdict.status == "approve":
                 approved = True
                 break
+            if verdict.status == "suggestions":
+                # Recenzentka przyjmuje turę i oddaje uwagi właścicielowi
+                # zakresu — czyli następnej turze PO przez handoff. Bez tego
+                # wyjścia każda słuszna, ale niekrytyczna uwaga kosztowała
+                # pełny obrót dwóch najdroższych ról.
+                approved = True
+                unsettled = last_notes
+                log("Product Owner: tura przyjęta; uwagi na następną turę: "
+                    f"{'; '.join(last_notes)[:300]}")
+                break
+            repeated = _notes_repeat(review_history, last_notes)
+            if repeated:
+                stalled.append(repeated)
+                ledger.append(project, "po: recenzentka powtórzyła uwagę "
+                                       f"({repeated[:120]})")
+                # Jak w bootstrapie: jedno powtórzenie bywa parafrazą świeżej
+                # recenzentki, drugie dowodzi, że PO tej uwagi nie umie
+                # rozliczyć — i tylko ono uzasadnia zatrzymanie przebiegu.
+                if len(stalled) >= 2:
+                    raise AgentError(
+                        "Product Owner: recenzja dwa razy wróciła do uwagi, "
+                        f"której korekty nie rozliczyły ({repeated[:200]}). "
+                        "Potrzebna decyzja użytkownika.")
+            review_history += [note for note in last_notes
+                               if note not in review_history]
             review_corrections = last_notes
             parser_corrections = []
             # Recenzent ocenia semantykę; następna tura dostaje uwagi przez
@@ -913,9 +951,27 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
             if prompt_notes:
                 ledger.append(project, "po: request_changes — " + "; ".join(prompt_notes)[:200])
         if not approved:
-            raise AgentError(
-                "Product Owner: wyczerpano budżet korekt/recenzji; "
-                + "; ".join(last_notes or parser_corrections)[:300])
+            # Wyczerpany budżet nie znaczy jednego — ta sama asymetria, co w
+            # ``_reviewed_bootstrap``. Seria RÓŻNYCH uwag to recenzja bez dna,
+            # a nie zepsuty backlog: parser już orzekł, że struktura jest
+            # poprawna, więc twarde zatrzymanie wyrzuciłoby cały przebieg (w
+            # awarii z 2026-08-13 pięć zacommitowanych zadań i godzinę pracy)
+            # za cudzą opinię o kierunku. Dopiero uwaga wracająca mimo korekt
+            # albo tura, która nigdy nie przeszła parsera, wymaga człowieka.
+            if not settled or stalled:
+                cause = ("uwaga wróciła mimo korekt "
+                         f"({stalled[-1][:200]})" if stalled else
+                         "żadna tura nie przeszła walidacji struktury")
+                raise AgentError(
+                    "Product Owner: wyczerpano budżet korekt/recenzji — "
+                    f"{cause}; "
+                    + "; ".join(last_notes or parser_corrections)[:300])
+            data = settled
+            unsettled = last_notes
+            log("Product Owner: budżet recenzji wyczerpany bez powtórzonej "
+                "uwagi — przyjmuję turę, uwagi idą na następną.")
+            ledger.append(project, "po: budżet recenzji wyczerpany, tura "
+                                   f"przyjęta; {len(last_notes)} uwag dalej")
     except Exception as exc:  # noqa: BLE001 — faza nie zostawia pół-zmian
         changed = _turn_changes(before_manifest, _tree_manifest(project))
         dest = _dump_phase_work(project, cfg, "Product Owner", base_sha, changed, exc)
@@ -979,6 +1035,11 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
     # żyją dalej w backlogu albo w docs/PROJECT.md, więc kolejna tura płaciłaby
     # wyłącznie za ponowne przeczytanie rozliczonej treści.
     handoff_path.unlink(missing_ok=True)
+    # Uwagi nierozliczone w tej turze zajmują dokładnie to miejsce: nie blokują
+    # przebiegu, ale wracają do PO, gdy będzie miał materiał, żeby je rozstrzygnąć.
+    # Zapis MUSI iść po skasowaniu handoffu — inaczej ta linia kasowałaby go z nimi.
+    if unsettled:
+        _write_po_handoff(cfg, project, unsettled)
     ledger.append(
         project,
         f"po ({trigger}): +{len(data['stories_added'])} historyjek, "
