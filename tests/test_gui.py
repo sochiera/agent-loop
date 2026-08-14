@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from forge import catalog, gui, routing, runlock
+from forge import catalog, gui, profiles, routing, runlock
 from forge.config import Config, TASK_DIFFICULTIES
+from forge.profiles import SHARED_SLUG as SHARED
 from forge.gui import (
     AGENTS,
     DEFAULT_BRIEF,
@@ -65,15 +66,16 @@ class GuiRunSettingsTest(unittest.TestCase):
         # uruchomieniu nowej wersji byłaby regresją, nie „czystym startem".
         self.assertEqual(
             run_settings({"brief": "/tmp/b.md", "project": "/tmp/p"}),
-            [{"brief": "/tmp/b.md", "project": "/tmp/p"}])
+            [{"brief": "/tmp/b.md", "project": "/tmp/p", "profile": SHARED}])
 
     def test_empty_settings_give_one_default_run(self) -> None:
         self.assertEqual(run_settings({}),
-                         [{"brief": DEFAULT_BRIEF, "project": DEFAULT_PROJECT}])
+                         [{"brief": DEFAULT_BRIEF, "project": DEFAULT_PROJECT,
+                           "profile": SHARED}])
 
     def test_two_runs_survive_a_round_trip(self) -> None:
-        runs = [{"brief": "a.md", "project": "/tmp/a"},
-                {"brief": "b.md", "project": "/tmp/b"}]
+        runs = [{"brief": "a.md", "project": "/tmp/a", "profile": "tylko-gpt"},
+                {"brief": "b.md", "project": "/tmp/b", "profile": SHARED}]
         self.assertEqual(run_settings({"runs": runs}), runs)
 
     def test_more_runs_than_the_panel_allows_are_cut(self) -> None:
@@ -84,7 +86,21 @@ class GuiRunSettingsTest(unittest.TestCase):
     def test_damaged_entries_fall_back_to_defaults(self) -> None:
         self.assertEqual(
             run_settings({"runs": [{"brief": 7}, "śmieć"]}),
-            [{"brief": DEFAULT_BRIEF, "project": DEFAULT_PROJECT}])
+            [{"brief": DEFAULT_BRIEF, "project": DEFAULT_PROJECT,
+              "profile": SHARED}])
+
+    def test_a_run_without_a_profile_keeps_the_shared_one(self) -> None:
+        # Plik sprzed profili opisuje biegi bez tego klucza. Każda inna wartość
+        # niż wspólny znaczyłaby, że aktualizacja Forge po cichu zmieniła
+        # modele, którymi pracuje projekt.
+        self.assertEqual(
+            run_settings({"runs": [{"brief": "a.md", "project": "/tmp/a"}]}),
+            [{"brief": "a.md", "project": "/tmp/a", "profile": SHARED}])
+
+    def test_a_damaged_profile_value_is_ignored(self) -> None:
+        self.assertEqual(
+            run_settings({"runs": [{"brief": "a.md", "project": "/tmp/a",
+                                    "profile": 7}]})[0]["profile"], SHARED)
 
 
 class GuiRoutingPathTest(unittest.TestCase):
@@ -432,8 +448,8 @@ class ParallelRunsTest(unittest.TestCase):
             project.mkdir()
         self.saved: list[dict] = []
         self.settings = {"runs": [
-            {"brief": "a.md", "project": str(self.first)},
-            {"brief": "b.md", "project": str(self.second)},
+            {"brief": "a.md", "project": str(self.first), "profile": SHARED},
+            {"brief": "b.md", "project": str(self.second), "profile": SHARED},
         ]}
         patches = (
             patch("forge.gui.load_settings", return_value=self.settings),
@@ -572,6 +588,257 @@ class ParallelRunsTest(unittest.TestCase):
         self.window.save_paths()
 
         self.assertEqual(self.saved[-1]["runs"], self.settings["runs"])
+
+
+@needs_gtk
+class RunProfilesTest(unittest.TestCase):
+    """Osobne modele dla osobnych biegów — sedno tej przebudowy."""
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.root = Path(self._directory.name)
+        self.first = self.root / "alfa"
+        self.second = self.root / "beta"
+        for project in (self.first, self.second):
+            project.mkdir()
+        self.saved: list[dict] = []
+        self.settings = {"runs": [
+            {"brief": "a.md", "project": str(self.first), "profile": SHARED},
+            {"brief": "b.md", "project": str(self.second), "profile": SHARED},
+        ]}
+        patches = (
+            patch("forge.gui.load_settings", return_value=self.settings),
+            patch("forge.gui.save_settings",
+                  side_effect=lambda payload, *_a, **_k: self.saved.append(payload)),
+            patch("forge.gui.routing_path", return_value=self.root / "routing.json"),
+        )
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        self.addCleanup(self._directory.cleanup)
+        self.window = gui.ForgeWindow(Adw.Application(
+            application_id="pl.agentloop.ForgeProfiles"))
+        self.addCleanup(self.window.destroy)
+
+    def _pick(self, role: str, difficulty: str, model: str) -> None:
+        """Wybierz model w karcie roli tak, jak zrobiłby to operator."""
+        chooser = self.window.role_cards[role].slots[difficulty]
+        chooser.model.set_selected(next(
+            index for index, choice in enumerate(chooser.choices())
+            if choice.entry is not None and choice.entry.name == model))
+
+    def _agents(self, routing_value: routing.Routing) -> set[str]:
+        config = Config(routing=routing_value)
+        return {agent for agent, _model, _effort
+                in config.role_chain("coder", "standard")}
+
+    def test_the_panel_starts_on_the_shared_profile(self) -> None:
+        self.assertEqual(self.window.editing_slug, SHARED)
+        self.assertEqual([run.profile_slug for run in self.window.runs],
+                         [SHARED, SHARED])
+
+    def test_two_runs_can_work_on_different_models(self) -> None:
+        alfa, beta = self.window.runs
+        self._pick("coder", "standard", "opus")
+
+        gpt = self.window.profiles.create("Tylko GPT")
+        self.window.edit_profile(gpt.slug)
+        self._pick("coder", "standard", "gpt-5.6-luna")
+        beta.set_profile(gpt.slug)
+
+        self.assertEqual(self._agents(self.window.run_routing(alfa)), {"claude"})
+        self.assertEqual(self._agents(self.window.run_routing(beta)),
+                         {"opencode"})
+
+    def test_editing_one_profile_leaves_the_other_alone(self) -> None:
+        self._pick("coder", "standard", "opus")
+        gpt = self.window.profiles.create("Tylko GPT")
+
+        self.window.edit_profile(gpt.slug)
+        self._pick("coder", "standard", "gpt-5.6-luna")
+        self.window.edit_profile(SHARED)
+
+        self.assertEqual(
+            self.window.profiles.routing(SHARED).slot("coder", "standard").model,
+            "opus")
+        self.assertEqual(
+            self.window.profiles.routing(gpt.slug).slot("coder", "standard").model,
+            "openai/gpt-5.6-luna")
+
+    def test_switching_the_editor_shows_the_other_profile_in_the_cards(self) -> None:
+        self._pick("coder", "standard", "opus")
+        gpt = self.window.profiles.create("Tylko GPT")
+        self.window.edit_profile(gpt.slug)
+        self._pick("coder", "standard", "gpt-5.6-luna")
+
+        self.window.edit_profile(SHARED)
+
+        self.assertEqual(self.window.current_routing()
+                         .slot("coder", "standard").model, "opus")
+
+    def test_a_role_untouched_by_the_new_profile_returns_to_policy(self) -> None:
+        # Karty są wspólne dla profili: gdyby nie czyściły się przy zmianie,
+        # na ekranie zostałby wybór z poprzedniego profilu i pierwszy klik
+        # zapisałby go jako wybór operatora dla tego.
+        self._pick("coder", "simple", "opus")
+        clean = self.window.profiles.create("Czysty")
+        self.window.profiles.set_routing(clean.slug, routing.Routing())
+
+        self.window.edit_profile(clean.slug)
+
+        policy = Config(routing=routing.Routing()).role("coder", "simple")
+        self.assertEqual(
+            self.window.current_routing().slot("coder", "simple"),
+            routing.Endpoint(agent=policy[0], model=policy[1], effort=policy[2]))
+
+    def test_the_run_remembers_its_profile_between_sessions(self) -> None:
+        gpt = self.window.profiles.create("Tylko GPT")
+        self.window.runs[1].set_profile(gpt.slug)
+
+        self.window.save_paths()
+
+        self.assertEqual([entry["profile"] for entry in self.saved[-1]["runs"]],
+                         [SHARED, gpt.slug])
+
+    def test_the_snapshot_carries_the_models_of_that_run(self) -> None:
+        beta = self.window.runs[1]
+        gpt = self.window.profiles.create("Tylko GPT")
+        self.window.edit_profile(gpt.slug)
+        self._pick("coder", "standard", "gpt-5.6-luna")
+        beta.set_profile(gpt.slug)
+
+        path = beta.routing_snapshot(self.window.run_routing(beta))
+
+        self.assertEqual(
+            routing.load(path, TASK_DIFFICULTIES).slot("coder", "standard").model,
+            "openai/gpt-5.6-luna")
+
+    def test_only_a_run_that_uses_claude_asks_about_its_session(self) -> None:
+        # Zamek na PLIKOWĄ sesję Claude Code jest zasobem globalnym, ale bieg
+        # bez Claude'a w routingu nie ma powodu się o niego rozbijać.
+        alfa, beta = self.window.runs
+        for role in self.window.role_cards:
+            for difficulty in self.window.role_cards[role].slots:
+                self._pick(role, difficulty, "gpt-5.6-luna")
+        claude = self.window.profiles.create("Z Claude'em")
+        self.window.edit_profile(claude.slug)
+        self._pick("coder", "standard", "opus")
+        beta.set_profile(claude.slug)
+
+        seen: list[bool] = []
+
+        def busy(config: Config, *_args: object) -> str:
+            uses = any(name == "claude" for name in config.agents_in_use())
+            seen.append(uses)
+            return "sesję trzyma inny bieg" if uses else ""
+
+        with patch("forge.gui.preflight.claude_file_session_busy",
+                   side_effect=busy):
+            self.assertEqual(self.window.blocking_problem(alfa), "")
+            self.assertIn("sesję trzyma inny bieg",
+                          self.window.blocking_problem(beta))
+        self.assertEqual(seen, [False, True])
+
+    def test_a_run_pointing_at_a_deleted_profile_is_refused(self) -> None:
+        # Cichy powrót na profil wspólny oznaczałby bieg wykonany modelami,
+        # których dla tego projektu nikt nie wybrał.
+        beta = self.window.runs[1]
+        gpt = self.window.profiles.create("Tylko GPT")
+        beta.set_profile(gpt.slug)
+        self.window.profiles.delete(gpt.slug)
+
+        self.assertIn("profilu", self.window.blocking_problem(beta))
+
+    def test_deleting_a_profile_moves_idle_runs_to_the_shared_one(self) -> None:
+        beta = self.window.runs[1]
+        gpt = self.window.profiles.create("Tylko GPT")
+        beta.set_profile(gpt.slug)
+        self.window.edit_profile(gpt.slug)
+
+        self.window._delete_profile()
+
+        self.assertEqual(beta.profile_slug, SHARED)
+        self.assertEqual(self.window.editing_slug, SHARED)
+        self.assertFalse(self.window.profiles.has(gpt.slug))
+
+    def test_a_profile_running_a_run_cannot_be_deleted(self) -> None:
+        beta = self.window.runs[1]
+        gpt = self.window.profiles.create("Tylko GPT")
+        beta.set_profile(gpt.slug)
+        beta.process = _FakeProcess()
+        self.window.edit_profile(gpt.slug)
+
+        self.window._delete_profile()
+
+        self.assertTrue(self.window.profiles.has(gpt.slug))
+        self.assertEqual(beta.profile_slug, gpt.slug)
+
+    def test_renaming_keeps_the_run_attached(self) -> None:
+        beta = self.window.runs[1]
+        gpt = self.window.profiles.create("Tylko GPT")
+        beta.set_profile(gpt.slug)
+        self.window.edit_profile(gpt.slug)
+
+        self.window.profile_name.set_text("GPT i nic więcej")
+        self.window._rename_profile(self.window.profile_name)
+
+        self.assertEqual(beta.profile_slug, gpt.slug)
+        self.assertEqual(self.window.profiles.label(gpt.slug),
+                         "GPT i nic więcej")
+
+    def test_an_abandoned_name_restores_the_previous_one(self) -> None:
+        # Pole nazwy rozlicza się także przy wyjściu ogniskiem, więc puste musi
+        # znaczyć „nic nie zmieniam", a nie „skasuj nazwę".
+        gpt = self.window.profiles.create("Tylko GPT")
+        self.window.edit_profile(gpt.slug)
+
+        self.window.profile_name.set_text("   ")
+        self.window._rename_profile(self.window.profile_name)
+
+        self.assertEqual(self.window.profiles.label(gpt.slug), "Tylko GPT")
+        self.assertEqual(self.window.profile_name.get_text(), "Tylko GPT")
+
+    def test_the_shared_profile_keeps_its_name(self) -> None:
+        self.window.profile_name.set_text("Coś innego")
+        self.window._rename_profile(self.window.profile_name)
+
+        self.assertEqual(self.window.profiles.label(SHARED),
+                         profiles.SHARED_LABEL)
+
+    def test_a_run_can_use_gpt_while_another_mixes_three_tools(self) -> None:
+        # Dokładnie przypadek, dla którego powstały profile.
+        alfa, beta = self.window.runs
+        for difficulty in TASK_DIFFICULTIES:
+            self._pick("coder", difficulty, "gpt-5.6-luna")
+            self._pick("tester", difficulty, "gpt-5.6-luna")
+
+        mixed = self.window.profiles.create("Trzy narzędzia")
+        self.window.edit_profile(mixed.slug)
+        self._pick("coder", "complex", "opus")
+        self._pick("tester", "standard", "grok-4.5")
+        beta.set_profile(mixed.slug)
+
+        alfa_models = {self.window.run_routing(alfa).slot(role, difficulty).model
+                       for role in ("coder", "tester")
+                       for difficulty in TASK_DIFFICULTIES}
+        beta_routing = self.window.run_routing(beta)
+
+        self.assertEqual(alfa_models, {"openai/gpt-5.6-luna"})
+        self.assertEqual(beta_routing.slot("coder", "complex").agent, "claude")
+        self.assertEqual(beta_routing.slot("tester", "standard").model,
+                         "xai/grok-4.5")
+        self.assertEqual(beta_routing.slot("coder", "simple").model,
+                         "openai/gpt-5.6-luna")
+
+    def test_the_run_dropdown_shows_a_missing_profile_instead_of_hiding_it(
+            self) -> None:
+        beta = self.window.runs[1]
+        beta.profile_slug = "znikniety"
+        beta.refresh_profiles()
+
+        self.assertIn("BRAK", " ".join(
+            label for _slug, label in beta._profile_choices))
+        self.assertEqual(beta.profile_slug, "znikniety")
 
 
 if __name__ == "__main__":

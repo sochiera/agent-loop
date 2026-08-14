@@ -13,6 +13,11 @@ prywatny dla maszyny. Tu decydujesz, że koder ma jechać konkretnym modelem
 konkretnego providera OpenCode, a Product Owner ma być Claude'em. Plik jest
 wspólny dla GUI i uruchomień z CLI, więc zmiana dostawcy nie wymaga commita.
 
+Nazwany zestaw tych wyborów to **profil**, a każdy bieg wskazuje własny — patrz
+[`PROFILE-MODELI.md`](PROFILE-MODELI.md). Profile nazwane leżą w
+`~/.config/forge/profiles/<slug>.json` i mają dokładnie ten sam format, co plik
+opisany niżej; `routing.json` pozostaje profilem wspólnym.
+
 ## Plik routingu
 
 ```json
@@ -57,6 +62,11 @@ Reguły:
   nie do przekazania w argv są pomijane. Literówka w ręcznej edycji cofa cię do
   polityki projektu, a nie wywala biegu.
 - `FORGE_ROUTING_FILE` wskazuje inny plik; `none`/`off` wyłącza całą warstwę.
+  Bez tej zmiennej pliku szuka wybór profilu: `--routing-profile <nazwa>` albo
+  `FORGE_ROUTING_PROFILE=<slug>`, a w ich braku — profil wspólny. Wskazanie
+  profilu, którego nie ma, zatrzymuje start; to jedyne miejsce tej warstwy,
+  które NIE jest pobłażliwe, bo cicha praca na polityce domyślnej kosztowałaby
+  cały bieg wykonany nie tymi modelami.
 - Zakazy ról obowiązują też wpisy zapasowe: mistrz nie przyjmie Codeksa ani
   jako pierwszy wybór, ani jako zapas — taki plik zatrzymuje start z
   komunikatem, zamiast cicho oddać mu rolę po pierwszej awarii.

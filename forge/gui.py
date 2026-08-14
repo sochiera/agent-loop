@@ -3,17 +3,23 @@
 Uruchomienie:
     python3 -m forge.gui
 
-Panel konfiguracji jest edytorem pliku ``routing.json`` (patrz routing.py): dla
-każdej roli wybierasz MODEL RAZEM Z EFFORTEM (a dla ról czułych na zakres
-zadania — osobno dla simple/standard/complex) i łańcuch zapasowy. Model, effort
-i trasa są jedną pozycją; GPT i Grok zawsze biegną przez OpenCode. Wybór zapisuje się
-poza repozytorium, więc obowiązuje też
-uruchomienia z CLI i nie wymaga commita przy każdej zmianie dostawcy.
+Panel konfiguracji jest edytorem PROFILI routingu (patrz profiles.py i
+routing.py): dla każdej roli wybierasz MODEL RAZEM Z EFFORTEM (a dla ról czułych
+na zakres zadania — osobno dla simple/standard/complex) i łańcuch zapasowy.
+Model, effort i trasa są jedną pozycją; GPT i Grok zawsze biegną przez OpenCode.
+Wybór zapisuje się poza repozytorium, więc obowiązuje też uruchomienia z CLI
+i nie wymaga commita przy każdej zmianie dostawcy.
 
 Jedno okno prowadzi KILKA BIEGÓW naraz — każdy ma własny projekt, własny brief,
-własny proces i własną zakładkę logu. Routing ról jest wspólny (te same modele
-w obu projektach to typowy przypadek), ale każdy bieg dostaje jego MIGAWKĘ,
-więc późniejsze przekręcenie pokrętła nie sięga procesu, który już pracuje.
+własny proces, własną zakładkę logu i WŁASNY PROFIL MODELI. Profil jest nazwanym
+zestawem nadpisań ról: jeden bieg może chodzić wyłącznie na GPT, a drugi
+równolegle mieszać GPT, Claude'a i Groka. Sekcja „Modele ról" edytuje jeden
+profil naraz — ten wybrany w jej nagłówku — a wiersz biegu tylko WSKAZUJE profil,
+którym ma pracować. Profil wspólny to dotychczasowy ``routing.json``, więc biegi
+z linii poleceń niczego nie tracą. Każdy bieg dostaje przy starcie MIGAWKĘ
+swojego profilu, więc późniejsze przekręcenie pokrętła nie sięga procesu, który
+już pracuje.
+
 Trzy rzeczy, których równoległość nie znosi, mają swoje zamki — wszystkie
 rozstrzyga sam orkiestrator, więc obowiązują tak samo drugie okno panelu, jak
 i uruchomienie z linii poleceń. Panel tylko w nie ZAGLĄDA, żeby operator dostał
@@ -23,6 +29,8 @@ powód przed startem procesu, a nie po nim:
 - kod z migawki (``snapshot``), żeby commit w repozytorium Forge nie wywrócił
   pracującej pętli — patrz ``docs/AWARIE-2026-08-11.md``,
 - wyłączność na plikową sesję Claude Code, dopóki nie ma nierotującego tokenu.
+  Od czasu profili to pytanie zadaje się PER BIEG: bieg, którego profil nie
+  woła Claude'a, nie bierze tego zamku i nie daje się nim zablokować.
 """
 from __future__ import annotations
 
@@ -48,6 +56,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 from .config import Config, TASK_DIFFICULTIES, validate_master_agent
 from . import catalog
 from . import preflight
+from . import profiles as profiles_module
 from . import report
 from . import routing as routing_module
 from . import runlock
@@ -115,6 +124,11 @@ def routing_path(environ: dict[str, str] | None = None) -> Path:
             or routing_module.default_path(environ))
 
 
+def profiles_dir(environ: dict[str, str] | None = None) -> Path:
+    """Katalog profili nazwanych — zawsze obok pliku, który panel edytuje."""
+    return routing_path(environ).parent / profiles_module.DIRECTORY_NAME
+
+
 def resolve_path(value: str) -> Path:
     """Ścieżka względna liczona od repozytorium Forge, nie od cwd GUI.
 
@@ -135,7 +149,10 @@ def run_settings(settings: dict[str, Any]) -> list[dict[str, str]]:
 
     Starszy plik opisywał jeden bieg płaskimi kluczami ``brief``/``project``.
     Migrujemy go do jednoelementowej listy, bo inaczej pierwsze uruchomienie
-    nowej wersji wyrzuciłoby operatorowi jego ostatni wybór ścieżek."""
+    nowej wersji wyrzuciłoby operatorowi jego ostatni wybór ścieżek.
+
+    Brak klucza ``profile`` znaczy PROFIL WSPÓLNY — czyli dokładnie to, czym
+    pracowały wszystkie biegi, zanim profile powstały."""
     entries = settings.get("runs")
     runs: list[dict[str, str]] = []
     if isinstance(entries, list):
@@ -144,9 +161,12 @@ def run_settings(settings: dict[str, Any]) -> list[dict[str, str]]:
                 continue
             brief = entry.get("brief")
             project = entry.get("project")
+            profile = entry.get("profile")
             runs.append({
                 "brief": brief if isinstance(brief, str) else DEFAULT_BRIEF,
                 "project": project if isinstance(project, str) else DEFAULT_PROJECT,
+                "profile": (profile if isinstance(profile, str)
+                            else profiles_module.SHARED_SLUG),
             })
     if runs:
         return runs
@@ -156,6 +176,7 @@ def run_settings(settings: dict[str, Any]) -> list[dict[str, str]]:
         "brief": legacy_brief if isinstance(legacy_brief, str) else DEFAULT_BRIEF,
         "project": (legacy_project if isinstance(legacy_project, str)
                     else DEFAULT_PROJECT),
+        "profile": profiles_module.SHARED_SLUG,
     }]
 
 
@@ -649,18 +670,25 @@ class RoleCard(Gtk.Expander):
 
 
 class Run:
-    """Jeden bieg: własny projekt, własny proces, własny log.
+    """Jeden bieg: własny projekt, własny proces, własny log, własny profil.
 
     Cały stan przebiegu (proces, czas startu, bufor logu, uchwyt pliku sesji)
     należy do TEGO obiektu, a nie do okna — inaczej drugi bieg nadpisywałby
-    pierwszemu wszystko, od czasu startu po plik logu."""
+    pierwszemu wszystko, od czasu startu po plik logu.
 
-    def __init__(self, owner: "ForgeWindow", brief: str, project: str):
+    Profil trzymamy jako SLUG, a nie jako pozycję na liście ani gotowy
+    ``Routing``: lista zmienia kolejność przy każdym przemianowaniu, a kopia
+    routingu rozjechałaby się z tym, co operator właśnie wyklikał w sekcji
+    modeli. Rozstrzygający odczyt następuje dopiero przy starcie biegu."""
+
+    def __init__(self, owner: "ForgeWindow", brief: str, project: str,
+                 profile: str = profiles_module.SHARED_SLUG):
         self.owner = owner
         self.process: subprocess.Popen[str] | None = None
         self.started_at = 0.0
         self.stop_requested = False
         self._session_log_fh: Any = None
+        self.profile_slug = profile
 
         self.brief = Gtk.Entry(text=brief, placeholder_text=DEFAULT_BRIEF)
         self.project = Gtk.Entry(text=project, placeholder_text=DEFAULT_PROJECT)
@@ -744,8 +772,81 @@ class Run:
             box.set_hexpand(True)
             paths.append(box)
         panel.append(paths)
+        panel.append(self._build_profile_row())
         self._update_title()
         return panel
+
+    def _build_profile_row(self) -> Gtk.Widget:
+        """Wiersz wyboru profilu modeli dla tego biegu.
+
+        Sam wybór, bez edycji: gdyby każdy bieg miał własny komplet kart ról,
+        panel powtórzyłby jedenaście kart tyle razy, ile jest biegów — a dwa
+        biegi na tym samym profilu rozjeżdżałyby się przy pierwszej zmianie."""
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        caption = Gtk.Label(label="Profil modeli", xalign=0)
+        caption.add_css_class("field-label")
+        caption.set_size_request(120, -1)
+        row.append(caption)
+
+        self._profile_choices: list[tuple[str, str]] = []
+        self.profile = Gtk.DropDown(model=_string_list([]))
+        self.profile.set_hexpand(True)
+        _searchable(self.profile)
+        self.profile.connect("notify::selected", self._profile_selected)
+        row.append(self.profile)
+
+        self.edit_profile_button = Gtk.Button(
+            label="Modele…",
+            tooltip_text="Pokaż role tego profilu w sekcji poniżej")
+        self.edit_profile_button.add_css_class("flat")
+        self.edit_profile_button.connect(
+            "clicked", lambda _button: self.owner.edit_profile(self.profile_slug))
+        row.append(self.edit_profile_button)
+        self.refresh_profiles()
+        return row
+
+    def _profile_options(self) -> list[tuple[str, str]]:
+        """Pary (slug, etykieta) na pokrętło profilu.
+
+        Wybór wskazujący profil, którego już nie ma (skasowany w drugim oknie,
+        usunięty plik), zostaje NA LIŚCIE z adnotacją. Ciche przestawienie na
+        profil wspólny byłoby najgorszym z możliwych wyników: bieg ruszyłby
+        z modelami, których operator dla tego projektu nie wybrał."""
+        options = [(profile.slug, profile.name)
+                   for profile in self.owner.profiles.profiles()]
+        if all(slug != self.profile_slug for slug, _label in options):
+            options.append((self.profile_slug, f"{self.profile_slug} — BRAK"))
+        return options
+
+    def refresh_profiles(self) -> None:
+        """Odśwież pokrętło po zmianie listy profili, zachowując wybór biegu."""
+        self._profile_choices = self._profile_options()
+        self._profile_muted = True
+        self.profile.set_model(_string_list(
+            [label for _slug, label in self._profile_choices]))
+        for index, (slug, _label) in enumerate(self._profile_choices):
+            if slug == self.profile_slug:
+                self.profile.set_selected(index)
+                break
+        self._profile_muted = False
+
+    def _profile_selected(self, *_args: Any) -> None:
+        if getattr(self, "_profile_muted", False):
+            return
+        index = self.profile.get_selected()
+        if index == Gtk.INVALID_LIST_POSITION or not 0 <= index < len(
+                self._profile_choices):
+            return
+        slug = self._profile_choices[index][0]
+        if slug == self.profile_slug:
+            return
+        self.profile_slug = slug
+        self.owner.save_paths()
+
+    def set_profile(self, slug: str) -> None:
+        """Przestaw bieg na inny profil (np. po usunięciu poprzedniego)."""
+        self.profile_slug = slug
+        self.refresh_profiles()
 
     def _build_log_page(self) -> Gtk.Widget:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -785,7 +886,9 @@ class Run:
                                 Gtk.FileChooserAction.SELECT_FOLDER, self.project)
 
     def settings(self) -> dict[str, str]:
-        return {"brief": self.brief.get_text(), "project": self.project.get_text()}
+        return {"brief": self.brief.get_text(),
+                "project": self.project.get_text(),
+                "profile": self.profile_slug}
 
     def project_path(self) -> Path:
         return resolve_project(self.project.get_text())
@@ -873,6 +976,10 @@ class Run:
         self.stop_button.set_sensitive(running)
         self.brief.set_sensitive(not running)
         self.project.set_sensitive(not running)
+        # Profil pracującego biegu jest już rozstrzygnięty — proces czyta
+        # własną migawkę, więc przestawienie pokrętła i tak by nim nie sięgnęło.
+        # Pole zamknięte, żeby nie obiecywało zmiany, której nie będzie.
+        self.profile.set_sensitive(not running)
         self.remove_button.set_sensitive(not running)
         for button in self.path_buttons:
             button.set_sensitive(not running)
@@ -886,10 +993,11 @@ class Run:
     def routing_snapshot(self, routing: routing_module.Routing) -> Path:
         """Zapisz routing, którym pracuje TEN bieg, obok jego stanu.
 
-        Wspólny plik ról jest edytowalny w trakcie pracy (drugi bieg trzeba
-        przecież skonfigurować), więc bieg dostaje własną kopię. Przy okazji
-        zostaje ślad, czym naprawdę pracował — inaczej porównanie kosztu dwóch
-        projektów opiera się na pamięci operatora.
+        Plik profilu jest edytowalny w trakcie pracy (drugi bieg trzeba przecież
+        skonfigurować, a bywa, że na tym samym profilu), więc bieg dostaje własną
+        kopię. Przy okazji zostaje ślad, czym naprawdę pracował — razem z nazwą
+        profilu, bo inaczej porównanie kosztu dwóch projektów opiera się na
+        pamięci operatora.
 
         Nazwa jest JEDNORAZOWA. Stała kolidowałaby przy dwóch startach tego
         samego projektu z różnych okien: zapis wyprzedza zamek projektu (a
@@ -899,14 +1007,17 @@ class Run:
         directory = self.project_path() / ".forge" / ROUTING_RUN_DIR
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = directory / f"run-{stamp}-{uuid.uuid4().hex[:8]}.json"
+        label = self.owner.profiles.label(self.profile_slug)
         try:
             directory.mkdir(parents=True, exist_ok=True)
-            routing_module.save(routing, path)
+            routing_module.save(routing, path, {"name": label})
         except OSError as exc:
+            # Awaryjny powrót do PLIKU TEGO PROFILU, nie do wspólnego: bieg ma
+            # ruszyć modelami, które dla niego wybrano, albo nie ruszyć wcale.
             self.append_log(
-                f"UWAGA: nie udało się zapisać routingu biegu ({exc}); "
-                "używam wspólnego pliku ról.")
-            return self.owner.routing_file
+                f"UWAGA: nie udało się zapisać migawki routingu ({exc}); "
+                f"używam pliku profilu „{label}”.")
+            return self.owner.profiles.path(self.profile_slug)
         prune_routing_snapshots(directory, protect=path)
         return path
 
@@ -918,7 +1029,7 @@ class Run:
             self.show_error(problem)
             return
         try:
-            routing = self.owner.current_routing()
+            routing = self.owner.run_routing(self)
             code = snapshot.create()
             launch = build_launch(
                 self.brief.get_text(), self.project.get_text(), routing,
@@ -943,7 +1054,9 @@ class Run:
         self.started_at = time.monotonic()
         self.stop_requested = False
         self._set_running(True)
-        self.append_log(f"Uruchamiam forge — {code.describe()}")
+        self.append_log(
+            f"Uruchamiam forge — {code.describe()}, "
+            f"profil modeli „{self.owner.profiles.label(self.profile_slug)}”")
         threading.Thread(target=self._read_process, daemon=True).start()
         GLib.timeout_add_seconds(1, self._update_elapsed)
 
@@ -1025,7 +1138,13 @@ class ForgeWindow(Adw.ApplicationWindow):
         super().__init__(application=app, title="Forge — panel sterowania")
         self.settings = load_settings()
         self.routing_file = routing_path()
-        self.routing = routing_module.load(self.routing_file, TASK_DIFFICULTIES)
+        self.profiles = profiles_module.Store.load(
+            self.routing_file, profiles_dir(), TASK_DIFFICULTIES)
+        # Profil pokazywany w sekcji „Modele ról". Wiersze biegów wskazują
+        # profile niezależnie od tego wyboru — edytujemy jeden naraz, bo karty
+        # ról są kosztowne (jedenaście ról × do trzech pokręteł na katalogu
+        # kilkudziesięciu modeli), a ich powielenie na bieg nic by nie wniosło.
+        self.editing_slug = profiles_module.SHARED_SLUG
         window_settings = self.settings.get("window", {})
         if not isinstance(window_settings, dict):
             window_settings = {}
@@ -1040,6 +1159,9 @@ class ForgeWindow(Adw.ApplicationWindow):
         self._closing = False
         self._chooser: Gtk.FileChooserNative | None = None
         self._ready = False
+        # Podmiana zawartości kart przy przełączaniu profilu nie jest wyborem
+        # operatora, więc nie może zostać zapisana jako jego wybór.
+        self._applying_profile = False
 
         header = Adw.HeaderBar()
         title = Adw.WindowTitle(title="Forge", subtitle="Orkiestrator agentów")
@@ -1094,12 +1216,15 @@ class ForgeWindow(Adw.ApplicationWindow):
         heading.set_markup("<span size='x-large' weight='bold'>Konfiguracja biegu</span>")
         info = Gtk.Label(
             label=("Dla każdej roli wybierz jedną pozycję model–effort. "
-                   "Ostatni wybór jest przywracany przy kolejnym uruchomieniu. "
-                   "Routing zapisuje się w "
-                   + str(self.routing_file) + " i obowiązuje także uruchomienia "
-                   "z linii poleceń. Każdy bieg dostaje jego migawkę w chwili "
-                   "startu, więc zmiany w trakcie pracy nie dotykają biegu, "
-                   "który już ruszył."),
+                   "Zestaw wyborów to PROFIL: każdy bieg wskazuje własny, więc "
+                   "jeden projekt może chodzić na samym GPT, a drugi mieszać "
+                   "GPT, Claude'a i Groka. Profil wspólny zapisuje się w "
+                   + str(self.routing_file) + " i obowiązuje uruchomienia "
+                   "z linii poleceń bez dodatkowych zabiegów; nazwane profile "
+                   "leżą w " + str(profiles_dir()) + " i wybiera się je przez "
+                   "--routing-profile. Każdy bieg dostaje migawkę swojego "
+                   "profilu w chwili startu, więc zmiany w trakcie pracy nie "
+                   "dotykają biegu, który już ruszył."),
             xalign=0,
             wrap=True,
         )
@@ -1120,11 +1245,14 @@ class ForgeWindow(Adw.ApplicationWindow):
         config.append(self.add_run_button)
 
         for entry in run_settings(self.settings):
-            self.add_run(entry["brief"], entry["project"], notify=False)
+            self.add_run(entry["brief"], entry["project"], notify=False,
+                         profile=entry["profile"])
 
         roles_heading = Gtk.Label(xalign=0)
-        roles_heading.set_markup("<span size='large' weight='bold'>Role</span>")
+        roles_heading.set_markup(
+            "<span size='large' weight='bold'>Modele ról</span>")
         config.append(roles_heading)
+        config.append(self._build_profile_bar())
 
         defaults = Config(routing=routing_module.Routing())
         # Katalog czyta konfigurację OpenCode z dysku — jedno zbudowanie na okno,
@@ -1133,11 +1261,9 @@ class ForgeWindow(Adw.ApplicationWindow):
         self.role_cards: dict[str, RoleCard] = {}
         for definition in ROLE_DEFS:
             card = RoleCard(definition, defaults, self._role_changed, entries)
-            saved = self.routing.roles.get(definition.name)
-            if saved is not None:
-                card.apply(saved)
             self.role_cards[definition.name] = card
             config.append(card)
+        self._show_profile(self.editing_slug)
         config_scroll.set_child(config)
 
         log_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -1160,12 +1286,187 @@ class ForgeWindow(Adw.ApplicationWindow):
         split.set_shrink_end_child(False)
         return split
 
+    # --- profile ----------------------------------------------------------
+    def _build_profile_bar(self) -> Gtk.Widget:
+        """Wybór i zarządzanie profilem, którego role widać poniżej."""
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        caption = Gtk.Label(label="Profil", xalign=0)
+        caption.add_css_class("field-label")
+        caption.set_size_request(120, -1)
+        bar.append(caption)
+
+        self._editor_choices: list[str] = []
+        self._editor_muted = False
+        self.profile_chooser = Gtk.DropDown(model=_string_list([]))
+        self.profile_chooser.set_hexpand(True)
+        _searchable(self.profile_chooser)
+        self.profile_chooser.connect("notify::selected", self._editor_selected)
+        bar.append(self.profile_chooser)
+
+        self.profile_name = Gtk.Entry(
+            placeholder_text="nazwa profilu",
+            tooltip_text="Nazwa jest tylko etykietą — biegi wskazują profil "
+                         "po nazwie pliku, więc zmiana nie osieroci żadnego "
+                         "wiersza")
+        self.profile_name.set_hexpand(True)
+        self.profile_name.connect("activate", self._rename_profile)
+        # Sam Enter nie wystarczy: nazwa wpisana i porzucona kliknięciem gdzie
+        # indziej przepadłaby bez śladu, a to najczęstsza droga wyjścia z pola.
+        focus = Gtk.EventControllerFocus()
+        focus.connect("leave", lambda _controller: self._rename_profile(
+            self.profile_name))
+        self.profile_name.add_controller(focus)
+        bar.append(self.profile_name)
+
+        add = Gtk.Button(label="+  Nowy profil",
+                         tooltip_text="Nowy profil jako kopia bieżącego")
+        add.add_css_class("flat")
+        add.connect("clicked", lambda _button: self._create_profile())
+        bar.append(add)
+
+        self.delete_profile_button = Gtk.Button(
+            icon_name="user-trash-symbolic", tooltip_text="Usuń ten profil")
+        self.delete_profile_button.add_css_class("flat")
+        self.delete_profile_button.connect(
+            "clicked", lambda _button: self._delete_profile())
+        bar.append(self.delete_profile_button)
+        return bar
+
+    def _refresh_profile_chooser(self) -> None:
+        self._editor_choices = self.profiles.slugs()
+        labels = [profile.name for profile in self.profiles.profiles()]
+        self._editor_muted = True
+        self.profile_chooser.set_model(_string_list(labels))
+        if self.editing_slug in self._editor_choices:
+            self.profile_chooser.set_selected(
+                self._editor_choices.index(self.editing_slug))
+        self._editor_muted = False
+        shared = self.editing_slug == profiles_module.SHARED_SLUG
+        self.profile_name.set_text(self.profiles.label(self.editing_slug))
+        self.profile_name.set_sensitive(not shared)
+        self.delete_profile_button.set_sensitive(not shared)
+
+    def _show_profile(self, slug: str) -> None:
+        """Pokaż w kartach ról zawartość tego profilu.
+
+        Karty są WSPÓLNE dla wszystkich profili, więc rola, której nowy profil
+        nie nadpisuje, musi wrócić do polityki domyślnej — inaczej zostałaby na
+        ekranie wartość z poprzednio oglądanego profilu i po pierwszej zmianie
+        pokrętła zostałaby zapisana jako wybór operatora."""
+        self.editing_slug = slug
+        routing = self.profiles.routing(slug)
+        self._applying_profile = True
+        try:
+            for role, card in self.role_cards.items():
+                card.apply(routing.roles.get(role)
+                           or routing_module.RoleRouting())
+        finally:
+            self._applying_profile = False
+        self._refresh_profile_chooser()
+
+    def edit_profile(self, slug: str) -> None:
+        """Przełącz sekcję ról na ten profil (przycisk „Modele…" w wierszu)."""
+        if self.profiles.has(slug) and slug != self.editing_slug:
+            self._show_profile(slug)
+
+    def _editor_selected(self, *_args: Any) -> None:
+        if self._editor_muted:
+            return
+        index = self.profile_chooser.get_selected()
+        if index == Gtk.INVALID_LIST_POSITION or not 0 <= index < len(
+                self._editor_choices):
+            return
+        slug = self._editor_choices[index]
+        if slug != self.editing_slug:
+            self._show_profile(slug)
+
+    def _create_profile(self) -> None:
+        # Najpierw utrwal to, co widać na ekranie: kopiujemy profil BIEŻĄCY,
+        # a jego zapis mógł się wcześniej nie udać (pełny dysk, prawa).
+        self.save_settings()
+        try:
+            profile = self.profiles.create(source=self.editing_slug)
+        except (OSError, ValueError) as exc:
+            self._warn_runs(f"nie udało się utworzyć profilu: {exc}")
+            return
+        self._show_profile(profile.slug)
+        self._refresh_run_profiles()
+        self.profile_name.grab_focus()
+        self.profile_name.select_region(0, -1)
+
+    def _rename_profile(self, _entry: Gtk.Entry) -> None:
+        current = self.profiles.label(self.editing_slug)
+        text = self.profile_name.get_text().strip()
+        # Puste pole to porzucona edycja, nie żądanie skasowania nazwy —
+        # przywracamy poprzednią zamiast straszyć operatora błędem.
+        if self.editing_slug == profiles_module.SHARED_SLUG or not text \
+                or text == current:
+            self.profile_name.set_text(current)
+            return
+        try:
+            self.profiles.rename(self.editing_slug, text)
+        except (OSError, ValueError) as exc:
+            self._warn_runs(f"nie udało się zmienić nazwy profilu: {exc}")
+        self._refresh_profile_chooser()
+        self._refresh_run_profiles()
+
+    def _delete_profile(self) -> None:
+        """Usuń profil; biegi, które go wskazywały, wracają na wspólny.
+
+        Bieg PRACUJĄCY blokuje usunięcie. Jego proces czyta już własną migawkę,
+        więc technicznie nic by mu się nie stało — ale wiersz w panelu opisywałby
+        wtedy inne modele niż te, którymi ten bieg realnie pracuje."""
+        slug = self.editing_slug
+        if slug == profiles_module.SHARED_SLUG:
+            return
+        busy = [run.title() for run in self.runs
+                if run.is_running() and run.profile_slug == slug]
+        if busy:
+            self._warn_runs(
+                f"profil „{self.profiles.label(slug)}” prowadzi bieg "
+                f"{', '.join(busy)} — najpierw go zatrzymaj.")
+            return
+        moved = [run for run in self.runs if run.profile_slug == slug]
+        try:
+            self.profiles.delete(slug)
+        except ValueError as exc:
+            self._warn_runs(str(exc))
+            return
+        for run in moved:
+            run.set_profile(profiles_module.SHARED_SLUG)
+            run.append_log(
+                "UWAGA: profil modeli tego biegu został usunięty — wracam "
+                "na profil wspólny.")
+        self._show_profile(profiles_module.SHARED_SLUG)
+        self._refresh_run_profiles()
+        self.save_paths()
+
+    def _refresh_run_profiles(self) -> None:
+        for run in self.runs:
+            run.refresh_profiles()
+
+    def _warn_runs(self, message: str) -> None:
+        for run in self.runs:
+            run.append_log(f"UWAGA: {message}")
+
+    def run_routing(self, run: Run) -> routing_module.Routing:
+        """Nadpisania ról, którymi ma ruszyć TEN bieg.
+
+        Dla profilu właśnie edytowanego bierzemy stan KART, a nie pliku: między
+        przekręceniem pokrętła a kliknięciem Start leży zapis, który mógł się nie
+        udać (pełny dysk, prawa do katalogu), a bieg ma ruszyć tym, co operator
+        widzi na ekranie."""
+        if run.profile_slug == self.editing_slug:
+            return self.current_routing()
+        return self.profiles.routing(run.profile_slug)
+
     # --- biegi ------------------------------------------------------------
     def add_run(self, brief: str = DEFAULT_BRIEF, project: str = DEFAULT_PROJECT,
-                notify: bool = True) -> Run | None:
+                notify: bool = True,
+                profile: str = profiles_module.SHARED_SLUG) -> Run | None:
         if len(self.runs) >= MAX_RUNS:
             return None
-        run = Run(self, brief, project)
+        run = Run(self, brief, project, profile)
         self.runs.append(run)
         self.runs_box.append(run.panel)
         self.logs.append_page(run.page, run.tab_label)
@@ -1211,7 +1512,10 @@ class ForgeWindow(Adw.ApplicationWindow):
         if busy:
             return busy
         try:
-            config = Config(routing=self.current_routing())
+            # Routing TEGO biegu, nie okna: od czasu profili odpowiedź na
+            # „czy potrzebuję Claude'a" bywa różna dla dwóch wierszy panelu,
+            # a zamek na plikową sesję dotyczy tylko tych, które go wołają.
+            config = Config(routing=self.run_routing(run))
         except ValueError as exc:
             return str(exc)
         # Pytamy ZAWSZE, nie tylko przy drugim biegu w tym oknie: plikowa sesja
@@ -1314,10 +1618,12 @@ class ForgeWindow(Adw.ApplicationWindow):
                 run.append_log(f"UWAGA: nie udało się zapisać ustawień GUI: {exc}")
 
     def _role_changed(self) -> None:
+        if self._applying_profile:
+            return
         self.save_settings()
 
     def save_settings(self) -> None:
-        """Zapisz ścieżki, geometrię i routing ról.
+        """Zapisz ścieżki, geometrię i routing EDYTOWANEGO profilu.
 
         Wołane przy KAŻDEJ zmianie pokrętła, nie tylko przy starcie — inaczej
         „to ma się zapamiętać" trzymałoby się wyłącznie udanych uruchomień."""
@@ -1325,10 +1631,9 @@ class ForgeWindow(Adw.ApplicationWindow):
             return
         self.save_paths()
         try:
-            routing_module.save(self.current_routing(), self.routing_file)
-        except OSError as exc:
-            for run in self.runs:
-                run.append_log(f"UWAGA: nie udało się zapisać routingu ról: {exc}")
+            self.profiles.set_routing(self.editing_slug, self.current_routing())
+        except (OSError, ValueError) as exc:
+            self._warn_runs(f"nie udało się zapisać profilu modeli: {exc}")
 
     def _close_requested(self, _window: Gtk.Window) -> bool:
         self.save_settings()

@@ -13,6 +13,7 @@ import os
 from dataclasses import dataclass, field
 
 from . import adapters
+from . import profiles as profiles_module
 from . import routing as routing_module
 
 
@@ -274,11 +275,13 @@ class Config:
     # Przed rollbackiem przy porażce: branch forge/failed/<id> na HEAD (+ residual commit).
     keep_failed_ref: bool = os.environ.get("FORGE_KEEP_FAILED_REF", "1") != "0"
 
-    # Nadpisania operatora (plik ~/.config/forge/routing.json — patrz routing.py).
-    # Wybór z GUI ma być trwały i wspólny z uruchomieniami z CLI, więc czyta go
-    # sama konfiguracja, a nie warstwa uruchamiająca.
+    # Nadpisania operatora (patrz routing.py i profiles.py). Wybór z GUI ma być
+    # trwały i wspólny z uruchomieniami z CLI, więc czyta go sama konfiguracja,
+    # a nie warstwa uruchamiająca. Źródło rozstrzyga profiles.load_from_env:
+    # migawka biegu (FORGE_ROUTING_FILE), nazwany profil (FORGE_ROUTING_PROFILE)
+    # albo plik wspólny — czyli dotychczasowe ~/.config/forge/routing.json.
     routing: routing_module.Routing = field(
-        default_factory=lambda: routing_module.load_from_env(
+        default_factory=lambda: profiles_module.load_from_env(
             difficulties=TASK_DIFFICULTIES))
 
     def __post_init__(self) -> None:

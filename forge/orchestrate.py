@@ -24,6 +24,7 @@ from . import backlog
 from . import ledger
 from . import master_gate
 from . import notebooks
+from . import profiles
 from . import prompts
 from . import preflight
 from . import runlock
@@ -2580,6 +2581,20 @@ def _reexec_from_snapshot() -> None:
             "bieg pracuje na drzewie roboczym.")
 
 
+def _routing_kwargs(args: argparse.Namespace) -> dict:
+    """Nadpisania ról dla tego biegu, gdy operator wskazał nazwany profil.
+
+    Profil rozstrzyga się TUTAJ, a nie po zbudowaniu ``Config``: podmiana pola
+    po fakcie ominęłaby ``__post_init__``, czyli zakaz Codeksa dla mistrza.
+    Nieznana nazwa jest błędem uruchomienia — cicha praca na polityce domyślnej
+    kosztowałaby cały bieg wykonany nie tymi modelami, o które prosił operator."""
+    name = (args.routing_profile or "").strip()
+    if not name:
+        return {}
+    return {"routing": profiles.load_named(
+        profiles.resolve(name), TASK_DIFFICULTIES)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Forge KISS: tester → coder → review; max_tdd_rounds chroni małe zadania.")
     parser.add_argument("--brief", default="game.md"); parser.add_argument("--project", default="game")
@@ -2587,13 +2602,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--discard-legacy-task", action="store_true", help="Porzuć aktywny stary task i zachowaj stabilny stan.")
     parser.add_argument("--max-iters", type=int, default=0); parser.add_argument("--batch-size", type=int); parser.add_argument("--max-tdd-rounds", type=int)
     parser.add_argument("--tester-agent"); parser.add_argument("--coder-agent"); parser.add_argument("--reviewer-agent"); parser.add_argument("--planner-agent")
+    parser.add_argument(
+        "--routing-profile", default="",
+        help="Nazwany profil modeli (patrz profiles.py); pusty = profil wspólny.")
     args = parser.parse_args(argv)
     # Tylko dla PRAWDZIWEGO uruchomienia z powłoki: wywołanie programowe
     # (testy, osadzenie) dostało argumenty w ``argv`` i nie ma czego ponawiać.
     if argv is None:
         _reexec_from_snapshot()
     try:
-        cfg = Config(brief_path=args.brief)
+        cfg = Config(brief_path=args.brief, **_routing_kwargs(args))
     except ValueError as exc:
         parser.error(str(exc))
     for key in ("batch_size", "max_tdd_rounds", "tester_agent", "coder_agent", "reviewer_agent", "planner_agent"):

@@ -30,6 +30,16 @@ from it, and a provider dropdown appears only for models reachable more than one
 way (`gpt-5.6-luna` via Codex or the OpenCode bridge, `glm-5.2` via two OpenCode
 providers). See [docs/ROUTING-I-FALLBACK.md](docs/ROUTING-I-FALLBACK.md).
 
+A named set of those choices is a **profile**, and every run picks its own: one
+project can run on GPT alone while another mixes GPT, Claude and Grok in
+parallel. Profiles are ordinary routing files in
+`~/.config/forge/profiles/<slug>.json`; `routing.json` remains the shared
+profile, so a command line without any variable behaves exactly as before. From
+a shell, `--routing-profile "Tylko GPT"` (or `FORGE_ROUTING_PROFILE=tylko-gpt`)
+selects one, and naming a profile that does not exist stops the run up front
+rather than quietly falling back to the default policy. See
+[docs/PROFILE-MODELI.md](docs/PROFILE-MODELI.md).
+
 Providers configured in `opencode.json` take their keys from `{env:NAME}`, which
 resolves against the environment of the Forge process — so a shell started before
 the key was exported, a desktop launcher or a systemd unit would otherwise fail
@@ -52,10 +62,10 @@ refuses to start a run whose roles have no working endpoint left. See
 ## Two projects at once
 
 One panel drives several runs: each row is a separate project with its own
-brief, its own orchestrator process and its own log tab. Model routing stays
-shared — the same models in both projects is the normal case — but every run
-takes a snapshot of it at start, so configuring the second run cannot disturb
-the first.
+brief, its own orchestrator process, its own log tab and its own **model
+profile**. Every run takes a snapshot of its profile at start, so configuring the
+second run cannot disturb the first, and the snapshot records which profile the
+run actually worked with.
 
 Three resources do not survive sharing. Each is guarded by a lock the
 orchestrator itself takes, so a run started from the command line participates
@@ -76,9 +86,11 @@ into those locks to explain a refusal before spending a process on it.
   edits (a debugger, say).
 - **The Claude Code session.** While Forge authenticates from the shared
   credentials file, one machine-wide lock admits a single run; the second is
-  refused up front rather than three hours later. Set the non-rotating token
-  described above and the lock is not taken at all — any number of runs can then
-  work in parallel.
+  refused up front rather than three hours later. The question is asked per run,
+  against that run's own profile, so a run whose models never reach Claude
+  neither takes the lock nor trips over it. Set the non-rotating token described
+  above and the lock is not taken at all — any number of runs can then work in
+  parallel.
 
 ## Research direction
 

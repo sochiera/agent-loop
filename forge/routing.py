@@ -285,13 +285,21 @@ def load_from_env(
     return load(path, difficulties) if path is not None else Routing()
 
 
-def save(routing: Routing, path: Path) -> None:
-    """Zapisz atomowo — przerwany zapis nie może zostawić uszkodzonego pliku."""
+def save(routing: Routing, path: Path,
+         extra: dict[str, Any] | None = None) -> None:
+    """Zapisz atomowo — przerwany zapis nie może zostawić uszkodzonego pliku.
+
+    ``extra`` dokłada pola obok ``roles`` (etykieta profilu, patrz
+    ``profiles.py``). ``parse`` ignoruje wszystko, czego nie zna, więc plik
+    z dodatkami pozostaje zwykłym plikiem routingu — także dla starszej wersji
+    Forge, która o profilach nic nie wie."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(routing.as_dict())
+    payload.update(extra or {})
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps(routing.as_dict(), ensure_ascii=False, indent=2) + "\n",
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     os.replace(temporary, path)

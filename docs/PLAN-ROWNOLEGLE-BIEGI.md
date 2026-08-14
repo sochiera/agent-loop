@@ -214,9 +214,13 @@ przydatne przy porównywaniu kosztu dwóch projektów. ~10 linii.
 
 ## 4. Czego świadomie NIE robimy
 
-- **Osobny routing per bieg w GUI.** Modele mają być te same; osobne panele ról
+- ~~**Osobny routing per bieg w GUI.** Modele mają być te same; osobne panele ról
   to podwojony interfejs bez odbiorcy. Gdyby kiedyś było potrzebne, etap 4 jest
-  naturalnym punktem zaczepienia.
+  naturalnym punktem zaczepienia.~~ **Nieaktualne od 14.08.2026**: każdy bieg
+  wskazuje własny PROFIL modeli — patrz [`PROFILE-MODELI.md`](PROFILE-MODELI.md).
+  Etap 4 rzeczywiście okazał się punktem zaczepienia, a „podwojony interfejs"
+  udało się ominąć: profil wybiera się w wierszu biegu, a karty ról pozostają
+  jednym kompletem, który edytuje jeden profil naraz.
 - **Osobne izolowane domy CLI per bieg** (`~/.config/forge/claude-<projekt>`).
   Dwa równoległe procesy `claude` na jednym katalogu konfiguracyjnym to
   normalny tryb pracy narzędzia (sesje trzymane są per projekt), a jedyny realny
@@ -235,7 +239,8 @@ przydatne przy porównywaniu kosztu dwóch projektów. ~10 linii.
 1. **Rachunek za tokeny podwaja się** i limity dostawcy przychodzą dwa razy
    szybciej. Łańcuchy zapasowe już to obsługują, ale przy tych samych modelach
    w obu biegach oba przełączą się na zapas w tym samym momencie — warto dać
-   drugiemu biegowi inną kolejność zapasów.
+   drugiemu biegowi inną kolejność zapasów. Od 14.08.2026 jest na to narzędzie:
+   osobny profil modeli na bieg ([`PROFILE-MODELI.md`](PROFILE-MODELI.md)).
 2. **Rywalizacja o CPU/IO** przy uruchamianiu testów obu projektów naraz;
    jeśli któryś projekt ma ciężką suitę, czasy tur wzrosną w obu.
 3. **Projekt = to repozytorium.** Bieg pracujący na agent-loop commituje do
