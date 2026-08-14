@@ -148,7 +148,26 @@ Regresja jest pilnowana testem, który przekręca **pokrętłem**, a nie woła
 sprzed naprawy ten test wywala interpreter). Pierwotne testy przechodziły
 właśnie dlatego, że omijały pokrętło.
 
-### 3.7. Zapis migawki może się nie udać
+### 3.7. Dwa hałasy środowiska, które przy okazji ucichły
+
+Nie należą do profili, ale zaśmiecały każde uruchomienie panelu:
+
+- **`Locale not supported by C library`** — terminal snapa VS Code eksportuje
+  `LOCPATH` wskazujący katalog lokalizacji wewnątrz swojej rewizji. Po
+  aktualizacji snapa stara rewizja znika, a długo żyjąca powłoka nadal podaje tę
+  ścieżkę, więc `setlocale(LC_ALL, "")` zawodzi i **cały panel dostaje formaty
+  oraz sortowanie spod `C`** mimo poprawnego `LANG`. `repair_locale` zdejmuje tę
+  zmienną, ale tylko gdy to naprawdę ona zawiniła; gdy usunięcie nie pomaga,
+  środowisko zostaje nietknięte. Wywołanie musi wyprzedzić **import**
+  `gi.repository` — to on ustawia lokalizację, więc naprawa w `main()`
+  przywracała formaty już po tym, jak ostrzeżenie padło.
+- **`Gtk.FileChooser.* is deprecated`** (trzy na każde otwarcie okna wyboru) —
+  cała rodzina `Gtk.FileChooser` jest przestarzała od GTK 4.10. Wybór ścieżek
+  idzie przez `Gtk.FileDialog`: wynik przychodzi wywołaniem zwrotnym, a
+  rezygnacja użytkownika jest `GLib.Error` tą samą drogą, co realna awaria —
+  w obu wypadkach pole zostaje nietknięte.
+
+### 3.8. Zapis migawki może się nie udać
 
 Gdy zapis `<projekt>/.forge/routing/run-….json` padnie (pełny dysk, prawa),
 bieg dostaje **plik swojego profilu**, a nie wspólny. Wariant „awaryjnie
@@ -169,7 +188,7 @@ przed którym broni reszta tej sekcji.
 | `tests/test_profiles.py` | 21 testów warstwy profili — bez GTK |
 | `tests/test_gui.py`, `tests/test_cli.py` | profil per bieg, zamek Claude'a per bieg, wybór profilu z wiersza poleceń i ze środowiska |
 
-`python3 -m pytest -q`: **701 przechodzi** (przed pracą 622).
+`python3 -m pytest -q`: **714 przechodzi** (przed pracą 622).
 
 ---
 

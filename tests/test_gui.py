@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import contextlib
+import locale
 import os
 import tempfile
 import unittest
 import warnings
 from unittest.mock import patch
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -32,7 +34,7 @@ from forge.gui import (
     save_settings,
     trim_log_buffer,
 )
-from forge.gui import Adw, GLib, Gtk
+from forge.gui import Adw, Gio, GLib, Gtk
 
 # Widgety wymagają zainicjowanego GTK; bez sesji graficznej testy logiki
 # (ustawienia, argv, kolorowanie logu) nadal muszą się wykonać.
@@ -202,6 +204,190 @@ class GuiResolveProjectTest(unittest.TestCase):
 
     def test_absolute_project_is_unchanged(self) -> None:
         self.assertEqual(resolve_project("/tmp/some-project"), Path("/tmp/some-project"))
+
+
+class GuiLocaleTest(unittest.TestCase):
+    """LOCPATH ze snapa VS Code strącał panel na lokalizację 'C'."""
+
+    def setUp(self) -> None:
+        saved = locale.setlocale(locale.LC_ALL)
+        self.addCleanup(locale.setlocale, locale.LC_ALL, saved)
+
+    def test_a_stale_locpath_is_dropped(self) -> None:
+        # Katalog istnieje, ale nie ma w nim tej lokalizacji — dokładnie to
+        # zostaje po aktualizacji snapa, gdy powłoka podaje starą rewizję.
+        with tempfile.TemporaryDirectory() as empty, \
+                patch.dict(os.environ, {"LOCPATH": empty}):
+            dropped = gui.repair_locale()
+
+            if dropped:
+                self.assertEqual(dropped, empty)
+                self.assertNotIn("LOCPATH", os.environ)
+                # Sedno: po zdjęciu zmiennej lokalizacja daje się ustawić.
+                locale.setlocale(locale.LC_ALL, "")
+
+    def test_a_healthy_environment_is_left_alone(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LOCPATH", None)
+
+            self.assertEqual(gui.repair_locale(), "")
+
+    def test_a_locpath_that_is_not_the_problem_survives(self) -> None:
+        # Gdy lokalizacji nie ma w systemie, zdjęcie LOCPATH nic nie da —
+        # środowisko ma wtedy zostać nietknięte, bo przyczyna leży gdzie indziej.
+        with tempfile.TemporaryDirectory() as empty, \
+                patch.dict(os.environ, {"LOCPATH": empty,
+                                        "LC_ALL": "xx_YY.UTF-8"}):
+            self.assertEqual(gui.repair_locale(), "")
+            self.assertEqual(os.environ["LOCPATH"], empty)
+
+
+class GuiChooserStartTest(unittest.TestCase):
+    def test_an_existing_folder_opens_itself(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(gui.chooser_start(directory, folder=True),
+                             Path(directory))
+
+    def test_a_project_that_does_not_exist_yet_opens_its_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                gui.chooser_start(str(Path(directory) / "jeszcze-go-nie-ma"),
+                                  folder=True),
+                Path(directory))
+
+    def test_an_existing_brief_is_preselected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            brief = Path(directory) / "brief.md"
+            brief.write_text("cel\n", encoding="utf-8")
+            self.assertEqual(gui.chooser_start(str(brief), folder=False), brief)
+
+    def test_a_missing_brief_falls_back_to_its_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                gui.chooser_start(str(Path(directory) / "brak.md"), folder=False),
+                Path(directory))
+
+    def test_a_relative_path_counts_from_the_forge_repository(self) -> None:
+        # Ścieżki względne liczą się od repozytorium Forge, nie od cwd panelu.
+        self.assertEqual(gui.chooser_start("docs", folder=True), ROOT / "docs")
+
+
+class _FakeDialog:
+    """Okno wyboru pliku bez sesji graficznej — API ``Gtk.FileDialog``."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.initial: tuple[str, str] | None = None
+        self.mode = ""
+        self.callback: Any = None
+
+    def set_initial_folder(self, location: Any) -> None:
+        self.initial = ("folder", location.get_path())
+
+    def set_initial_file(self, location: Any) -> None:
+        self.initial = ("file", location.get_path())
+
+    def select_folder(self, _parent: Any, _cancellable: Any, callback: Any) -> None:
+        self.mode, self.callback = "folder", callback
+
+    def open(self, _parent: Any, _cancellable: Any, callback: Any) -> None:
+        self.mode, self.callback = "file", callback
+
+    def _finish(self, result: Any) -> Any:
+        if result is None:
+            raise GLib.Error("anulowane przez użytkownika")
+        return result
+
+    select_folder_finish = _finish
+    open_finish = _finish
+
+    def answer(self, path: str | None) -> None:
+        """Odpowiedz tak, jak zrobiłoby prawdziwe okno (``None`` = anulowano)."""
+        self.callback(self, Gio.File.new_for_path(path) if path else None)
+
+
+@needs_gtk
+class GuiFileDialogTest(unittest.TestCase):
+    """Wybór ścieżek przez Gtk.FileDialog — Gtk.FileChooser jest przestarzały."""
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.root = Path(self._directory.name)
+        (self.root / "alfa").mkdir()
+        self.addCleanup(self._directory.cleanup)
+        patches = (
+            patch("forge.gui.load_settings", return_value={"runs": [
+                {"brief": "a.md", "project": str(self.root / "alfa")}]}),
+            patch("forge.gui.save_settings"),
+            patch("forge.gui.routing_path", return_value=self.root / "routing.json"),
+        )
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        self.window = gui.ForgeWindow(Adw.Application(
+            application_id="pl.agentloop.ForgeDialog"))
+        self.addCleanup(self.window.destroy)
+        self.dialogs: list[_FakeDialog] = []
+
+        def build(**kwargs: Any) -> _FakeDialog:
+            self.dialogs.append(_FakeDialog(**kwargs))
+            return self.dialogs[-1]
+
+        item = patch.object(gui.Gtk, "FileDialog", build)
+        item.start()
+        self.addCleanup(item.stop)
+
+    def test_the_deprecated_chooser_is_not_called_any_more(self) -> None:
+        # Rodzina Gtk.FileChooser jest przestarzała od GTK 4.10 i wypisywała
+        # po trzy DeprecationWarning na każde otwarcie okna wyboru.
+        source = (ROOT / "forge" / "gui.py").read_text(encoding="utf-8")
+        self.assertNotIn("Gtk.FileChooserNative(", source)
+        self.assertNotIn("Gtk.FileChooserAction", source)
+
+    def test_choosing_a_project_folder_writes_it_into_the_row(self) -> None:
+        run = self.window.runs[0]
+        chosen = self.root / "beta"
+        chosen.mkdir()
+
+        run._choose_project(None)
+        dialog = self.dialogs[-1]
+        dialog.answer(str(chosen))
+
+        self.assertEqual(dialog.mode, "folder")
+        self.assertEqual(dialog.initial, ("folder", str(self.root / "alfa")))
+        self.assertEqual(run.project.get_text(), str(chosen))
+
+    def test_choosing_a_brief_starts_in_its_folder_when_it_is_missing(self) -> None:
+        run = self.window.runs[0]
+        run.brief.set_text(str(self.root / "alfa" / "jeszcze-nie-ma.md"))
+
+        run._choose_brief(None)
+
+        self.assertEqual(self.dialogs[-1].mode, "file")
+        self.assertEqual(self.dialogs[-1].initial,
+                         ("folder", str(self.root / "alfa")))
+
+    def test_an_existing_brief_is_preselected(self) -> None:
+        run = self.window.runs[0]
+        brief = self.root / "alfa" / "brief.md"
+        brief.write_text("cel\n", encoding="utf-8")
+        run.brief.set_text(str(brief))
+
+        run._choose_brief(None)
+
+        self.assertEqual(self.dialogs[-1].initial, ("file", str(brief)))
+
+    def test_cancelling_leaves_the_field_alone(self) -> None:
+        # Rezygnacja przychodzi jako GLib.Error, tą samą drogą co realna
+        # awaria — pole ma w obu wypadkach zostać nietknięte.
+        run = self.window.runs[0]
+        before = run.project.get_text()
+
+        run._choose_project(None)
+        self.dialogs[-1].answer(None)
+
+        self.assertEqual(run.project.get_text(), before)
+        self.assertIsNone(self.window._chooser)
 
 
 class GuiStatusTest(unittest.TestCase):

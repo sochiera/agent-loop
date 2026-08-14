@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import json
+import locale
 import re
 import signal
 import subprocess
@@ -47,7 +48,50 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-import gi
+LOCALE_PATH_ENV = "LOCPATH"
+
+
+def repair_locale(environ: dict[str, str] | None = None) -> str:
+    """Zdejmij ``LOCPATH``, jeśli to on psuje ustawienie lokalizacji.
+
+    Zwraca usuniętą wartość albo ``""``, gdy nie było czego naprawiać.
+
+    Terminal wbudowany w snapa (VS Code) eksportuje ``LOCPATH`` wskazujący
+    katalog lokalizacji WEWNĄTRZ swojej rewizji. Po aktualizacji snapa stara
+    rewizja znika, a długo żyjąca powłoka nadal podaje tę ścieżkę procesom
+    potomnym — wtedy ``setlocale(LC_ALL, "")`` zawodzi i GTK ogłasza „Locale not
+    supported by C library. Using the fallback 'C' locale.", po czym panel
+    dostaje sortowanie i formaty spod ``C`` mimo poprawnie ustawionego ``LANG``.
+
+    Zmienna nie jest nasza i nie mamy dla niej zastosowania, więc przy realnej
+    awarii po prostu ją zdejmujemy — także dla procesów potomnych, bo agentom
+    CLI psuje ona lokalizację tak samo. Gdy usunięcie nie pomaga, przyczyna leży
+    gdzie indziej (brak wygenerowanej lokalizacji) i oddajemy środowisko
+    nietknięte."""
+    environ = os.environ if environ is None else environ
+    stale = environ.get(LOCALE_PATH_ENV)
+    if not stale:
+        return ""
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+        return ""
+    except locale.Error:
+        pass
+    del environ[LOCALE_PATH_ENV]
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        environ[LOCALE_PATH_ENV] = stale
+        return ""
+    return stale
+
+
+# Musi wyprzedzić IMPORT gi: lokalizację ze środowiska czyta już wczytanie
+# ``gi.repository``, a nie dopiero start aplikacji — naprawa zrobiona w ``main``
+# przywracała poprawne formaty, ale ostrzeżenie GTK zdążyło już paść.
+DROPPED_LOCALE_PATH = repair_locale()
+
+import gi  # noqa: E402
 
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
@@ -142,6 +186,18 @@ def resolve_path(value: str) -> Path:
 
 def resolve_project(project: str) -> Path:
     return resolve_path(project)
+
+
+def chooser_start(value: str, folder: bool) -> Path:
+    """Miejsce, od którego ma zacząć się wybieranie pliku albo katalogu.
+
+    Nieistniejąca ścieżka nie jest błędem — pole bywa wypełnione projektem,
+    którego jeszcze nie ma. Wtedy otwieramy najbliższy istniejący katalog
+    zamiast rzucać operatora do miejsca, w którym akurat stanął proces."""
+    current = resolve_path(value)
+    if folder:
+        return current if current.is_dir() else current.parent
+    return current if current.exists() else current.parent
 
 
 def run_settings(settings: dict[str, Any]) -> list[dict[str, str]]:
@@ -887,12 +943,11 @@ class Run:
         self.owner.save_paths()
 
     def _choose_brief(self, _button: Gtk.Button) -> None:
-        self.owner.open_chooser("Wybierz plik z briefem",
-                                Gtk.FileChooserAction.OPEN, self.brief)
+        self.owner.open_chooser("Wybierz plik z briefem", self.brief)
 
     def _choose_project(self, _button: Gtk.Button) -> None:
-        self.owner.open_chooser("Wybierz katalog projektu",
-                                Gtk.FileChooserAction.SELECT_FOLDER, self.project)
+        self.owner.open_chooser("Wybierz katalog projektu", self.project,
+                                folder=True)
 
     def settings(self) -> dict[str, str]:
         return {"brief": self.brief.get_text(),
@@ -1166,7 +1221,7 @@ class ForgeWindow(Adw.ApplicationWindow):
         self.set_size_request(860, 620)
         self.runs: list[Run] = []
         self._closing = False
-        self._chooser: Gtk.FileChooserNative | None = None
+        self._chooser: Gtk.FileDialog | None = None
         self._ready = False
         # Podmiana zawartości kart przy przełączaniu profilu nie jest wyborem
         # operatora, więc nie może zostać zapisana jako jego wybór.
@@ -1589,40 +1644,48 @@ class ForgeWindow(Adw.ApplicationWindow):
             run.stop()
 
     # --- wspólne dla okna -------------------------------------------------
-    def open_chooser(
-        self, title: str, action: Gtk.FileChooserAction, target: Gtk.Entry
-    ) -> None:
-        chooser = Gtk.FileChooserNative(
-            title=title,
-            transient_for=self,
-            action=action,
-            accept_label="Wybierz",
-            cancel_label="Anuluj",
-        )
-        current = resolve_path(target.get_text())
+    def open_chooser(self, title: str, target: Gtk.Entry,
+                     folder: bool = False) -> None:
+        """Wskaż plik albo katalog i wpisz wynik do pola.
+
+        ``Gtk.FileDialog`` zamiast ``FileChooserNative``: cała rodzina
+        ``Gtk.FileChooser`` jest przestarzała od GTK 4.10, a jej metody wołane
+        w tym miejscu wypisywały po trzy ``DeprecationWarning`` na każde
+        otwarcie okna. Nowe API jest asynchroniczne — wynik przychodzi
+        wywołaniem zwrotnym, a rezygnacja użytkownika jest błędem ``GLib.Error``,
+        nie osobnym kodem odpowiedzi."""
+        dialog = Gtk.FileDialog(title=title, accept_label="Wybierz")
+        start = chooser_start(target.get_text(), folder)
         try:
-            if action == Gtk.FileChooserAction.SELECT_FOLDER:
-                initial = current if current.is_dir() else current.parent
-                chooser.set_current_folder(Gio.File.new_for_path(str(initial)))
-            elif current.exists():
-                chooser.set_file(Gio.File.new_for_path(str(current)))
+            location = Gio.File.new_for_path(str(start))
+            if folder or start.is_dir():
+                dialog.set_initial_folder(location)
             else:
-                chooser.set_current_folder(Gio.File.new_for_path(str(current.parent)))
+                dialog.set_initial_file(location)
         except GLib.Error:
             pass
 
-        def selected(dialog: Gtk.FileChooserNative, response: int) -> None:
-            if response == Gtk.ResponseType.ACCEPT:
-                chosen = dialog.get_file()
-                if chosen is not None and chosen.get_path():
-                    target.set_text(chosen.get_path())
-                    self.save_settings()
+        def selected(source: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
             self._chooser = None
-            dialog.destroy()
+            try:
+                chosen = (source.select_folder_finish(result) if folder
+                          else source.open_finish(result))
+            except GLib.Error:
+                # Anulowanie przychodzi tą samą drogą, co realna awaria —
+                # w obu wypadkach pole zostaje takie, jakie było.
+                return
+            path = chosen.get_path() if chosen is not None else ""
+            if path:
+                target.set_text(path)
+                self.save_settings()
 
-        chooser.connect("response", selected)
-        self._chooser = chooser
-        chooser.show()
+        # Referencja na czas operacji: okno dialogowe bez właściciela po stronie
+        # Pythona bywa zebrane przez GC, zanim użytkownik zdąży kliknąć.
+        self._chooser = dialog
+        if folder:
+            dialog.select_folder(self, None, selected)
+        else:
+            dialog.open(self, None, selected)
 
     def current_routing(self) -> routing_module.Routing:
         return routing_module.Routing(roles={
@@ -1734,6 +1797,12 @@ class ForgeApplication(Adw.Application):
 
 
 def main() -> int:
+    # Samej naprawy dokonał już import modułu (musiała wyprzedzić GTK);
+    # tutaj zostaje powiadomienie, bo dopiero teraz mamy dokąd je napisać.
+    if DROPPED_LOCALE_PATH:
+        print(f"UWAGA: zdjęto LOCPATH={DROPPED_LOCALE_PATH} — wskazywał "
+              f"katalog bez tej lokalizacji, przez co GTK spadało na 'C'. "
+              f"Zwykle zostawia go terminal snapa (VS Code) po aktualizacji.")
     try:
         return ForgeApplication().run(sys.argv)
     except KeyboardInterrupt:
