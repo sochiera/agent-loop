@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 import unittest
+import warnings
 from unittest.mock import patch
 from pathlib import Path
 
@@ -30,7 +32,7 @@ from forge.gui import (
     save_settings,
     trim_log_buffer,
 )
-from forge.gui import Adw, Gtk
+from forge.gui import Adw, GLib, Gtk
 
 # Widgety wymagają zainicjowanego GTK; bez sesji graficznej testy logiki
 # (ustawienia, argv, kolorowanie logu) nadal muszą się wykonać.
@@ -631,6 +633,79 @@ class RunProfilesTest(unittest.TestCase):
         config = Config(routing=routing_value)
         return {agent for agent, _model, _effort
                 in config.role_chain("coder", "standard")}
+
+    @staticmethod
+    def _pump() -> None:
+        """Domknij pętlę zdarzeń — panel odracza tam przebudowę kart."""
+        context = GLib.MainContext.default()
+        while context.iteration(False):
+            pass
+
+    @contextlib.contextmanager
+    def _no_gtk_complaints(self):
+        """Zbierz skargi GLib/GTK zamiast pozwolić im zniknąć w stderr.
+
+        Naruszenie ochrony pamięci przy przekręcaniu pokrętła zapowiada się
+        asercją ``G_IS_OBJECT``, która nie podnosi żadnego wyjątku — bez tego
+        przechwytu test przechodziłby także wtedy, gdy panel wywala się
+        operatorowi. PyGObject przepuszcza takie komunikaty przez moduł
+        ``warnings``, więc wystarczy je tam złapać (``log_set_writer_func``
+        odpada: GLib pozwala ustawić go raz na proces i próba zdjęcia go
+        wywraca interpreter)."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            captured: list[str] = []
+            yield captured
+            captured.extend(
+                str(item.message) for item in caught
+                if issubclass(item.category, Warning)
+                and "assertion" in str(item.message))
+
+    def test_turning_the_profile_dial_does_not_corrupt_the_widget(self) -> None:
+        # Regresja: podmiana modelu pokrętła WEWNĄTRZ jego własnej emisji
+        # notify::selected zwalniała listę pod dispatcherem GTK — ostrzeżenie
+        # „G_IS_OBJECT failed", a przy otwartym popupie segfault panelu.
+        self._pick("coder", "standard", "opus")
+        gpt = self.window.profiles.create("Tylko GPT")
+        self.window._refresh_profile_chooser()
+        shared_at = self.window._editor_choices.index(SHARED)
+        gpt_at = self.window._editor_choices.index(gpt.slug)
+
+        with self._no_gtk_complaints() as complaints:
+            for position in (gpt_at, shared_at, gpt_at):
+                self.window.profile_chooser.set_selected(position)
+                self._pump()
+
+        self.assertEqual(complaints, [])
+        self.assertEqual(self.window.editing_slug, gpt.slug)
+
+    def test_the_dial_and_the_cards_end_up_on_the_same_profile(self) -> None:
+        self._pick("coder", "standard", "opus")
+        gpt = self.window.profiles.create("Tylko GPT")
+        self.window.edit_profile(gpt.slug)
+        self._pick("coder", "standard", "gpt-5.6-luna")
+        self.window._refresh_profile_chooser()
+
+        self.window.profile_chooser.set_selected(
+            self.window._editor_choices.index(SHARED))
+        self._pump()
+
+        self.assertEqual(self.window.editing_slug, SHARED)
+        self.assertEqual(self.window.current_routing()
+                         .slot("coder", "standard").model, "opus")
+
+    def test_a_run_dial_change_survives_the_same_treatment(self) -> None:
+        beta = self.window.runs[1]
+        gpt = self.window.profiles.create("Tylko GPT")
+        beta.refresh_profiles()
+
+        with self._no_gtk_complaints() as complaints:
+            beta.profile.set_selected(
+                [slug for slug, _label in beta._profile_choices].index(gpt.slug))
+            self._pump()
+
+        self.assertEqual(complaints, [])
+        self.assertEqual(beta.profile_slug, gpt.slug)
 
     def test_the_panel_starts_on_the_shared_profile(self) -> None:
         self.assertEqual(self.window.editing_slug, SHARED)

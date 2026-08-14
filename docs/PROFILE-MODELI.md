@@ -120,7 +120,35 @@ więc `../../.ssh/config` musi odpaść wcześniej. Kolizje nazw dostają sufiks
 liczbowy, sprawdzany także wobec plików nieznanych jeszcze temu oknu (profil
 założony w drugim panelu nie może zostać nadpisany).
 
-### 3.6. Zapis migawki może się nie udać
+### 3.6. Przebudowa kart nie może biec wewnątrz emisji sygnału
+
+Pierwsza wersja panelu wywracała się (naruszenie ochrony pamięci) przy zmianie
+profilu pokrętłem. `_editor_selected` jest handlerem `notify::selected`
+pokrętła profilu, a wołało `_refresh_profile_chooser`, które podmieniało
+**model tego samego pokrętła**. Zwolnienie poprzedniego `Gtk.StringList` razem
+z jego modelem zaznaczenia w środku trwającej emisji daje najpierw
+`g_object_notify_by_pspec: assertion 'G_IS_OBJECT (object)' failed`, a przy
+otwartym popupie segfault.
+
+Dwie warstwy naprawy, obie potrzebne:
+
+1. **Przełączenie profilu jest odroczone** do bezczynności pętli głównej
+   (`GLib.idle_add`) — przebudowa jedenastu kart, z których każda potrafi
+   przebudować własną listę modeli, nie ma prawa grzebać w widgetach pod
+   dispatcherem GTK. Stan czytamy z pokrętła w chwili wykonania, więc dwa
+   szybkie przekręcenia zostawiają profil wybrany jako ostatni.
+2. **Model podmieniamy tylko przy realnej zmianie listy** — i tak najczęściej
+   odświeżamy pasek zaraz po tym, jak operator sam przekręcił pokrętło, więc
+   podmiana była czystą stratą, która przy okazji wyrywała obiekt spod emisji.
+   Zaznaczenie ustawiamy mimo to zawsze: bieg bywa przestawiany na inny profil
+   przy niezmienionej liście (powrót na wspólny po usunięciu).
+
+Regresja jest pilnowana testem, który przekręca **pokrętłem**, a nie woła
+`edit_profile`, i przechwytuje skargi GLib przez moduł `warnings` (na kodzie
+sprzed naprawy ten test wywala interpreter). Pierwotne testy przechodziły
+właśnie dlatego, że omijały pokrętło.
+
+### 3.7. Zapis migawki może się nie udać
 
 Gdy zapis `<projekt>/.forge/routing/run-….json` padnie (pełny dysk, prawa),
 bieg dostaje **plik swojego profilu**, a nie wspólny. Wariant „awaryjnie
@@ -141,7 +169,7 @@ przed którym broni reszta tej sekcji.
 | `tests/test_profiles.py` | 21 testów warstwy profili — bez GTK |
 | `tests/test_gui.py`, `tests/test_cli.py` | profil per bieg, zamek Claude'a per bieg, wybór profilu z wiersza poleceń i ze środowiska |
 
-`python3 -m pytest -q`: **666 przechodzi** (przed pracą 622).
+`python3 -m pytest -q`: **701 przechodzi** (przed pracą 622).
 
 ---
 

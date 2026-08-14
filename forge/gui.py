@@ -819,11 +819,20 @@ class Run:
         return options
 
     def refresh_profiles(self) -> None:
-        """Odśwież pokrętło po zmianie listy profili, zachowując wybór biegu."""
-        self._profile_choices = self._profile_options()
+        """Odśwież pokrętło po zmianie listy profili, zachowując wybór biegu.
+
+        Model podmieniamy tylko przy realnej zmianie listy — zwolnienie
+        poprzedniego ``Gtk.StringList`` pod trwającą emisją sygnału kończy się
+        notyfikacją na obiekcie już zwolnionym (patrz
+        ``ForgeWindow._refresh_profile_chooser``)."""
+        choices = self._profile_options()
         self._profile_muted = True
-        self.profile.set_model(_string_list(
-            [label for _slug, label in self._profile_choices]))
+        # Zaznaczenie ustawiamy ZAWSZE: bieg bywa przestawiany na inny profil
+        # przy niezmienionej liście (np. po usunięciu wraca na wspólny).
+        if choices != self._profile_choices:
+            self._profile_choices = choices
+            self.profile.set_model(_string_list(
+                [label for _slug, label in self._profile_choices]))
         for index, (slug, _label) in enumerate(self._profile_choices):
             if slug == self.profile_slug:
                 self.profile.set_selected(index)
@@ -1296,6 +1305,7 @@ class ForgeWindow(Adw.ApplicationWindow):
         bar.append(caption)
 
         self._editor_choices: list[str] = []
+        self._editor_labels: list[str] = []
         self._editor_muted = False
         self.profile_chooser = Gtk.DropDown(model=_string_list([]))
         self.profile_chooser.set_hexpand(True)
@@ -1333,10 +1343,20 @@ class ForgeWindow(Adw.ApplicationWindow):
         return bar
 
     def _refresh_profile_chooser(self) -> None:
-        self._editor_choices = self.profiles.slugs()
+        """Odśwież pasek profilu; listę podmieniaj TYLKO gdy naprawdę się zmieniła.
+
+        Podmiana modelu pokrętła zwalnia poprzedni ``Gtk.StringList`` razem
+        z wewnętrznym modelem zaznaczenia. Zrobiona bez potrzeby — a najczęściej
+        wołamy to zaraz po tym, jak operator sam przekręcił pokrętło — wyrywa
+        obiekt spod trwającej emisji sygnału i kończy się notyfikacją na
+        obiekcie już zwolnionym (``G_IS_OBJECT`` failed), a przy otwartym
+        popupie naruszeniem ochrony pamięci."""
         labels = [profile.name for profile in self.profiles.profiles()]
+        self._editor_choices = self.profiles.slugs()
         self._editor_muted = True
-        self.profile_chooser.set_model(_string_list(labels))
+        if labels != self._editor_labels:
+            self._editor_labels = labels
+            self.profile_chooser.set_model(_string_list(labels))
         if self.editing_slug in self._editor_choices:
             self.profile_chooser.set_selected(
                 self._editor_choices.index(self.editing_slug))
@@ -1370,15 +1390,28 @@ class ForgeWindow(Adw.ApplicationWindow):
             self._show_profile(slug)
 
     def _editor_selected(self, *_args: Any) -> None:
+        """Operator przekręcił pokrętło profilu — przebuduj karty PO emisji.
+
+        Przełączenie profilu podmienia zawartość jedenastu kart, a pokrętło
+        modelu potrafi przy okazji przebudować własną listę (model spoza
+        katalogu). Wykonane wewnątrz emisji ``notify::selected`` grzebałoby
+        w widgetach pod dispatcherem GTK — łącznie z pokrętłem, które ten
+        sygnał właśnie wysyła. Bezczynność pętli głównej jest najbliższym
+        momentem, w którym emisja jest już zamknięta."""
         if self._editor_muted:
             return
+        GLib.idle_add(self._apply_editor_selection)
+
+    def _apply_editor_selection(self) -> bool:
+        # Stan czytamy z pokrętła TERAZ, a nie z chwili sygnału: dwa szybkie
+        # przekręcenia mają zostawić profil wybrany jako ostatni.
         index = self.profile_chooser.get_selected()
-        if index == Gtk.INVALID_LIST_POSITION or not 0 <= index < len(
+        if index != Gtk.INVALID_LIST_POSITION and 0 <= index < len(
                 self._editor_choices):
-            return
-        slug = self._editor_choices[index]
-        if slug != self.editing_slug:
-            self._show_profile(slug)
+            slug = self._editor_choices[index]
+            if slug != self.editing_slug:
+                self._show_profile(slug)
+        return GLib.SOURCE_REMOVE
 
     def _create_profile(self) -> None:
         # Najpierw utrwal to, co widać na ekranie: kopiujemy profil BIEŻĄCY,
