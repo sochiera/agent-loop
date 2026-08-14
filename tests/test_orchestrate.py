@@ -509,3 +509,76 @@ def test_turn_change_list_leaves_room_for_the_reason() -> None:
     assert described.endswith("+7]")
     assert orchestrate._describe_turn_changes([]) == "bez_zmian"
     assert orchestrate._describe_turn_changes(["a.py", "b.py"]) == "[a.py, b.py]"
+
+
+def test_git_failure_carries_the_reason_not_just_the_exit_code(tmp_path) -> None:
+    """`capture_output` połyka stderr, więc bieg padał z samym „exit status
+    128". Powód musi być w wyjątku, bo inaczej diagnoza kosztuje kolejny bieg."""
+    project = str(tmp_path)
+    orchestrate.ensure_repo(project)
+
+    with pytest.raises(AgentError) as err:
+        orchestrate.git(project, "checkout", "nie-ma-takiej-galezi")
+
+    assert "nie-ma-takiej-galezi" in str(err.value)
+    assert "kod 1" in str(err.value)
+    # `check=False` nadal zwraca wynik zamiast rzucać — zbyt wielu wołających
+    # sprawdza sam kod wyjścia.
+    assert orchestrate.git(project, "checkout", "nie-ma", check=False).returncode == 1
+
+
+def test_failed_push_keeps_the_commit_and_the_run(tmp_path, monkeypatch) -> None:
+    """Wypchnięcie to dostawa kopii, nie bramka: jedno fatal ze zdalnego gita
+    ubijało proces PO poprawnym commicie, a restart mielił bramkę od nowa."""
+    monkeypatch.setattr(orchestrate, "_PUSH_RETRY_DELAY_S", 0)
+    project = str(tmp_path)
+    orchestrate.ensure_repo(project)
+    subprocess.run(["git", "remote", "add", "origin", str(tmp_path / "nie-ma.git")],
+                   cwd=tmp_path, check=True)
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    orchestrate.commit_all(project, "feat: praca", Config(git_push=True, git_remote="origin"))
+
+    assert not orchestrate.has_changes(project)
+    committed = subprocess.run(["git", "log", "-1", "--format=%s"], cwd=tmp_path,
+                               text=True, capture_output=True, check=True).stdout
+    assert committed.strip() == "feat: praca"
+
+
+def test_push_retries_once_before_leaving_the_backlog_to_the_next_commit(
+        monkeypatch) -> None:
+    monkeypatch.setattr(orchestrate, "_PUSH_RETRY_DELAY_S", 0)
+    codes = [128, 0]
+    attempts: list[tuple[str, ...]] = []
+
+    def fake_git(_project: str, *args: str, check: bool = True, env=None):
+        if args[0] == "remote":
+            return subprocess.CompletedProcess(args, 0, "origin\n", "")
+        attempts.append(args)
+        return subprocess.CompletedProcess(args, codes.pop(0), "", "fatal: brak sieci")
+
+    monkeypatch.setattr(orchestrate, "git", fake_git)
+    cfg = Config(git_push=True, git_remote="origin")
+
+    orchestrate.push("/tmp", cfg)
+    assert len(attempts) == 2
+
+    codes[:] = [128] * 10
+    attempts.clear()
+    orchestrate.push("/tmp", cfg)
+    assert len(attempts) == orchestrate._PUSH_ATTEMPTS
+
+
+def test_checked_subprocess_failure_stops_safely_with_its_output(tmp_path, capsys) -> None:
+    """Wyjątek spoza naszej trójki leciał obok bezpiecznego stopu: traceback,
+    zero checkpointu — więc restart powtarzał całe ukończone zadanie."""
+    state_path = tmp_path / ".forge" / "STATE.json"
+    State(bootstrapped=True, iteration=7).save(str(state_path))
+    boom = subprocess.CalledProcessError(128, ["git", "push"], None, "fatal: brak klucza")
+
+    with patch("forge.orchestrate.one_iteration", side_effect=boom):
+        code = orchestrate.main(["--project", str(tmp_path), "--max-iters", "1"])
+
+    assert code == 1
+    assert State.load(str(state_path)).bootstrapped is True
+    assert "fatal: brak klucza" in capsys.readouterr().err

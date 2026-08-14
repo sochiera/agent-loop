@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from dataclasses import replace
 from pathlib import Path
@@ -42,6 +43,11 @@ prostego ". Cytuj apostrofami albo pisz bez cudzysłowu.
 Zwróć teraz wyłącznie jeden poprawny obiekt JSON w formacie podanym wyżej.
 """
 
+# Awarie wypychania są zwykle chwilowe (DNS, ssh-agent, zdalny timeout), więc
+# jedno ponowienie po krótkiej przerwie łapie je taniej niż następny bieg.
+_PUSH_ATTEMPTS = 2
+_PUSH_RETRY_DELAY_S = 5.0
+
 _TASK_STATE_FIELDS = (
     "current_task", "task_phase", "tdd_round",
     "tester_session", "coder_session", "tester_decision", "tester_handoff",
@@ -54,8 +60,21 @@ _TASK_STATE_FIELDS = (
 
 def git(project: str, *args: str, check: bool = True,
         env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=project, text=True, capture_output=True,
-                          check=check, env=env)
+    """Uruchom git; przy `check` zamień porażkę na AgentError NIOSĄCY stderr.
+
+    `capture_output` połyka wyjście, więc goły `CalledProcessError` mówi tylko
+    „exit status 128" — a to jest cała różnica między „ssh nie ma klucza",
+    „nie ma sieci" a „remote odrzucił push". Diagnoza kosztuje wtedy kolejny
+    bieg, więc powód musi trafić do wyjątku od razu. AgentError (jak w
+    preflight._checked) daje przy okazji bezpieczny stop z checkpointem
+    zamiast tracebacka bez zapisanego stanu."""
+    result = subprocess.run(["git", *args], cwd=project, text=True,
+                            capture_output=True, check=False, env=env)
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout or "brak wyjścia").strip()
+        raise AgentError(
+            f"git {' '.join(args)}: kod {result.returncode}: {detail[:2000]}")
+    return result
 
 
 def ensure_repo(project: str) -> None:
@@ -106,9 +125,28 @@ def commit_all(project: str, message: str, cfg: Config | None = None) -> None:
 
 
 def push(project: str, cfg: Config) -> None:
+    """Wypchnij HEAD, ale NIE przerywaj biegu, gdy się nie uda.
+
+    Praca jest bezpieczna w chwili commita — wypchnięcie to dostawa kopii, nie
+    bramka jakości. Twarde `check=True` kosztowało już cały bieg: jedno fatal
+    ze zdalnego gita (kod 128) ubijało proces PO poprawnym commicie, więc
+    restart mielił od nowa zieloną bramkę zadania. Zaległość dogoni następny
+    commit, bo `push HEAD` wysyła wszystko, co narosło."""
     remotes = git(project, "remote", check=False).stdout.split()
-    if cfg.git_remote in remotes:
-        git(project, "push", cfg.git_remote, "HEAD")
+    if cfg.git_remote not in remotes:
+        return
+    for attempt in range(1, _PUSH_ATTEMPTS + 1):
+        result = git(project, "push", cfg.git_remote, "HEAD", check=False)
+        if result.returncode == 0:
+            return
+        detail = (result.stderr or result.stdout or "brak wyjścia").strip()
+        last = attempt == _PUSH_ATTEMPTS
+        log(f"  git push do {cfg.git_remote} nieudany (kod {result.returncode}, "
+            f"próba {attempt}/{_PUSH_ATTEMPTS}): {detail[:500]}"
+            + ("; commit został lokalnie, wyśle go następny push."
+               if last else "; ponawiam."))
+        if not last:
+            time.sleep(_PUSH_RETRY_DELAY_S)
 
 
 def run_tests(project: str, test_cmd: str, timeout: int) -> bool:
@@ -1424,6 +1462,20 @@ def _decision_with_retry(prompt: str, invoke, parser, *, on_reject=None):
             raise
 
 
+def _stop_reason(exc: BaseException) -> str:
+    """Powód w komunikacie bezpiecznego stopu, z wyjściem procesu włącznie.
+
+    Nasze wywołania gita idą przez `git()`, które samo dokłada stderr. Ta
+    gałąź jest siatką dla checked subprocessów spoza tej ścieżki: bez niej
+    operator dostaje samo „returned non-zero exit status N", czyli dokładnie
+    tę diagnozę, której brak kosztował już jeden bieg."""
+    if not isinstance(exc, subprocess.CalledProcessError):
+        return str(exc)
+    streams = [stream for stream in (exc.stderr, exc.stdout) if isinstance(stream, str)]
+    detail = next((text.strip() for text in streams if text.strip()), "")
+    return f"{exc}: {detail[:2000]}" if detail else str(exc)
+
+
 def _dump_invalid_decision(project: str, cfg: Config, state: State, exc: InvalidDecision) -> None:
     """Zachowaj surowe wyjście agenta, które ubiło bieg: bez tego diagnoza
     formatu po fakcie wymaga surowej telemetrii spoza projektu (jeśli w ogóle
@@ -2608,11 +2660,13 @@ def _run(args: argparse.Namespace, cfg: Config,
                 + (f"/{args.max_iters}" if args.max_iters else "") + " ---")
             if not one_iteration(cfg, args.project, state): break
             state.save(str(path)); count += 1
-    except (AgentError, InvalidDecision, LimitExhausted) as exc:
+    except (AgentError, InvalidDecision, LimitExhausted,
+            subprocess.CalledProcessError) as exc:
         state.save(str(path))
         if isinstance(exc, InvalidDecision):
             _dump_invalid_decision(args.project, cfg, state, exc)
-        print(f"Forge zatrzymany bezpiecznie: {exc}. Checkpoint zapisano w {path}.",
+        print(f"Forge zatrzymany bezpiecznie: {_stop_reason(exc)}. "
+              f"Checkpoint zapisano w {path}.",
               file=__import__("sys").stderr, flush=True)
         return 3 if isinstance(exc, LimitExhausted) else 1
     except KeyboardInterrupt:
