@@ -1004,8 +1004,13 @@ def test_idle_review_cycles_end_the_task_instead_of_looping(
 
 def test_real_progress_resets_the_review_cycle_counter(tmp_path: Path) -> None:
     """Licznik pilnuje JAŁOWYCH okrążeń. Dopóki tester faktycznie poprawia kod,
-    kolejne rundy recenzji są normalną pracą i nie mają prawa zabić zadania."""
-    cfg = Config(git_push=False, max_review_cycles=2)
+    kolejne rundy recenzji są normalną pracą i nie mają prawa zabić zadania.
+
+    Budżet blokad (`max_review_turns`) jest tu świadomie wyłączony: to osobny
+    bezpiecznik na churn produktywny i ma własny test. Ten sprawdza wyłącznie,
+    że postęp zeruje licznik livelocka.
+    """
+    cfg = Config(git_push=False, max_review_cycles=2, max_review_turns=99)
     _task, state, _cfg = _task_repo(tmp_path)
     edits = iter(range(1, 99))
 
@@ -1025,3 +1030,43 @@ def test_real_progress_resets_the_review_cycle_counter(tmp_path: Path) -> None:
 
     assert state.review_cycles == 1
     assert "PORZUCONE" not in ledger.tail(str(tmp_path))
+
+
+def test_review_turn_budget_degrades_a_blocking_verdict_instead_of_killing_task(
+        tmp_path: Path) -> None:
+    """Churn produktywny ma sufit, a jego przekroczenie nie kasuje pracy.
+
+    `max_review_cycles` mierzy okrążenia JAŁOWE i z definicji nie widzi tego
+    przypadku: recenzent zgłasza za każdym razem inną uwagę, koder ją stosuje,
+    odcisk drzewa się zmienia, licznik wraca do zera — a zadanie kręci się bez
+    końca, wyglądając na postęp. Trzecia blokada degraduje się więc do
+    sugestii: zadanie idzie do commitu, a uwaga zostaje trwałym śladem.
+    """
+    cfg = Config(git_push=False, max_review_cycles=99, max_review_turns=2)
+    _task, state, _cfg = _task_repo(tmp_path)
+    edits = iter(range(1, 99))
+
+    def role_call(_cfg, project, _state, _role, _prompt, _log):
+        Path(project, "app.py").write_text(
+            f"VALUE = {next(edits)}\n", encoding="utf-8")
+        return '{"status":"review"}'
+
+    with patch("forge.orchestrate._call_role", side_effect=role_call), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.agents.run_agent", return_value=(
+             '{"verdict":"request_changes","notes":["wciąż coś nowego"]}')), \
+         patch("forge.orchestrate.build_then_test_result", return_value=(True, "ok")):
+        for _ in range(12):
+            if not orchestrate.run_task(
+                    cfg, str(tmp_path), state, lambda phase: phase):
+                break
+            if not state.current_task:
+                break
+
+    tail = ledger.tail(str(tmp_path))
+    assert "review-degradacja" in tail
+    assert "PORZUCONE" not in tail
+    assert "UKOŃCZONE" in tail
+    # Uwaga nie ginie razem z blokadą — zostaje w trwałym śladzie audytowym.
+    nits = Path(tmp_path, ".forge", "nits.md")
+    assert nits.is_file() and "wciąż coś nowego" in nits.read_text(encoding="utf-8")

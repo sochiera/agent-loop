@@ -191,8 +191,23 @@ class Config:
     # wsad. Wyzwalacz odwrotu: wzrost odsetka przeglądów z `replan=true` albo
     # zauważalny dryf kierunku → FORGE_STEERING_BATCHES=1.
     steering_batches: int = int(os.environ.get("FORGE_STEERING_BATCHES", "2"))
-    # Próg wyzwalacza refill; nie jest limitem jakości backlogu.
+    # Próg wyzwalacza refill; nie jest limitem jakości backlogu. Liczy
+    # historyjki NIEDOMKNIĘTE (`backlog.count_open`), a więc to samo, co widzi
+    # Product Owner w pliku — patrz komentarz przy tamtej funkcji.
     backlog_low_water: int = int(os.environ.get("FORGE_BACKLOG_LOW_WATER", "2"))
+    # Bezpiecznik kadencji weryfikacji historyjek: po tylu zadaniach bez
+    # weryfikacji faza rusza, nawet jeśli żadna historyjka nie domknęła się w
+    # tym czasie. Bez niego wsad złożony z samego długu technicznego (zadania
+    # bez `story`) potrafi przeciągnąć zaległe `do weryfikacji` przez cały bieg.
+    verify_every_tasks: int = int(os.environ.get("FORGE_VERIFY_EVERY_TASKS", "3"))
+    # Co ile ZADAŃ planista ma wpleść zadanie długu technicznego z regresjami.
+    #
+    # Liczy zadania, nie wsady, bo wsad przestał być stabilną miarą pracy.
+    # Reguła „co piąty wsad" była kalibrowana przy wsadach po ~2,5 zadania, co
+    # dawało jeden dług na ~12 zadań; po sklejeniu historyjki w jedno zadanie
+    # ten sam zapis oznaczałby dług dwa razy rzadziej. 12 zachowuje kadencję,
+    # którą tamta reguła realnie wymuszała, i przestaje zależeć od grubości wsadu.
+    debt_every_tasks: int = int(os.environ.get("FORGE_DEBT_EVERY_TASKS", "12"))
     # Miękki sufit dla recenzenta PO; migracja może go legalnie przekroczyć.
     max_backlog_stories: int = int(os.environ.get("FORGE_MAX_BACKLOG_STORIES", "6"))
     # Budżet rund bootstrapu i przeglądu kierunku. Wyczerpanie oznacza, że
@@ -210,6 +225,22 @@ class Config:
     # uwagę rozliczoną argumentem zamiast diffem; czwarte kosztuje tyle samo, co
     # trzy pierwsze, i nigdy nie kończy się inaczej.
     max_review_cycles: int = int(os.environ.get("FORGE_MAX_REVIEW_CYCLES", "3"))
+    # Ile razy recenzja może ZABLOKOWAĆ zadanie werdyktem `request_changes`,
+    # zanim kolejny taki werdykt zdegraduje się do `suggestions`.
+    #
+    # To osobny bezpiecznik niż `max_review_cycles` i mierzy coś innego. Tamten
+    # liczy okrążenia JAŁOWE (identyczny odcisk drzewa) i z definicji nie widzi
+    # churnu produktywnego: recenzent zgłasza za każdym razem inną uwagę, koder
+    # ją stosuje, drzewo się zmienia, licznik wraca do zera — i zadanie kręci
+    # się bez końca, wyglądając na postęp. W mierzonym biegu 45% recenzji
+    # kończyło się `request_changes`, a pojedyncze zadania zjadały po dziesięć
+    # rund na uwagach spoza kryteriów akceptacji.
+    #
+    # Degradacja jest właściwą reakcją, bo alternatywą jest `_fail_task`, czyli
+    # `git reset --hard` i utrata CAŁEJ pracy nad zadaniem za uwagi, których
+    # sam recenzent nie uznał za złamanie kryterium. Uwaga nie ginie: wraca
+    # jako sugestia i trafia do nits.md jako trwały ślad.
+    max_review_turns: int = int(os.environ.get("FORGE_MAX_REVIEW_TURNS", "2"))
     # Agent CLI każdej roli nowego modelu. "claude"/"codex" mają wbudowaną
     # obsługę; dowolna inna nazwa → agent generyczny z FORGE_AGENT_<NAME>_CMD
     # (patrz adapters.py). Domyślnie tester i koder to opencode (z.ai).

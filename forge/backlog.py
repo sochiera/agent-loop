@@ -6,6 +6,7 @@ którego kolejne fazy nie potrafią jednoznacznie odczytać.
 """
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,8 +20,8 @@ _HEADING = re.compile(
 )
 _ANY_STORY_HEADING = re.compile(rf"^##\s+(?P<id>{_ID})(?:\s|$)")
 _FIELD = re.compile(
-    r"^\s*-\s*(?P<name>Dlaczego teraz|Sprawdzenie|Poza zakresem):\s*"
-    r"(?P<value>.*)\s*$",
+    r"^\s*-\s*(?P<name>Dlaczego teraz|Sprawdzenie|Poza zakresem|Sekcja briefu):"
+    r"\s*(?P<value>.*)\s*$",
     re.IGNORECASE,
 )
 
@@ -34,8 +35,31 @@ class Story:
     why_now: str
     check: str
     out_of_scope: str
+    # Nazwa sekcji briefu, którą ta historyjka otwiera lub pogłębia. Wiąże
+    # backlog z mapą pokrycia (patrz `coverage.py`); pusta w projektach sprzed
+    # tego mechanizmu i w briefach bez nagłówków `##`.
+    brief_section: str
     body: str
     line: int
+
+
+def section_key(name: str) -> str:
+    """Klucz porównania nazw sekcji briefu: bez wielkości liter i odstępów.
+
+    Dopasowanie musi być tolerancyjne, bo nazwę sekcji przepisuje ręcznie model.
+    Twarde porównanie zamieniałoby każdą literówkę i podwójną spację w
+    naruszenie kontraktu, czyli w kolejną pełnopłatną turę za zero wartości.
+    """
+    return " ".join(str(name).split()).casefold()
+
+
+def closest_section(name: str, known: list[str]) -> str:
+    """Najbliższa istniejąca nazwa sekcji albo pusty string."""
+    keys = [section_key(item) for item in known]
+    match = difflib.get_close_matches(section_key(name), keys, n=1, cutoff=0.6)
+    if not match:
+        return ""
+    return known[keys.index(match[0])]
 
 
 def _status_parts(raw: str) -> tuple[str, str]:
@@ -52,7 +76,8 @@ def _story_from_block(lines: list[str], line: int) -> Story | None:
     if not match:
         return None
 
-    fields = {"Dlaczego teraz": [], "Sprawdzenie": [], "Poza zakresem": []}
+    fields = {"Dlaczego teraz": [], "Sprawdzenie": [], "Poza zakresem": [],
+              "Sekcja briefu": []}
     narrative: list[str] = []
     for raw in lines[1:]:
         clean = raw.rstrip("\r\n")
@@ -66,6 +91,7 @@ def _story_from_block(lines: list[str], line: int) -> Story | None:
                 "Dlaczego teraz": "Dlaczego teraz",
                 "Sprawdzenie": "Sprawdzenie",
                 "Poza zakresem": "Poza zakresem",
+                "Sekcja briefu": "Sekcja briefu",
             }[name[:1].upper() + name[1:].lower()]
             fields[key].append(field.group("value").strip())
         elif clean.strip():
@@ -79,6 +105,7 @@ def _story_from_block(lines: list[str], line: int) -> Story | None:
         why_now="\n".join(fields["Dlaczego teraz"]).strip(),
         check="\n".join(fields["Sprawdzenie"]).strip(),
         out_of_scope="\n".join(fields["Poza zakresem"]).strip(),
+        brief_section="\n".join(fields["Sekcja briefu"]).strip(),
         body="\n".join(narrative).strip(),
         line=line,
     )
@@ -170,6 +197,7 @@ def coerce_statuses(text: str, before: list[Story]) -> tuple[str, list[str]]:
 def validate_hard(
     before: list[Story], after: list[Story], dropped: list[dict],
     orphans: list[str], reopened: list[dict] | None = None,
+    brief_sections: list[str] | None = None,
 ) -> list[str]:
     """Zwróć naruszenia twardych invariantów, których Forge nie umie naprawić.
 
@@ -179,6 +207,7 @@ def validate_hard(
     """
     violations: list[str] = []
     ids: set[str] = set()
+    known_ids = {story.id for story in before}
     for story in after:
         if not re.fullmatch(_ID, story.id):
             violations.append(f"historyjka ma niepoprawne ID: {story.id!r}")
@@ -189,6 +218,32 @@ def validate_hard(
             violations.append(f"{story.id}: brak niepustego pola Sprawdzenie")
         if not story.why_now.strip():
             violations.append(f"{story.id}: brak niepustego pola Dlaczego teraz")
+        # Wiązanie z sekcją briefu egzekwujemy pod dwoma warunkami. Po pierwsze
+        # brief musi mieć sekcje: brief bez nagłówków `##` jest legalny, a wymóg
+        # pola, którego nie da się poprawnie wypełnić, zakleszczyłby turę
+        # Product Ownera na własnym walidatorze — dokładnie tak, jak kiedyś
+        # zrobiła to para reguł o statusach.
+        #
+        # Po drugie egzekwujemy go tylko dla historyjek NOWYCH w tej turze.
+        # Backlog sprzed tego mechanizmu ma kilkanaście pozycji bez pola i
+        # zażądanie ich wszystkich naraz zamieniłoby pierwszą turę PO w
+        # zderzenie z budżetem korekt, czyli w twardą awarię biegu. Zaległość
+        # jest widoczna w mapie pokrycia jako „MAPA NIEPEŁNA" i tam wyłącza
+        # regułę blokującą, więc migracja rozkłada się na kilka tur, zamiast
+        # zabijać pierwszą.
+        if brief_sections and story.status != "porzucona" and story.id not in known_ids:
+            value = story.brief_section.strip()
+            if not value:
+                violations.append(
+                    f"{story.id}: brak pola Sekcja briefu; wpisz nazwę jednej "
+                    "z sekcji briefu")
+            elif not any(section_key(value) == section_key(name)
+                         for name in brief_sections):
+                hint = closest_section(value, brief_sections)
+                suffix = f"; czy chodziło o {hint!r}?" if hint else ""
+                violations.append(
+                    f"{story.id}: Sekcja briefu {value!r} nie jest sekcją "
+                    f"briefu{suffix}")
 
     dropped_ids = {
         str(item.get("id", "")) for item in dropped
@@ -242,8 +297,28 @@ def set_status(text: str, story_id: str, status: str, reason: str = "") -> str:
     return "".join(output)
 
 
+# Historyjka niedomknięta: praca nad nią jest zaczęta albo jeszcze nie ruszyła,
+# ale na pewno nie jest rozliczona dowodem. Tylko `zrobiona` i `porzucona` są
+# stanami końcowymi.
+OPEN_STATUSES = ("nowa", "w toku", "do weryfikacji")
+
+
 def count_open(stories: list[Story]) -> int:
-    return sum(story.status == "nowa" for story in stories)
+    """Ile historyjek jest niedomkniętych.
+
+    Liczyło kiedyś wyłącznie `nowa` — i to była przyczyna zacisku, w którym
+    maszyna sama się zatrzymywała. Domknięte zadanie przestawia historyjkę na
+    `do weryfikacji`, więc licznik `nowa` spadał do zera przy KAŻDYM domknięciu
+    i wyzwalacz refilla odpalał bez przerwy. Product Owner widział tymczasem
+    cały plik — dziesiątki historyjek `do weryfikacji` przy miękkim sufcie —
+    więc czytał ten sam stan jako zakaz poszerzania i dokładał po jednej.
+    Wyzwalacz i sufit mierzyły dwie różne rzeczy, a bieg kręcił się w miejscu.
+
+    Jedna definicja „otwartej" historyjki usuwa tę sprzeczność: zaległość
+    niezweryfikowanych jest zatorem do rozładowania weryfikacją, a nie brakiem
+    pracy do dobrania.
+    """
+    return sum(story.status in OPEN_STATUSES for story in stories)
 
 
 def ids_by_status(stories: list[Story], *statuses: str) -> list[str]:

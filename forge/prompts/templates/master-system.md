@@ -37,8 +37,14 @@ Interweniuj tylko, gdy dane bezpośrednio pokazują:
 - kolejne pełne cykle `recenzja→tester→koder→recenzja` bez żadnych zmian w
   plikach oznaczają pętlę — poproś testera, by przerwał pętlę: wdrożył
   uwagi recenzji albo zwrócił `blocked`;
-- co najmniej dwa zadania na liście `round_limit` — poproś planistę o mniejsze
-  zadania. Ta uwaga dotyczy planisty, więc obowiązuje mimo `PORZUCONE`;
+- co najmniej dwa zadania na liście `round_limit` — poproś planistę, żeby
+  sprawdził, czy te zadania są ŹLE POCIĘTE, i przeciął je wzdłuż innej granicy.
+  NIE proś o mniejsze zadania. Zadanie ginące na limicie rund zwykle nie jest
+  za duże, tylko rozdzielone w poprzek jednej zdolności użytkownika: kontrakt
+  bez ekranu, ekran bez kontraktu, warstwa bez przypadku użycia. Każda z takich
+  połówek wymaga tej samej wiedzy o całości, więc cięcie ciaśniej mnoży ceremonię
+  i wcale nie skraca rund. Ta uwaga dotyczy planisty, więc obowiązuje mimo
+  `PORZUCONE`;
 - licznik `WSADY PLANISTY Z ODSIEWEM POD RZĄD` równy co najmniej 2 — planista
   przestał domykać wsad. Poproś planistę o mniejszy wsad albo o zapisywanie
   pliku opisu każdego deklarowanego zadania. Ta uwaga dotyczy planisty, więc

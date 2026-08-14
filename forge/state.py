@@ -30,6 +30,14 @@ class State:
     po_refill_batch: int = -1
     stories_verified_at_batch: int = 0
     stories_verified_sha: str = ""
+    # Kadencja weryfikacji historyjek. Oba pola zeruje `phase_verify_stories`.
+    # `story_closed_since_verify` niesie naturalny moment na dowód (domknięcie
+    # historyjki), a `tasks_since_verify` jest bezpiecznikiem na wsady bez
+    # historyjek. Licznik żyje w stanie, a nie jest wyliczany z dziennika, bo
+    # musi przetrwać restart: bieg wznowiony w połowie wsadu inaczej zaczynałby
+    # kadencję od zera i znowu odkładał weryfikację w nieskończoność.
+    tasks_since_verify: int = 0
+    story_closed_since_verify: bool = False
     # Krótki ostatni wsad oznacza drenaż backlogu. Nie ustawiamy tu
     # ``steering_due``: ono nie ma strażnika pustej kolejki.
     batch_drained: bool = False
@@ -42,6 +50,10 @@ class State:
     # to kilkadziesiąt wpisów — dwa kolejne odsiewy nigdy nie zmieściłyby się
     # razem ani w oknie mistrza (60 linii), ani w całej pamięci dziennika (80).
     plan_sift_streak: int = 0
+    # Numer zadania, przy którym planista dostał ostatnio wymóg długu
+    # technicznego. Kadencja długu liczy zadania, nie wsady — patrz
+    # `Config.debt_every_tasks`.
+    debt_at_task: int = 0
     test_cmd: str = ""
     build_cmd: str = ""
     project_kind: str = "app"
@@ -67,6 +79,11 @@ class State:
     # licznika, bo dopiero on odróżnia jałowe okrążenie od realnej poprawki.
     review_cycles: int = 0
     review_cycle_hash: str = ""
+    # Ile razy recenzja zablokowała TO zadanie werdyktem `request_changes` —
+    # niezależnie od tego, czy drzewo się zmieniło. Licznik obok `review_cycles`,
+    # bo tamten mierzy livelock (zero zmian), a ten churn (same zmiany, wciąż
+    # nowe uwagi). Zerowany razem z resztą stanu zadania.
+    review_turns: int = 0
     corrections_done: bool = False
     corrections_tree_hash: str = ""
     task_start_tag: str = ""
@@ -82,6 +99,10 @@ class State:
     # Product Owner: stan migracji BACKLOG.md. Brak pola w starym STATE.json
     # oznacza brak migracji i jest uzupełniany deterministycznie przez preflight.
     backlog_migrated: bool = False
+    # Sekcje briefu świadomie odpuszczone przez Product Ownera (kanoniczne
+    # nazwy nagłówków). Fakt cyklu życia, więc jego właścicielem jest Forge,
+    # a nie proza w BACKLOG.md — dokładnie jak przy statusach historyjek.
+    sections_waived: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: str) -> "State":

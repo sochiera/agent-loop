@@ -150,6 +150,22 @@ def test_planner_declares_explicit_task_dependencies() -> None:
     assert "identyfikator" in prompt
 
 
+def test_planner_keeps_one_capability_in_one_task() -> None:
+    """Historyjka to domyślnie jedno zadanie, a para API/ekran jest zakazana.
+
+    Rozcinanie zdolności na „publiczny kontrakt X" i „to samo X na ekranie"
+    podwajało najdroższą, w pełni szeregową część procesu: obie połówki dotykają
+    tego samego kodu i przechodzą przez pełny cykl tester→koder→recenzja osobno.
+    W mierzonym biegu sześć takich par kosztowało dwanaście cykli zamiast sześciu.
+    """
+    prompt = prompts.plan_batch_prompt(4, 1)
+
+    assert "JEDNA HISTORYJKA TO DOMYŚLNIE JEDNO ZADANIE" in prompt
+    assert "Zakazana" in prompt and "na\nekranie" in prompt
+    # Podział wolno uzasadnić wyłącznie prawdziwą zależnością techniczną.
+    assert "PRAWDZIWA" in prompt
+
+
 def test_planner_contract_owns_outcomes_not_test_design() -> None:
     prompt = prompts.plan_batch_prompt(4, 1)
 
@@ -239,10 +255,36 @@ def test_reviewer_prompt_is_plain_code_review() -> None:
     assert '"verdict":"approve"' in prompt
     assert '"verdict":"suggestions"' in prompt
     assert '"verdict":"request_changes"' in prompt
-    assert "można bezpiecznie zacommitować" in prompt
-    assert "użyj `suggestions`" in prompt
-    assert "użyj `request_changes`" in prompt
-    assert "umieść ją w `nits`" in prompt
+    assert "ZAMKNIĘTĄ listę dwóch powodów" in prompt
+    assert "nits" in prompt
+
+
+def test_reviewer_measures_the_diff_against_the_task_not_its_own_taste() -> None:
+    """Recenzent dostaje kryteria i kontrakt jako materiał, nie jako ścieżkę.
+
+    Miękki test rozstrzygający („czy diff nadal można bezpiecznie zacommitować")
+    przepuszczał każdą uwagę o lokalnej kompletności jako blokującą: 45%
+    werdyktów w mierzonym biegu żądało zmian, a zadania traciły po dziesięć
+    rund na przypadkach, których własne kryteria nie obiecywały.
+    """
+    prompt = prompts.review_task_prompt_kiss(
+        "task.md", start_tag="forge/task-start", changed=["app.py"],
+        criteria="1. Ekran pokazuje wynik.", contract="GET /api/result → 200.")
+
+    assert "1. Ekran pokazuje wynik." in prompt
+    assert "GET /api/result → 200." in prompt
+    # Uwaga słuszna, ale spoza kryteriów, ma jawnie wskazany kanał.
+    assert "routing brzegowy" in prompt
+    assert "suggestions" in prompt
+
+
+def test_reviewer_prompt_without_a_task_file_does_not_invite_blocking() -> None:
+    """Brak sekcji w pliku zadania nie może stać się powodem blokady."""
+    prompt = prompts.review_task_prompt_kiss(
+        "task.md", start_tag="forge/task-start", changed=["app.py"])
+
+    assert "{{" not in prompt
+    assert prompt.count("(brak — nie blokuj z tego powodu)") == 2
 
 
 def test_suggestions_prompt_finalizes_without_a_second_review() -> None:

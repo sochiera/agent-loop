@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from forge import brief, orchestrate, prompts
+from forge import brief, ledger, orchestrate, prompts
 from forge.config import Config
 from forge.state import State
 from forge.agents import AgentError
@@ -54,6 +54,169 @@ def test_product_owner_prompt_has_all_trigger_variants_and_rules() -> None:
         assert "Sprawdzenie:" in prompt
         assert "US-NNN" in prompt
         assert "stories_dropped" in prompt
+
+
+def test_first_backlog_plans_the_shape_of_the_whole_mvp() -> None:
+    """Start planuje kształt MVP, nie pierwszy przyrost.
+
+    Poprzednia wersja tego promptu mówiła „maksymalnie 3 historyjki, chętnie
+    mniej", a kolejne przeglądy dokładały po jednej pozycji sąsiadującej z tym,
+    co już działało. Po pięćdziesięciu zadaniach osiem sekcji briefu nie miało
+    ani jednej linii kodu — bez ani jednej złej decyzji lokalnej, bo proces
+    pogłębiał jedyną część mapy, którą widział.
+    """
+    prompt = prompts.product_owner_prompt(
+        trigger="start", notebook_path=".forge/notebooks/product-owner.md")
+
+    assert "KSZTAŁT CAŁEGO MVP" in prompt
+    assert "KAŻDĄ sekcję z mapy pokrycia" in prompt
+    assert "ŻADNEJ GŁĘBI" in prompt
+    assert "Każda sekcja mapy pokrycia dostaje dokładnie jedną historyjkę" in prompt
+    # Sufit nie może przyciąć mapy, którą ta tura ma dopiero pokazać.
+    assert "sufit historyjek na tę jedną turę nie obowiązuje" in prompt
+
+
+def test_soft_ceiling_stays_lifted_until_the_mvp_map_is_settled(
+        tmp_path: Path) -> None:
+    """Sufit trzyma rozmiar mapy, dopóki mapa nie zostanie rozliczona.
+
+    Podniesienie samego startu nie wystarczało: tura startowa zakłada tyle
+    historyjek, ile sekcji, a już następny refill widziałby przy nich sufit
+    sześciu. Jedynym racjonalnym ruchem Product Ownera byłoby wtedy porzucenie
+    mapy MVP, którą tura startowa dopiero co zbudowała — czyli dokładne
+    odtworzenie starego zacisku, tyle że jedną turę później.
+    """
+    project, cfg, state = _project(tmp_path)
+    cfg.max_backlog_stories = 1
+    sectioned = "# Cel\n" + "".join(
+        f"\n## Sekcja {n}\n\ntreść\n" for n in range(1, 4))
+    (project / "docs" / "BRIEF-SNAPSHOT.md").write_text(sectioned, encoding="utf-8")
+    Path(cfg.brief_path).write_text(sectioned, encoding="utf-8")
+    state.brief_digest = brief.digest(sectioned)
+
+    def _backlog(*statuses: str) -> str:
+        blocks = ["# Backlog\n"]
+        for number, status in enumerate(statuses, 1):
+            blocks.append(
+                f"## US-{number:03d} — Zdolność {number}  [{status}]\n\n"
+                "Jako użytkownik chcę czegoś.\n\n"
+                "- Dlaczego teraz: dowód.\n"
+                f"- Sekcja briefu: Sekcja {number}\n"
+                "- Sprawdzenie: uruchom demo.\n")
+        return "\n".join(blocks)
+
+    seen: list[str] = []
+
+    def agent(_name, prompt, *_args, **_kwargs):
+        seen.append(prompt)
+        if "świeża recenzentka Product Ownera" in prompt:
+            return '{"verdict":"approve","notes":[]}'
+        return _decision()
+
+    # Mapa nierozliczona: sufit rośnie do liczby sekcji, także przy refillu.
+    (project / "BACKLOG.md").write_text(
+        _backlog("zrobiona", "do weryfikacji", "nowa"), encoding="utf-8")
+    with patch("forge.agents.run_agent", side_effect=agent):
+        orchestrate.phase_product_owner(
+            cfg, str(project), state, lambda phase: phase, "refill")
+    assert "miękkiego sufitu 3 historyjek" in seen[0]
+
+    # Mapa rozliczona (zrobiona + świadomie pominięta): sufit wraca do normy.
+    seen.clear()
+    state.sections_waived = ["Sekcja 3"]
+    (project / "BACKLOG.md").write_text(
+        _backlog("zrobiona", "zrobiona"), encoding="utf-8")
+    with patch("forge.agents.run_agent", side_effect=agent):
+        orchestrate.phase_product_owner(
+            cfg, str(project), state, lambda phase: phase, "refill")
+    assert "miękkiego sufitu 1 historyjek" in seen[0]
+
+
+def test_skipping_a_context_section_is_a_declaration_not_a_sentence_in_prose(
+        tmp_path: Path) -> None:
+    """Odpuszczenie sekcji jest deklaracją, którą zapisuje Forge.
+
+    Bez tego kanału kontrakt był sprzeczny: prompt startu pozwalał pominąć
+    sekcję będącą kontekstem, a recenzentka MUSIAŁA zablokować turę za jej
+    pustkę. Pominięcie widoczne wyłącznie w `summary` nie ma jak trafić do
+    mapy, z której liczy się reguła blokująca.
+    """
+    project, cfg, state = _project(tmp_path)
+    sectioned = "# Cel\n\n## Konfigurator\n\ntreść\n\n## Podsumowanie\n\ntreść\n"
+    (project / "docs" / "BRIEF-SNAPSHOT.md").write_text(sectioned, encoding="utf-8")
+    Path(cfg.brief_path).write_text(sectioned, encoding="utf-8")
+    state.brief_digest = brief.digest(sectioned)
+    (project / "BACKLOG.md").write_text(
+        BACKLOG.replace("- Sprawdzenie:",
+                        "- Sekcja briefu: Konfigurator\n- Sprawdzenie:"),
+        encoding="utf-8")
+
+    def agent(_name, prompt, *_args, **_kwargs):
+        if "świeża recenzentka Product Ownera" in prompt:
+            return '{"verdict":"approve","notes":[]}'
+        return ('{"summary":"x","stories_added":[],"stories_dropped":[],'
+                '"stories_reopened":[],'
+                '"sections_skipped":[{"name":"  podsumowanie ",'
+                '"reason":"opis kontekstu, nie wymaganie"}],'
+                '"changes":[],"replan":false,"goal_reached":false,"notebook":""}')
+
+    with patch("forge.agents.run_agent", side_effect=agent):
+        orchestrate.phase_product_owner(
+            cfg, str(project), state, lambda phase: phase, "refill")
+
+    # Nazwa zostaje znormalizowana do kanonicznego nagłówka, żeby mapa i
+    # walidator nie mogły uznać jej za dwie różne sekcje.
+    assert state.sections_waived == ["Podsumowanie"]
+    assert "pominięta" in ledger.tail(str(project))
+
+
+
+
+def test_coverage_map_reaches_both_product_owner_and_the_reviewer() -> None:
+    """Mapa pokrycia jest twardym wejściem obu ról decydujących o kierunku.
+
+    Bez niej PO nie widzi briefu wcale: czyta PROJECT.md i BACKLOG.md, więc
+    widzi wyłącznie to, co już zaplanowano. Dlatego kolejne historyjki pogłębiały
+    działające części produktu, a osiem sekcji briefu stało pustych przez cały bieg
+    — i był to ruch całkowicie legalny, bo żadna rola nie mogła zauważyć dziury.
+    """
+    table = ("| sekcja briefu | waga | stan | historyjki |\n"
+             "NASTĘPNA SEKCJA DO OTWARCIA: Import z x-kom (stan: brak, waga: 9)")
+
+    po_prompt = prompts.product_owner_prompt(
+        trigger="refill", notebook_path=".forge/notebooks/product-owner.md",
+        coverage=table)
+    review_prompt = prompts.po_review_prompt(
+        {"summary": "x",
+         "sections_skipped": [{"name": "Podsumowanie", "reason": "kontekst"}]},
+        coverage=table)
+
+    for prompt in (po_prompt, review_prompt):
+        assert "{{" not in prompt
+        assert "NASTĘPNA SEKCJA DO OTWARCIA: Import z x-kom" in prompt
+
+    # PO ma wiedzieć, że wskazana sekcja wyprzedza pogłębianie tego, co działa.
+    assert "Sekcja briefu:" in po_prompt
+    assert "sections_skipped" in po_prompt
+    # Recenzentka ma dokładnie JEDEN powód, by zablokować turę…
+    assert "REGUŁA BLOKUJĄCA" in review_prompt
+    assert "jedyny\npowód" in review_prompt
+    # …i widzi odpuszczenia jako deklaracje jeszcze nieobecne w mapie.
+    assert "- Podsumowanie: kontekst" in review_prompt
+
+
+def test_incomplete_map_is_declared_to_the_reviewer_as_disarming_the_rule() -> None:
+    """Recenzentka musi wiedzieć, kiedy reguła blokująca NIE obowiązuje.
+
+    Backlog sprzed mechanizmu ma historyjki bez pola `Sekcja briefu`. Gdyby
+    reguła działała na takiej mapie, recenzentka blokowałaby każdą turę za
+    rzekomo pustą sekcję, którą tamte historyjki dawno pokryły — i pierwszy
+    przebieg na istniejącym projekcie nie ruszyłby z miejsca.
+    """
+    review_prompt = prompts.po_review_prompt({"summary": "x"})
+
+    assert "NIEPEŁNA" in review_prompt
+    assert "nie blokuj z powodu pokrycia" in review_prompt
 
 
 def test_product_owner_repair_happens_before_reviewer(tmp_path: Path) -> None:
@@ -299,16 +462,98 @@ def test_stories_reopened_without_reason_is_a_contract_violation() -> None:
 
 
 def test_po_triggers_have_priority_and_refill_guard(tmp_path: Path) -> None:
+    """Kadencja wyprzedza refill; aktywna kolejka wycisza oba.
+
+    Kolejność jest odwrotna niż pierwotnie, bo pierwotna zagładzała kadencję:
+    refill odpala z niskiego stanu kolejki, a ten wraca po każdym domknięciu,
+    więc warunek kadencji nie był sprawdzany ani razu przez dwadzieścia wsadów.
+    """
     project, cfg, state = _project(tmp_path)
     state.brief_digest = brief.digest(Path(cfg.brief_path).read_text(encoding="utf-8"))
     cfg.backlog_low_water = 2
     state.plan_batches = 3
     state.steered_at_batch = 0
+    assert orchestrate._po_trigger(cfg, str(project), state) == "cadence"
+    state.steered_at_batch = state.plan_batches
     assert orchestrate._po_trigger(cfg, str(project), state) == "refill"
     state.po_refill_batch = state.plan_batches
-    assert orchestrate._po_trigger(cfg, str(project), state) == "cadence"
+    assert orchestrate._po_trigger(cfg, str(project), state) == ""
     state.task_queue = [{"id": "task-001"}]
     assert orchestrate._po_trigger(cfg, str(project), state) == ""
+
+
+def _backlog_awaiting_verification(count: int) -> str:
+    blocks = ["# Backlog\n"]
+    for number in range(1, count + 1):
+        blocks.append(
+            f"## US-{number:03d} — Zdolność {number}  [do weryfikacji]\n\n"
+            "Jako użytkownik chcę czegoś, żeby osiągnąć cel.\n\n"
+            "- Dlaczego teraz: PROJECT.md opisuje tę potrzebę.\n"
+            f"- Sprawdzenie: uruchom demo {number}.\n")
+    return "\n".join(blocks)
+
+
+def test_unverified_backlog_is_a_jam_to_clear_not_a_queue_to_refill(
+        tmp_path: Path) -> None:
+    """Zaległość `do weryfikacji` blokuje refill i wymusza weryfikację.
+
+    Regresja na zacisk, w którym maszyna sama się zatrzymywała. `count_open`
+    liczyło wyłącznie `nowa`, więc domknięcie KAŻDEGO zadania zbijało licznik
+    do zera i refill odpalał bez końca; kadencja, jedyna gałąź wołająca wtedy
+    weryfikację, nie była nigdy sprawdzana. Product Owner widział tymczasem
+    rosnący plik przy miękkim sufcie i czytał go jako zakaz poszerzania
+    zakresu — w mierzonym biegu dało to 19 historyjek, z których ANI JEDNA nie
+    dostała statusu `zrobiona` przez trzynaście godzin.
+    """
+    project, cfg, state = _project(tmp_path)
+    state.brief_digest = brief.digest(Path(cfg.brief_path).read_text(encoding="utf-8"))
+    (project / "BACKLOG.md").write_text(
+        _backlog_awaiting_verification(19), encoding="utf-8")
+    cfg.backlog_low_water = 2
+    state.plan_batches = 1
+    state.steered_at_batch = 1
+    state.po_refill_batch = 0
+
+    # Zator nie jest brakiem pracy: dziewiętnaście niedomkniętych historyjek
+    # nie ma prawa wyglądać jak pusta kolejka.
+    assert orchestrate._po_trigger(cfg, str(project), state) == ""
+    # A gdyby Product Owner miał dostać turę z innego powodu, dowód idzie
+    # pierwszy — bez tego planowałby kierunek na backlogu bez ani jednego
+    # rozliczonego wyniku.
+    assert orchestrate._verification_due(
+        cfg, str(project), state, before_po=True)
+
+
+def test_verification_cadence_survives_a_batch_without_stories(
+        tmp_path: Path) -> None:
+    """Wsad samego długu technicznego nie może uśpić weryfikacji.
+
+    Zadania bez `story` nigdy nie przestawią historyjki na `do weryfikacji`,
+    więc naturalny wyzwalacz nie padnie. Zaległość i tak czeka, dlatego drugim
+    wyzwalaczem jest licznik domkniętych zadań.
+    """
+    project, cfg, state = _project(tmp_path)
+    (project / "BACKLOG.md").write_text(
+        _backlog_awaiting_verification(2), encoding="utf-8")
+    cfg.verify_every_tasks = 3
+    state.story_closed_since_verify = False
+
+    state.tasks_since_verify = 2
+    assert not orchestrate._verification_due(
+        cfg, str(project), state, before_po=False)
+    state.tasks_since_verify = 3
+    assert orchestrate._verification_due(
+        cfg, str(project), state, before_po=False)
+
+
+def test_verification_is_free_when_nothing_awaits_proof(tmp_path: Path) -> None:
+    """Pusty zbiór nie kosztuje tury — faza nie może odpalać na sucho."""
+    project, cfg, state = _project(tmp_path)
+    state.story_closed_since_verify = True
+    state.tasks_since_verify = 99
+    # BACKLOG.md z `_project` ma wyłącznie historyjkę `nowa`.
+    assert not orchestrate._verification_due(
+        cfg, str(project), state, before_po=True)
 
 
 def test_bottomless_review_never_throws_away_a_valid_backlog(

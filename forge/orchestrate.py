@@ -21,6 +21,7 @@ from .agents import (AgentError, LimitExhausted, _extract_json_detail, extract_j
 from .config import Config, DEFAULT_TASK_DIFFICULTY, TASK_DIFFICULTIES
 from . import brief
 from . import backlog
+from . import coverage
 from . import ledger
 from . import master_gate
 from . import notebooks
@@ -56,6 +57,7 @@ _TASK_STATE_FIELDS = (
     "tester_record", "coder_record", "review_notes",
     "review_suggestions_pending", "corrections_done", "corrections_tree_hash",
     "task_start_tag", "coder_tree_hash", "review_cycles", "review_cycle_hash",
+    "review_turns",
 )
 
 
@@ -273,32 +275,32 @@ def _story_status(project: str, story_id: str) -> str:
     return ""
 
 
-def stories_touched_since(project: str, sha: str = "") -> set[str]:
-    """Historyjki z ukończonych tasków; SHA jest markerem świeżości raportu."""
-    del sha  # ledger jest runtime'em i nie jest commitowany razem ze zmianą taska.
-    found: set[str] = set()
-    pattern = re.compile(r"task-\d+ UKOŃCZONE(?:\s+\((US-\d{3})\))?")
-    for line in ledger.tail(project, ledger.KEEP_LINES).splitlines():
-        match = pattern.search(line)
-        if match and match.group(1):
-            found.add(match.group(1))
-    return found
-
-
 def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
     _housekeeping(cfg, project)
     feedback = Path(project, cfg.runtime_dir, "verification", "latest-feedback.md")
     failures = Path(project, cfg.runtime_dir, "failures.md")
     steering = _steering_path(cfg, project)
     start_index = _next_task_index(project)
-    next_batch = state.plan_batches + 1
     log(f"Planowanie: proszę planistę o maks. {cfg.batch_size} zadań od task-{start_index:03d}…")
+    # Kadencja długu technicznego liczy ZADANIA, nie wsady: wsad przestał być
+    # stabilną miarą pracy, odkąd historyjka mieści się domyślnie w jednym
+    # zadaniu. `start_index` jest globalnym, monotonicznym numerem zadania.
+    # `max(..., 1)` bo numeracja zadań startuje od 1, a `debt_at_task` od 0:
+    # bez tego pierwsza kadencja byłaby o jedno zadanie krótsza od każdej
+    # następnej. Wartość to liczba zadań utworzonych od ostatniego wymogu.
+    #
+    # Kadencję zapisujemy dopiero wtedy, gdy wsad NAPRAWDĘ powstał (niżej).
+    # Zapis w tym miejscu zjadałby ją przy `no_more_tasks`: planista, który nie
+    # miał z czego planować, i tak przesuwałby licznik, więc wymóg długu padłby
+    # na pusto i wracał dopiero po kolejnych dwunastu zadaniach.
+    require_debt = (start_index - max(state.debt_at_task, 1)
+                    >= cfg.debt_every_tasks)
     plan_prompt = prompts.plan_batch_prompt(
         cfg.batch_size, start_index, state.project_kind,
         verify_feedback_path=str(feedback) if feedback.exists() else "",
         failure_feedback_path=str(failures) if failures.exists() else "",
         steering_path=str(steering) if steering.exists() else "",
-        require_debt=next_batch % 5 == 0)
+        require_debt=require_debt)
     plan_prompt += _ledger_context(project, ledger.PHASE_LINES)
     # Mistrz widzi w dzienniku również historię wsadów — serię zadań ginących
     # na round_limit potrafi skomentować zanim planista utnie kolejny za grubo.
@@ -359,12 +361,14 @@ def phase_plan_batch(cfg: Config, project: str, state: State, logf) -> dict:
                                f"{len(tasks)} (odsiew: {', '.join(sifted)})")
     if not tasks and not data.get("no_more_tasks"):
         raise AgentError("planista nie utworzył żadnego poprawnego zadania")
-    state.plan_batches = next_batch
+    state.plan_batches += 1
     if tasks:
         log(f"Planowanie: utworzono {len(tasks)} zadań: {', '.join(t['id'] for t in tasks)}")
         ledger.append(project, f"plan: utworzono {len(tasks)} zadań "
                                f"({tasks[0]['id']}…{tasks[-1]['id']})")
         state.empty_plans = 0
+        if require_debt:
+            state.debt_at_task = start_index
     elif data.get("no_more_tasks"):
         log("Planowanie: planista zgłosił brak dalszych zadań.")
         ledger.append(project, "plan: planista zgłosił brak dalszych zadań")
@@ -727,7 +731,14 @@ def _write_po_handoff(cfg: Config, project: str, notes: list[str]) -> None:
 
 
 def _po_trigger(cfg: Config, project: str, state: State) -> str:
-    """Wyzwalacze Product Ownera: start, brief, refill, potem kadencja."""
+    """Wyzwalacze Product Ownera: start, brief, kadencja, potem refill.
+
+    Kadencja stoi PRZED refillem, bo odwrotna kolejność ją zagładzała. Refill
+    odpala z niskiego stanu kolejki, a ten po każdym domknięciu wracał — więc
+    warunek kadencji nie był nigdy sprawdzany i przegląd kierunku nie zdarzył
+    się ani razu przez dwadzieścia wsadów. Refill jest korektą ilościową i może
+    poczekać jedną iterację; kadencja jest jedynym momentem korekty kierunku.
+    """
     if brief.changed(project, state.brief_digest, brief.read(cfg.brief_path)):
         return "brief"
     if state.current_task or state.task_queue:
@@ -740,16 +751,65 @@ def _po_trigger(cfg: Config, project: str, state: State) -> str:
         # Pierwszy przebieg PO nie jest uzupełnianiem kolejki, tylko jej
         # założeniem — i to jego jedyna okazja, żeby dostać o tym prompt.
         return "start"
+    if state.plan_batches - state.steered_at_batch >= cfg.steering_batches:
+        return "cadence"
     if (backlog.count_open(stories) < cfg.backlog_low_water
             and state.po_refill_batch != state.plan_batches):
         return "refill"
     if state.steering_due:
         return "refill"
-    if state.plan_batches - state.steered_at_batch >= cfg.steering_batches:
-        return "cadence"
     if state.batch_drained:
         return "cadence"
     return ""
+
+
+def _coverage_table(project: str, brief_text: str,
+                    waived: list[str] | None = None) -> str:
+    """Mapa pokrycia briefu dla promptów Product Ownera i jego recenzentki.
+
+    Czytana świeżo z dysku, bo backlog zmienia się w trakcie tury PO — mapa
+    sprzed jego zapisu wskazywałaby dziurę, którą właśnie zasypał.
+    """
+    stories, _orphans = backlog.load(project)
+    return coverage.render(
+        coverage.build(brief_text, stories, waived),
+        coverage.unmapped(stories, brief_text))
+
+
+def _stories_awaiting_verification(project: str) -> bool:
+    stories, _orphans = backlog.load(project)
+    return bool(backlog.ids_by_status(stories, "do weryfikacji"))
+
+
+def _verification_due(cfg: Config, project: str, state: State,
+                      *, before_po: bool) -> bool:
+    """Czy weryfikacja historyjek ma ruszyć na najbliższej granicy zadania.
+
+    Weryfikacja przestała być gałęzią przeglądu kierunku i ma własne
+    wyzwalacze, bo jako gałąź nie ruszała wcale: `refill` wygrywał z `cadence`
+    w każdej iteracji, a `phase_verify_stories` wołała wyłącznie ta druga.
+    Skutek był samopodtrzymujący — bez weryfikacji nie powstaje `zrobiona`,
+    bez `zrobiona` backlog rośnie w niedomkniętych, a rosnący backlog wygląda
+    dla Product Ownera jak zakaz poszerzania zakresu.
+
+    Trzy wyzwalacze, bo trzy różne rzeczy mogą pójść nie tak:
+
+    - ``before_po`` — twarda gwarancja: Product Owner nie dostaje tury, dopóki
+      wiszą historyjki bez dowodu. To ten warunek naprawia zgłoszony zacisk i
+      dlatego nie ma progu ani okna;
+    - domknięta historyjka — naturalny moment na dowód, kiedy jest co dowodzić;
+    - ``tasks_since_verify`` — bezpiecznik na wsad złożony z długu technicznego
+      (zadania bez `story`), gdzie pierwszy z tych warunków nie padnie nigdy,
+      a zaległość i tak czeka.
+    """
+    if state.current_task:
+        return False
+    if not _stories_awaiting_verification(project):
+        return False
+    if before_po:
+        return True
+    return (state.story_closed_since_verify
+            or state.tasks_since_verify >= cfg.verify_every_tasks)
 
 
 def _restore_head(project: str, base_sha: str, label: str) -> bool:
@@ -848,6 +908,24 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
     except brief.TooLargeToSync as exc:
         raise AgentError(f"brief zbyt duży do synchronizacji: {exc}") from exc
 
+    # Mapa pokrycia liczy się z BIEŻĄCEGO briefu, nie ze snapshotu: przy
+    # triggerze `brief` snapshot jest jeszcze poprzednią wersją i pokazywałby
+    # sekcje, których użytkownik właśnie się pozbył albo nie zawierałby tych,
+    # które właśnie dopisał.
+    brief_text = current if current is not None else previous
+    brief_sections = coverage.sections(brief_text)
+    # Miękki sufit zostaje podniesiony do rozmiaru mapy tak długo, aż mapa
+    # zostanie ROZLICZONA — czyli każda sekcja będzie zrobiona albo świadomie
+    # pominięta. Podniesienie samego startu nie wystarczało: tura startowa
+    # zakłada tyle historyjek, ile sekcji, a już następny refill widziałby przy
+    # nich sufit sześciu. Jedynym racjonalnym ruchem Product Ownera byłoby
+    # wtedy porzucenie mapy MVP, którą tura startowa dopiero co zbudowała.
+    max_backlog = cfg.max_backlog_stories
+    if brief_sections and not coverage.settled(
+            coverage.build(brief_text, backlog.load(project)[0],
+                           state.sections_waived)):
+        max_backlog = max(max_backlog, len(brief_sections))
+
     base_sha = git(project, "rev-parse", "HEAD", check=False).stdout.strip()
     before_manifest = _tree_manifest(project)
     before_stories, before_orphans = backlog.load(project)
@@ -880,11 +958,17 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
     unsettled: list[str] = []
     try:
         for round_number in range(1, cfg.max_bootstrap_reviews + 1):
+            # Mapa jest przeliczana w KAŻDEJ rundzie: poprzednia runda mogła
+            # dopisać historyjkę i przesunąć sekcję, a PO poprawiający backlog
+            # na starej mapie celowałby w dziurę, której już nie ma.
+            coverage_text = _coverage_table(
+                project, brief_text, state.sections_waived)
             prompt = prompts.product_owner_prompt(
                 trigger=trigger, brief_diff=change, story_report=story_report,
                 queued_tasks=queued, parked=parked, migration=migration,
                 notebook_path=notebook_path, review_notes=review_corrections,
-                max_backlog=cfg.max_backlog_stories, handoff=handoff)
+                max_backlog=max_backlog, handoff=handoff,
+                coverage=coverage_text)
             prompt += _ledger_context(project, ledger.PHASE_LINES)
             if parser_corrections:
                 prompt += "\n\n" + prompts.po_parse_corrections_prompt(parser_corrections)
@@ -905,7 +989,7 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
             after_stories, orphans = backlog.load(project)
             violations = backlog.validate_hard(
                 before_stories, after_stories, data["stories_dropped"], orphans,
-                data["stories_reopened"])
+                data["stories_reopened"], brief_sections=brief_sections)
             if violations:
                 if violations == previous_violations:
                     # Ten sam zestaw naruszeń po pełnej turze z tymi uwagami
@@ -935,7 +1019,10 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
             review_before = _tree_manifest(project)
             review_snapshot = _snapshot_tree(project)
             verdict = _decision_with_retry(
-                prompts.po_review_prompt(data, max_backlog=cfg.max_backlog_stories),
+                prompts.po_review_prompt(
+                    data, max_backlog=max_backlog,
+                    coverage=_coverage_table(
+                        project, brief_text, state.sections_waived)),
                 lambda value: run_role(
                     "po_reviewer", value, cfg, project, logf("po-review")),
                 lambda text: parse_review_decision(text, project=project),
@@ -1040,6 +1127,24 @@ def phase_product_owner(cfg: Config, project: str, state: State, logf,
     # dzienniku i linia w notatce kierunku są dla dalszego procesu faktem: ID
     # bez pokrycia w backlogu (walidator już je odsiewa, ale to ostatnia
     # instancja przed ogłoszeniem) dałoby planiście pracę bez historyjki.
+    # Odpuszczenie sekcji jest faktem cyklu życia, więc zapisuje je Forge, a
+    # nie proza Product Ownera. Nazwę normalizujemy do kanonicznego nagłówka:
+    # mapa i walidator muszą rozstrzygać tak samo, inaczej sekcja „pominięta"
+    # przez jedną z nich dalej wyglądałaby dla drugiej jak dziura w produkcie.
+    for item in data["sections_skipped"]:
+        canonical = coverage.resolve(item["name"], brief_text)
+        if not canonical:
+            ledger.append(
+                project, "po: ostrzeżenie — nieznana sekcja briefu w "
+                         f"sections_skipped {item['name']!r}")
+            continue
+        if canonical in state.sections_waived:
+            continue
+        state.sections_waived.append(canonical)
+        ledger.append(project,
+                      f"po: sekcja briefu {canonical!r} pominięta "
+                      f"({item['reason']})")
+
     applied_reopened: list[dict[str, str]] = []
     for item in data["stories_reopened"]:
         changed = _set_story_status(project, item["id"], "nowa")
@@ -1121,6 +1226,40 @@ def _changed(project: str, tag: str) -> list[str]:
     tracked = git(project, "diff", "--name-only", tag).stdout.splitlines()
     return sorted(name for name in {*tracked, *_untracked(project)}
                   if not _is_volatile_artifact(name))
+
+
+_TASK_SECTION_HEADING = re.compile(r"^##\s+(?P<name>.+?)\s*$", re.MULTILINE)
+
+
+def _read_task_file(project: str, task: dict) -> str:
+    """Treść pliku zadania albo pusty string.
+
+    Brak pliku nie może wywrócić recenzji: opis zadania jest materiałem, a nie
+    warunkiem uruchomienia roli. Puste sekcje prompt opisuje jawnie jako brak.
+    """
+    try:
+        return Path(project, str(task.get("file", ""))).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _task_section(text: str, name: str) -> str:
+    """Treść sekcji ``## <name>`` z pliku zadania; pusta, gdy jej nie ma.
+
+    Recenzent dostawał dotąd wyłącznie ŚCIEŻKĘ zadania i sam rozstrzygał, czym
+    mierzy diff — a wolny wybór miary kończył się mierzeniem lokalnej
+    kompletności modułu zamiast tego, co zadanie obiecało. Werdykt blokujący ma
+    dziś zamkniętą listę powodów, więc materiał do ich rozliczenia musi stać w
+    promptcie jako osobne pole.
+    """
+    headings = list(_TASK_SECTION_HEADING.finditer(text))
+    for index, match in enumerate(headings):
+        if match.group("name").strip().casefold() != name.casefold():
+            continue
+        end = (headings[index + 1].start() if index + 1 < len(headings)
+               else len(text))
+        return text[match.end():end].strip()
+    return ""
 
 
 def _untracked(project: str) -> list[str]:
@@ -1602,6 +1741,32 @@ def _story_reasons(data: dict, key: str) -> list[dict[str, str]]:
     return normalized
 
 
+def _sections_skipped(data: dict) -> list[dict[str, str]]:
+    """Znormalizuj deklarację świadomie pominiętych sekcji briefu.
+
+    Odpuszczenie sekcji jest legalnym ruchem — brief bywa dokumentem, w którym
+    część nagłówków to kontekst (podsumowanie, kryterium ukończenia), a nie
+    wymaganie. Musi być jednak DEKLARACJĄ, a nie zdaniem w `summary`: reguła
+    blokująca recenzentki liczy się z mapy, więc pominięcie widoczne wyłącznie
+    w prozie zostawiałoby kontrakt sprzeczny — prompt pozwalałby pominąć,
+    a recenzentka musiałaby zablokować.
+    """
+    items = data.get("sections_skipped", [])
+    if not isinstance(items, (list, tuple)):
+        raise InvalidDecision("pole `sections_skipped` musi być listą obiektów")
+    normalized: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise InvalidDecision("element sections_skipped musi być obiektem")
+        name = str(item.get("name", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+        if not name or not reason:
+            raise InvalidDecision(
+                "sections_skipped wymaga niepustych pól name i reason")
+        normalized.append({"name": name, "reason": reason})
+    return normalized
+
+
 def _require_product_owner(data: dict) -> None:
     _require_steering(data)
     added = data.get("stories_added", [])
@@ -1609,12 +1774,14 @@ def _require_product_owner(data: dict) -> None:
         raise InvalidDecision("pole `stories_added` musi być listą ID")
     dropped = _story_reasons(data, "stories_dropped")
     reopened = _story_reasons(data, "stories_reopened")
+    skipped = _sections_skipped(data)
     notebook = data.get("notebook", "")
     if not isinstance(notebook, str):
         raise InvalidDecision("pole `notebook` musi być tekstem")
     data["stories_added"] = [str(item).strip() for item in added if str(item).strip()]
     data["stories_dropped"] = dropped
     data["stories_reopened"] = reopened
+    data["sections_skipped"] = skipped
     data["notebook"] = notebook.strip()
 
 
@@ -1937,9 +2104,12 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             )
     if state.task_phase == "review":
         before_review = _tree_manifest(project)
+        task_text = _read_task_file(project, task)
         review_prompt = prompts.review_task_prompt_kiss(
             task["file"], start_tag=state.task_start_tag,
             changed=_changed(project, state.task_start_tag),
+            criteria=_task_section(task_text, "Kryteria akceptacji"),
+            contract=_task_section(task_text, "Publiczny kontrakt"),
             verdict_cmd=verdict_contract.command(cfg.runtime_dir, "review"))
         log(f"Zadanie {task['id']}: recenzja (świeży kontekst)…")
         review = _decision_with_retry(
@@ -1963,7 +2133,26 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
             _append_review_nits(cfg, project, task["id"], nits)
             ledger.append(project, f"{task['id']} review-nits: "
                                    f"{'; '.join(nits)[:160]}")
-        if review.status == "request_changes":
+        status = review.status
+        if status == "request_changes":
+            state.review_turns += 1
+            if state.review_turns > cfg.max_review_turns:
+                # Budżet blokad wyczerpany. Uwagi nie znikają — przestają tylko
+                # wstrzymywać commit. Recenzent, który po dwóch blokadach wciąż
+                # znajduje NOWE powody, ocenia już jakość lokalną, a nie
+                # spełnienie kryteriów zadania; kolejne okrążenie kosztuje trzy
+                # tury ról i nie kończy się inaczej.
+                status = "suggestions"
+                _append_review_nits(cfg, project, task["id"], review_notes)
+                log(f"Zadanie {task['id']}: {state.review_turns}. blokada "
+                    f"recenzji przy limicie {cfg.max_review_turns} — uwagi "
+                    "zdegradowane do sugestii, zadanie idzie dalej.")
+                ledger.append(
+                    project,
+                    f"{task['id']} review-degradacja: {state.review_turns} "
+                    f"blokad przy limicie {cfg.max_review_turns}; uwagi jako "
+                    f"sugestie: {'; '.join(review_notes)[:160]}")
+        if status == "request_changes":
             state.review_suggestions_pending = False
             state.review_notes = review_notes
             state.tester_handoff = (
@@ -1977,14 +2166,14 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
                 return True
             _checkpoint(project, state, "tester")
             return True
-        if review.status == "suggestions" or review_changes != "bez_zmian":
+        if status == "suggestions" or review_changes != "bez_zmian":
             # Jeden cykl domykający zamiast dwóch bramek. Uwagi drobne i
             # przypadkowy zapis read-only reviewera rozstrzyga TESTER i on
             # dostarcza — bez drugiej recenzji, bo to ona wcześniej odsyłała
             # zaakceptowaną pracę na kolejne okrążenie, w nieskończoność.
             state.review_notes = review_notes
             state.review_suggestions_pending = True
-            if review.status == "suggestions":
+            if status == "suggestions":
                 state.tester_handoff = (
                     "Reviewer zaakceptował bieżący diff z opcjonalnymi sugestiami. "
                     "Oceń każdą aktywną uwagę review, zastosuj albo odrzuć z powodem, "
@@ -2051,6 +2240,11 @@ def run_task(cfg: Config, project: str, state: State, logf) -> bool:
     if story and not any(str(item.get("story", "")).strip() == story
                          for item in state.task_queue):
         _set_story_status(project, story, "do weryfikacji")
+        state.story_closed_since_verify = True
+    # Kadencja weryfikacji liczy zadania domknięte, a nie iteracje: iteracja
+    # bywa turą roli, planowaniem albo przeglądem, a dowodu wymaga dopiero
+    # praca, która weszła do drzewa.
+    state.tasks_since_verify += 1
     commit_all(project, f"feat: {task['title']}", cfg)
     notebooks.remove(project, cfg.runtime_dir, task["id"])
     git(project, "tag", "-d", state.task_start_tag, check=False)
@@ -2104,17 +2298,27 @@ def _require_story_verification(data: dict) -> None:
 
 
 def phase_verify_stories(cfg: Config, project: str, state: State, logf) -> bool:
-    """Zweryfikuj historyjki oczekujące na dowód; pusty zbiór nic nie kosztuje."""
+    """Zweryfikuj historyjki oczekujące na dowód; pusty zbiór nic nie kosztuje.
+
+    Weryfikacji podlega WYŁĄCZNIE status `do weryfikacji`, czyli historyjka,
+    pod którą Forge naprawdę domknął zadanie. Nie ma tu żadnej gałęzi
+    „pierwszej inwentaryzacji": brała ona do sześciu dowolnych nieporzuconych
+    historyjek, więc razem z jedną domkniętą trafiał do weryfikatorki komplet
+    świeżo zaplanowanych `nowa`. Ta gałąź była nieszkodliwa dopóty, dopóki
+    weryfikacja praktycznie nie ruszała; po naprawie kadencji odpala już po
+    pierwszym commicie historyjki — i wtedy jej jedynym możliwym skutkiem jest
+    szkoda. `potwierdzona` na niezbudowanej historyjce zamyka ją jako
+    `zrobiona`, a `niepotwierdzona` przestawia ją na `w toku`, gdzie utyka bez
+    zadania, bo planista bierze pracę z `nowa`.
+
+    Cena rezygnacji jest znana i mała: backlog zmigrowany z prozy nie zostanie
+    zinwentaryzowany jednym wywołaniem. Wykonana już praca zostanie rozpoznana
+    przez zadanie, które ją zastanie — drożej o jedno zadanie, ale bez
+    zgadywania statusów przez rolę, która nie widziała, co powstało.
+    """
     candidates, _ = backlog.load(project)
-    touched = stories_touched_since(project, state.stories_verified_sha)
-    if not state.stories_verified_sha:
-        # Pierwsza inwentaryzacja migracji nie może udawać, że nic nie
-        # zrobiono tylko dlatego, że stare wpisy mają status `nowa`.
-        selected = [story for story in candidates if story.status != "porzucona"][:
-            cfg.max_backlog_stories]
-    else:
-        selected = [story for story in candidates
-                    if story.status == "do weryfikacji" or story.id in touched]
+    selected = [story for story in candidates
+                if story.status == "do weryfikacji"]
     if not selected:
         return False
 
@@ -2126,7 +2330,8 @@ def phase_verify_stories(cfg: Config, project: str, state: State, logf) -> bool:
         project, state, cfg, cycle_dir, sha=sha_before,
         targets=cfg.effective_verify_targets(state.verify_targets))
     stories_text = "\n".join(
-        f"- {story.id}: {story.check} (dlaczego: {story.why_now})"
+        f"- {story.id} [sekcja briefu: {story.brief_section or 'brak'}]: "
+        f"{story.check} (dlaczego: {story.why_now})"
         for story in selected)
     evidence_text = "\n".join(
         f"- {name}: rc={item.get('rc')}, log={item.get('log', '')}"
@@ -2170,6 +2375,8 @@ def phase_verify_stories(cfg: Config, project: str, state: State, logf) -> bool:
         encoding="utf-8")
     state.stories_verified_at_batch = state.plan_batches
     state.stories_verified_sha = verified_sha
+    state.tasks_since_verify = 0
+    state.story_closed_since_verify = False
     return True
 
 
@@ -2242,16 +2449,25 @@ def one_iteration(cfg: Config, project: str, state: State) -> bool:
     # ruszyło. Weryfikacja starego celu po zmianie kierunku byłaby stratą, więc
     # przegląd wyprzedza także ją.
     trigger = "" if state.current_task else _po_trigger(cfg, project, state)
+    # Weryfikacja historyjek jest własną fazą i wyprzedza KAŻDĄ turę Product
+    # Ownera, nie tylko kadencję. Dopóki wisiała pod jednym triggerem, refill
+    # ją zagładzał; dopóki wyprzedza wszystkie, PO nigdy nie planuje kierunku
+    # na backlogu bez dowodów. Pusty zbiór historyjek nic nie kosztuje.
+    if not state.current_task and _verification_due(
+            cfg, project, state, before_po=bool(trigger)):
+        _require_clean(project, "weryfikacją historyjek")
+        if phase_verify_stories(cfg, project, state, logf):
+            return True
     if trigger:
         _require_clean(project, "przeglądem kierunku")
+        # Raport dostaje każdy trigger, nie tylko `brief`. Kadencja uruchamiała
+        # dotąd weryfikację i mimo to szła do PO z pustym raportem, choć jej
+        # własny prompt każe „użyć raportu historyjek i dowodów" — dowód
+        # powstawał i był wyrzucany w tej samej iteracji.
         report = ""
-        if trigger == "cadence":
-            phase_verify_stories(cfg, project, state, logf)
-        elif trigger == "brief":
-            if (state.stories_verified_sha and
-                    state.plan_batches - state.stories_verified_at_batch
-                    < cfg.steering_batches):
-                report = _fresh_story_report(project, state)
+        if (state.plan_batches - state.stories_verified_at_batch
+                < cfg.steering_batches):
+            report = _fresh_story_report(project, state)
         phase_product_owner(cfg, project, state, logf, trigger,
                             story_report=report)
         return True

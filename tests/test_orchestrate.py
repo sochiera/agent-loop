@@ -435,13 +435,7 @@ def test_housekeeping_flags_oversized_documentation_index(tmp_path) -> None:
     assert "2 KB" in backlog
 
 
-def test_fifth_planning_batch_requests_technical_debt_task(tmp_path) -> None:
-    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "tests@example.test"],
-                   cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "Forge Tests"],
-                   cwd=tmp_path, check=True)
-    state = State(bootstrapped=True, plan_batches=4)
+def _planner_probe(tmp_path, state, cfg) -> list[str]:
     prompts_seen: list[str] = []
 
     def planner(prompt, *_args, **_kwargs):
@@ -451,12 +445,76 @@ def test_fifth_planning_batch_requests_technical_debt_task(tmp_path) -> None:
     with patch("forge.orchestrate._housekeeping"), \
          patch("forge.orchestrate._master_notes", return_value={}), \
          patch("forge.orchestrate.run_planner", side_effect=planner):
-        orchestrate.phase_plan_batch(
-            Config(git_push=False), str(tmp_path), state,
-            lambda phase: phase)
+        orchestrate.phase_plan_batch(cfg, str(tmp_path), state, lambda phase: phase)
+    return prompts_seen
 
-    assert state.plan_batches == 5
+
+def test_technical_debt_cadence_counts_tasks_not_batches(tmp_path) -> None:
+    """Kadencja długu technicznego przestaje zależeć od grubości wsadu.
+
+    Reguła „co piąty wsad" była kalibrowana przy wsadach po ~2,5 zadania, więc
+    realnie znaczyła „co ~12 zadań". Odkąd historyjka mieści się domyślnie w
+    jednym zadaniu, ten sam zapis wymuszałby dług dwa razy rzadziej — liczba
+    wsadów przestała być miarą wykonanej pracy.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.test"],
+                   cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Forge Tests"],
+                   cwd=tmp_path, check=True)
+    tasks = tmp_path / ".forge" / "tasks"
+    tasks.mkdir(parents=True)
+    cfg = Config(git_push=False, debt_every_tasks=12)
+
+    # Jedenaście zadań za sobą: jeszcze nie czas, choćby wsadów było wiele.
+    for number in range(1, 12):
+        tasks.joinpath(f"task-{number:03d}.md").write_text("x", encoding="utf-8")
+    state = State(bootstrapped=True, plan_batches=40)
+    assert "zadaniem długu technicznego" not in _planner_probe(
+        tmp_path, state, cfg)[0]
+
+    # Dwunaste zadanie domyka kadencję — niezależnie od licznika wsadów.
+    tasks.joinpath("task-012.md").write_text("x", encoding="utf-8")
+    assert "zadaniem długu technicznego" in _planner_probe(
+        tmp_path, state, cfg)[0]
+    # Planista zgłosił `no_more_tasks`, więc wymóg PADŁ NA PUSTO i kadencja
+    # zostaje nienaruszona. Zapis licznika przed planowaniem zjadałby ją tutaj:
+    # dług wróciłby dopiero po kolejnych dwunastu zadaniach.
+    assert state.debt_at_task == 0
+    assert "zadaniem długu technicznego" in _planner_probe(
+        tmp_path, state, cfg)[0]
+
+
+def test_debt_cadence_is_consumed_only_by_a_batch_that_really_happened(
+        tmp_path) -> None:
+    """Dopiero utworzony wsad zdejmuje wymóg długu; pusty go nie zjada."""
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.test"],
+                   cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Forge Tests"],
+                   cwd=tmp_path, check=True)
+    tasks = tmp_path / ".forge" / "tasks"
+    tasks.mkdir(parents=True)
+    for number in range(1, 13):
+        tasks.joinpath(f"task-{number:03d}.md").write_text("x", encoding="utf-8")
+    cfg = Config(git_push=False, debt_every_tasks=12)
+    state = State(bootstrapped=True)
+    prompts_seen: list[str] = []
+
+    def planner(prompt, *_args, **_kwargs):
+        prompts_seen.append(prompt)
+        tasks.joinpath("task-013.md").write_text("opis", encoding="utf-8")
+        return ('{"no_more_tasks":false,"tasks":[{"id":"task-013",'
+                '"title":"Dług","file":".forge/tasks/task-013.md",'
+                '"story":"","depends_on":[],"difficulty":"standard"}]}')
+
+    with patch("forge.orchestrate._housekeeping"), \
+         patch("forge.orchestrate._master_notes", return_value={}), \
+         patch("forge.orchestrate.run_planner", side_effect=planner):
+        orchestrate.phase_plan_batch(cfg, str(tmp_path), state, lambda phase: phase)
+
     assert "zadaniem długu technicznego" in prompts_seen[0]
+    assert state.debt_at_task == 13
 
 
 def test_agent_runtime_dirs_are_excluded_from_the_repo(tmp_path) -> None:

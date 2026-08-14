@@ -2,6 +2,26 @@
 
 Dokument wykonawczy. Diagnoza jest w sekcji 1, design i strumienie dalej.
 
+> **Stan: wdrożone, ale CZĘŚCIOWO ZASTĄPIONE.** Przebieg z 13–14.08.2026
+> pokazał, że opisana tu maszyna zaciska się sama: `refill` wyprzedzał
+> `cadence` i ją zerował, więc weryfikacja historyjek nie ruszyła ani razu
+> przez dwadzieścia wsadów; `count_open` liczył wyłącznie `nowa`, więc licznik
+> spadał do zera po każdym domkniętym zadaniu, podczas gdy Product Owner
+> widział cały plik i czytał go jako zakaz poszerzania backlogu. Aktualny opis
+> maszyny jest w [PIPELINE.md](PIPELINE.md). Zmienione względem tego dokumentu:
+>
+> | tu opisane | dziś |
+> |---|---|
+> | kolejność `brief` → `refill` → `cadence` | `brief` → `start` → `cadence` → `refill` |
+> | `count_open` = historyjki `nowa` | `nowa` + `w toku` + `do weryfikacji` |
+> | weryfikacja jako gałąź `cadence` | własna faza, wyprzedza każdą turę PO |
+> | pierwszy backlog = 3 historyjki na demo | po jednej historyjce na sekcję briefu |
+> | recenzentka pyta o „najcieńszy sensowny przyrost" | o JEDNĄ zdolność; za cienki = za gruby |
+> | brak mapy pokrycia briefu | `coverage.py` jako twarde wejście PO i recenzentki |
+>
+> Sekcje poniżej zostają jako zapis rozumowania i historii decyzji; nie czytaj
+> ich jako opisu bieżącego zachowania.
+
 ## 0. Stan po przeglądzie
 
 Pięć uwag z przeglądu, wszystkie przyjęte i wprowadzone do designu:
@@ -314,7 +334,7 @@ Parser stojący przed recenzentem oszczędza przy okazji wywołania: źle
 sformatowana tura nigdy nie dociera do modelu recenzenta.
 
 **Poziom 2 — miękkie oceny semantyczne.** Zostają uwagami recenzenta PO (§S8):
-czy przyrost jest najcieńszy sensowny, czy teza wynika z dowodów, czy
+czy plasterek odpowiada jednej zdolności użytkownika, czy teza wynika z dowodów, czy
 `goal_reached` jest uczciwe, czy historyjka faktycznie opisuje wynik, a nie
 rozwiązanie. Tego parser nie policzy i nie ma udawać, że potrafi.
 
@@ -520,8 +540,12 @@ historyjek stoi w backlogu" — miara bezpośrednia zamiast pochodnej.
 | wyzwalacz | warunek | weryfikator przed PO |
 |---|---|---|
 | `brief` | skrót briefu ≠ snapshot | nie (reuse raportu) |
-| `refill` | < `FORGE_BACKLOG_LOW_WATER` (2) historyjek o statusie `nowa` | nie |
 | `cadence` | `plan_batches - steered_at_batch >= FORGE_STEERING_BATCHES` | **tak** |
+| `refill` | < `FORGE_BACKLOG_LOW_WATER` (2) historyjek NIEDOMKNIĘTYCH | **tak** |
+
+> Kolejność i warunek poprawione po awarii z 13–14.08.2026 — patrz nota
+> na początku dokumentu. Weryfikacja nie jest już gałęzią `cadence`,
+> tylko własną fazą wyprzedzającą każdy z tych wyzwalaczy.
 
 Wszystkie sprawdzane **wyłącznie na granicy zadań przy pustej kolejce** —
 warunek z `_steering_trigger` zostaje bez zmian i nie wolno go „uprościć"
@@ -577,7 +601,10 @@ miejsce, z którego zdejmuje się kontrolę. Ale zmienia profil i cenę.
   2. czy teza o kierunku wynika z raportu weryfikatora, a nie z domysłu;
   3. czy nic nie zniknęło bez wpisu w `stories_dropped`;
   4. czy `goal_reached` jest uczciwe wobec raportu;
-  5. czy przyrost jest najcieńszy sensowny.
+  5. czy plasterek odpowiada JEDNEJ zdolności użytkownika (za cienki jest
+     tak samo wadliwy jak za gruby);
+  6. czy przyrost otwiera sekcję briefu wskazaną przez mapę pokrycia —
+     to jedyny powód blokady.
 
 To ocena obiektywna, więc `strong` wystarcza — nie potrzeba dwóch `max` na
 rundę.

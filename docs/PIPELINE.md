@@ -21,6 +21,15 @@ fingerprint drzewa jest identyczny jak przy poprzednim powrocie, zwiększa
 licznik; `max_review_cycles` (domyślnie 3) przekroczony kończy zadanie jako
 `PORZUCONE: review_loop`. Realna zmiana w drzewie zeruje licznik.
 
+Osobno liczony jest CHURN, czyli okrążenia produktywne. `max_review_turns`
+(domyślnie 2) ogranicza liczbę blokad `request_changes` w jednym zadaniu;
+kolejna degraduje się do `suggestions`, a uwagi trafiają do `nits.md`. Dwa
+liczniki, bo mierzą co innego: recenzent zgłaszający za każdym razem INNĄ
+uwagę, którą koder stosuje, nigdy nie trafia w licznik jałowy — drzewo się
+zmienia, więc tamten wraca do zera. Degradacja jest właściwą reakcją, bo
+jedyną alternatywą jest `_fail_task`, czyli `git reset --hard` i utrata całej
+pracy nad zadaniem.
+
 ## Bootstrap, preflight i Product Owner
 
 Projekt prowadzimy zwinnie: zakres nie jest ustalany z góry, tylko rośnie w
@@ -52,20 +61,42 @@ zajdzie którykolwiek warunek:
 - **zmiana briefu** (skrót różny od snapshotu) — najmocniejsze wejście, wygrywa
   z pozostałymi powodami;
 - **start** — backlogu nie ma wcale i żaden refill jeszcze nie padł, czyli PO
-  zakłada pierwszą kolejkę po bootstrapie: maksymalnie 3 historyjki prowadzące
-  do uruchamialnego demo;
+  zakłada pierwszą kolejkę po bootstrapie. Ta jedna tura planuje KSZTAŁT CAŁEGO
+  MVP: po jednej historyjce na każdą sekcję briefu, w najcieńszej wersji, bez
+  głębi. Sekcję będącą kontekstem, a nie wymaganiem, PO zgłasza deklaracją
+  `sections_skipped`;
 - **kadencja** — minęły `FORGE_STEERING_BATCHES` (domyślnie 2) wsady planisty
-  od ostatniego przeglądu, czyli co 2×`FORGE_BATCH_SIZE` = 16 zadań;
-- **refill** — otwartych historyjek jest mniej niż `FORGE_BACKLOG_LOW_WATER`
-  (domyślnie 2);
+  od ostatniego przeglądu. Stoi PRZED refillem: odwrotna kolejność ją
+  zagładzała, bo refill odpala z niskiego stanu kolejki, a ten wraca po każdym
+  domknięciu;
+- **refill** — niedomkniętych historyjek jest mniej niż
+  `FORGE_BACKLOG_LOW_WATER` (domyślnie 2). Niedomknięta to `nowa`, `w toku`
+  albo `do weryfikacji` — jedna definicja wspólna z sufitem, który czyta PO.
+  Licznik liczący samo `nowa` zerował się przy każdym domknięciu zadania i
+  właśnie ta rozbieżność robiła z procesu zacisk;
 - **wyczerpany backlog** — planista zgłosił `no_more_tasks` i to jest bezpiecznik
   refill.
 
+Weryfikacja historyjek jest osobną fazą, nie gałęzią przeglądu, i wyprzedza
+KAŻDĄ turę Product Ownera; poza tym rusza po domknięciu historyjki albo po
+`FORGE_VERIFY_EVERY_TASKS` (domyślnie 3) zadaniach. Ocenia wyłącznie status
+`do weryfikacji` — nigdy `nowa`, bo weryfikatorka nie widziała, co powstało, a
+`potwierdzona` na niezbudowanej historyjce zamknęłaby ją jako `zrobiona`.
+
 Rola dostaje powód uruchomienia, diff briefu (tylko gdy się zmienił), raport
-weryfikatora historyjek przy kadencji, listę niezaczętych zadań, notatkę
-parkingu, nierozstrzygnięte uwagi recenzenta architektury (`.forge/po-handoff.md`
-— materiał, nie zobowiązanie) i ścieżkę notatnika; `docs/PROJECT.md`
-i `BACKLOG.md` czyta sama. Wolno jej zapisać wyłącznie te dwa pliki — każdą inną
+weryfikatora historyjek, **mapę pokrycia briefu**, listę niezaczętych zadań,
+notatkę parkingu, nierozstrzygnięte uwagi recenzenta architektury
+(`.forge/po-handoff.md` — materiał, nie zobowiązanie) i ścieżkę notatnika;
+`docs/PROJECT.md` i `BACKLOG.md` czyta sama.
+
+Mapa pokrycia (`coverage.py`) wiąże sekcje briefu z historyjkami przez pole
+`Sekcja briefu:` i liczy stan każdej sekcji DETERMINISTYCZNIE z backlogu:
+`brak`, `szkielet`, `jest` albo `pominięta`. Z mapy Forge wylicza wiersz
+`NASTĘPNA SEKCJA DO OTWARCIA` — największą pustą, a gdy pustych nie ma,
+największą rozgrzebaną. To jedyny powód, dla którego recenzentka PO może
+zablokować turę; reguła milczy, gdy brief nie ma sekcji albo gdy mapa jest
+NIEPEŁNA (istnieją historyjki bez rozpoznanej sekcji). Miękki sufit backlogu
+zostaje podniesiony do rozmiaru mapy, dopóki mapa nie jest rozliczona. Wolno jej zapisać wyłącznie te dwa pliki — każdą inną
 zmianę Forge wykrywa manifestem drzewa i cofa, zanim cokolwiek trafi do commita.
 Bramka kotwiczy się na SHA sprzed fazy, nie na bieżącym HEAD: własny commit roli
 albo recenzenta jest wycofywany (`reset --mixed`), więc nie da się przemycić
@@ -79,9 +110,11 @@ promptcie zatrzymuje przegląd z prośbą o podział dokumentu.
 
 Kierunek jest recenzowany, bo błąd na tym poziomie propaguje się na wszystkie
 kolejne zadania. Świeży recenzent (`bootstrap_reviewer`, najsilniejszy
-model) ocenia kierunek, nie styl: czy zmiana wynika ze stanu projektu, czy krok
-jest najcieńszym sensownym przyrostem, czy nic nie zniknęło po cichu i czy
-`goal_reached` jest uczciwe. `request_changes` wraca do roli przeglądu z uwagami;
+model) ocenia kierunek, nie styl: czy zmiana wynika ze stanu projektu, czy
+plasterek odpowiada jednej zdolności użytkownika (za cienki jest tak samo
+wadliwy jak za gruby), czy nic nie zniknęło po cichu i czy `goal_reached` jest
+uczciwe. Blokować wolno mu wyłącznie za pokrycie mapy; każda inna uwaga jest
+`suggestions`. `request_changes` wraca do roli przeglądu z uwagami;
 budżet to `FORGE_MAX_BOOTSTRAP_REVIEWS` (domyślnie 4) recenzji. Wyczerpanie
 budżetu cofa zmiany i zatrzymuje przebieg z checkpointem — dalej potrzebna jest
 decyzja użytkownika.
@@ -193,7 +226,19 @@ Po decyzji `review` świeży, read-only reviewer wykonuje zwykłe code review:
 szuka błędów, przypadków brzegowych, naruszeń kontraktu i SOLID/KISS, design
 smells, zbędnej złożoności, duplikacji, mylących nazw oraz testów bez wartości.
 Nie zastępuje pełnej bramki, ale może uruchomić wąski test dla konkretnego
-podejrzenia. `approve` wymaga pustej listy uwag. `suggestions` jest dozwolone
+podejrzenia. Dostaje kryteria akceptacji i publiczny kontrakt zadania jako
+osobne pola promptu, nie samą ścieżkę pliku — bo werdykt blokujący ma się
+rozliczyć z konkretnego kryterium.
+
+`request_changes` ma ZAMKNIĘTĄ listę dwóch powodów: złamanie kryterium
+akceptacji albo regresja publicznego kontraktu. Wszystko inne — routing
+brzegowy, kruche asercje, kolejny wariant walidacji, jakość testu, nazewnictwo,
+duplikacja — jest `suggestions` albo `nits`. Granica jest wąska celowo: w
+mierzonym biegu 45% werdyktów blokowało, a pojedyncze zadania traciły po
+dziesięć rund na uwagach spoza własnych kryteriów. Regresji nikt przez to nie
+przepuszcza — pełny pakiet testów jest bramką przed commitem po werdykcie.
+
+`approve` wymaga pustej listy uwag. `suggestions` jest dozwolone
 tylko wtedy, gdy diff można bezpiecznie commitować bez zastosowania uwag.
 Tester ocenia każdą sugestię, może sam poprawić testy albo przekazać
 zaakceptowaną zmianę koderowi, a następnie wybiera `finalize`. Jeśli poprawki
@@ -311,6 +356,15 @@ Zadania niosą pole `story`, a Forge deterministycznie przeprowadza statusy
 niepotwierdzeniu. Weryfikator historyjek wykonuje zewnętrzne `Sprawdzenie:` i
 zapisuje raport z `verified_at_batch` oraz `verified_sha`; nie czyta diffu i nie
 zastępuje code review. Niezgodny nagłówek raportu oznacza brak świeżego raportu.
+Raport trafia do Product Ownera przy KAŻDYM triggerze — kadencja uruchamiała go
+kiedyś i szła do PO z pustym raportem, więc dowód powstawał i był wyrzucany w
+tej samej iteracji.
+
+Backlog migrowany ze starszego formatu nie musi uzupełnić pola `Sekcja briefu:`
+w jednej turze: walidator wymaga go wyłącznie od historyjek nowych w danej
+turze, a mapa oznacza się wtedy jako NIEPEŁNA i sama wyłącza regułę blokującą.
+Żądanie kilkunastu uzupełnień naraz zderzyłoby pierwszą turę z budżetem korekt,
+czyli z twardą awarią biegu.
 
 Kanoniczna pełna suita repozytorium:
 

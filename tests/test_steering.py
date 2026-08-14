@@ -113,12 +113,25 @@ def test_first_backlog_after_bootstrap_fires_the_start_trigger(
     assert orchestrate._po_trigger(cfg, str(project), state) == ""
 
 
-def test_start_prompt_asks_only_for_the_thinnest_demo_slice() -> None:
+def test_start_prompt_asks_for_the_whole_mvp_map() -> None:
+    """Ten test strzegł wcześniej dokładnej odwrotności tego, czego chcemy.
+
+    Po przepisaniu promptu startu asercja „maksymalnie 3 historyjki" nadal
+    przechodziła — trafiała w akapit, który cytuje starą regułę jako opis
+    nieudanego przebiegu. Test zielony, a chroniona reguła odwrotna: dlatego
+    sprawdzamy teraz zapis instrukcji, a nie fragment uzasadnienia.
+    """
     prompt = prompts.product_owner_prompt(trigger="start")
 
     assert "Pierwszy backlog projektu" in prompt
-    assert "maksymalnie 3 historyjki" in prompt
     assert "BACKLOG.md\nmoże nie istnieć" in prompt
+    assert "KSZTAŁT CAŁEGO MVP" in prompt
+    assert "Każda sekcja mapy pokrycia dostaje dokładnie jedną historyjkę" in prompt
+    assert "ŻADNEJ GŁĘBI" in prompt
+    # Pominięcie sekcji jest legalne WYŁĄCZNIE jako deklaracja — inaczej
+    # kontrakt startu i reguła blokująca recenzentki byłyby sprzeczne.
+    assert "zgłoś ją w `sections_skipped`" in prompt
+    assert "NIE pomijaj jej milczeniem ani zdaniem w `summary`" in prompt
 
 
 def test_start_turn_creates_the_backlog_from_scratch(tmp_path: Path) -> None:
@@ -358,6 +371,75 @@ def test_iteration_reviews_direction_before_planning(tmp_path: Path) -> None:
 
     assert po.call_args.args[4] == "cadence"
     plan.assert_not_called()
+
+
+def test_iteration_proves_stories_before_letting_the_product_owner_plan(
+        tmp_path: Path) -> None:
+    """Weryfikacja jest własną fazą i wyprzedza KAŻDĄ turę Product Ownera.
+
+    Dopóki wisiała pod triggerem `cadence`, refill ją zagładzał: odpalał z
+    niskiego stanu kolejki, a ten wracał po każdym domknięciu. W mierzonym
+    biegu weryfikacja nie ruszyła ani razu przez dwadzieścia wsadów, więc
+    `zrobiona` nie powstało nigdy, a rosnąca zaległość wyglądała dla PO jak
+    zakaz poszerzania zakresu.
+    """
+    project, state, cfg = _po_repo(tmp_path)
+    Path(project, "BACKLOG.md").write_text(
+        BACKLOG.replace("[nowa]", "[do weryfikacji]"), encoding="utf-8")
+    _git(project, "commit", "-qam", "historyjka czeka na dowód")
+    cfg.backlog_low_water = 9
+
+    order: list[str] = []
+    with patch("forge.orchestrate.phase_verify_stories",
+               side_effect=lambda *a, **k: order.append("verify") or True) as verify, \
+         patch("forge.orchestrate.phase_product_owner",
+               side_effect=lambda *a, **k: order.append("po")) as po:
+        orchestrate.one_iteration(cfg, str(project), state)
+
+    verify.assert_called_once()
+    po.assert_not_called()
+    assert order == ["verify"]
+
+
+def test_verification_never_judges_stories_that_were_only_planned(
+        tmp_path: Path) -> None:
+    """Weryfikacji podlega wyłącznie `do weryfikacji`, nigdy `nowa`.
+
+    Dawna gałąź „pierwszej inwentaryzacji" brała do sześciu dowolnych
+    nieporzuconych historyjek, więc razem z jedną domkniętą trafiał do
+    weryfikatorki komplet świeżo zaplanowanych. Było to nieszkodliwe dopóty,
+    dopóki weryfikacja praktycznie nie ruszała; po naprawie kadencji odpala już
+    po pierwszym commicie historyjki i jej jedynym możliwym skutkiem byłaby
+    szkoda: `potwierdzona` zamyka niezbudowaną historyjkę jako `zrobiona`,
+    a `niepotwierdzona` przestawia ją na `w toku`, gdzie utknie bez zadania,
+    bo planista bierze pracę z `nowa`.
+    """
+    project, state, cfg = _po_repo(tmp_path)
+    Path(project, "BACKLOG.md").write_text(
+        BACKLOG.replace("[nowa]", "[do weryfikacji]")
+        + "\n## US-002 — Dopiero zaplanowana  [nowa]\n\n"
+        "Jako użytkownik chcę czegoś.\n\n"
+        "- Dlaczego teraz: dowód.\n- Sprawdzenie: uruchom demo.\n",
+        encoding="utf-8")
+    _git(project, "commit", "-qam", "jedna czeka na dowód, druga dopiero stoi")
+    seen: list[str] = []
+
+    def agent(_name, prompt, *_args, **_kwargs):
+        seen.append(prompt)
+        return ('{"stories":[{"id":"US-001","status":"potwierdzona",'
+                '"evidence":"demo działa"}],"verdict":"complete","notes":[]}')
+
+    with patch("forge.agents.run_agent", side_effect=agent), \
+         patch("forge.orchestrate.verify.collect_evidence", return_value={}):
+        assert orchestrate.phase_verify_stories(
+            cfg, str(project), state, lambda phase: phase)
+
+    assert "US-001" in seen[0]
+    assert "US-002" not in seen[0]
+    backlog_text = Path(project, "BACKLOG.md").read_text(encoding="utf-8")
+    assert "## US-001 — Pierwszy wynik  [zrobiona]" in backlog_text
+    # Historyjka wyłącznie zaplanowana zostaje tam, gdzie planista ją znajdzie.
+    assert "## US-002 — Dopiero zaplanowana  [nowa]" in backlog_text
 
 
 def test_iteration_never_reviews_during_an_active_task(tmp_path: Path) -> None:

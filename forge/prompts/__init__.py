@@ -75,7 +75,8 @@ def product_owner_prompt(*, trigger: str, brief_diff: str = "",
                          story_report: str = "", queued_tasks=None,
                          parked: str = "", migration: bool = False,
                          notebook_path: str = "", review_notes=None,
-                         max_backlog: int = 6, handoff: str = "") -> str:
+                         max_backlog: int = 6, handoff: str = "",
+                         coverage: str = "") -> str:
     """Prompt PO niesie wyłącznie wejścia, których nie ma w jego plikach."""
     corrections = _corrections("po-corrections.md", review_notes)
     parked_text = render("po-parked.md", PARKED_TEXT=parked) if parked else ""
@@ -99,6 +100,7 @@ def product_owner_prompt(*, trigger: str, brief_diff: str = "",
         NOTEBOOK=notebook,
         CORRECTIONS=corrections,
         MAX_BACKLOG=max_backlog,
+        COVERAGE=coverage or "(mapa pokrycia niedostępna)",
     )
 
 
@@ -116,14 +118,26 @@ def _story_reasons_block(items) -> str:
     return "\n".join(lines) or "(brak)"
 
 
-def po_review_prompt(result: dict, *, max_backlog: int = 6) -> str:
+def _sections_skipped_block(items) -> str:
+    """Lista ``{name, reason}`` odpuszczonych sekcji — jeszcze nie w mapie."""
+    lines = [
+        f"- {str(item.get('name', '?'))}: {str(item.get('reason', '')).strip()}"
+        for item in (items or []) if isinstance(item, dict)
+    ]
+    return "\n".join(lines) or "(brak)"
+
+
+def po_review_prompt(result: dict, *, max_backlog: int = 6,
+                     coverage: str = "") -> str:
     return render(
         "po-review.md",
         SUMMARY=str(result.get("summary", "(brak)")),
         GOAL_REACHED="tak" if result.get("goal_reached") else "nie",
         DROPPED=_story_reasons_block(result.get("stories_dropped")),
         REOPENED=_story_reasons_block(result.get("stories_reopened")),
+        SKIPPED=_sections_skipped_block(result.get("sections_skipped")),
         MAX_BACKLOG=max_backlog,
+        COVERAGE=coverage or "(mapa pokrycia niedostępna)",
     )
 
 
@@ -340,12 +354,22 @@ def coder_task_prompt(
 
 def review_task_prompt_kiss(
         task_file: str, *, start_tag: str, changed: list[str],
+        criteria: str = "", contract: str = "",
         verdict_cmd: str = "") -> str:
+    """Prompt recenzenta zadania.
+
+    ``criteria`` i ``contract`` idą jako osobne pola, a nie jako zachęta do
+    przeczytania pliku zadania. Werdykt blokujący ma zamkniętą listę powodów i
+    musi się rozliczyć z konkretnego kryterium — recenzent, który dostaje samą
+    ścieżkę, mierzy diff własnym wyobrażeniem o kompletności modułu.
+    """
     return render(
         "reviewer.md",
         TASK_FILE=task_file,
         START_TAG=start_tag,
         CHANGED=", ".join(changed) or "(brak)",
+        CRITERIA=criteria.strip() or "(brak — nie blokuj z tego powodu)",
+        CONTRACT=contract.strip() or "(brak — nie blokuj z tego powodu)",
         VERDICT=verdict_commit(verdict_cmd),
     )
 

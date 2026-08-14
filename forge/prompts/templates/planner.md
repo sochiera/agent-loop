@@ -17,7 +17,21 @@ osobny przegląd kierunku, nie ty. Planuj to, co realnie stoi w backlogu, i
 zwróć `no_more_tasks`, gdy nie ma z czego planować — wtedy przegląd kierunku
 wskaże następny przyrost. Nie wymyślaj pracy na zapas.
 
-Przygotuj maksymalnie {{BATCH_SIZE}} małych zadań od task-{{START_INDEX}};
+JEDNA HISTORYJKA TO DOMYŚLNIE JEDNO ZADANIE. Zdolność użytkownika planuj w
+całości: publiczny kontrakt, ekran i test w tym samym zadaniu. Podział na dwa
+zadania jest dopuszczalny wyłącznie wtedy, gdy między nimi istnieje PRAWDZIWA
+zależność techniczna, którą zapiszesz w `depends_on` — a nie dlatego, że jedna
+połowa dotyczy API, a druga interfejsu.
+
+Zakazana jest w szczególności para „publiczny kontrakt X" i „to samo X na
+ekranie". Obie połówki dotykają tego samego kodu, wymagają tej samej wiedzy o
+całości i przechodzą przez pełny cykl tester→koder→recenzja osobno. To podwaja
+najdroższą, w pełni szeregową część procesu i nie skraca żadnej rundy: w
+mierzonym biegu sześć takich par kosztowało dwanaście pełnych cykli zamiast
+sześciu. Zadanie ma być małe w sensie zakresu zmiany, a nie pocięte w poprzek
+jednej zdolności.
+
+Przygotuj maksymalnie {{BATCH_SIZE}} zadań od task-{{START_INDEX}};
 zapisz każde w .forge/tasks/task-NNN.md. Identyfikator musi mieć dokładnie
 format `task-NNN` (litera w numerze, prefiks albo sufiks powodują odrzucenie
 zadania) — Forge wylicza z niego numer następnego wsadu. Wariant zadania zapisz
