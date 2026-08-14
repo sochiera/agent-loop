@@ -64,12 +64,17 @@ MODEL_LEVEL_ROUTING: dict[str, dict[str, tuple[str, str]]] = {
         "strong": ("opus", "medium"),
         "max": ("opus", "high"),
     },
+    # Jeden model na wszystkich poziomach, więc całą różnicę robi effort —
+    # Grok przyjmuje ich cztery (low/medium/high/xhigh), co pokrywa skalę
+    # poziomów bez powtarzania punktu pracy poza dwoma najniższymi.
+    # Most OpenCode nazywa najwyższy wariant `max`, nie `xhigh` (patrz
+    # catalog.configured_efforts) — to ta sama pozycja pod inną nazwą.
     "grok": {
-        "economy": ("grok-4.5", "low"),
-        "efficient": ("grok-4.5", "low"),
-        "balanced": ("grok-4.5", "medium"),
-        "strong": ("grok-4.5", "high"),
-        "max": ("grok-4.5", "high"),
+        "economy": ("grok-4.6", "low"),
+        "efficient": ("grok-4.6", "low"),
+        "balanced": ("grok-4.6", "medium"),
+        "strong": ("grok-4.6", "high"),
+        "max": ("grok-4.6", "xhigh"),
     },
     # Cienkie role na dwóch najniższych poziomach jadą Luną; GLM-5.2 zostaje
     # dla poziomu balanced. STRONG i MAX idą przez Token Plan do Qwen3.8 Max.

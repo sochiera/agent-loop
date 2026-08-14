@@ -498,9 +498,9 @@ class ModelChooserTest(unittest.TestCase):
         self.assertEqual(chooser.value(),
                          ("opencode", "openai/gpt-5.6-sol", "max"))
 
-        chooser.set_value("grok", "grok-4.5", "high")
+        chooser.set_value("grok", "grok-4.6", "high")
         self.assertEqual(chooser.value(),
-                         ("opencode", "xai/grok-4.5", "high"))
+                         ("opencode", "xai/grok-4.6", "high"))
 
 
 @needs_gtk
@@ -1076,7 +1076,7 @@ class RunProfilesTest(unittest.TestCase):
         mixed = self.window.profiles.create("Trzy narzędzia")
         self.window.edit_profile(mixed.slug)
         self._pick("coder", "complex", "opus")
-        self._pick("tester", "standard", "grok-4.5")
+        self._pick("tester", "standard", "grok-4.6")
         beta.set_profile(mixed.slug)
 
         alfa_models = {self.window.run_routing(alfa).slot(role, difficulty).model
@@ -1087,7 +1087,7 @@ class RunProfilesTest(unittest.TestCase):
         self.assertEqual(alfa_models, {"openai/gpt-5.6-luna"})
         self.assertEqual(beta_routing.slot("coder", "complex").agent, "claude")
         self.assertEqual(beta_routing.slot("tester", "standard").model,
-                         "xai/grok-4.5")
+                         "xai/grok-4.6")
         self.assertEqual(beta_routing.slot("coder", "simple").model,
                          "openai/gpt-5.6-luna")
 

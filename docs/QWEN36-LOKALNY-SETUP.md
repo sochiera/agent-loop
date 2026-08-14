@@ -458,7 +458,7 @@ Ceny z `~/.config/opencode/opencode.json` ($/M tokenów). Prędkości lokalne zm
 | `qwen3.5-397b` / `-fast` | NeuralWatt | 397B MoE | 262k | 0.69 / 4.14 | wyraźnie wyżej |
 | `kimi-k2.7-code` / `-flex` | NeuralWatt | frontier, kod | 262k | 0.95 / 4.00 | wyraźnie wyżej |
 | `glm-5.2` (4 warianty) | NeuralWatt | frontier MoE | 1M | 1.45 / 4.50 | wyraźnie wyżej |
-| `grok-4.5` | xAI (forge) | frontier | — | — | wyraźnie wyżej |
+| `grok-4.6` | xAI (forge) | frontier | — | — | wyraźnie wyżej |
 | Claude Opus 5 | Anthropic | frontier | — | — | wyraźnie wyżej |
 
 > Podział na półki dla modeli chmurowych to **ocena po klasie parametrów i cenniku**,

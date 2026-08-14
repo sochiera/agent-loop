@@ -6,10 +6,10 @@ odwrotne niż konfiguracja: czym da się uruchomić dany model. Jeden model bywa
 osiągalny kilkoma TRASAMI (``Route``) i dopiero wtedy GUI pyta o dostawcę:
 
 - modele GPT → wyłącznie most OpenCode (np. ``openai/gpt-5.6-luna``);
-- modele Grok → wyłącznie most OpenCode (np. ``xai/grok-4.5``);
+- modele Grok → wyłącznie most OpenCode (np. ``xai/grok-4.6``);
 - ``glm-5.2`` → OpenCode u każdego dostawcy, który go serwuje (dziś
   ``zai-coding-plan``, a po dopisaniu drugiego — obu naraz);
-- ``sonnet``, ``grok-4.5``, ``qwen3.8-max`` → dokładnie jedna trasa,
+- ``sonnet``, ``grok-4.6``, ``qwen3.8-max`` → dokładnie jedna trasa,
   więc pytanie o dostawcę byłoby pustym klikiem.
 
 Tożsamością modelu jest NAGA nazwa: prefiks ``provider/`` z modeli OpenCode
@@ -48,7 +48,7 @@ EFFORTS: dict[str, tuple[str, ...]] = {
     "claude": ("", "low", "medium", "high"),
     "codex": ("", "low", "medium", "high", "xhigh"),
     "opencode": ("", "low", "medium", "high", "max"),
-    "grok": ("", "low", "medium", "high"),
+    "grok": ("", "low", "medium", "high", "xhigh"),
     "kiro": ("", "low", "medium", "high"),
 }
 DEFAULT_EFFORTS: tuple[str, ...] = ("", "low", "medium", "high", "max")

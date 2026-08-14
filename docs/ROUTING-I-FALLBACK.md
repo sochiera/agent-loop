@@ -110,7 +110,7 @@ pojawia się tylko przy modelu, który tras ma więcej:
 | `gpt-5.6-luna` | `codex` • `opencode · openai` |
 | `sonnet` | `claude` • `kiro` |
 | `glm-5.2` | tyle, ilu dostawców OpenCode go serwuje |
-| `grok-4.5`, `haiku`, `qwen3.8-max`, … | jedna — pokrętła nie ma |
+| `grok-4.6`, `haiku`, `qwen3.8-max`, … | jedna — pokrętła nie ma |
 
 Dostawcy OpenCode są tu osobnymi trasami, bo to oni różnią się ceną, limitem i
 opóźnieniem. Kolejność tras stawia natywne CLI przed mostem OpenCode: mają

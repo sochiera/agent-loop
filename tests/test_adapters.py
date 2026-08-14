@@ -137,7 +137,7 @@ class GenericSpecTest(unittest.TestCase):
             spec.template,
             {"prompt": "journal", "prompt_file": "/tmp/prompt.md",
              "system": "rules", "schema": '{"type":"object"}',
-             "model": "grok-4.5", "effort": "low", "project": "/p",
+             "model": "grok-4.6", "effort": "low", "project": "/p",
              "output": ""},
         )
         for flag in (
@@ -235,7 +235,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
         cfg = Config(coder_agent="grok", coder_model="", codex_model="gpt-x")
         agent, model, effort = cfg.role("coder")
         self.assertEqual(agent, "grok")
-        self.assertEqual(model, "grok-4.5")
+        self.assertEqual(model, "grok-4.6")
         self.assertEqual(effort, "low")
 
     def test_unknown_generic_role_keeps_legacy_fields(self) -> None:
@@ -275,7 +275,7 @@ class ConfigRoleResolutionTest(unittest.TestCase):
     def test_known_generic_routing_reaches_template_arguments(self) -> None:
         """Routing providera musi trafić do argv, nie tylko do Config.role()."""
         for agent, role, difficulty, expected in (
-            ("grok", "coder", "complex", ("grok-4.5", "medium")),
+            ("grok", "coder", "complex", ("grok-4.6", "medium")),
             ("opencode", "reviewer", "standard",
              ("zai-coding-plan/glm-5.2", "high")),
             ("opencode", "reviewer", "complex",

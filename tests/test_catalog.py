@@ -83,10 +83,10 @@ class TestIndex:
         ]
 
     def test_grok_is_exposed_only_through_opencode(self) -> None:
-        entry = _entry(catalog.index({}), "grok-4.5")
+        entry = _entry(catalog.index({}), "grok-4.6")
 
         assert [(route.agent, route.model) for route in entry.routes] == [
-            ("opencode", "xai/grok-4.5"),
+            ("opencode", "xai/grok-4.6"),
         ]
 
     def test_two_opencode_providers_of_one_model_are_two_routes(self) -> None:
@@ -100,7 +100,7 @@ class TestIndex:
 
     def test_model_with_one_route_is_not_ambiguous(self) -> None:
         # Pytanie o dostawcę byłoby wtedy pustym klikiem.
-        assert not _entry(catalog.index({}), "grok-4.5").ambiguous
+        assert not _entry(catalog.index({}), "grok-4.6").ambiguous
         assert not _entry(catalog.index({}), "haiku").ambiguous
 
     def test_curated_alias_merges_names_differing_between_clis(self) -> None:
