@@ -134,25 +134,26 @@ python3 -m forge run \
   --brief /path/to/brief.md \
   --branch main \
   --brain codex:gpt-5.6-sol:high \
-  --planner claude:opus:high \
-  --coder-tdd opencode:provider/cheap-code-model \
-  --coder-explore opencode:provider/cheap-code-model \
-  --coder-classic opencode:provider/cheap-code-model \
+  --planner codex:gpt-5.6-sol:high \
   --reviewer codex:gpt-5.6-terra:high \
   --tester codex:gpt-5.6-terra:high
 ```
 
+The three omitted coder selectors use the default `codex:gpt-5.6-luna:high`.
+
 Add `--no-push` for a local-only run. Forge still commits and fast-forwards the selected branch.
 
-If the controller process fails after at least one batch was delivered, resume the same brain
-session and run history after fixing the cause:
+If the controller process fails or is interrupted after at least one batch was delivered, resume
+the same brain session and run history after fixing the cause:
 
 ```bash
 python3 -m forge recover --repo /path/to/product --run-id RUN_ID
 ```
 
 Runs started in the UI expose the same recovery action as **Recover same run** when their
-controller has stopped in the failed state.
+controller has stopped. If coding and validation finished before a review/provider failure, Forge
+recreates the candidate worktrees from their binary patches and resumes at review instead of
+spending tokens to implement the batch again.
 
 ## Artifacts
 
@@ -199,7 +200,8 @@ derived from tokens.
 
 ## Failure behavior
 
-- A process crash or timeout is retried with an explicit explanation.
+- A transient process crash is retried with an explicit explanation. Deterministic CLI errors,
+  provider usage limits, and agent timeouts are not immediately retried.
 - An invalid brain, reviewer, tester, or planner response receives contract feedback and is resumed.
 - A coder with repeated turns that do not change plan progress is marked `stalled`; its artifacts
   remain available and the other candidates continue.
@@ -208,6 +210,10 @@ derived from tokens.
   failed push without rewriting history.
 - Pause, resume, and cancel take effect at safe phase/agent-call boundaries. They do not kill an
   active provider process in the middle of a filesystem operation.
+- Planner commands marked `[winner-only]` are omitted from the three candidate validation passes
+  and run once after review. This is intended for live, external, destructive, or long acceptance
+  checks. Their recorded result is passed to the winner and black-box tester so neither repeats an
+  unchanged expensive timeout.
 
 ## Development
 
