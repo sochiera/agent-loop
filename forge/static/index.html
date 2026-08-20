@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Forge Control Room</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div><span class="mark">F</span><h1>Forge</h1></div>
+    <p>One persistent brain. Three competing implementations. One delivered winner.</p>
+  </header>
+  <main>
+    <section class="panel setup">
+      <div class="section-title"><span>01</span><h2>New run</h2></div>
+      <form id="run-form">
+        <div class="grid two">
+          <label>Repository<input id="repo" required placeholder="/absolute/path/to/repository"></label>
+          <label>Delivery branch<div class="branch-row"><input id="branch" value="main" required><button type="button" id="branches" class="quiet">Load</button></div></label>
+        </div>
+        <label>Product brief<textarea id="brief" rows="8" required placeholder="# Product goal&#10;Describe the final product, not the next task."></textarea></label>
+        <div class="model-head"><h3>Role models</h3><p>Use <code>provider:model:effort</code>. Providers: codex, claude, opencode.</p></div>
+        <div id="models" class="grid roles"></div>
+        <div class="actions"><label class="check"><input id="push" type="checkbox" checked> Push winner to origin</label><button type="submit" class="primary">Start Forge</button></div>
+        <p id="form-error" class="error"></p>
+      </form>
+    </section>
+    <section class="panel runs">
+      <div class="section-title"><span>02</span><h2>Runs</h2></div>
+      <div id="run-list" class="run-list"><p class="empty">No runs in this process.</p></div>
+    </section>
+    <section id="detail" class="panel detail hidden">
+      <div class="section-title"><span>03</span><h2>Run detail</h2></div>
+      <div id="detail-body"></div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

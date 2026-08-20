@@ -1,132 +1,205 @@
 # Forge
 
-Forge is a non-commercial, MIT-licensed experiment in reliable AI agent orchestration. It turns a project brief into small, verifiable development tasks and coordinates specialized agents to implement them through a transparent TDD workflow.
+Forge is a local orchestrator for long-running, high-quality software delivery. It keeps one
+powerful product brain alive for the entire run, asks that brain for substantial batches of work,
+and has three cheaper coding agents implement every batch independently. A reviewer chooses the
+best candidate, the winner fixes the review findings, Forge commits and pushes it to the selected
+branch, and a black-box tester reports observable product behavior back to the same brain session.
 
-## How it works
+The controller does not decide product scope, quality, or completion. It executes the brain's
+decisions, validates message contracts, retries failed processes, records evidence, and performs
+the Git operations required to deliver the selected candidate.
+
+## Pipeline
 
 ```text
-product owner → planner → tester ↔ coder → reviewer
-                    ↑                          │
-                    └── weryfikator historyjek ┘
+brief.md
+   │
+   ▼
+persistent brain (no repository and no tools)
+   │ forge.run_batch(objective, success criteria)
+   ▼
+planner ──► plan.md with micro-feature checkboxes and validation commands
+   │
+   ├──────────────┬──────────────────┐
+   ▼              ▼                  ▼
+TDD coder     exploratory coder   classic coder
+own worktree   own worktree        own worktree
+same plan      same plan           same plan
+   └──────────────┴──────────────────┘
+                  │
+                  ▼
+reviewer compares code, tests, diffs, and validation evidence
+                  │
+                  ▼
+winner fixes findings ──► commit ──► fast-forward selected branch ──► push
+                  │
+                  ▼
+black-box tester (public behavior, runtime output, screenshots)
+                  │ report
+                  └──────────────────────────────► persistent brain
 ```
 
-- Product Owner utrzymuje cel projektu i cienki, uporządkowany backlog historyjek.
-- The planner creates small batches of focused tasks.
-- The tester and coder iterate using explicit TDD states.
-- A fresh, read-only reviewer approves changes or requests corrections.
-- A story verifier checks observable outcomes and updates story lifecycle status.
-- A ledger and checkpoints keep progress visible and recoverable.
+The loop ends only when the brain calls `forge.finish`. There is intentionally no independent
+final verifier and no mechanical product-completion threshold.
 
-See [docs/PIPELINE.md](docs/PIPELINE.md) for details.
+## Design principles
 
-## Choosing models per role
+- **One persistent brain session.** Forge always resumes its original provider session. Native
+  context compaction may occur, but Forge never silently starts a replacement brain.
+- **The brain cannot inspect the repository.** It runs in a separate state directory. Claude and
+  OpenCode receive an empty/denied tool surface. Codex starts with user configuration ignored,
+  shell, unified exec, apps/plugins, browser/computer, multi-agent, image, and web tools disabled,
+  a read-only sandbox, and a contract gate that rejects any remaining tool event.
+- **Large batches, not a micro-loop.** The brain requests a cohesive feature, refactor, bug batch,
+  or product-level test effort. The planner expands it into implementation-sized checkboxes.
+- **Real competition.** All three coders start from the same commit and complete the same plan in
+  isolated Git worktrees. They do not see each other's work.
+- **Uniform goal behavior.** Forge does not depend on provider-specific `/goal` implementations.
+  A coder is resumed with the same session and an explicit reason while unchecked tasks remain.
+- **Warnings are evidence, not product decisions.** Forge records stalls, timeouts, failed checks,
+  and token use. A repeatedly hung or non-progressing coder is left as an incomplete candidate so
+  the process can continue; Forge does not reinterpret the final brief.
+- **Repository history is the delivery mechanism.** Only the selected candidate is committed. The
+  target branch is fast-forwarded and pushed directly to `origin` when push is enabled.
 
-Each role has a default policy (role → level → provider). Per-machine choices —
-which concrete model per task difficulty, and a fallback chain used when a
-provider hits its limit or fails hard — live in `~/.config/forge/routing.json`
-and can be clicked together in the GUI (`python3 -m forge.gui`), so switching
-providers needs no commit. The GUI asks for a **model**; the CLI tool follows
-from it, and a provider dropdown appears only for models reachable more than one
-way (`gpt-5.6-luna` via Codex or the OpenCode bridge, `glm-5.2` via two OpenCode
-providers). See [docs/ROUTING-I-FALLBACK.md](docs/ROUTING-I-FALLBACK.md).
+## Requirements
 
-A named set of those choices is a **profile**, and every run picks its own: one
-project can run on GPT alone while another mixes GPT, Claude and Grok in
-parallel. Profiles are ordinary routing files in
-`~/.config/forge/profiles/<slug>.json`; `routing.json` remains the shared
-profile, so a command line without any variable behaves exactly as before. From
-a shell, `--routing-profile "Tylko GPT"` (or `FORGE_ROUTING_PROFILE=tylko-gpt`)
-selects one, and naming a profile that does not exist stops the run up front
-rather than quietly falling back to the default policy. See
-[docs/PROFILE-MODELI.md](docs/PROFILE-MODELI.md).
+- Linux or macOS with Git and Python 3.12 or newer.
+- At least one authenticated supported agent CLI:
+  - `codex`
+  - `claude`
+  - `opencode`
+- A clean target Git repository with a local delivery branch. When push is enabled it must have an
+  `origin` remote.
 
-Providers configured in `opencode.json` take their keys from `{env:NAME}`, which
-resolves against the environment of the Forge process — so a shell started before
-the key was exported, a desktop launcher or a systemd unit would otherwise fail
-with `401 No API-key provided` in the middle of a role. Preflight closes that gap:
-it reads the `*.env` files next to `opencode.json`, fills in whatever the routed
-providers need, and aborts up front if a role has no usable endpoint left.
-Explicit environment always wins over those files; `FORGE_ENV_FILES` overrides the
-search (`none` disables it).
+Forge uses existing CLI authentication. It does not require API keys and has no runtime Python
+dependencies.
 
-Claude Code is authenticated the same way. By default Forge links the operator's
-`~/.claude/.credentials.json` into its isolated home, but that file carries a
-single-use refresh token: two Forge instances (or one instance plus the IDE
-extension) racing to refresh it kill the session for everyone. Set
-`CLAUDE_CODE_OAUTH_TOKEN` — or `FORGE_CLAUDE_OAUTH_TOKEN` to give Forge a token
-of its own — from `claude setup-token`, and the shared file is left out of the
-picture entirely. Either way preflight reads the session state up front and
-refuses to start a run whose roles have no working endpoint left. See
-[docs/AWARIE-2026-08-11.md](docs/AWARIE-2026-08-11.md).
+## Install
 
-## Two projects at once
-
-One panel drives several runs: each row is a separate project with its own
-brief, its own orchestrator process, its own log tab and its own **model
-profile**. Every run takes a snapshot of its profile at start, so configuring the
-second run cannot disturb the first, and the snapshot records which profile the
-run actually worked with.
-
-Three resources do not survive sharing. Each is guarded by a lock the
-orchestrator itself takes, so a run started from the command line participates
-on exactly the same terms as one started from the panel; the panel only peeks
-into those locks to explain a refusal before spending a process on it.
-
-- **The project directory.** One run per tree, enforced by an `flock` on
-  `<project>/.forge/run.lock`.
-- **The Forge source tree.** Every run moves itself onto a snapshot of the
-  `forge` package under `~/.cache/forge/code/` — the panel prepares one before
-  launching, and a bare `python3 -m forge.orchestrate` re-executes itself from a
-  fresh one. Committing to this repository under a working loop can therefore no
-  longer split the code held in memory from the prompt templates read off disk
-  (`docs/AWARIE-2026-08-11.md`). A running snapshot holds a shared lease, so
-  housekeeping cannot delete the code of a loop that has been working for weeks.
-  Two consequences worth knowing: a fix made mid-run applies only after that run
-  restarts, and `FORGE_CODE_SNAPSHOT=0` opts out when you deliberately want live
-  edits (a debugger, say).
-- **The Claude Code session.** While Forge authenticates from the shared
-  credentials file, one machine-wide lock admits a single run; the second is
-  refused up front rather than three hours later. The question is asked per run,
-  against that run's own profile, so a run whose models never reach Claude
-  neither takes the lock nor trips over it. Set the non-rotating token described
-  above and the lock is not taken at all — any number of runs can then work in
-  parallel.
-
-## Research direction
-
-The project explores:
-
-- reliable autonomous implementation from requirements,
-- efficient context management across long-running tasks,
-- quality gates and role isolation,
-- routing work between different cloud models,
-- hybrid cloud and local LLM workflows,
-- reducing token cost while preserving implementation quality.
-
-## Quick start
-
-Requirements: Python 3.10+, Git and configured AI agent CLIs.
+Run directly from a checkout:
 
 ```bash
-python3 -m pip install -r requirements-dev.txt
-python3 -m forge.orchestrate \
-  --brief game.md \
-  --project game \
-  --max-tdd-rounds 8
+python3 -m forge ui
 ```
 
-Run the tests:
+Or install an editable command in a virtual environment:
 
 ```bash
-python3 -m pytest -q
+python3 -m venv .venv
+.venv/bin/pip install -e .
+.venv/bin/forge ui
 ```
 
-## Community
+On Ubuntu, install the matching `python3-venv` package first if `python3 -m venv` reports that
+`ensurepip` is unavailable.
 
-Forge is developed as a private-time AI passion project by Jan Sochiera and Dominik Kuraś. Findings, practical examples and limitations will be shared with Sii Workers through project updates and a recorded presentation.
+The UI listens only on `127.0.0.1` by default and opens `http://127.0.0.1:8787`. It accepts exactly
+the operational inputs Forge needs: target repository, delivery branch, product brief, model
+selection for every role, and whether to push.
 
-Feedback and experiments on non-confidential sample projects are welcome.
+## Model selection
 
-## License
+Every role uses this selector:
 
-[MIT](LICENSE)
+```text
+provider:model[:effort]
+```
+
+Examples:
+
+```text
+codex:gpt-5.6-sol:high
+claude:opus:high
+opencode:neuralwatt/kimi-k2.7-code-flex
+```
+
+The model part may be empty to use the CLI's configured default, for example `opencode:`. The
+seven selections are `brain`, `planner`, `coder_tdd`, `coder_explore`, `coder_classic`, `reviewer`,
+and `tester`.
+
+Use strong models for the brain and planner, medium models for review and black-box testing, and
+cheaper coding models for the three competitors. Forge records the actual configured provider,
+model, effort, elapsed time, session ID, and reported token counts for every invocation.
+
+## Command-line run
+
+```bash
+python3 -m forge run \
+  --repo /path/to/product \
+  --brief /path/to/brief.md \
+  --branch main \
+  --brain codex:gpt-5.6-sol:high \
+  --planner claude:opus:high \
+  --coder-tdd opencode:provider/cheap-code-model \
+  --coder-explore opencode:provider/cheap-code-model \
+  --coder-classic opencode:provider/cheap-code-model \
+  --reviewer codex:gpt-5.6-terra:high \
+  --tester codex:gpt-5.6-terra:high
+```
+
+Add `--no-push` for a local-only run. Forge still commits and fast-forwards the selected branch.
+
+## Artifacts
+
+Every run is fully inspectable under:
+
+```text
+TARGET_REPO/.forge/runs/RUN_ID/
+├── state.json
+├── config.json
+├── brief.md
+├── events.jsonl
+├── usage.jsonl
+├── brain/
+└── batches/
+    └── 001/
+        ├── objective.json
+        ├── plan.md
+        ├── review-bundle.json
+        ├── review.json
+        ├── black-box.json
+        ├── black-box-evidence/
+        ├── delivery.json
+        ├── candidate-metrics.json
+        └── candidates/
+            ├── tdd/
+            ├── explore/
+            └── classic/
+```
+
+Each candidate directory contains every prompt and response, raw provider events, checkbox
+progress, validation output, Git status, diffstat, a binary-safe patch, and its own `metrics.json`.
+The batch-level `candidate-metrics.json` shows completion, review score, validation results, wall
+time, warnings, and token use side by side.
+
+Forge adds `.forge/` to the target repository's local `.git/info/exclude`; it does not modify the
+product's `.gitignore`.
+
+Provider-reported usage is normalized to input, cached input, output, and reasoning tokens. Some
+providers or custom model endpoints may omit usage; Forge then records zero rather than inventing a
+number. Subscription-plan limits and monetary cost are provider concerns and cannot always be
+derived from tokens.
+
+## Failure behavior
+
+- A process crash or timeout is retried with an explicit explanation.
+- An invalid brain, reviewer, tester, or planner response receives contract feedback and is resumed.
+- A coder with repeated turns that do not change plan progress is marked `stalled`; its artifacts
+  remain available and the other candidates continue.
+- If all candidates produce no code, the run fails visibly instead of manufacturing progress.
+- Forge refuses to start in a dirty repository, refuses a non-fast-forward delivery, and reports a
+  failed push without rewriting history.
+- Pause, resume, and cancel take effect at safe phase/agent-call boundaries. They do not kill an
+  active provider process in the middle of a filesystem operation.
+
+## Development
+
+```bash
+python3 -m pytest
+python3 -m compileall -q forge
+```
+
+The test suite performs the complete orchestration flow with deterministic fake agents and real
+temporary Git worktrees, commits, and fast-forward delivery. It does not consume model tokens.

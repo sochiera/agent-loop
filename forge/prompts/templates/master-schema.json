@@ -1,1 +1,0 @@
-{"type":"object","properties":{"tester":{"type":"string"},"coder":{"type":"string"},"planner":{"type":"string"}},"required":["tester","coder","planner"],"additionalProperties":false}
