@@ -4,6 +4,7 @@ from pathlib import Path
 from forge.agents import (
     AgentRequest,
     AgentRunner,
+    _NON_RETRYABLE_ERRORS,
     _claude_parse,
     _codex_parse,
     _opencode_parse,
@@ -113,3 +114,8 @@ def test_codex_coder_uses_lean_cached_tool_surface(tmp_path: Path):
     assert "plugins" in command
     assert "multi_agent" in command
     assert "shell_tool" not in command
+
+
+def test_usage_limit_is_classified_as_non_retryable():
+    message = "You've hit your usage limit. Purchase more credits or try again next week."
+    assert any(marker in message.lower() for marker in _NON_RETRYABLE_ERRORS)

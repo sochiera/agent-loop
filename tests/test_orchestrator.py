@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from forge.agents import AgentRequest, AgentTimeout
+from forge.agents import AgentConfigurationFailure, AgentRequest, AgentTimeout
 from forge.models import AgentResult, ModelSpec, ROLE_NAMES, RunConfig, Usage
 from forge.orchestrator import ForgeOrchestrator
 
@@ -143,6 +143,35 @@ class TimeoutRunner:
         raise AgentTimeout("deliberate timeout", raw_output="timed out")
 
 
+class ReviewFailureRunner(FakeRunner):
+    def run(self, request: AgentRequest) -> AgentResult:
+        if request.role == "reviewer":
+            raise AgentConfigurationFailure("review unavailable", raw_output="usage limit")
+        return super().run(request)
+
+
+class CapturedReviewRecoveryRunner(FakeRunner):
+    def run(self, request: AgentRequest) -> AgentResult:
+        if request.role == "brain":
+            text = json.dumps(
+                {
+                    "tool": "forge.finish",
+                    "reason": "recovered batch satisfies the brief",
+                    "objective": "",
+                    "success_criteria": [],
+                    "summary": "Captured review recovered.",
+                }
+            )
+            return AgentResult(
+                text=text,
+                session_id=request.session_id,
+                usage=Usage(input_tokens=3, output_tokens=2),
+                elapsed_seconds=0.01,
+                raw_output=text,
+            )
+        return super().run(request)
+
+
 def test_full_competition_flow_without_model_calls(tmp_path: Path):
     repo = tmp_path / "target"
     repo.mkdir()
@@ -231,4 +260,42 @@ def test_brain_must_return_a_resumable_session(tmp_path: Path):
         orchestrator.run()
 
     assert orchestrator.state.status == "failed"
+
+
+def test_recovery_restores_captured_candidates_and_resumes_review(tmp_path: Path):
+    repo = tmp_path / "target"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "forge@example.test")
+    git(repo, "config", "user.name", "Forge Test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Build a greeting feature.\n", encoding="utf-8")
+    models = {role: ModelSpec("codex", "fake", "low") for role in ROLE_NAMES}
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="captured-review",
+        runner=ReviewFailureRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+
+    with pytest.raises(AgentConfigurationFailure):
+        orchestrator.run()
+
+    artifacts = repo / ".forge" / "runs" / "captured-review" / "batches" / "001"
+    assert (artifacts / "review-bundle.json").is_file()
+    assert not (tmp_path / "state" / "worktrees" / "captured-review" / "tdd").exists()
+    orchestrator.state.batches = [{"cycle": 0}]
+    orchestrator.store.save_state(orchestrator.state)
+    orchestrator.runner = CapturedReviewRecoveryRunner()
+
+    recovered = orchestrator.recover_failed()
+
+    assert recovered.status == "complete"
+    assert recovered.cycle == 1
+    assert recovered.batches[-1]["winner"] == "tdd"
+    assert "hello from tdd" in (repo / "feature.txt").read_text(encoding="utf-8")
     assert git(repo, "status", "--porcelain") == ""

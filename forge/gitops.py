@@ -123,6 +123,25 @@ class GitCompetition:
             self.candidates[name] = CandidateWorktree(name, path, branch)
         return dict(self.candidates)
 
+    def restore_candidates(self, patches: dict[str, str]) -> dict[str, CandidateWorktree]:
+        """Recreate cleaned candidate worktrees from captured binary patches."""
+        candidates = self.create_candidates()
+        for name, candidate in candidates.items():
+            patch = patches.get(name, "")
+            if not patch.strip():
+                continue
+            result = subprocess.run(
+                ["git", "apply", "--binary", "-"],
+                cwd=candidate.path,
+                input=patch,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            if result.returncode != 0:
+                raise GitError(f"could not restore {name} candidate patch:\n{result.stdout.strip()}")
+        return candidates
+
     def capture(self, candidate: CandidateWorktree) -> dict[str, Any]:
         # Intent-to-add makes untracked source files visible in the patch without staging content.
         _run(candidate.path, "add", "-N", ".", check=False)

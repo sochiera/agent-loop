@@ -183,16 +183,41 @@ class ForgeOrchestrator:
         if not self.state.batches:
             raise RuntimeError("failed run has no delivered batch to resume from")
         latest = self.state.batches[-1]
-        # Planning increments the cycle before delivery. If the process dies in
-        # that window, continue from the last batch that actually reached main.
-        self.state.cycle = int(latest["cycle"])
+        latest_cycle = int(latest["cycle"])
+        pending_cycle = int(self.state.cycle)
+        resume_captured = (
+            pending_cycle > latest_cycle and self._has_captured_batch(pending_cycle)
+        )
+        # Planning increments the cycle before delivery. Preserve it only when
+        # all candidate patches/outcomes were captured; otherwise retry from
+        # the last batch that actually reached main.
+        self.state.cycle = pending_cycle if resume_captured else latest_cycle
         self.state.status = "running"
         self.state.cancel_requested = False
         self.state.paused = False
         self.state.active_agents.clear()
-        self._save(f"Recovering run after delivered batch {self.state.cycle}.")
+        recovery_point = (
+            f"captured batch {self.state.cycle} review"
+            if resume_captured
+            else f"delivered batch {self.state.cycle}"
+        )
+        self._save(f"Recovering run from {recovery_point}.")
         try:
             self._preflight()
+            if resume_captured:
+                batch = self._resume_captured_batch(self.state.cycle)
+                self.state.batches.append(batch)
+                self._save(f"Batch {self.state.cycle} delivered and black-box tested.")
+                decision = self._brain_decision(
+                    brain_feedback(
+                        cycle=self.state.cycle,
+                        objective=str(batch["objective"]),
+                        review=batch["review"],
+                        test=batch["black_box"],
+                        metrics=batch["candidate_metrics"],
+                    )
+                )
+                return self._run_from_decision(decision)
             decision = self._brain_decision(
                 brain_feedback(
                     cycle=self.state.cycle,
@@ -217,6 +242,70 @@ class ForgeOrchestrator:
         finally:
             if self._competition is not None:
                 self._competition.cleanup()
+
+    def _has_captured_batch(self, cycle: int) -> bool:
+        root = self.store.root / "batches" / f"{cycle:03d}"
+        required = [root / "objective.json", root / "plan.md", root / "review-bundle.json"]
+        for name in ("tdd", "explore", "classic"):
+            required.extend(
+                [
+                    root / "candidates" / name / "candidate.patch",
+                    root / "candidates" / name / "outcome.json",
+                ]
+            )
+        return all(path.is_file() for path in required) and not (root / "delivery.json").exists()
+
+    def _resume_captured_batch(self, cycle: int) -> dict[str, Any]:
+        assert self._competition is not None
+        batch_rel = f"batches/{cycle:03d}"
+        root = self.store.root / batch_rel
+        objective = json.loads((root / "objective.json").read_text(encoding="utf-8"))
+        decision = BrainDecision(
+            "forge.run_batch",
+            str(objective.get("brain_reason", "Resume captured batch review.")),
+            str(objective["objective"]),
+            tuple(str(item) for item in objective["success_criteria"]),
+        )
+        plan = (root / "plan.md").read_text(encoding="utf-8")
+        patches = {
+            name: (root / "candidates" / name / "candidate.patch").read_text(
+                encoding="utf-8"
+            )
+            for name in ("tdd", "explore", "classic")
+        }
+        worktrees = self._competition.restore_candidates(patches)
+        outcomes: dict[str, CandidateOutcome] = {}
+        for name, worktree in worktrees.items():
+            plan_path = worktree.path / ".forge" / "plan.md"
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write(plan_path, plan)
+            value = json.loads(
+                (root / "candidates" / name / "outcome.json").read_text(encoding="utf-8")
+            )
+            tasks = value.get("tasks", {})
+            completed = int(tasks.get("completed", 0))
+            total = int(tasks.get("total", 0))
+            outcomes[name] = CandidateOutcome(
+                name=name,
+                worktree=worktree,
+                session_id=value.get("session_id"),
+                status=str(value.get("status", "failed")),
+                plan=PlanProgress(completed, total, ()),
+                turns=int(value.get("turns", 0)),
+                validation=list(value.get("validation", [])),
+                summary=str(value.get("summary", "")),
+                warnings=[str(item) for item in value.get("warnings", [])],
+            )
+        bundle = self._capture_candidates(outcomes, batch_rel)
+        self._save(f"Restored captured candidates for batch {cycle}; resuming review.")
+        return self._review_deliver_and_test(
+            decision=decision,
+            commands=validation_commands(plan),
+            outcomes=outcomes,
+            bundle=bundle,
+            batch_rel=batch_rel,
+            cycle=cycle,
+        )
 
     def _run_from_decision(self, decision: BrainDecision) -> RunState:
         while decision.tool != "forge.finish":
@@ -368,6 +457,27 @@ class ForgeOrchestrator:
         bundle = self._capture_candidates(outcomes, batch_rel)
         if not any(item["git"]["patch"].strip() for item in bundle.values()):
             raise RuntimeError("all three candidates produced no code changes")
+
+        return self._review_deliver_and_test(
+            decision=decision,
+            commands=commands,
+            outcomes=outcomes,
+            bundle=bundle,
+            batch_rel=batch_rel,
+            cycle=cycle,
+        )
+
+    def _review_deliver_and_test(
+        self,
+        *,
+        decision: BrainDecision,
+        commands: tuple[str, ...],
+        outcomes: dict[str, CandidateOutcome],
+        bundle: dict[str, dict[str, Any]],
+        batch_rel: str,
+        cycle: int,
+    ) -> dict[str, Any]:
+        assert self._competition is not None
 
         self._phase("review", f"Reviewing all candidates for batch {cycle}.")
         review = self._review(decision, outcomes, bundle, batch_rel)
@@ -893,7 +1003,7 @@ class ForgeOrchestrator:
                 )
             except AgentConfigurationFailure as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
-                self._warning(f"{role} has a non-retryable CLI/configuration error: {exc}")
+                self._warning(f"{role} has a non-retryable provider/CLI error: {exc}")
                 raise
             except AgentTimeout as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)

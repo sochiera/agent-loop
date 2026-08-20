@@ -40,6 +40,9 @@ _NON_RETRYABLE_ERRORS = (
     "invalid_json_schema",
     "invalid schema for response_format",
     "not inside a trusted directory",
+    "you've hit your usage limit",
+    "purchase more credits",
+    "insufficient_quota",
 )
 
 _CODEX_LEAN_FEATURES = (

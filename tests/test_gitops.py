@@ -39,6 +39,26 @@ def test_competition_fast_forwards_selected_branch(tmp_path: Path):
     assert not (tmp_path / "worktrees" / "tdd").exists()
 
 
+def test_competition_restores_candidates_from_captured_binary_patches(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    root = tmp_path / "worktrees"
+    original = GitCompetition(repo, "main", "run", root)
+    original.prepare(require_remote=False)
+    candidates = original.create_candidates()
+    (candidates["tdd"].path / "feature.txt").write_text("restored\n", encoding="utf-8")
+    (candidates["classic"].path / "asset.bin").write_bytes(bytes(range(256)))
+    patches = {name: original.capture(candidate)["patch"] for name, candidate in candidates.items()}
+    original.cleanup()
+
+    recovered = GitCompetition(repo, "main", "run", root)
+    recovered.prepare(require_remote=False)
+    restored = recovered.restore_candidates(patches)
+
+    assert (restored["tdd"].path / "feature.txt").read_text(encoding="utf-8") == "restored\n"
+    assert (restored["classic"].path / "asset.bin").read_bytes() == bytes(range(256))
+    recovered.cleanup()
+
+
 def test_prepare_bootstraps_unborn_branch_and_excludes_brief(tmp_path: Path):
     repo = tmp_path / "empty"
     repo.mkdir()
