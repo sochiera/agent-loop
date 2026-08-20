@@ -19,7 +19,7 @@ from forge.plans import (
     validate_plan,
     validation_commands,
 )
-from forge.prompts import planner_prompt, tester_prompt as _tester_prompt
+from forge.prompts import planner_prompt, tester_prompt as _tester_prompt, winner_fix_prompt
 
 
 def test_model_spec_round_trip():
@@ -134,6 +134,22 @@ def test_tester_prompt_reuses_expensive_validation_evidence(tmp_path: Path):
     assert "TIMED OUT after 900.8s" in prompt
     assert "motherboard page 20" in prompt
     assert "Do not repeat an already-recorded expensive or timed-out command" in prompt
+
+
+def test_winner_fix_prompt_does_not_repeat_unchanged_timeout():
+    prompt = winner_fix_prompt(
+        ["Improve the bounded importer"],
+        [
+            {
+                "command": "npm run import:full",
+                "elapsed_seconds": 900,
+                "return_code": -15,
+                "timed_out": True,
+            }
+        ],
+    )
+    assert "TIMED OUT after 900.0s" in prompt
+    assert "Do not repeat an expensive or timed-out command unchanged" in prompt
 
 
 def test_markdown_plan_progress_and_commands():

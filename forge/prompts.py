@@ -210,16 +210,26 @@ Return JSON only:
 """
 
 
-def winner_fix_prompt(feedback: list[str]) -> str:
+def winner_fix_prompt(feedback: list[str], validation: list[dict[str, object]]) -> str:
     items = "\n".join(f"- {item}" for item in feedback) or "- No blocking findings; re-verify the batch."
+    evidence = "\n".join(
+        f"- {'TIMED OUT' if item.get('timed_out') else ('PASSED' if item.get('return_code') == 0 else 'FAILED')} "
+        f"after {float(item.get('elapsed_seconds', 0)):.1f}s: {item.get('command', '')}"
+        for item in validation
+    )
     return f"""Forge selected your implementation as the competition winner. The independent
 reviewer returned the findings below:
 
 {items}
 
+VALIDATION FORGE ALREADY RAN ON THIS CANDIDATE
+{evidence or '- No candidate validation was recorded.'}
+
 Fix every applicable finding in this worktree, preserve the completed objective, and rerun the
-relevant validation commands. Do not commit or push; Forge will do that after this response. End
-with a concise list of fixes and exact validation results.
+relevant focused validation commands. Do not repeat an expensive or timed-out command unchanged;
+Forge runs the complete final validation after your response. Repeat such a command yourself only
+after a specific fix that can materially change its result. Do not commit or push; Forge will do
+that after this response. End with a concise list of fixes and exact validation results.
 """
 
 

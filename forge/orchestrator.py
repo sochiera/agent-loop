@@ -380,7 +380,7 @@ class ForgeOrchestrator:
         fix_result = self._invoke(
             role=f"coder_{winner_name}",
             model=self.config.models[f"coder_{winner_name}"],
-            prompt=winner_fix_prompt(review["feedback"]),
+            prompt=winner_fix_prompt(review["feedback"], winner.validation),
             cwd=winner.worktree.path,
             session_id=winner.session_id,
             access="write",
