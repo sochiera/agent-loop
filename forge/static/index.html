@@ -3,38 +3,85 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
   <title>Forge Control Room</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header>
-    <div><span class="mark">F</span><h1>Forge</h1></div>
-    <p>One persistent brain. Three competing implementations. One delivered winner.</p>
+  <header class="masthead">
+    <a class="brand" href="#" aria-label="Forge home"><span class="mark">F</span><span>Forge</span></a>
+    <div class="mast-copy">
+      <strong>Competitive delivery, under control.</strong>
+      <span>One persistent brain · Three implementations · One shipped winner</span>
+    </div>
+    <div class="local-badge"><span></span> Local control room</div>
   </header>
+
   <main>
-    <section class="panel setup">
-      <div class="section-title"><span>01</span><h2>New run</h2></div>
+    <section class="panel setup-panel">
+      <div class="section-title">
+        <div><span class="eyebrow">New run</span><h1>Start a Forge run</h1></div>
+        <button type="button" id="recommended" class="button ghost">Restore recommended models</button>
+      </div>
+
       <form id="run-form">
         <div class="grid two">
-          <label>Repository<input id="repo" required placeholder="/absolute/path/to/repository"></label>
-          <label>Delivery branch<div class="branch-row"><input id="branch" value="main" required><button type="button" id="branches" class="quiet">Load</button></div></label>
+          <label class="field grow">
+            <span>Target repository</span>
+            <div class="joined"><input id="repo" required autocomplete="off" placeholder="/absolute/path/to/repository"><button type="button" id="inspect-repo" class="button secondary">Inspect</button></div>
+            <small id="repo-hint">Forge requires a Git repository. Empty repositories are supported.</small>
+          </label>
+          <label class="field">
+            <span>Delivery branch</span>
+            <select id="branch" required><option>main</option></select>
+            <small>The winner is fast-forwarded here.</small>
+          </label>
         </div>
-        <label>Product brief<textarea id="brief" rows="8" required placeholder="# Product goal&#10;Describe the final product, not the next task."></textarea></label>
-        <div class="model-head"><h3>Role models</h3><p>Use <code>provider:model:effort</code>. Providers: codex, claude, opencode.</p></div>
-        <div id="models" class="grid roles"></div>
-        <div class="actions"><label class="check"><input id="push" type="checkbox" checked> Push winner to origin</label><button type="submit" class="primary">Start Forge</button></div>
-        <p id="form-error" class="error"></p>
+
+        <div id="repo-summary" class="repo-summary hidden" aria-live="polite"></div>
+
+        <div class="brief-head">
+          <div><span class="eyebrow">Product direction</span><h2>Final product brief</h2></div>
+          <span class="field-note">Use a file or paste Markdown</span>
+        </div>
+        <label class="field">
+          <span>Brief file <em>optional</em></span>
+          <input id="brief-path" autocomplete="off" placeholder="/path/to/goal.md">
+        </label>
+        <label class="field">
+          <span>Brief preview / pasted brief</span>
+          <textarea id="brief" rows="9" placeholder="# Product goal&#10;Describe the complete product, not only the next task."></textarea>
+          <small id="brief-hint">When a brief file is set, Forge reads that file at run start.</small>
+        </label>
+
+        <div class="model-head">
+          <div><span class="eyebrow">Routing</span><h2>Models by role</h2></div>
+          <p><code>provider:model:effort</code></p>
+        </div>
+        <div id="models" class="model-grid"></div>
+
+        <div class="submit-row">
+          <label class="toggle"><input id="push" type="checkbox" checked><span></span><div><strong>Push the winner</strong><small>Push the selected branch to <code>origin</code></small></div></label>
+          <button type="submit" class="button primary"><span>Start Forge</span><span aria-hidden="true">→</span></button>
+        </div>
+        <p id="form-error" class="error" role="alert"></p>
       </form>
     </section>
-    <section class="panel runs">
-      <div class="section-title"><span>02</span><h2>Runs</h2></div>
-      <div id="run-list" class="run-list"><p class="empty">No runs in this process.</p></div>
-    </section>
-    <section id="detail" class="panel detail hidden">
-      <div class="section-title"><span>03</span><h2>Run detail</h2></div>
+
+    <aside class="panel runs-panel">
+      <div class="section-title compact"><div><span class="eyebrow">Workspace</span><h2>Runs</h2></div><span id="run-count" class="count">0</span></div>
+      <div id="run-list" class="run-list"><p class="empty">No runs in this process yet.</p></div>
+    </aside>
+
+    <section id="detail" class="panel detail-panel hidden">
+      <div class="section-title"><div><span class="eyebrow">Live evidence</span><h2>Run detail</h2></div><span id="live-indicator" class="live-indicator">Idle</span></div>
       <div id="detail-body"></div>
     </section>
   </main>
+
+  <template id="model-template">
+    <label class="model-card"><span class="model-label"></span><small class="model-help"></small><input required spellcheck="false"></label>
+  </template>
   <script src="/app.js"></script>
 </body>
 </html>

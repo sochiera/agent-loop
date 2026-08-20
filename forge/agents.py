@@ -14,6 +14,7 @@ from typing import Any
 
 from .artifacts import atomic_write
 from .models import AgentResult, ModelSpec, Usage
+from .validation import _signal_session
 
 
 class AgentFailure(RuntimeError):
@@ -24,6 +25,33 @@ class AgentFailure(RuntimeError):
 
 class AgentTimeout(AgentFailure):
     pass
+
+
+class AgentConfigurationFailure(AgentFailure):
+    """A deterministic CLI/configuration error that retrying cannot fix."""
+
+
+_NON_RETRYABLE_ERRORS = (
+    "error loading config.toml",
+    "unexpected argument",
+    "unrecognized option",
+    "unknown option",
+    "invalid value",
+    "invalid_json_schema",
+    "invalid schema for response_format",
+    "not inside a trusted directory",
+)
+
+_CODEX_LEAN_FEATURES = (
+    "apps",
+    "browser_use",
+    "computer_use",
+    "image_generation",
+    "in_app_browser",
+    "multi_agent",
+    "plugins",
+    "remote_plugin",
+)
 
 
 @dataclass
@@ -190,18 +218,33 @@ class AgentRunner:
         try:
             raw, _ = process.communicate(request.prompt, timeout=request.timeout_seconds)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
+            _signal_session(process.pid, signal.SIGTERM)
             try:
                 raw, _ = process.communicate(timeout=5)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                _signal_session(process.pid, signal.SIGKILL)
                 raw, _ = process.communicate()
             raise AgentTimeout(
                 f"{request.role} timed out after {request.timeout_seconds}s", raw_output=raw
             )
+        except BaseException:
+            # KeyboardInterrupt and process-level shutdown must not orphan a
+            # model CLI or any tool subprocess group that it created.
+            _signal_session(process.pid, signal.SIGTERM)
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                _signal_session(process.pid, signal.SIGKILL)
+                process.communicate()
+            raise
         elapsed = time.monotonic() - started
         if process.returncode != 0:
-            raise AgentFailure(
+            failure_type = (
+                AgentConfigurationFailure
+                if any(marker in raw.lower() for marker in _NON_RETRYABLE_ERRORS)
+                else AgentFailure
+            )
+            raise failure_type(
                 f"{request.role} exited with code {process.returncode}", raw_output=raw
             )
         events = _json_lines(raw)
@@ -246,7 +289,7 @@ class AgentRunner:
 
     def _codex_command(self, request: AgentRequest) -> list[str]:
         if request.session_id:
-            command = ["codex", "exec", "resume", "--json"]
+            command = ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
         else:
             command = ["codex", "exec", "--json", "--skip-git-repo-check"]
         if request.model.model:
@@ -259,34 +302,22 @@ class AgentRunner:
             command += ["--config", f'sandbox_mode="{sandbox}"']
         else:
             command += ["--sandbox", sandbox]
+        if request.role != "tester":
+            # Product roles need Codex's native filesystem/shell tools, not the
+            # user's potentially large plugin/app/browser catalog. A stable,
+            # smaller tool surface improves prompt-cache reuse on every tool turn.
+            command += ["--ignore-user-config"]
+            for feature in _CODEX_LEAN_FEATURES:
+                command += ["--disable", feature]
         if request.access == "none":
             # Codex has no single "--tools none" switch. Build the equivalent
             # from documented feature/config controls and reject any remaining
             # tool event at the Forge contract boundary.
             command += [
-                "--ignore-user-config",
                 "--disable",
                 "shell_tool",
                 "--disable",
                 "unified_exec",
-                "--disable",
-                "apps",
-                "--disable",
-                "browser_use",
-                "--disable",
-                "computer_use",
-                "--disable",
-                "image_generation",
-                "--disable",
-                "in_app_browser",
-                "--disable",
-                "multi_agent",
-                "--disable",
-                "plugins",
-                "--disable",
-                "remote_plugin",
-                "--config",
-                "agents.enabled=false",
                 "--config",
                 "tools.web_search=false",
                 "--config",

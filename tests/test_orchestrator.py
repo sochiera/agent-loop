@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from forge.agents import AgentRequest
+from forge.agents import AgentRequest, AgentTimeout
 from forge.models import AgentResult, ModelSpec, ROLE_NAMES, RunConfig, Usage
 from forge.orchestrator import ForgeOrchestrator
 
@@ -109,6 +109,40 @@ class MissingBrainSessionRunner(FakeRunner):
         return result
 
 
+class FinishRecoveryRunner:
+    def __init__(self):
+        self.session_id = ""
+
+    def run(self, request: AgentRequest) -> AgentResult:
+        assert request.role == "brain"
+        self.session_id = request.session_id or ""
+        text = json.dumps(
+            {
+                "tool": "forge.finish",
+                "reason": "the delivered batch satisfies the brief",
+                "objective": "",
+                "success_criteria": [],
+                "summary": "Recovered with the original brain.",
+            }
+        )
+        return AgentResult(
+            text=text,
+            session_id=request.session_id,
+            usage=Usage(input_tokens=3, output_tokens=2),
+            elapsed_seconds=0.01,
+            raw_output=text,
+        )
+
+
+class TimeoutRunner:
+    def __init__(self):
+        self.calls = 0
+
+    def run(self, request: AgentRequest) -> AgentResult:
+        self.calls += 1
+        raise AgentTimeout("deliberate timeout", raw_output="timed out")
+
+
 def test_full_competition_flow_without_model_calls(tmp_path: Path):
     repo = tmp_path / "target"
     repo.mkdir()
@@ -145,6 +179,32 @@ def test_full_competition_flow_without_model_calls(tmp_path: Path):
     assert (artifacts / "batches/001/black-box.json").is_file()
     assert (artifacts / "usage.jsonl").is_file()
     assert git(repo, "status", "--porcelain") == ""
+
+    # Simulate an interrupt after the next batch number was reserved during
+    # planning but before anything reached main.
+    orchestrator.state.status = "running"
+    orchestrator.state.cycle = 2
+    orchestrator.store.save_state(orchestrator.state)
+    recovery_runner = FinishRecoveryRunner()
+    orchestrator.runner = recovery_runner
+    recovered = orchestrator.recover_failed()
+    assert recovered.status == "complete"
+    assert recovered.cycle == 1
+    assert recovery_runner.session_id == "brain-session"
+
+    timeout_runner = TimeoutRunner()
+    orchestrator.runner = timeout_runner
+    with pytest.raises(AgentTimeout):
+        orchestrator._invoke(
+            role="coder_tdd",
+            model=models["coder_tdd"],
+            prompt="continue",
+            cwd=repo,
+            relative="timeout-check",
+            candidate="tdd",
+        )
+    assert timeout_runner.calls == 1
+    assert orchestrator.state.active_agents == {}
 
 
 def test_brain_must_return_a_resumable_session(tmp_path: Path):

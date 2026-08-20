@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .models import ModelSpec, ROLE_NAMES, RunConfig
+from .models import DEFAULT_MODEL_SELECTORS, ModelSpec, ROLE_NAMES, RunConfig
 from .orchestrator import ForgeOrchestrator
 from .web import serve
 
@@ -19,13 +19,21 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--brief", required=True, help="final product brief in Markdown")
     run.add_argument("--branch", default="main", help="local branch to fast-forward and push")
     for role in ROLE_NAMES:
+        coder = role.startswith("coder_")
         run.add_argument(
             "--" + role.replace("_", "-"),
-            required=True,
+            required=not coder,
+            default=DEFAULT_MODEL_SELECTORS[role] if coder else None,
             metavar="PROVIDER:MODEL[:EFFORT]",
         )
     run.add_argument("--no-push", action="store_true", help="commit locally without pushing")
     run.add_argument("--agent-timeout", type=int, default=3600, metavar="SECONDS")
+
+    recover = sub.add_parser(
+        "recover", help="resume a failed or interrupted run after its latest delivered batch"
+    )
+    recover.add_argument("--repo", required=True, help="target Git repository")
+    recover.add_argument("--run-id", required=True, help="existing Forge run identifier")
 
     ui = sub.add_parser("ui", help="start the local web control room")
     ui.add_argument("--host", default="127.0.0.1")
@@ -39,6 +47,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ui":
         serve(args.host, args.port, open_browser=not args.no_browser)
         return 0
+    if args.command == "recover":
+        repo = Path(args.repo).expanduser().resolve()
+        config_path = repo / ".forge" / "runs" / args.run_id / "config.json"
+        if not config_path.is_file():
+            raise SystemExit(f"Forge run config does not exist: {config_path}")
+        config = RunConfig.from_dict(json.loads(config_path.read_text(encoding="utf-8")))
+        config.repo = str(repo)
+        orchestrator = ForgeOrchestrator(
+            config,
+            run_id=args.run_id,
+            on_event=lambda event: print(json.dumps(event, sort_keys=True), flush=True),
+        )
+        state = orchestrator.recover_failed()
+        print(json.dumps(state.to_dict(), indent=2))
+        return 0 if state.status == "complete" else 1
     models = {
         role: ModelSpec.parse(getattr(args, role))
         for role in ROLE_NAMES

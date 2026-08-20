@@ -1,7 +1,7 @@
 import subprocess
 from pathlib import Path
 
-from forge.gitops import GitCompetition
+from forge.gitops import GitCompetition, list_branches
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -30,9 +30,51 @@ def test_competition_fast_forwards_selected_branch(tmp_path: Path):
     (candidates["tdd"].path / "feature.txt").write_text("winner\n", encoding="utf-8")
     captured = competition.capture(candidates["tdd"])
     assert "feature.txt" in captured["patch"]
+    assert "feature.txt" in captured["review_patch"]
     sha = competition.commit_and_deliver(candidates["tdd"], "winner", push=False)
     assert git(repo, "rev-parse", "HEAD") == sha
     assert git(repo, "rev-parse", "HEAD~1") == base
     assert (repo / "feature.txt").read_text(encoding="utf-8") == "winner\n"
     competition.cleanup()
     assert not (tmp_path / "worktrees" / "tdd").exists()
+
+
+def test_prepare_bootstraps_unborn_branch_and_excludes_brief(tmp_path: Path):
+    repo = tmp_path / "empty"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "forge@example.test")
+    git(repo, "config", "user.name", "Forge Test")
+    (repo / "goal.md").write_text("Build something.\n", encoding="utf-8")
+    assert list_branches(repo) == ["main"]
+
+    competition = GitCompetition(
+        repo,
+        "main",
+        "run",
+        tmp_path / "worktrees",
+        local_excludes=("/goal.md",),
+    )
+    base = competition.prepare(require_remote=False)
+
+    assert git(repo, "rev-parse", "HEAD") == base
+    assert git(repo, "branch", "--show-current") == "main"
+    assert git(repo, "status", "--porcelain") == ""
+    assert git(repo, "log", "-1", "--pretty=%s") == "Initialize repository for Forge"
+
+
+def test_capture_excludes_generated_dependency_trees(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    competition = GitCompetition(repo, "main", "run", tmp_path / "worktrees")
+    competition.prepare(require_remote=False)
+    candidate = competition.create_candidates()["tdd"]
+    (candidate.path / "node_modules/pkg").mkdir(parents=True)
+    (candidate.path / "node_modules/pkg/index.js").write_text("generated\n", encoding="utf-8")
+    (candidate.path / "feature.js").write_text("product\n", encoding="utf-8")
+
+    captured = competition.capture(candidate)
+
+    assert "feature.js" in captured["patch"]
+    assert "node_modules" not in captured["patch"]
+    assert "node_modules" not in captured["status"]
+    competition.cleanup()

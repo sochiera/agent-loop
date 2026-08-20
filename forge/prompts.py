@@ -14,10 +14,10 @@ specialized agents. Your only action is to return exactly one JSON object repres
 these virtual tool calls:
 
 1. Start a cohesive, substantial batch of product work:
-{"tool":"forge.run_batch","reason":"...","objective":"...","success_criteria":["..."]}
+{"tool":"forge.run_batch","reason":"...","objective":"...","success_criteria":["..."],"summary":""}
 
 2. Finish only when the entire original brief is implemented:
-{"tool":"forge.finish","reason":"...","summary":"..."}
+{"tool":"forge.finish","reason":"...","objective":"","success_criteria":[],"summary":"..."}
 
 Choose work that creates meaningful product progress: a large feature, a related bug-fix batch,
 a major refactor that unlocks features, or black-box/TDD coverage that protects real behavior.
@@ -68,7 +68,14 @@ not include prose outside the JSON object.
 """
 
 
-def planner_prompt(objective: str, criteria: tuple[str, ...], plan_path: Path) -> str:
+def planner_prompt(
+    objective: str,
+    criteria: tuple[str, ...],
+    plan_path: Path,
+    *,
+    repository_context: str,
+    environment_context: str,
+) -> str:
     criteria_text = "\n".join(f"- {item}" for item in criteria)
     return f"""You are Forge's senior planner. Inspect the current repository and design one
 implementation plan for the batch below.
@@ -78,6 +85,12 @@ BATCH OBJECTIVE
 
 SUCCESS CRITERIA
 {criteria_text}
+
+MECHANICAL REPOSITORY SNAPSHOT
+{repository_context}
+
+HOST TOOLCHAIN SNAPSHOT
+{environment_context}
 
 Return only the complete Markdown contents for {plan_path.name}. Forge writes your final response
 to that file. Use exactly this high-level structure:
@@ -90,13 +103,18 @@ to that file. Use exactly this high-level structure:
 - [ ] TASK-002: ...
 ## Validation commands
 - `one real non-interactive command`
-- `another command when useful`
+- [winner-only] `an expensive external or full acceptance command when useful`
 
 Write many small, ordered micro-feature tasks that describe observable behavior and design intent.
 Do not prescribe class names, function names, or line-by-line implementation. Include integration,
 edge cases, tests, documentation, and cleanup needed for a production-quality result. Every task
 must be independently checkable and collectively cover the complete batch. Validation commands
-must be safe to run unattended from the repository root. Do not edit the repository.
+must be safe to run unattended from the repository root. Mark expensive live, network-wide,
+destructive, or long-running acceptance checks as `[winner-only]`; Forge runs ordinary checks on
+all three candidates and winner-only checks once after review. Do not edit the repository.
+Choose a technology supported by the detected toolchain. If another runtime is genuinely needed,
+include an explicit reproducible setup task and do not assume a temporary agent-only PATH will be
+available to Forge validation or the black-box tester.
 """
 
 
@@ -132,7 +150,10 @@ its checkbox to [x] in that same Markdown file. Run the validation commands and 
 you need. Do not merely mark tasks complete, weaken tests, remove requirements, or optimize for the
 reviewer. Do not commit, push, rebase, merge, or touch other worktrees; Forge handles Git after the
 competition. Continue until every plan checkbox is complete or a real external blocker prevents
-progress. End with a concise factual summary and test evidence.
+progress. Batch related inspection, edits, and validation instead of making one tool call per
+checkbox. Run focused checks at meaningful milestones and the full validation commands once near
+the end; Forge independently reruns them after your turn. End with a concise factual summary and
+test evidence.
 """
 
 
@@ -203,10 +224,31 @@ with a concise list of fixes and exact validation results.
 
 
 def tester_prompt(
-    *, objective: str, criteria: tuple[str, ...], commands: tuple[str, ...], evidence_dir: Path
+    *,
+    objective: str,
+    criteria: tuple[str, ...],
+    commands: tuple[str, ...],
+    validation: list[dict[str, object]],
+    evidence_dir: Path,
 ) -> str:
     criteria_text = "\n".join(f"- {item}" for item in criteria)
     command_text = "\n".join(f"- {item}" for item in commands)
+    validation_lines: list[str] = []
+    for result in validation:
+        status = (
+            "TIMED OUT"
+            if result.get("timed_out")
+            else ("PASSED" if result.get("return_code") == 0 else "FAILED")
+        )
+        validation_lines.append(
+            f"- {status} after {float(result.get('elapsed_seconds', 0)):.1f}s: "
+            f"{result.get('command', '')}"
+        )
+        if status != "PASSED":
+            output = str(result.get("output", "")).strip()
+            if output:
+                validation_lines.append(f"  Last output: {output[-1200:]}")
+    validation_text = "\n".join(validation_lines) or "- No delivery validation was recorded."
     return f"""You are Forge's black-box product tester. Evaluate the delivered product only
 through its public interfaces and observable behavior. Do not read source code, diffs, internal
 implementation files, or test source. You may build, launch, drive, and observe the product. Use
@@ -223,8 +265,13 @@ SUCCESS CRITERIA
 KNOWN VALIDATION/LAUNCH COMMANDS
 {command_text or '- Discover public entry points from user-facing documentation and executable help.'}
 
+DELIVERY VALIDATION ALREADY RUN BY FORGE
+{validation_text}
+
 These commands are context, not permission to inspect internals. Run one only when it exercises a
 public entry point; do not use source-level unit-test commands as a substitute for black-box use.
+Do not repeat an already-recorded expensive or timed-out command with the same inputs. Treat its
+result as evidence, and use bounded, targeted public-interface checks to learn something new.
 
 Report what visibly works, what is missing or broken, and evidence the persistent brain can use to
 choose the next batch. Do not fix anything.

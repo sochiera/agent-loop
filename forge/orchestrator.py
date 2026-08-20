@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -13,7 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .agents import AgentFailure, AgentRequest, AgentResult, AgentRunner
+from .agents import (
+    AgentConfigurationFailure,
+    AgentFailure,
+    AgentRequest,
+    AgentResult,
+    AgentRunner,
+    AgentTimeout,
+)
 from .artifacts import ArtifactStore, atomic_write, utc_now
 from .contracts import (
     BRAIN_SCHEMA,
@@ -27,7 +35,13 @@ from .contracts import (
 )
 from .gitops import CandidateWorktree, GitCompetition, GitError
 from .models import ModelSpec, RunConfig, RunState
-from .plans import PlanProgress, progress, validate_plan, validation_commands
+from .plans import (
+    PlanProgress,
+    candidate_validation_commands,
+    progress,
+    validate_plan,
+    validation_commands,
+)
 from .prompts import (
     brain_feedback,
     brain_initial,
@@ -107,6 +121,7 @@ class ForgeOrchestrator:
             config=config.to_dict(),
         )
         self._control = threading.Condition()
+        self._activity_lock = threading.Lock()
         self._competition: GitCompetition | None = None
 
     def pause(self) -> None:
@@ -137,26 +152,7 @@ class ForgeOrchestrator:
             decision = self._brain_decision(
                 brain_initial(self.brief_path.read_text(encoding="utf-8"))
             )
-            while decision.tool != "forge.finish":
-                self._checkpoint()
-                batch = self._run_batch(decision)
-                self.state.batches.append(batch)
-                self._save(f"Batch {self.state.cycle} delivered and black-box tested.")
-                decision = self._brain_decision(
-                    brain_feedback(
-                        cycle=self.state.cycle,
-                        objective=decision.objective,
-                        review=batch["review"],
-                        test=batch["black_box"],
-                        metrics=batch["candidate_metrics"],
-                    )
-                )
-            self.state.status = "complete"
-            self.state.phase = "complete"
-            self.state.final_summary = decision.summary
-            self._save(decision.reason)
-            self.store.write_text("final-summary.md", decision.summary + "\n")
-            return self.state
+            return self._run_from_decision(decision)
         except RunCancelled:
             self.state.status = "cancelled"
             self.state.phase = "cancelled"
@@ -172,6 +168,78 @@ class ForgeOrchestrator:
             if self._competition is not None:
                 self._competition.cleanup()
 
+    def recover_failed(self) -> RunState:
+        """Continue a failed or interrupted run after its latest delivered batch."""
+        self.state = self.store.load_state()
+        recoverable = {"failed", "cancelled", "running"}
+        if self.state.status not in recoverable:
+            raise RuntimeError(
+                f"only failed or interrupted runs can be recovered (status: {self.state.status})"
+            )
+        if self.state.status == "running" and self.state.active_agents:
+            raise RuntimeError("interrupted run still records active agents; stop them before recovery")
+        if not self.state.brain_session_id:
+            raise RuntimeError("failed run has no persistent brain session to resume")
+        if not self.state.batches:
+            raise RuntimeError("failed run has no delivered batch to resume from")
+        latest = self.state.batches[-1]
+        # Planning increments the cycle before delivery. If the process dies in
+        # that window, continue from the last batch that actually reached main.
+        self.state.cycle = int(latest["cycle"])
+        self.state.status = "running"
+        self.state.cancel_requested = False
+        self.state.paused = False
+        self.state.active_agents.clear()
+        self._save(f"Recovering run after delivered batch {self.state.cycle}.")
+        try:
+            self._preflight()
+            decision = self._brain_decision(
+                brain_feedback(
+                    cycle=self.state.cycle,
+                    objective=str(latest["objective"]),
+                    review=latest["review"],
+                    test=latest["black_box"],
+                    metrics=latest["candidate_metrics"],
+                )
+            )
+            return self._run_from_decision(decision)
+        except RunCancelled:
+            self.state.status = "cancelled"
+            self.state.phase = "cancelled"
+            self._save("Run cancelled by the operator.")
+            return self.state
+        except Exception as exc:
+            self.state.status = "failed"
+            self.state.phase = "failed"
+            self._warning(f"Run recovery failed: {exc}")
+            self._save(str(exc))
+            raise
+        finally:
+            if self._competition is not None:
+                self._competition.cleanup()
+
+    def _run_from_decision(self, decision: BrainDecision) -> RunState:
+        while decision.tool != "forge.finish":
+            self._checkpoint()
+            batch = self._run_batch(decision)
+            self.state.batches.append(batch)
+            self._save(f"Batch {self.state.cycle} delivered and black-box tested.")
+            decision = self._brain_decision(
+                brain_feedback(
+                    cycle=self.state.cycle,
+                    objective=decision.objective,
+                    review=batch["review"],
+                    test=batch["black_box"],
+                    metrics=batch["candidate_metrics"],
+                )
+            )
+        self.state.status = "complete"
+        self.state.phase = "complete"
+        self.state.final_summary = decision.summary
+        self._save(decision.reason)
+        self.store.write_text("final-summary.md", decision.summary + "\n")
+        return self.state
+
     def _preflight(self) -> None:
         self._phase("preflight", "Checking providers and target repository.")
         if self.check_binaries:
@@ -181,7 +249,11 @@ class ForgeOrchestrator:
         self.brain_dir.mkdir(parents=True, exist_ok=True)
         self.worktree_root.mkdir(parents=True, exist_ok=True)
         self._competition = GitCompetition(
-            self.repo, self.config.branch, self.run_id, self.worktree_root
+            self.repo,
+            self.config.branch,
+            self.run_id,
+            self.worktree_root,
+            local_excludes=self._brief_local_excludes(),
         )
         base = self._competition.prepare(require_remote=self.config.push)
         self.store.write_data("git.json", {"branch": self.config.branch, "base_sha": base})
@@ -247,6 +319,7 @@ class ForgeOrchestrator:
         self._phase("planning", f"Planning batch {cycle}.")
         plan = self._make_plan(decision, batch_rel)
         commands = validation_commands(plan)
+        candidate_commands = candidate_validation_commands(plan)
 
         self._phase("coding", f"Three coders are competing on batch {cycle}.")
         worktrees = self._competition.create_candidates()
@@ -262,7 +335,7 @@ class ForgeOrchestrator:
                     self._run_coder,
                     candidate,
                     decision,
-                    commands,
+                    candidate_commands,
                     batch_rel,
                 ): name
                 for name, candidate in worktrees.items()
@@ -352,7 +425,11 @@ class ForgeOrchestrator:
 
         self._competition.cleanup()
         self._competition = GitCompetition(
-            self.repo, self.config.branch, self.run_id, self.worktree_root
+            self.repo,
+            self.config.branch,
+            self.run_id,
+            self.worktree_root,
+            local_excludes=self._brief_local_excludes(),
         )
         self._competition.prepare(require_remote=self.config.push)
 
@@ -360,7 +437,9 @@ class ForgeOrchestrator:
         black_box_worktree = self._competition.create_detached("black-box")
         try:
             try:
-                black_box = self._black_box(decision, commands, batch_rel, black_box_worktree)
+                black_box = self._black_box(
+                    decision, commands, final_validation, batch_rel, black_box_worktree
+                )
             except RunCancelled:
                 raise
             except Exception as exc:
@@ -393,7 +472,14 @@ class ForgeOrchestrator:
         }
 
     def _make_plan(self, decision: BrainDecision, batch_rel: str) -> str:
-        prompt = planner_prompt(decision.objective, decision.success_criteria, Path("plan.md"))
+        repository_context, repository_is_empty = self._planner_context()
+        prompt = planner_prompt(
+            decision.objective,
+            decision.success_criteria,
+            Path("plan.md"),
+            repository_context=repository_context,
+            environment_context=self._environment_context(),
+        )
         session: str | None = None
         for attempt in range(1, 4):
             result = self._invoke(
@@ -402,7 +488,7 @@ class ForgeOrchestrator:
                 prompt=prompt,
                 cwd=self.repo,
                 session_id=session,
-                access="read",
+                access="none" if repository_is_empty else "read",
                 relative=f"{batch_rel}/planner/attempt-{attempt}",
             )
             session = result.session_id
@@ -418,6 +504,58 @@ class ForgeOrchestrator:
             self.store.write_text(f"{batch_rel}/plan.md", result.text.rstrip() + "\n")
             return result.text.rstrip() + "\n"
         raise RuntimeError("planner failed to produce a valid Markdown plan")
+
+    def _planner_context(self) -> tuple[str, bool]:
+        result = subprocess.run(
+            ["git", "ls-files"],
+            cwd=self.repo,
+            text=True,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        files = [line for line in result.stdout.splitlines() if line]
+        if not files:
+            return (
+                "The selected branch has no tracked product files. It contains only Forge-local "
+                "inputs/artifacts, so repository inspection would return no useful information.",
+                True,
+            )
+        preview = "\n".join(f"- {name}" for name in files[:200])
+        suffix = "" if len(files) <= 200 else f"\n- ... and {len(files) - 200} more tracked files"
+        return (f"Tracked files ({len(files)} total):\n{preview}{suffix}", False)
+
+    @staticmethod
+    def _environment_context() -> str:
+        commands = (
+            "git",
+            "python3",
+            "node",
+            "npm",
+            "pnpm",
+            "bun",
+            "go",
+            "cargo",
+            "java",
+            "docker",
+        )
+        available = [command for command in commands if shutil.which(command)]
+        unavailable = [command for command in commands if command not in available]
+        return (
+            f"Available commands: {', '.join(available) or 'none'}. "
+            f"Not detected: {', '.join(unavailable) or 'none'}."
+        )
+
+    def _brief_local_excludes(self) -> tuple[str, ...]:
+        try:
+            relative = self.brief_path.relative_to(self.repo)
+        except ValueError:
+            return ()
+        if not relative.parts or relative.parts[0] == ".git":
+            return ()
+        value = relative.as_posix()
+        for character in "\\*?[]":
+            value = value.replace(character, "\\" + character)
+        return ("/" + value,)
 
     def _run_coder(
         self,
@@ -530,6 +668,9 @@ class ForgeOrchestrator:
         for name, outcome in outcomes.items():
             git = self._competition.capture(outcome.worktree)
             self.store.write_text(f"{batch_rel}/candidates/{name}/candidate.patch", git["patch"])
+            self.store.write_text(
+                f"{batch_rel}/candidates/{name}/review.patch", git["review_patch"]
+            )
             self.store.write_text(f"{batch_rel}/candidates/{name}/diffstat.txt", git["diffstat"])
             self.store.write_text(f"{batch_rel}/candidates/{name}/status.txt", git["status"])
             self.store.write_data(f"{batch_rel}/candidates/{name}/outcome.json", outcome.to_dict())
@@ -541,8 +682,9 @@ class ForgeOrchestrator:
                     "status": value["git"]["status"],
                     "diffstat": value["git"]["diffstat"],
                     "patch_path": str(
-                        self.store.root / batch_rel / "candidates" / name / "candidate.patch"
+                        self.store.root / batch_rel / "candidates" / name / "review.patch"
                     ),
+                    "review_patch_truncated": value["git"]["review_patch_truncated"],
                 },
             }
             for name, value in bundle.items()
@@ -585,7 +727,7 @@ class ForgeOrchestrator:
         review_dir.mkdir(parents=True, exist_ok=True)
         local_bundle = json.loads(source_bundle.read_text(encoding="utf-8"))
         for name in outcomes:
-            source_patch = self.store.root / batch_rel / "candidates" / name / "candidate.patch"
+            source_patch = self.store.root / batch_rel / "candidates" / name / "review.patch"
             local_patch = review_dir / f"{name}.patch"
             atomic_write(local_patch, source_patch.read_text(encoding="utf-8"))
             local_bundle[name]["git"]["patch_path"] = str(local_patch)
@@ -634,6 +776,7 @@ class ForgeOrchestrator:
         self,
         decision: BrainDecision,
         commands: tuple[str, ...],
+        validation: list[dict[str, Any]],
         batch_rel: str,
         product_worktree: Path,
     ) -> dict[str, Any]:
@@ -643,6 +786,7 @@ class ForgeOrchestrator:
             objective=decision.objective,
             criteria=decision.success_criteria,
             commands=commands,
+            validation=validation,
             evidence_dir=evidence,
         )
         session: str | None = None
@@ -725,6 +869,14 @@ class ForgeOrchestrator:
         for attempt in range(1, self.config.retry_count + 2):
             self._checkpoint()
             self.store.write_text(f"{relative}.prompt.md", current_prompt)
+            activity_key = candidate or role
+            self._activity_started(
+                activity_key,
+                role=role,
+                candidate=candidate,
+                model=model,
+                attempt=attempt,
+            )
             try:
                 result = self.runner.run(
                     AgentRequest(
@@ -739,6 +891,17 @@ class ForgeOrchestrator:
                         timeout_seconds=self.config.agent_timeout_seconds,
                     )
                 )
+            except AgentConfigurationFailure as exc:
+                self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
+                self._warning(f"{role} has a non-retryable CLI/configuration error: {exc}")
+                raise
+            except AgentTimeout as exc:
+                self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
+                self._warning(
+                    f"{role} reached its {self.config.agent_timeout_seconds}s limit; "
+                    "the candidate will continue without another costly agent process"
+                )
+                raise
             except AgentFailure as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
                 self._warning(f"{role} attempt {attempt} failed: {exc}")
@@ -750,6 +913,10 @@ class ForgeOrchestrator:
                     + prompt
                 )
                 continue
+            finally:
+                # Do not leave a phantom live card behind when the runner raises
+                # an unexpected process or filesystem exception.
+                self._activity_finished(activity_key)
             self.store.write_text(f"{relative}.raw.jsonl", result.raw_output)
             self.store.write_text(f"{relative}.response.md", result.text.rstrip() + "\n")
             self.store.record_agent_call(
@@ -770,6 +937,57 @@ class ForgeOrchestrator:
             )
             return result
         raise AssertionError("unreachable")
+
+    def _activity_started(
+        self,
+        key: str,
+        *,
+        role: str,
+        candidate: str,
+        model: ModelSpec,
+        attempt: int,
+    ) -> None:
+        with self._activity_lock:
+            self.state.active_agents[key] = {
+                "role": role,
+                "candidate": candidate,
+                "model": model.display(),
+                "attempt": attempt,
+                "started_at": utc_now(),
+            }
+            self.store.save_state(self.state)
+
+    def _activity_finished(self, key: str) -> None:
+        with self._activity_lock:
+            self.state.active_agents.pop(key, None)
+            self.store.save_state(self.state)
+
+    def activity_snapshot(self) -> dict[str, dict[str, Any]]:
+        with self._activity_lock:
+            snapshot = {key: dict(value) for key, value in self.state.active_agents.items()}
+        competition = self._competition
+        if competition is None:
+            return snapshot
+        for value in snapshot.values():
+            candidate_name = value.get("candidate")
+            candidate = competition.candidates.get(str(candidate_name))
+            if candidate is None:
+                continue
+            plan_path = candidate.path / ".forge" / "plan.md"
+            if plan_path.is_file():
+                state = progress(plan_path.read_text(encoding="utf-8", errors="replace"))
+                value["tasks_completed"] = state.completed
+                value["tasks_total"] = state.total
+            status = subprocess.run(
+                ["git", "status", "--short"],
+                cwd=candidate.path,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            if status.returncode == 0:
+                value["changed_files"] = len(status.stdout.splitlines())
+        return snapshot
 
     def _checkpoint(self) -> None:
         with self._control:

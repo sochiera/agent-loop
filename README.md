@@ -70,8 +70,8 @@ final verifier and no mechanical product-completion threshold.
   - `codex`
   - `claude`
   - `opencode`
-- A clean target Git repository with a local delivery branch. When push is enabled it must have an
-  `origin` remote.
+- A clean target Git repository. Forge can bootstrap an unborn selected branch in a repository
+  with no commits. When push is enabled the repository must have an `origin` remote.
 
 Forge uses existing CLI authentication. It does not require API keys and has no runtime Python
 dependencies.
@@ -119,6 +119,9 @@ The model part may be empty to use the CLI's configured default, for example `op
 seven selections are `brain`, `planner`, `coder_tdd`, `coder_explore`, `coder_classic`, `reviewer`,
 and `tester`.
 
+All three coder fields default to `codex:gpt-5.6-luna:high` in the UI and CLI. They can still be
+overridden independently.
+
 Use strong models for the brain and planner, medium models for review and black-box testing, and
 cheaper coding models for the three competitors. Forge records the actual configured provider,
 model, effort, elapsed time, session ID, and reported token counts for every invocation.
@@ -140,6 +143,16 @@ python3 -m forge run \
 ```
 
 Add `--no-push` for a local-only run. Forge still commits and fast-forwards the selected branch.
+
+If the controller process fails after at least one batch was delivered, resume the same brain
+session and run history after fixing the cause:
+
+```bash
+python3 -m forge recover --repo /path/to/product --run-id RUN_ID
+```
+
+Runs started in the UI expose the same recovery action as **Recover same run** when their
+controller has stopped in the failed state.
 
 ## Artifacts
 
@@ -175,7 +188,9 @@ The batch-level `candidate-metrics.json` shows completion, review score, validat
 time, warnings, and token use side by side.
 
 Forge adds `.forge/` to the target repository's local `.git/info/exclude`; it does not modify the
-product's `.gitignore`.
+product's `.gitignore`. It also locally excludes dependency/cache trees such as `node_modules`,
+virtual environments, Python caches, and TypeScript build-info files so a missing project
+`.gitignore` cannot turn generated dependencies into a huge review patch or delivery commit.
 
 Provider-reported usage is normalized to input, cached input, output, and reasoning tokens. Some
 providers or custom model endpoints may omit usage; Forge then records zero rather than inventing a

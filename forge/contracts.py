@@ -21,7 +21,20 @@ BRAIN_SCHEMA: dict[str, Any] = {
         "success_criteria": {"type": "array", "items": {"type": "string"}},
         "summary": {"type": "string"},
     },
-    "required": ["tool", "reason"],
+    "required": ["tool", "reason", "objective", "success_criteria", "summary"],
+}
+
+
+_ASSESSMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "score": {"type": "number"},
+        "summary": {"type": "string"},
+        "strengths": {"type": "array", "items": {"type": "string"}},
+        "problems": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["score", "summary", "strengths", "problems"],
 }
 
 
@@ -32,7 +45,16 @@ REVIEW_SCHEMA: dict[str, Any] = {
         "winner": {"type": "string", "enum": ["tdd", "explore", "classic"]},
         "reason": {"type": "string"},
         "feedback": {"type": "array", "items": {"type": "string"}},
-        "candidates": {"type": "object"},
+        "candidates": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "tdd": _ASSESSMENT_SCHEMA,
+                "explore": _ASSESSMENT_SCHEMA,
+                "classic": _ASSESSMENT_SCHEMA,
+            },
+            "required": ["tdd", "explore", "classic"],
+        },
     },
     "required": ["winner", "reason", "feedback", "candidates"],
 }

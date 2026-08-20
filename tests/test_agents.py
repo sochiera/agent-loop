@@ -66,7 +66,6 @@ def test_brain_commands_are_restricted(tmp_path: Path):
     assert "shell_tool" in codex
     assert "image_generation" in codex
     assert "plugins" in codex
-    assert "agents.enabled=false" in codex
     claude = runner._command(
         AgentRequest("brain", ModelSpec("claude", "sonnet", ""), "x", tmp_path, access="none")
     )
@@ -95,5 +94,22 @@ def test_codex_resume_uses_configured_sandbox_not_unsupported_flag(tmp_path: Pat
         )
     )
     assert command[:3] == ["codex", "exec", "resume"]
+    assert "--skip-git-repo-check" in command
     assert "--sandbox" not in command
     assert any("sandbox_mode" in item for item in command)
+
+
+def test_codex_coder_uses_lean_cached_tool_surface(tmp_path: Path):
+    command = AgentRunner()._command(
+        AgentRequest(
+            "coder_tdd",
+            ModelSpec("codex", "gpt-5.6-luna", "high"),
+            "implement",
+            tmp_path,
+            access="write",
+        )
+    )
+    assert "--ignore-user-config" in command
+    assert "plugins" in command
+    assert "multi_agent" in command
+    assert "shell_tool" not in command

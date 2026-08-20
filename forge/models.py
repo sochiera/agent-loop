@@ -17,6 +17,16 @@ ROLE_NAMES = (
     "tester",
 )
 
+DEFAULT_MODEL_SELECTORS = {
+    "brain": "codex:gpt-5.6-sol:high",
+    "planner": "codex:gpt-5.6-sol:high",
+    "coder_tdd": "codex:gpt-5.6-luna:high",
+    "coder_explore": "codex:gpt-5.6-luna:high",
+    "coder_classic": "codex:gpt-5.6-luna:high",
+    "reviewer": "codex:gpt-5.6-terra:high",
+    "tester": "codex:gpt-5.6-terra:high",
+}
+
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -131,6 +141,7 @@ class RunState:
     final_summary: str = ""
     paused: bool = False
     cancel_requested: bool = False
+    active_agents: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

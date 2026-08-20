@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import atomic_write
-from .gitops import list_branches
+from .gitops import list_branches, repository_summary
 from .models import ModelSpec, ROLE_NAMES, RunConfig
 from .orchestrator import ForgeOrchestrator
 
@@ -63,20 +63,29 @@ class RunRegistry:
         )
         orchestrator = ForgeOrchestrator(config, state_home=self.state_home)
         live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())
+        with self._lock:
+            self._runs[orchestrator.run_id] = live
+        self._launch(live, recover=False)
+        return orchestrator.state.to_dict()
 
+    @staticmethod
+    def _launch(live: LiveRun, *, recover: bool) -> None:
         def target() -> None:
             try:
-                orchestrator.run()
+                if recover:
+                    live.orchestrator.recover_failed()
+                else:
+                    live.orchestrator.run()
             except Exception:
                 live.error = traceback.format_exc()
 
+        live.error = ""
         live.thread = threading.Thread(
-            target=target, name=f"forge-{orchestrator.run_id}", daemon=True
+            target=target,
+            name=f"forge-{live.orchestrator.run_id}",
+            daemon=True,
         )
-        with self._lock:
-            self._runs[orchestrator.run_id] = live
         live.thread.start()
-        return orchestrator.state.to_dict()
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -95,6 +104,13 @@ class RunRegistry:
             live = self._runs.get(run_id)
         if live is None:
             raise KeyError(run_id)
+        if action == "recover":
+            if live.thread.is_alive():
+                raise ValueError("run process is still active")
+            if live.orchestrator.state.status not in {"failed", "cancelled", "running"}:
+                raise ValueError("only a failed or interrupted run can be recovered")
+            self._launch(live, recover=True)
+            return self._describe(live)
         {"pause": live.orchestrator.pause, "resume": live.orchestrator.resume, "cancel": live.orchestrator.cancel}[action]()
         return self._describe(live)
 
@@ -106,6 +122,7 @@ class RunRegistry:
         if live.error:
             value["error"] = live.error
         if detailed:
+            value["active_agents"] = live.orchestrator.activity_snapshot()
             for name in ("events.jsonl", "usage.jsonl"):
                 path = live.orchestrator.store.root / name
                 value[name.removesuffix(".jsonl")] = (
@@ -134,6 +151,20 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 return self._json({"branches": list_branches(repo)})
             except Exception as exc:
                 return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        if parsed.path == "/api/repository":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                repo = Path(query.get("repo", [""])[0]).expanduser().resolve()
+                value = repository_summary(repo)
+                for filename in ("goal.md", "brief.md"):
+                    brief = repo / filename
+                    if brief.is_file() and brief.stat().st_size <= 2_000_000:
+                        value["brief_path"] = str(brief)
+                        value["brief_text"] = brief.read_text(encoding="utf-8")
+                        break
+                return self._json(value)
+            except Exception as exc:
+                return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         return self._static(parsed.path)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -146,6 +177,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 "pause",
                 "resume",
                 "cancel",
+                "recover",
             }:
                 return self._json(self.registry.control(parts[2], parts[3]))
             return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
