@@ -20,7 +20,7 @@ const phases = ["preflight", "brain", "planning", "coding", "review", "winner-fi
 const phaseLabels = ["Preflight", "Brain", "Plan", "Code ×3", "Review", "Fix", "Deliver", "White-box", "Black-box"];
 const storageKey = "forge-control-room-v3";
 const providerLabels = {codex: "Codex", opencode: "OpenCode"};
-const familyLabels = {gpt: "GPT", grok: "Grok", qwen: "Qwen", deepseek: "DeepSeek", glm: "GLM", minimax: "MiniMax"};
+const familyLabels = {gpt: "GPT", grok: "Grok", qwen: "Qwen", deepseek: "DeepSeek", gemini: "Gemini", glm: "GLM"};
 const effortLabels = {"": "Default", low: "Low", medium: "Medium", high: "High"};
 const fallbackCatalog = {
   providers: ["codex", "opencode"],
@@ -34,16 +34,11 @@ const fallbackCatalog = {
     {key: "qwen-3.8-max", label: "Qwen 3.8 Max", family: "qwen", providers: ["opencode"], ids: {opencode: "alibaba-token-plan/qwen3.8-max"}, efforts: ["", "low", "medium", "high"]},
     {key: "deepseek-v4-flash-0731", label: "DeepSeek Flash 0731", family: "deepseek", providers: ["opencode"], ids: {opencode: "alibaba-token-plan/deepseek-v4-flash-0731"}, efforts: ["", "low", "medium", "high"]},
     {key: "deepseek-v4-pro-0813", label: "DeepSeek Pro 0813", family: "deepseek", providers: ["opencode"], ids: {opencode: "alibaba-token-plan/deepseek-v4-pro-0813"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-deepseek-v4-flash", label: "DeepSeek V4 Flash OR", family: "deepseek", providers: ["opencode"], ids: {opencode: "openrouter/deepseek/deepseek-v4-flash"}, efforts: ["", "low", "medium", "high"]},
+    {key: "or-gemini-3.7-flash", label: "Gemini 3.7 Flash OR", family: "gemini", providers: ["opencode"], ids: {opencode: "openrouter/google/gemini-3.7-flash"}, efforts: ["", "low", "medium", "high"]},
+    {key: "or-gpt-5.6-luna", label: "GPT-5.6 Luna OR", family: "gpt", providers: ["opencode"], ids: {opencode: "openrouter/openai/gpt-5.6-luna"}, efforts: ["", "low", "medium", "high"]},
     {key: "or-deepseek-v4-flash-0731", label: "DeepSeek Flash 0731 OR", family: "deepseek", providers: ["opencode"], ids: {opencode: "openrouter/deepseek/deepseek-v4-flash-0731"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-deepseek-v4-flash-latest", label: "DeepSeek Flash latest OR", family: "deepseek", providers: ["opencode"], ids: {opencode: "openrouter/~deepseek/deepseek-v4-flash-latest"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-deepseek-v3.2", label: "DeepSeek V3.2 OR", family: "deepseek", providers: ["opencode"], ids: {opencode: "openrouter/deepseek/deepseek-v3.2"}, efforts: ["", "low", "medium", "high"]},
     {key: "or-deepseek-v4-pro", label: "DeepSeek V4 Pro OR", family: "deepseek", providers: ["opencode"], ids: {opencode: "openrouter/deepseek/deepseek-v4-pro"}, efforts: ["", "low", "medium", "high"]},
     {key: "or-deepseek-v4-pro-0813", label: "DeepSeek V4 Pro 0813 OR", family: "deepseek", providers: ["opencode"], ids: {opencode: "openrouter/deepseek/deepseek-v4-pro-0813"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-qwen-3.5-flash", label: "Qwen 3.5 Flash OR", family: "qwen", providers: ["opencode"], ids: {opencode: "openrouter/qwen/qwen3.5-flash-02-23"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-qwen-3-coder-next", label: "Qwen 3 Coder Next OR", family: "qwen", providers: ["opencode"], ids: {opencode: "openrouter/qwen/qwen3-coder-next"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-glm-4.7-flash", label: "GLM 4.7 Flash OR", family: "glm", providers: ["opencode"], ids: {opencode: "openrouter/z-ai/glm-4.7-flash"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-minimax-m2.5", label: "MiniMax M2.5 OR", family: "minimax", providers: ["opencode"], ids: {opencode: "openrouter/minimax/minimax-m2.5"}, efforts: ["", "low", "medium", "high"]},
     {key: "glm-5.3", label: "GLM 5.3", family: "glm", providers: ["opencode"], ids: {opencode: "zai-coding-plan/glm-5.3"}, efforts: ["", "low", "medium", "high"]},
   ],
 };

@@ -126,18 +126,17 @@ opencode:grok-4.6
 opencode:qwen-3.8-max
 opencode:deepseek-v4-flash-0731
 opencode:deepseek-v4-pro-0813
-opencode:or-deepseek-v4-flash
-opencode:or-deepseek-v4-flash-latest
+opencode:or-gemini-3.7-flash
+opencode:or-gpt-5.6-luna
+opencode:or-deepseek-v4-flash-0731
 opencode:or-deepseek-v4-pro
 opencode:or-deepseek-v4-pro-0813
-opencode:or-qwen-3-coder-next
-opencode:or-minimax-m2.5
 opencode:glm-5.3
 ```
 
-GPT-family models may run on Codex or OpenCode. Grok 4.6, Qwen, DeepSeek, GLM, and MiniMax
-models run on OpenCode only. OpenRouter DeepSeek/Qwen/GLM/MiniMax entries use the `or-` catalog
-keys and require an OpenRouter credential in OpenCode. Catalog keys (`gpt-5.6-sol`) and provider
+GPT-family models may run on Codex or OpenCode. Grok 4.6, Qwen, DeepSeek, Gemini, and GLM
+models run on OpenCode only. OpenRouter entries use the `or-` catalog keys and require an
+OpenRouter credential in OpenCode. Catalog keys (`gpt-5.6-sol`) and provider
 IDs (`openai/gpt-5.6-sol`) are both accepted. The fixed selections are `brain`, `planner`,
 `reviewer`, `tester`, and `whitebox`. The three coder tactics still exist as `coder_tdd`,
 `coder_explore`, and `coder_classic`, but the control room sends a coder model pool and Forge
