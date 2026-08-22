@@ -222,33 +222,58 @@ function restoreRecommended() {
   saveForm();
 }
 
-function saveForm() {
-  const value = {
+function collectForm() {
+  return {
     repo: document.querySelector("#repo").value,
     branch: document.querySelector("#branch").value,
+    brief_path: document.querySelector("#brief-path").value,
     briefPath: document.querySelector("#brief-path").value,
     brief: document.querySelector("#brief").value,
     push: document.querySelector("#push").checked,
     models: Object.fromEntries(roles.map(role => [role, selectorFromCard(roleCard(role))])),
     coder_models: coderSelectors(),
   };
+}
+
+function saveForm() {
+  const value = collectForm();
   localStorage.setItem(storageKey, JSON.stringify(value));
+  return persistForm(value);
+}
+
+function persistForm(value = collectForm()) {
+  return api("/api/preferences", {method: "POST", body: JSON.stringify(value)}).catch(() => {});
+}
+
+function readLocalForm() {
+  try {
+    return JSON.parse(localStorage.getItem(storageKey) || localStorage.getItem("forge-control-room-v2") || "null");
+  } catch (error) {
+    console.warn("Could not restore Forge form", error);
+    return null;
+  }
+}
+
+function hasSavedForm(value) {
+  if (!value || typeof value !== "object") return false;
+  if (value.models && Object.keys(value.models).length) return true;
+  if (Array.isArray(value.coder_models) && value.coder_models.length) return true;
+  return Boolean(value.repo || value.briefPath || value.brief_path);
+}
+
+function applyForm(value) {
+  if (!value || typeof value !== "object") return;
+  document.querySelector("#repo").value = value.repo || "";
+  document.querySelector("#brief-path").value = value.brief_path || value.briefPath || "";
+  document.querySelector("#brief").value = value.brief || "";
+  document.querySelector("#push").checked = value.push !== false;
+  roles.forEach(role => applySelector(roleCard(role), value.models?.[role] || defaults[role]));
+  replaceCoderPool(savedCoderPool(value));
+  setBranches([value.branch || "main"], value.branch || "main");
 }
 
 function restoreForm() {
-  try {
-    const value = JSON.parse(localStorage.getItem(storageKey) || localStorage.getItem("forge-control-room-v2"));
-    if (!value) return;
-    document.querySelector("#repo").value = value.repo || "";
-    document.querySelector("#brief-path").value = value.briefPath || "";
-    document.querySelector("#brief").value = value.brief || "";
-    document.querySelector("#push").checked = value.push !== false;
-    roles.forEach(role => applySelector(roleCard(role), value.models?.[role] || defaults[role]));
-    replaceCoderPool(savedCoderPool(value));
-    setBranches([value.branch || "main"], value.branch || "main");
-  } catch (error) {
-    console.warn("Could not restore Forge form", error);
-  }
+  applyForm(readLocalForm());
 }
 
 function setBranches(branches, selectedBranch) {
@@ -500,7 +525,10 @@ async function boot() {
   try { catalog = await api("/api/catalog"); }
   catch (error) { console.warn("Could not load model catalog", error); }
   buildModelFields();
-  restoreForm();
+  let value = null;
+  try { value = await api("/api/preferences"); }
+  catch (error) { console.warn("Could not load saved preferences", error); }
+  applyForm(hasSavedForm(value) ? value : readLocalForm());
   button.disabled = false;
 }
 
@@ -528,6 +556,7 @@ async function restartForge(confirm = false) {
   const button = document.querySelector("#restart");
   button.disabled = true;
   try {
+    await persistForm();
     const result = await api("/api/restart", {method: "POST", body: JSON.stringify({confirm})});
     if (result.needs_confirm) {
       showRestartConfirm(true);

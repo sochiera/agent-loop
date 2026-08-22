@@ -104,7 +104,8 @@ The UI listens only on `127.0.0.1` by default and opens `http://127.0.0.1:8787`.
 the operational inputs Forge needs: target repository, delivery branch, product brief, model
 selection for every role, a coder model pool, and whether to push. **Browse** opens a local
 filesystem explorer to pick the repository directory or a brief file. Closing the browser tab does
-not stop Forge; use **Restart** in the control room after code changes. A live run requires
+not stop Forge; use **Restart** in the control room after code changes. Model and form choices
+persist across control-room restarts. A live run requires
 confirmation before restart. The control room loads the closed catalog from `/api/catalog` and
 offers provider, model, and effort dropdowns instead of free-text selectors.
 

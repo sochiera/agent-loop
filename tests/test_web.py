@@ -11,7 +11,14 @@ import pytest
 from pathlib import Path
 
 from forge.models import ROLE_NAMES, RunState
-from forge.web import ForgeHandler, RunRegistry, browse_filesystem, read_text_file, restart_payload
+from forge.web import (
+    ForgeHandler,
+    RunRegistry,
+    browse_filesystem,
+    read_text_file,
+    restart_payload,
+    sanitize_preferences,
+)
 
 
 def test_web_control_room_serves_ui_and_api(tmp_path):
@@ -47,6 +54,7 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert "/api/catalog" in script
         assert "/api/browse" in script
         assert "/api/file" in script
+        assert "/api/preferences" in script
         runs = json.loads(urllib.request.urlopen(base + "/api/runs", timeout=2).read())
         assert runs == []
         encoded_repo = urllib.parse.quote(str(repo))
@@ -83,6 +91,28 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
             ).read()
         )
         assert preview["text"] == "# Build it\n"
+        empty_prefs = json.loads(urllib.request.urlopen(base + "/api/preferences", timeout=2).read())
+        assert empty_prefs["models"] == {}
+        saved_prefs = json.loads(
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    base + "/api/preferences",
+                    data=json.dumps(
+                        {
+                            "models": {"brain": "opencode:grok-4.6:high"},
+                            "coder_models": ["opencode:glm-5.3:high"],
+                            "push": False,
+                        }
+                    ).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                ),
+                timeout=2,
+            ).read()
+        )
+        assert saved_prefs["models"]["brain"] == "opencode:grok-4.6:high"
+        loaded_prefs = json.loads(urllib.request.urlopen(base + "/api/preferences", timeout=2).read())
+        assert loaded_prefs["coder_models"] == ["opencode:glm-5.3:high"]
         health = json.loads(urllib.request.urlopen(base + "/api/health", timeout=2).read())
         assert health == {"ok": True, "active_runs": 0}
         restart = json.loads(
@@ -222,3 +252,87 @@ def test_read_text_file_rejects_missing_and_binary(tmp_path):
         read_text_file(str(binary))
     with pytest.raises(ValueError, match="path does not exist"):
         browse_filesystem(str(tmp_path / "missing"))
+
+
+def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
+    assert sanitize_preferences(
+        {
+            "repo": "/tmp/repo",
+            "briefPath": "/tmp/goal.md",
+            "models": {"brain": "opencode:grok-4.6:high", "coder_tdd": "ignored"},
+            "coder_models": ["opencode:glm-5.3:high", "", "codex:gpt-5.6-luna:high"],
+            "push": False,
+            "ignore": True,
+        }
+    ) == {
+        "repo": "/tmp/repo",
+        "branch": "",
+        "brief_path": "/tmp/goal.md",
+        "brief": "",
+        "push": False,
+        "models": {"brain": "opencode:grok-4.6:high"},
+        "coder_models": ["opencode:glm-5.3:high", "codex:gpt-5.6-luna:high"],
+    }
+
+    repo = tmp_path / "empty-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
+    (repo / "goal.md").write_text("# Build it\n", encoding="utf-8")
+
+    class DummyOrchestrator:
+        def __init__(self, config, state_home=None):
+            self.config = config
+            self.run_id = "prefs-run"
+            self.state = RunState(
+                run_id=self.run_id,
+                status="created",
+                phase="preflight",
+                created_at="now",
+                updated_at="now",
+                config=config.to_dict(),
+            )
+            self.store = type("Store", (), {"root": tmp_path / "artifacts"})()
+
+        def run(self) -> None:
+            self.state.status = "running"
+
+        def activity_snapshot(self) -> dict:
+            return {}
+
+    monkeypatch.setattr("forge.web.ForgeOrchestrator", DummyOrchestrator)
+    registry = RunRegistry(state_home=tmp_path)
+    assert registry.load_preferences() == {
+        "repo": "",
+        "branch": "",
+        "brief_path": "",
+        "brief": "",
+        "push": True,
+        "models": {},
+        "coder_models": [],
+    }
+    saved = registry.save_preferences(
+        {
+            "models": {"brain": "opencode:grok-4.6:high"},
+            "coder_models": ["opencode:glm-5.3:high"],
+        }
+    )
+    assert saved["models"]["brain"] == "opencode:grok-4.6:high"
+    assert registry.load_preferences()["coder_models"] == ["opencode:glm-5.3:high"]
+
+    registry.start(
+        {
+            "repo": str(repo),
+            "brief_path": str(repo / "goal.md"),
+            "push": False,
+            "models": {role: "codex:gpt-5.6-sol:high" for role in ROLE_NAMES},
+            "coder_models": ["opencode:grok-4.6"],
+        }
+    )
+    (tmp_path / "ui-preferences.json").unlink()
+    fallback = registry.load_preferences()
+    assert fallback["models"]["brain"] == "codex:gpt-5.6-sol:high"
+    assert fallback["coder_models"] == [
+        "opencode:xai/grok-4.6",
+        "opencode:xai/grok-4.6",
+        "opencode:xai/grok-4.6",
+    ]

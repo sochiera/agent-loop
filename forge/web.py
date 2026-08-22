@@ -19,13 +19,63 @@ from typing import Any, Callable
 from .artifacts import atomic_write
 from .catalog import assign_coder_models, catalog_payload, DEFAULTS
 from .gitops import list_branches, repository_summary
-from .models import ModelSpec, ROLE_NAMES, RunConfig
+from .models import CODER_ROLES, ModelSpec, ROLE_NAMES, RunConfig
 from .orchestrator import ForgeOrchestrator
 
 
 STATIC = Path(__file__).with_name("static")
 MAX_BROWSE_ENTRIES = 1000
 MAX_PREVIEW_BYTES = 2_000_000
+PREFERENCE_ROLES = ("brain", "planner", "reviewer", "tester", "whitebox")
+MAX_CODER_PREFERENCES = 12
+
+
+def sanitize_preferences(payload: dict[str, Any]) -> dict[str, Any]:
+    models_raw = payload.get("models")
+    models: dict[str, str] = {}
+    if isinstance(models_raw, dict):
+        for role in PREFERENCE_ROLES:
+            value = str(models_raw.get(role) or "").strip()
+            if value:
+                models[role] = value
+    coder_models: list[str] = []
+    if isinstance(payload.get("coder_models"), list):
+        for item in payload["coder_models"]:
+            value = str(item or "").strip()
+            if not value:
+                continue
+            coder_models.append(value)
+            if len(coder_models) >= MAX_CODER_PREFERENCES:
+                break
+    return {
+        "repo": str(payload.get("repo") or ""),
+        "branch": str(payload.get("branch") or ""),
+        "brief_path": str(payload.get("brief_path") or payload.get("briefPath") or ""),
+        "brief": str(payload.get("brief") or payload.get("brief_text") or ""),
+        "push": payload.get("push") is not False,
+        "models": models,
+        "coder_models": coder_models,
+    }
+
+
+def preferences_from_config(config: RunConfig) -> dict[str, Any]:
+    return {
+        "repo": config.repo,
+        "branch": config.branch,
+        "brief_path": config.brief,
+        "brief": "",
+        "push": config.push,
+        "models": {
+            role: config.models[role].display()
+            for role in PREFERENCE_ROLES
+            if role in config.models
+        },
+        "coder_models": [
+            config.models[role].display()
+            for role in CODER_ROLES
+            if role in config.models
+        ],
+    }
 
 
 def browse_filesystem(raw_path: str = "") -> dict[str, Any]:
@@ -166,6 +216,13 @@ class RunRegistry:
         with self._lock:
             self._runs[orchestrator.run_id] = live
         self.persist_session()
+        self.save_preferences(
+            {
+                **payload,
+                "brief": brief_text or payload.get("brief") or "",
+                "brief_path": str(brief_path),
+            }
+        )
         self._launch(live, recover=False)
         return orchestrator.state.to_dict()
 
@@ -195,6 +252,41 @@ class RunRegistry:
     def _session_path(self) -> Path:
         root = self.state_home or Path.home() / ".local/state/forge"
         return Path(root) / "ui-session.json"
+
+    def _preferences_path(self) -> Path:
+        root = self.state_home or Path.home() / ".local/state/forge"
+        return Path(root) / "ui-preferences.json"
+
+    def save_preferences(self, payload: dict[str, Any]) -> dict[str, Any]:
+        cleaned = sanitize_preferences(payload)
+        path = self._preferences_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, json.dumps(cleaned, indent=2) + "\n")
+        return cleaned
+
+    def load_preferences(self) -> dict[str, Any]:
+        stored = self._read_preferences()
+        if stored.get("models") or stored.get("coder_models"):
+            return stored
+        return self._preferences_from_runs() or stored or sanitize_preferences({})
+
+    def _read_preferences(self) -> dict[str, Any]:
+        path = self._preferences_path()
+        if not path.is_file():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return sanitize_preferences(value) if isinstance(value, dict) else {}
+
+    def _preferences_from_runs(self) -> dict[str, Any]:
+        with self._lock:
+            lives = list(self._runs.values())
+        if not lives:
+            return {}
+        latest = max(lives, key=lambda item: str(item.orchestrator.state.updated_at))
+        return preferences_from_config(latest.orchestrator.config)
 
     def persist_session(self) -> None:
         with self._lock:
@@ -363,6 +455,8 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 return self._json({"error": "run not found"}, HTTPStatus.NOT_FOUND)
         if parsed.path == "/api/catalog":
             return self._json(catalog_payload())
+        if parsed.path == "/api/preferences":
+            return self._json(self.registry.load_preferences())
         if parsed.path == "/api/browse":
             query = urllib.parse.parse_qs(parsed.query)
             try:
@@ -405,6 +499,8 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 if self.request_restart is None:
                     return self._json({"error": "restart is unavailable"}, HTTPStatus.BAD_REQUEST)
                 return self._json(self.request_restart(bool(payload.get("confirm"))))
+            if self.path == "/api/preferences":
+                return self._json(self.registry.save_preferences(payload))
             if self.path == "/api/runs":
                 return self._json(self.registry.start(payload), HTTPStatus.CREATED)
             if self.path == "/api/runs/recover":
