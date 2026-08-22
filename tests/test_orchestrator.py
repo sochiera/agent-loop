@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from forge.agents import AgentConfigurationFailure, AgentRequest, AgentTimeout
+from forge.agents import (
+    AgentConfigurationFailure,
+    AgentRequest,
+    AgentTimeout,
+    AgentUsageLimit,
+)
 from forge.models import AgentResult, ModelSpec, ROLE_NAMES, RunConfig, Usage
 from forge.orchestrator import PROBE_PROMPT, ForgeOrchestrator
 
@@ -312,8 +317,6 @@ def test_recovery_restores_captured_candidates_and_resumes_review(tmp_path: Path
 
     artifacts = repo / ".forge" / "runs" / "captured-review" / "batches" / "001"
     assert (artifacts / "review-bundle.json").is_file()
-    orchestrator.state.batches = [{"cycle": 0}]
-    orchestrator.store.save_state(orchestrator.state)
     orchestrator.runner = CapturedReviewRecoveryRunner()
 
     recovered = orchestrator.recover_failed()
@@ -442,7 +445,7 @@ def test_recover_rejects_a_completed_run(tmp_path: Path):
         check_binaries=False,
     )
     orchestrator.run()
-    with pytest.raises(RuntimeError, match="only failed or paused"):
+    with pytest.raises(RuntimeError, match="only failed"):
         orchestrator.recover()
 
 
@@ -585,3 +588,233 @@ def test_failed_model_probe_stops_before_brain(tmp_path: Path):
     assert runner.brain_calls == 0
     assert orchestrator.state.status == "failed"
     assert not any(request.role == "brain" for request in runner.requests)
+
+
+class TwoBatchRunner(FakeRunner):
+    def run(self, request: AgentRequest) -> AgentResult:
+        if request.role == "brain":
+            self.brain_calls += 1
+            if self.brain_calls <= 2:
+                text = json.dumps(
+                    {
+                        "tool": "forge.run_batch",
+                        "reason": f"build batch {self.brain_calls}",
+                        "objective": f"Deliver greeting batch {self.brain_calls}",
+                        "success_criteria": ["feature.txt contains a greeting"],
+                    }
+                )
+            else:
+                text = json.dumps(
+                    {
+                        "tool": "forge.finish",
+                        "reason": "two batches are enough",
+                        "summary": "Greeting delivered twice.",
+                    }
+                )
+            return AgentResult(
+                text=text,
+                session_id=request.session_id or "brain-session",
+                usage=Usage(input_tokens=10, output_tokens=5),
+                elapsed_seconds=0.01,
+                raw_output=text,
+            )
+        if request.role.startswith("coder_") and "selected your implementation" not in request.prompt:
+            candidate = request.role.removeprefix("coder_")
+            (request.cwd / "feature.txt").write_text(
+                f"hello from {candidate}\nbatch {self.brain_calls}\n",
+                encoding="utf-8",
+            )
+            plan = request.cwd / ".forge" / "plan.md"
+            plan.write_text(
+                plan.read_text(encoding="utf-8").replace("[ ]", "[x]"),
+                encoding="utf-8",
+            )
+            return AgentResult(
+                text="Implemented all tasks and validation passes.",
+                session_id=request.session_id or f"{request.role}-session",
+                usage=Usage(input_tokens=10, output_tokens=5),
+                elapsed_seconds=0.01,
+                raw_output="implemented",
+            )
+        return super().run(request)
+
+
+class ExploreLimitRunner(TwoBatchRunner):
+    def __init__(self):
+        super().__init__()
+        self.explore_failures = 0
+        self.explore_models: list[str] = []
+
+    def run(self, request: AgentRequest) -> AgentResult:
+        limited = "grok" in request.model.display()
+        if request.role == "probe" and limited and self.explore_failures:
+            raise AgentUsageLimit(
+                "explore still limited",
+                raw_output="You've hit your usage limit. Purchase more credits.",
+            )
+        if request.role == "coder_explore":
+            self.explore_models.append(request.model.display())
+            if "selected your implementation" not in request.prompt and limited:
+                self.explore_failures += 1
+                raise AgentUsageLimit(
+                    "explore limited",
+                    raw_output="You've hit your usage limit. Purchase more credits.",
+                )
+        return super().run(request)
+
+
+class ReviewerLimitRunner(FakeRunner):
+    def __init__(self):
+        super().__init__()
+        self.reviewer_models: list[str] = []
+
+    def run(self, request: AgentRequest) -> AgentResult:
+        if request.role == "reviewer":
+            self.reviewer_models.append(request.model.display())
+            if request.model.provider == "codex":
+                raise AgentUsageLimit(
+                    "review limited",
+                    raw_output="You've hit your usage limit.",
+                )
+        return super().run(request)
+
+
+def _mixed_models() -> dict[str, ModelSpec]:
+    return {
+        "brain": ModelSpec.parse("codex:gpt-5.6-sol:high"),
+        "planner": ModelSpec.parse("codex:gpt-5.6-sol:high"),
+        "coder_tdd": ModelSpec.parse("codex:gpt-5.6-luna:high"),
+        "coder_explore": ModelSpec.parse("opencode:grok-4.6"),
+        "coder_classic": ModelSpec.parse("codex:gpt-5.6-luna:high"),
+        "reviewer": ModelSpec.parse("codex:gpt-5.6-terra:high"),
+        "tester": ModelSpec.parse("codex:gpt-5.6-terra:high"),
+        "whitebox": ModelSpec.parse("codex:gpt-5.6-terra:high"),
+    }
+
+
+def test_one_coder_usage_limit_does_not_abort_the_cycle(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+
+    class OneBatchExploreLimit(ExploreLimitRunner):
+        def run(self, request: AgentRequest) -> AgentResult:
+            if request.role == "brain":
+                self.brain_calls += 1
+                text = json.dumps(
+                    {
+                        "tool": "forge.run_batch" if self.brain_calls == 1 else "forge.finish",
+                        "reason": "one batch",
+                        "objective": "Deliver the greeting feature",
+                        "success_criteria": ["feature.txt contains a greeting"],
+                        "summary": "Done.",
+                    }
+                )
+                return AgentResult(
+                    text=text,
+                    session_id=request.session_id or "brain-session",
+                    usage=Usage(input_tokens=10, output_tokens=5),
+                    elapsed_seconds=0.01,
+                    raw_output=text,
+                )
+            return ExploreLimitRunner.run(self, request)
+
+    runner = OneBatchExploreLimit()
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", _mixed_models(), push=False),
+        run_id="coder-limit",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    state = orchestrator.run()
+    assert state.status == "complete"
+    assert runner.explore_failures == 1
+    assert "opencode:xai/grok-4.6" in state.disabled_models
+    assert "hello from tdd" in (repo / "feature.txt").read_text(encoding="utf-8")
+    metrics = state.batches[0]["candidate_metrics"]
+    assert metrics["explore"]["status"] == "failed"
+    assert metrics["tdd"]["status"] == "complete"
+    assert metrics["classic"]["status"] == "complete"
+
+
+def test_next_cycle_replaces_limited_coder_with_a_working_clone(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    runner = ExploreLimitRunner()
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", _mixed_models(), push=False),
+        run_id="clone-coder",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    state = orchestrator.run()
+    assert state.status == "complete"
+    assert state.cycle == 2
+    assert runner.explore_failures == 1
+    assert any("gpt-5.6-luna" in item for item in runner.explore_models)
+    assert orchestrator.config.models["coder_explore"].model == "gpt-5.6-luna"
+
+
+def test_staff_usage_limit_switches_to_backup_and_resumes(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    models = {role: ModelSpec.parse("codex:gpt-5.6-sol:high") for role in ROLE_NAMES}
+    runner = ReviewerLimitRunner()
+    orchestrator = ForgeOrchestrator(
+        RunConfig(
+            str(repo),
+            str(brief),
+            "main",
+            models,
+            push=False,
+            backup=ModelSpec.parse("opencode:grok-4.6"),
+        ),
+        run_id="staff-backup",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    state = orchestrator.run()
+    assert state.status == "complete"
+    assert runner.reviewer_models[0].startswith("codex:")
+    assert any(item.startswith("opencode:") for item in runner.reviewer_models)
+    assert orchestrator.config.models["reviewer"].provider == "opencode"
+    assert "codex:gpt-5.6-sol" in state.disabled_models
+    assert any("replacement brain session" in item for item in state.warnings)
+
+
+def test_reviewer_timeout_warning_uses_role_limit(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="reviewer-timeout",
+        runner=TimeoutRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    with pytest.raises(AgentTimeout):
+        orchestrator._invoke(
+            role="reviewer",
+            model=models["reviewer"],
+            prompt="review",
+            cwd=repo,
+            relative="reviewer-timeout-check",
+        )
+    assert any("1800s" in item for item in orchestrator.state.warnings)
+    assert not any("3600s" in item for item in orchestrator.state.warnings)
+
+
+def test_capture_marks_review_resume_phase(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", _mixed_models(), push=False),
+        run_id="capture-phase",
+        runner=ReviewFailureRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    with pytest.raises(AgentConfigurationFailure):
+        orchestrator.run()
+    assert orchestrator.state.checkpoint.get("resume_phase") == "review"
+    hint = orchestrator.recovery_hint()
+    assert hint["kind"] == "resume_review"
+    assert hint["cycle"] == 1

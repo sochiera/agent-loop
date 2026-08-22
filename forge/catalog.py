@@ -146,7 +146,7 @@ ROLE_TIMEOUTS = {
     "coder_tdd": 3600,
     "coder_explore": 3600,
     "coder_classic": 3600,
-    "reviewer": 600,
+    "reviewer": 1800,
     "tester": 1800,
     "whitebox": 1800,
     "probe": 60,
@@ -181,6 +181,16 @@ def resolve_identity(provider: str, model: str) -> tuple[str, str]:
 
 def validate_spec(spec: Any) -> None:
     resolve_identity(spec.provider, spec.model)
+
+
+def model_identity(spec: Any) -> str:
+    return f"{spec.provider}:{spec.model}"
+
+
+def spec_with_effort(spec: Any, effort: str = "") -> Any:
+    from .models import ModelSpec
+
+    return ModelSpec(spec.provider, spec.model, effort or spec.effort)
 
 
 def assign_coder_models(

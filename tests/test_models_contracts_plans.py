@@ -5,7 +5,7 @@ import pytest
 
 import random
 
-from forge.catalog import assign_coder_models, shuffle_coder_models
+from forge.catalog import ROLE_TIMEOUTS, assign_coder_models, shuffle_coder_models
 from forge.web import models_from_payload, restart_payload
 from forge.cli import _parser
 from forge.contracts import (
@@ -17,7 +17,7 @@ from forge.contracts import (
     parse_test,
     parse_whitebox,
 )
-from forge.models import ModelSpec
+from forge.models import ModelSpec, RunConfig
 from forge.plans import (
     candidate_validation_commands,
     progress,
@@ -26,6 +26,27 @@ from forge.plans import (
 )
 from forge.prompts import planner_prompt, tester_prompt as _tester_prompt, winner_fix_prompt
 from forge.validation import classify_command as classify
+
+
+def test_run_config_persists_backup_model():
+    models = {role: ModelSpec.parse("codex:gpt-5.6-sol:high") for role in (
+        "brain", "planner", "coder_tdd", "coder_explore", "coder_classic",
+        "reviewer", "tester", "whitebox",
+    )}
+    config = RunConfig(
+        repo="/tmp/repo",
+        brief="/tmp/brief.md",
+        branch="main",
+        models=models,
+        backup=ModelSpec.parse("opencode:grok-4.6"),
+    )
+    restored = RunConfig.from_dict(config.to_dict())
+    assert restored.backup is not None
+    assert restored.backup.display() == "opencode:xai/grok-4.6"
+
+
+def test_reviewer_role_timeout_is_thirty_minutes():
+    assert ROLE_TIMEOUTS["reviewer"] == 1800
 
 
 def test_model_spec_round_trip():

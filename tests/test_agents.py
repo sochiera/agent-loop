@@ -4,9 +4,12 @@ from pathlib import Path
 from forge.agents import (
     AgentRequest,
     AgentRunner,
+    AgentUsageLimit,
     _NON_RETRYABLE_ERRORS,
     _codex_parse,
     _opencode_parse,
+    failure_type_for,
+    is_usage_limit,
 )
 from forge.models import ModelSpec
 
@@ -108,3 +111,5 @@ def test_codex_coder_uses_lean_cached_tool_surface(tmp_path: Path):
 def test_usage_limit_is_classified_as_non_retryable():
     message = "You've hit your usage limit. Purchase more credits or try again next week."
     assert any(marker in message.lower() for marker in _NON_RETRYABLE_ERRORS)
+    assert is_usage_limit(message)
+    assert failure_type_for(message) is AgentUsageLimit

@@ -46,6 +46,8 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert "Forge Control Room" in html
         assert "model-provider" in html
         assert "Coder model pool" in html
+        assert 'id="shared-staff"' in html
+        assert 'id="enable-backup"' in html
         assert 'id="restart"' in html
         assert 'id="browse-repo"' in html
         assert 'id="browse-brief"' in html
@@ -279,6 +281,8 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
         "push": False,
         "models": {"brain": "opencode:grok-4.6:high"},
         "coder_models": ["opencode:glm-5.3:high", "codex:gpt-5.6-luna:high"],
+        "shared_staff_model": False,
+        "backup": "",
     }
 
     repo = tmp_path / "empty-repo"
@@ -316,6 +320,8 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
         "push": True,
         "models": {},
         "coder_models": [],
+        "shared_staff_model": False,
+        "backup": "",
     }
     saved = registry.save_preferences(
         {

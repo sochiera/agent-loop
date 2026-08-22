@@ -21,9 +21,17 @@ from .agents import (
     AgentResult,
     AgentRunner,
     AgentTimeout,
+    AgentUsageLimit,
+    is_usage_limit,
 )
 from .artifacts import ArtifactStore, atomic_write, utc_now
-from .catalog import ROLE_TIMEOUTS, shuffle_coder_models
+from .catalog import (
+    ROLE_TIMEOUTS,
+    assign_coder_models,
+    model_identity,
+    shuffle_coder_models,
+    spec_with_effort,
+)
 from .contracts import (
     BRAIN_SCHEMA,
     REVIEW_SCHEMA,
@@ -37,7 +45,7 @@ from .contracts import (
     parse_whitebox,
 )
 from .gitops import CandidateWorktree, GitCompetition, GitError
-from .models import ModelSpec, RunConfig, RunState
+from .models import CODER_ROLES, STAFF_ROLES, ModelSpec, RunConfig, RunState
 from .plans import (
     PlanProgress,
     candidate_validation_commands,
@@ -135,9 +143,18 @@ class ForgeOrchestrator:
                 created_at=now,
                 updated_at=now,
                 config=config.to_dict(),
+                original_models={
+                    role: {
+                        "provider": spec.provider,
+                        "model": spec.model,
+                        "effort": spec.effort,
+                    }
+                    for role, spec in config.models.items()
+                },
             )
         self._control = threading.Condition()
         self._activity_lock = threading.Lock()
+        self._roster_lock = threading.Lock()
         self._competition: GitCompetition | None = None
 
     def pause(self) -> None:
@@ -222,9 +239,9 @@ class ForgeOrchestrator:
                 self._competition.cleanup()
 
     def recover(self) -> RunState:
-        if self.state.status not in {"failed", "paused"}:
+        if self.state.status not in {"failed", "paused", "cancelled"}:
             raise RuntimeError(
-                f"run {self.run_id} is {self.state.status}; only failed or paused runs recover"
+                f"run {self.run_id} is {self.state.status}; only failed, paused, or cancelled runs recover"
             )
         self.state.status = "running"
         self.state.cancel_requested = False
@@ -232,45 +249,7 @@ class ForgeOrchestrator:
         self._save("Recovering run from the last durable checkpoint.")
         try:
             self._preflight()
-            checkpoint = dict(self.state.checkpoint or {})
-            delivered = {item.get("cycle") for item in self.state.batches}
-            decision_data = checkpoint.get("decision")
-            if self.state.cycle not in delivered and decision_data:
-                decision = BrainDecision(
-                    tool="forge.run_batch",
-                    reason=str(decision_data.get("reason") or "recovered batch"),
-                    objective=str(decision_data.get("objective") or ""),
-                    success_criteria=tuple(decision_data.get("success_criteria") or ()),
-                )
-                if self.state.cycle > 0:
-                    self.state.cycle -= 1
-                batch = self._run_batch(decision, recover=True)
-                self.state.batches.append(batch)
-                self._save(f"Recovered batch {self.state.cycle} delivered.")
-                decision = self._brain_decision(
-                    brain_feedback(cycle=self.state.cycle, report=batch["brain_report"])
-                )
-            elif self.state.batches:
-                last = self.state.batches[-1]
-                decision = self._brain_decision(
-                    brain_feedback(cycle=last["cycle"], report=last.get("brain_report") or {})
-                )
-            else:
-                decision = self._brain_decision(brain_initial(self._brief_text()))
-            while decision.tool != "forge.finish":
-                self._checkpoint()
-                batch = self._run_batch(decision)
-                self.state.batches.append(batch)
-                self._save(f"Batch {self.state.cycle} delivered and black-box tested.")
-                decision = self._brain_decision(
-                    brain_feedback(cycle=self.state.cycle, report=batch["brain_report"])
-                )
-            self.state.status = "complete"
-            self.state.phase = "complete"
-            self.state.final_summary = decision.summary
-            self._save(decision.reason)
-            self.store.write_text("final-summary.md", decision.summary + "\n")
-            return self.state
+            return self._continue_from_artifacts()
         except RunCancelled:
             self.state.status = "cancelled"
             self.state.phase = "cancelled"
@@ -303,48 +282,14 @@ class ForgeOrchestrator:
             self.state.active_agents.clear()
         if not self.state.brain_session_id:
             raise RuntimeError("failed run has no persistent brain session to resume")
-        if not self.state.batches:
-            raise RuntimeError("failed run has no delivered batch to resume from")
-        latest = self.state.batches[-1]
-        latest_cycle = int(latest["cycle"])
-        pending_cycle = int(self.state.cycle)
-        resume_captured = (
-            pending_cycle > latest_cycle and self._has_captured_batch(pending_cycle)
-        )
-        # Planning increments the cycle before delivery. Preserve it only when
-        # all candidate patches/outcomes were captured; otherwise retry from
-        # the last batch that actually reached main.
-        self.state.cycle = pending_cycle if resume_captured else latest_cycle
         self.state.status = "running"
         self.state.cancel_requested = False
         self.state.paused = False
         self.state.active_agents.clear()
-        recovery_point = (
-            f"captured batch {self.state.cycle} review"
-            if resume_captured
-            else f"delivered batch {self.state.cycle}"
-        )
-        self._save(f"Recovering run from {recovery_point}.")
+        self._save("Recovering run from captured artifacts or the last delivered batch.")
         try:
             self._preflight()
-            if resume_captured:
-                batch = self._resume_captured_batch(self.state.cycle)
-                self.state.batches.append(batch)
-                self._save(f"Batch {self.state.cycle} delivered and black-box tested.")
-                decision = self._brain_decision(
-                    brain_feedback(
-                        cycle=self.state.cycle,
-                        report=self._brain_report_from_batch(batch),
-                    )
-                )
-                return self._run_from_decision(decision)
-            decision = self._brain_decision(
-                brain_feedback(
-                    cycle=self.state.cycle,
-                    report=self._brain_report_from_batch(latest),
-                )
-            )
-            return self._run_from_decision(decision)
+            return self._continue_from_artifacts()
         except RunCancelled:
             self.state.status = "cancelled"
             self.state.phase = "cancelled"
@@ -371,6 +316,120 @@ class ForgeOrchestrator:
                 ]
             )
         return all(path.is_file() for path in required) and not (root / "delivery.json").exists()
+
+    def _has_delivery(self, cycle: int) -> bool:
+        return (self.store.root / "batches" / f"{cycle:03d}" / "delivery.json").is_file()
+
+    def _has_plan(self, cycle: int) -> bool:
+        root = self.store.root / "batches" / f"{cycle:03d}"
+        return (root / "plan.md").is_file() or (root / "objective.json").is_file()
+
+    def _batch_recorded(self, cycle: int) -> bool:
+        return any(int(item.get("cycle") or 0) == cycle for item in self.state.batches)
+
+    def _candidate_cycles(self) -> list[int]:
+        cycles: set[int] = set()
+        if self.state.cycle > 0:
+            cycles.add(int(self.state.cycle))
+        for batch in self.state.batches:
+            try:
+                cycles.add(int(batch["cycle"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        batches_dir = self.store.root / "batches"
+        if batches_dir.is_dir():
+            for child in batches_dir.iterdir():
+                if child.is_dir() and child.name.isdigit():
+                    cycles.add(int(child.name))
+        return sorted(cycles, reverse=True)
+
+    def _recovery_target(self) -> tuple[str, int]:
+        for cycle in self._candidate_cycles():
+            if self._has_captured_batch(cycle):
+                return "resume_review", cycle
+            if self._has_delivery(cycle):
+                if self._batch_recorded(cycle):
+                    return "next_brain", cycle
+                return "finish_batch", cycle
+            if self._has_plan(cycle):
+                return "recode", cycle
+        raise RuntimeError(
+            "run has nothing recoverable: no captured review, delivered batch, or plan"
+        )
+
+    def recovery_hint(self) -> dict[str, Any]:
+        if self.state.status == "complete":
+            return {}
+        try:
+            action, cycle = self._recovery_target()
+        except RuntimeError:
+            return {}
+        kind = "resume_review" if action == "resume_review" else "recover"
+        return {"kind": kind, "action": action, "cycle": cycle}
+
+    def _decision_from_cycle(self, cycle: int) -> BrainDecision:
+        path = self.store.root / "batches" / f"{cycle:03d}" / "objective.json"
+        if not path.is_file():
+            checkpoint = dict(self.state.checkpoint or {}).get("decision") or {}
+            return BrainDecision(
+                tool="forge.run_batch",
+                reason=str(checkpoint.get("reason") or "recovered batch"),
+                objective=str(checkpoint.get("objective") or ""),
+                success_criteria=tuple(checkpoint.get("success_criteria") or ()),
+            )
+        objective = json.loads(path.read_text(encoding="utf-8"))
+        return BrainDecision(
+            "forge.run_batch",
+            str(objective.get("brain_reason", "Resume captured batch.")),
+            str(objective.get("objective") or ""),
+            tuple(str(item) for item in objective.get("success_criteria") or ()),
+        )
+
+    def _continue_from_artifacts(self) -> RunState:
+        action, cycle = self._recovery_target()
+        self._save(f"Recovery target: {action} for batch {cycle}.")
+        if action == "resume_review":
+            self._refresh_roster(reason=f"resume review {cycle}", require_coders=False)
+            self.state.cycle = cycle
+            batch = self._resume_captured_batch(cycle)
+            self.state.batches.append(batch)
+            self._save(f"Batch {self.state.cycle} delivered and black-box tested.")
+            decision = self._brain_decision(
+                brain_feedback(
+                    cycle=self.state.cycle,
+                    report=self._brain_report_from_batch(batch),
+                )
+            )
+            return self._run_from_decision(decision)
+        if action in {"finish_batch", "recode"}:
+            if action == "recode":
+                self._refresh_roster(reason=f"recode batch {cycle}")
+            decision = self._decision_from_cycle(cycle)
+            self.state.cycle = max(cycle - 1, 0)
+            batch = self._run_batch(decision, recover=True)
+            self.state.batches.append(batch)
+            self._save(f"Batch {self.state.cycle} delivered and black-box tested.")
+            decision = self._brain_decision(
+                brain_feedback(
+                    cycle=self.state.cycle,
+                    report=self._brain_report_from_batch(batch),
+                )
+            )
+            return self._run_from_decision(decision)
+        last = next(
+            (item for item in reversed(self.state.batches) if int(item.get("cycle") or 0) == cycle),
+            None,
+        )
+        if last is None:
+            raise RuntimeError(f"delivered batch {cycle} is missing from run state")
+        self.state.cycle = cycle
+        decision = self._brain_decision(
+            brain_feedback(
+                cycle=cycle,
+                report=self._brain_report_from_batch(last),
+            )
+        )
+        return self._run_from_decision(decision)
 
     def _resume_captured_batch(self, cycle: int) -> dict[str, Any]:
         assert self._competition is not None
@@ -427,6 +486,8 @@ class ForgeOrchestrator:
     def _run_from_decision(self, decision: BrainDecision) -> RunState:
         while decision.tool != "forge.finish":
             self._checkpoint()
+            if self.state.cycle > 0:
+                self._refresh_roster(reason=f"before cycle {self.state.cycle + 1}")
             batch = self._run_batch(decision)
             self.state.batches.append(batch)
             self._save(f"Batch {self.state.cycle} delivered and black-box tested.")
@@ -449,6 +510,10 @@ class ForgeOrchestrator:
             for role, model in self.config.models.items():
                 if shutil.which(model.provider) is None:
                     raise ValueError(f"{role} provider executable is unavailable: {model.provider}")
+            if self.config.backup is not None and shutil.which(self.config.backup.provider) is None:
+                self._warning(
+                    f"backup provider executable is unavailable: {self.config.backup.provider}"
+                )
         self.brain_dir.mkdir(parents=True, exist_ok=True)
         self.worktree_root.mkdir(parents=True, exist_ok=True)
         self._competition = GitCompetition(
@@ -465,53 +530,158 @@ class ForgeOrchestrator:
     def _unique_run_models(self) -> list[tuple[str, ModelSpec]]:
         unique: list[tuple[str, ModelSpec]] = []
         seen: set[str] = set()
-        for role, spec in self.config.models.items():
-            key = spec.display()
+        items: list[tuple[str, ModelSpec]] = list(self.config.models.items())
+        originals = self._original_models()
+        for role, spec in originals.items():
+            items.append((f"original_{role}", spec))
+        if self.config.backup is not None:
+            items.append(("backup", self.config.backup))
+        for role, spec in items:
+            key = model_identity(spec)
             if key in seen:
                 continue
             seen.add(key)
             unique.append((role, spec))
         return unique
 
+    def _original_models(self) -> dict[str, ModelSpec]:
+        stored = self.state.original_models or {}
+        if stored:
+            return {role: ModelSpec(**spec) for role, spec in stored.items()}
+        return dict(self.config.models)
+
     def _probe_models(self) -> None:
+        self._refresh_roster(reason="start")
+
+    def _probe_spec(self, spec: ModelSpec) -> Exception | None:
+        slug = spec.display().replace("/", "_").replace(":", "_")
+        probe_root = self.state_home / "probes" / self.run_id
+        probe_root.mkdir(parents=True, exist_ok=True)
+        try:
+            self._invoke(
+                role="probe",
+                model=spec,
+                prompt=PROBE_PROMPT,
+                cwd=probe_root / slug,
+                access="none",
+                relative=f"preflight/probe-{slug}",
+                candidate=spec.display(),
+                allow_failover=False,
+            )
+        except RunCancelled:
+            raise
+        except Exception as exc:
+            return exc
+        return None
+
+    def _refresh_roster(self, *, reason: str, require_coders: bool = True) -> None:
         unique = self._unique_run_models()
         self._phase(
             "preflight",
-            f"Probing {len(unique)} unique model(s) with a no-tool ping.",
+            f"Probing {len(unique)} unique model(s) with a no-tool ping ({reason}).",
         )
-        probe_root = self.state_home / "probes" / self.run_id
-        probe_root.mkdir(parents=True, exist_ok=True)
-        failures: list[str] = []
+        results: dict[str, Exception | None] = {}
 
-        def probe(item: tuple[str, ModelSpec]) -> str | None:
-            role, spec = item
-            slug = spec.display().replace("/", "_").replace(":", "_")
-            try:
-                self._invoke(
-                    role="probe",
-                    model=spec,
-                    prompt=PROBE_PROMPT,
-                    cwd=probe_root / slug,
-                    access="none",
-                    relative=f"preflight/probe-{slug}",
-                    candidate=spec.display(),
-                )
-            except RunCancelled:
-                raise
-            except Exception as exc:
-                return f"{spec.display()} (from {role}): {exc}"
-            return None
+        def probe(item: tuple[str, ModelSpec]) -> tuple[str, Exception | None]:
+            _role, spec = item
+            return model_identity(spec), self._probe_spec(spec)
 
         workers = min(len(unique), 8) or 1
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(probe, item) for item in unique]
             for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    failures.append(result)
-        if failures:
-            raise ValueError("model preflight failed: " + "; ".join(failures))
-        self._save(f"Model preflight passed for {len(unique)} unique model(s).")
+                identity, error = future.result()
+                results[identity] = error
+
+        disabled = set(self.state.disabled_models)
+        hard_failures: list[str] = []
+        for identity, error in results.items():
+            if error is None:
+                disabled.discard(identity)
+                continue
+            if is_usage_limit(str(error), getattr(error, "raw_output", "")):
+                disabled.add(identity)
+            else:
+                disabled.add(identity)
+                hard_failures.append(f"{identity}: {error}")
+
+        self.state.disabled_models = sorted(disabled)
+        previous_brain = model_identity(self.config.models["brain"])
+        originals = self._original_models()
+        for role, spec in originals.items():
+            if model_identity(spec) not in disabled:
+                self.config.models[role] = spec
+
+        backup = self.config.backup
+        backup_ok = (
+            backup is not None
+            and model_identity(backup) not in disabled
+            and (
+                not self.check_binaries
+                or shutil.which(backup.provider) is not None
+            )
+        )
+        staff_blocked: list[str] = []
+        for role in STAFF_ROLES:
+            current = self.config.models[role]
+            if model_identity(current) not in disabled:
+                continue
+            if backup_ok:
+                self.config.models[role] = spec_with_effort(backup, current.effort)
+                self._warning(
+                    f"{role} switched to backup {self.config.models[role].display()} ({reason})."
+                )
+            else:
+                staff_blocked.append(f"{role}={current.display()}")
+
+        coder_needs_rebalance = any(
+            model_identity(self.config.models[role]) in disabled for role in CODER_ROLES
+        )
+        healthy_coders: list[ModelSpec] = []
+        seen_coders: set[str] = set()
+        for role in CODER_ROLES:
+            for spec in (originals.get(role), self.config.models.get(role)):
+                if spec is None:
+                    continue
+                identity = model_identity(spec)
+                if identity in disabled or identity in seen_coders:
+                    continue
+                healthy_coders.append(spec)
+                seen_coders.add(identity)
+        if not healthy_coders and backup_ok:
+            healthy_coders.append(backup)
+        if coder_needs_rebalance and healthy_coders:
+            previous = {
+                role: self.config.models[role].display() for role in CODER_ROLES
+            }
+            self.config.models = assign_coder_models(self.config.models, healthy_coders)
+            self._warning(
+                "Coder roster rebalanced after preflight: "
+                + ", ".join(
+                    f"{role}={self.config.models[role].display()}" for role in CODER_ROLES
+                )
+                + f" (was {previous})."
+            )
+        coder_blocked = coder_needs_rebalance and not healthy_coders
+
+        self._reset_brain_session_if_changed(previous_brain)
+        self._persist_models()
+        if staff_blocked or (coder_blocked and require_coders):
+            detail = "; ".join(
+                hard_failures
+                or [f"disabled={', '.join(self.state.disabled_models) or 'none'}"]
+            )
+            if staff_blocked:
+                raise ValueError(
+                    "model preflight failed: "
+                    + ", ".join(staff_blocked)
+                    + f"; {detail}"
+                )
+            raise ValueError("model preflight failed: no healthy coder models remain; " + detail)
+        self._save(
+            f"Model preflight passed for {len(unique)} unique model(s); "
+            f"{len(self.state.disabled_models)} disabled."
+        )
 
     def _brain_decision(self, prompt: str) -> BrainDecision:
         self._phase("brain", "Persistent brain is choosing the next Forge action.")
@@ -639,7 +809,7 @@ class ForgeOrchestrator:
         missing = {
             name: candidate
             for name, candidate in worktrees.items()
-            if name not in outcomes or outcomes[name].status == "failed"
+            if name not in outcomes and not self._has_candidate_patch(batch_rel, name)
         }
         if missing:
             with ThreadPoolExecutor(max_workers=3, thread_name_prefix="forge-coder") as pool:
@@ -713,9 +883,10 @@ class ForgeOrchestrator:
 
         self._phase("winner-fix", f"The winning coder is applying review feedback.")
         winner = outcomes[winner_name]
+        winner_model = self.config.models[f"coder_{winner_name}"]
         fix_result = self._invoke(
             role=f"coder_{winner_name}",
-            model=self.config.models[f"coder_{winner_name}"],
+            model=winner_model,
             prompt=winner_fix_prompt(
                 review["feedback"],
                 winner.validation,
@@ -727,8 +898,17 @@ class ForgeOrchestrator:
             relative=f"{batch_rel}/candidates/{winner_name}/winner-fix",
             candidate=winner_name,
         )
+        current_winner_model = self.config.models[f"coder_{winner_name}"]
         if not winner.session_id or fix_result.session_id != winner.session_id:
-            raise RuntimeError("winning coder provider did not preserve its original session")
+            if model_identity(current_winner_model) == model_identity(winner_model):
+                raise RuntimeError(
+                    "winning coder provider did not preserve its original session"
+                )
+            winner.session_id = fix_result.session_id
+            self._warning(
+                f"Winner {winner_name} continued on replacement "
+                f"{current_winner_model.display()} with a new session."
+            )
         final_validation = run_commands(commands, winner.worktree.path)
         failed_final_checks = [
             item
@@ -892,6 +1072,9 @@ class ForgeOrchestrator:
             "candidate_metrics": metrics,
         }
 
+    def _has_candidate_patch(self, batch_rel: str, name: str) -> bool:
+        return (self.store.root / batch_rel / "candidates" / name / "candidate.patch").is_file()
+
     def _load_outcomes(
         self, worktrees: dict[str, CandidateWorktree], batch_rel: str
     ) -> dict[str, CandidateOutcome]:
@@ -907,7 +1090,9 @@ class ForgeOrchestrator:
                 if plan_file.is_file()
                 else PlanProgress(0, 0, ())
             )
-            if data.get("status") == "failed":
+            if data.get("status") == "failed" and not self._has_candidate_patch(
+                batch_rel, name
+            ):
                 continue
             outcomes[name] = CandidateOutcome(
                 name=name,
@@ -1069,6 +1254,7 @@ class ForgeOrchestrator:
                 relative=f"{batch_rel}/candidates/{candidate.name}/turn-{turns}",
                 candidate=candidate.name,
                 invocation=turns,
+                allow_failover=False,
             )
             if not result.session_id:
                 raise RuntimeError(
@@ -1168,6 +1354,9 @@ class ForgeOrchestrator:
             for name, value in bundle.items()
         }
         self.store.write_data(f"{batch_rel}/review-bundle.json", review_bundle)
+        if isinstance(self.state.checkpoint, dict):
+            self.state.checkpoint["resume_phase"] = "review"
+        self._save(f"Captured {len(bundle)} candidates; ready for review.")
         return bundle
 
     def _review_outcome(
@@ -1397,6 +1586,60 @@ class ForgeOrchestrator:
             }
         return metrics
 
+    def _persist_models(self) -> None:
+        self.state.config = self.config.to_dict()
+        self.store.write_data("config.json", self.config.to_dict())
+        self.store.save_state(self.state)
+
+    def _record_disabled(self, spec: ModelSpec) -> None:
+        identity = model_identity(spec)
+        with self._roster_lock:
+            if identity not in self.state.disabled_models:
+                self.state.disabled_models.append(identity)
+                self._persist_models()
+
+    def _replacement_for(self, role: str, current: ModelSpec) -> ModelSpec | None:
+        disabled = set(self.state.disabled_models)
+        backup = self.config.backup
+        if (
+            backup is not None
+            and model_identity(backup) != model_identity(current)
+            and model_identity(backup) not in disabled
+        ):
+            return spec_with_effort(backup, current.effort)
+        if role.startswith("coder_"):
+            for other in CODER_ROLES:
+                spec = self.config.models[other]
+                if (
+                    model_identity(spec) != model_identity(current)
+                    and model_identity(spec) not in disabled
+                ):
+                    return spec_with_effort(spec, current.effort)
+        return None
+
+    def _reset_brain_session_if_changed(self, previous_identity: str) -> None:
+        current = self.config.models.get("brain")
+        if current is None or model_identity(current) == previous_identity:
+            return
+        if self.state.brain_session_id:
+            self._warning(
+                f"Brain model changed from {previous_identity} to {model_identity(current)}; "
+                "starting a replacement brain session."
+            )
+        self.state.brain_session_id = None
+
+    def _apply_replacement(self, exhausted: ModelSpec, replacement: ModelSpec) -> None:
+        with self._roster_lock:
+            identity = model_identity(exhausted)
+            if identity not in self.state.disabled_models:
+                self.state.disabled_models.append(identity)
+            previous_brain = model_identity(self.config.models["brain"])
+            for role, spec in list(self.config.models.items()):
+                if model_identity(spec) == identity:
+                    self.config.models[role] = spec_with_effort(replacement, spec.effort)
+            self._reset_brain_session_if_changed(previous_brain)
+            self._persist_models()
+
     def _invoke(
         self,
         *,
@@ -1411,8 +1654,12 @@ class ForgeOrchestrator:
         relative: str,
         candidate: str = "",
         invocation: int = 1,
+        allow_failover: bool = True,
     ) -> AgentResult:
         current_prompt = prompt
+        current_model = model
+        current_session = session_id
+        failover_used = False
         role_timeout = ROLE_TIMEOUTS.get(role, self.config.agent_timeout_seconds)
         if role.startswith("coder_"):
             role_timeout = ROLE_TIMEOUTS.get(role, ROLE_TIMEOUTS.get("coder_tdd", 3600))
@@ -1428,23 +1675,45 @@ class ForgeOrchestrator:
                 activity_key,
                 role=role,
                 candidate=candidate,
-                model=model,
+                model=current_model,
                 attempt=attempt,
             )
             try:
                 result = self.runner.run(
                     AgentRequest(
                         role=role,
-                        model=model,
+                        model=current_model,
                         prompt=current_prompt,
                         cwd=cwd,
-                        session_id=session_id,
+                        session_id=current_session,
                         access=access,
                         schema=schema,
                         extra_writable_dirs=extra_writable_dirs,
                         timeout_seconds=role_timeout,
                     )
                 )
+            except AgentUsageLimit as exc:
+                self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
+                self._warning(f"{role} hit a usage limit on {current_model.display()}: {exc}")
+                self._record_disabled(current_model)
+                if allow_failover and not failover_used:
+                    replacement = self._replacement_for(role, current_model)
+                    if replacement is not None:
+                        self._apply_replacement(current_model, replacement)
+                        if role in self.config.models:
+                            current_model = self.config.models[role]
+                        else:
+                            current_model = replacement
+                        current_session = None
+                        if role == "brain":
+                            self.state.brain_session_id = None
+                        failover_used = True
+                        attempt = 0
+                        self._warning(
+                            f"{role} switching to backup {current_model.display()} and resuming."
+                        )
+                        continue
+                raise
             except AgentConfigurationFailure as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
                 self._warning(f"{role} has a non-retryable provider/CLI error: {exc}")
@@ -1452,7 +1721,7 @@ class ForgeOrchestrator:
             except AgentTimeout as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
                 self._warning(
-                    f"{role} reached its {self.config.agent_timeout_seconds}s limit; "
+                    f"{role} reached its {role_timeout}s limit; "
                     "the candidate will continue without another costly agent process"
                 )
                 raise
@@ -1477,7 +1746,7 @@ class ForgeOrchestrator:
             self.store.write_text(f"{relative}.response.md", result.text.rstrip() + "\n")
             self.store.record_agent_call(
                 role=role,
-                model=model,
+                model=current_model,
                 result=result,
                 cycle=self.state.cycle,
                 candidate=candidate,

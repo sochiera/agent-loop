@@ -20,6 +20,8 @@ ROLE_NAMES = (
 
 CODER_ROLES = ("coder_tdd", "coder_explore", "coder_classic")
 
+STAFF_ROLES = ("brain", "planner", "reviewer", "tester", "whitebox")
+
 DEFAULT_MODEL_SELECTORS = {
     "brain": "codex:gpt-5.6-sol:high",
     "planner": "codex:gpt-5.6-sol:high",
@@ -73,6 +75,7 @@ class RunConfig:
     retry_count: int = 2
     stalled_turns: int = 3
     shuffle_coders: bool = False
+    backup: ModelSpec | None = None
 
     def validate(self) -> None:
         from .catalog import validate_spec
@@ -88,6 +91,8 @@ class RunConfig:
             raise ValueError(f"missing model selections: {', '.join(missing)}")
         for spec in self.models.values():
             validate_spec(spec)
+        if self.backup is not None:
+            validate_spec(self.backup)
         if not self.branch.strip():
             raise ValueError("branch cannot be empty")
         if self.agent_timeout_seconds < 1:
@@ -96,10 +101,12 @@ class RunConfig:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["models"] = {key: asdict(value) for key, value in self.models.items()}
+        data["backup"] = asdict(self.backup) if self.backup is not None else None
         return data
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "RunConfig":
+        backup = value.get("backup")
         return cls(
             repo=str(value["repo"]),
             brief=str(value["brief"]),
@@ -110,6 +117,7 @@ class RunConfig:
             retry_count=int(value.get("retry_count", 2)),
             stalled_turns=int(value.get("stalled_turns", 3)),
             shuffle_coders=bool(value.get("shuffle_coders", False)),
+            backup=ModelSpec(**backup) if isinstance(backup, dict) else None,
         )
 
 
@@ -159,6 +167,8 @@ class RunState:
     active_agents: dict[str, dict[str, Any]] = field(default_factory=dict)
     checkpoint: dict[str, Any] = field(default_factory=dict)
     last_red_flags: list[str] = field(default_factory=list)
+    original_models: dict[str, dict[str, Any]] = field(default_factory=dict)
+    disabled_models: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

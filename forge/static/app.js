@@ -18,7 +18,7 @@ const defaultCoderPool = [defaultCoder, defaultCoder, defaultCoder];
 const maxCoderModels = 12;
 const phases = ["preflight", "brain", "planning", "coding", "review", "winner-fix", "delivery", "whitebox", "black-box"];
 const phaseLabels = ["Preflight", "Brain", "Plan", "Code ×3", "Review", "Fix", "Deliver", "White-box", "Black-box"];
-const storageKey = "forge-control-room-v3";
+const storageKey = "forge-control-room-v4";
 const providerLabels = {codex: "Codex", opencode: "OpenCode"};
 const familyLabels = {gpt: "GPT", grok: "Grok", qwen: "Qwen", deepseek: "DeepSeek", gemini: "Gemini", glm: "GLM"};
 const effortLabels = {"": "Default", low: "Low", medium: "Medium", high: "High"};
@@ -206,6 +206,58 @@ function savedCoderPool(value) {
   return previous.length ? previous : defaultCoderPool;
 }
 
+function staffIdentity(value) {
+  const parsed = parseSelector(value);
+  return `${parsed.provider}:${parsed.entry?.key || ""}`;
+}
+
+function inferSharedStaff(value) {
+  if (value?.shared_staff_model === true) return true;
+  if (value?.shared_staff_model === false) return false;
+  const models = roles.map(role => value?.models?.[role]).filter(Boolean);
+  if (models.length < roles.length) return false;
+  const identities = new Set(models.map(staffIdentity));
+  return identities.size === 1;
+}
+
+function syncStaffMode() {
+  const shared = document.querySelector("#shared-staff").checked;
+  document.querySelector("#shared-staff-block").classList.toggle("hidden", !shared);
+  document.querySelector("#models").classList.toggle("hidden", shared);
+  const backupOn = document.querySelector("#enable-backup").checked;
+  document.querySelector("#staff-backup").classList.toggle("hidden", !shared || !backupOn);
+}
+
+function staffSelectorsFromShared() {
+  const base = parseSelector(selectorFromCard(document.querySelector("#staff-model .model-card")));
+  const model = base.entry?.key || "";
+  return Object.fromEntries(roles.map(role => {
+    const effort = document.querySelector(`.staff-effort[data-role="${role}"] select`)?.value || "";
+    return [role, effort ? `${base.provider}:${model}:${effort}` : `${base.provider}:${model}`];
+  }));
+}
+
+function applySharedFromModels(models, backup) {
+  const source = models?.brain || defaults.brain;
+  const staffCard = document.querySelector("#staff-model .model-card");
+  if (staffCard) applySelector(staffCard, source);
+  roles.forEach(role => {
+    const parsed = parseSelector(models?.[role] || source);
+    const select = document.querySelector(`.staff-effort[data-role="${role}"] select`);
+    if (select) {
+      const entry = resolveEntry(parsed.entry?.key || parseSelector(source).entry?.key);
+      select.innerHTML = effortOptions(entry, parsed.effort);
+      if ([...select.options].some(option => option.value === parsed.effort)) {
+        select.value = parsed.effort;
+      }
+    }
+  });
+  const backupCard = document.querySelector("#staff-backup .model-card");
+  const hasBackup = Boolean(backup);
+  document.querySelector("#enable-backup").checked = hasBackup;
+  if (backupCard) applySelector(backupCard, backup || "opencode:grok-4.6");
+}
+
 function buildModelFields() {
   const box = document.querySelector("#models");
   const template = document.querySelector("#model-template");
@@ -218,16 +270,52 @@ function buildModelFields() {
     applySelector(card, defaults[role]);
     box.appendChild(fragment);
   });
+  const staffBox = document.querySelector("#staff-model");
+  const staffFragment = template.content.cloneNode(true);
+  const staffCard = staffFragment.querySelector(".model-card");
+  staffCard.dataset.role = "staff";
+  staffFragment.querySelector(".model-label").textContent = "Staff model";
+  staffFragment.querySelector(".model-help").textContent = "Shared by brain, planner, reviewer, tester, whitebox";
+  applySelector(staffCard, defaults.brain);
+  staffBox.appendChild(staffFragment);
+  const efforts = document.querySelector("#staff-efforts");
+  roles.forEach(role => {
+    const label = document.createElement("label");
+    label.className = "staff-effort";
+    label.dataset.role = role;
+    label.innerHTML = `<span>${escapeHtml(roleMeta[role][0])}</span><select></select>`;
+    const parsed = parseSelector(defaults[role]);
+    label.querySelector("select").innerHTML = effortOptions(parsed.entry, parsed.effort);
+    efforts.appendChild(label);
+  });
+  const backupBox = document.querySelector("#staff-backup");
+  const backupFragment = template.content.cloneNode(true);
+  const backupCard = backupFragment.querySelector(".model-card");
+  backupCard.dataset.role = "backup";
+  backupFragment.querySelector(".model-label").textContent = "Backup";
+  backupFragment.querySelector(".model-help").textContent = "Different provider or model for usage-limit failover";
+  applySelector(backupCard, "opencode:grok-4.6");
+  backupBox.appendChild(backupFragment);
   replaceCoderPool(defaultCoderPool);
+  syncStaffMode();
 }
 
 function restoreRecommended() {
+  document.querySelector("#shared-staff").checked = false;
+  document.querySelector("#enable-backup").checked = false;
   roles.forEach(role => applySelector(roleCard(role), defaults[role]));
+  applySharedFromModels(defaults, "");
   replaceCoderPool(defaultCoderPool);
+  syncStaffMode();
   saveForm();
 }
 
 function collectForm() {
+  const shared = document.querySelector("#shared-staff").checked;
+  const backupOn = document.querySelector("#enable-backup").checked;
+  const models = shared
+    ? staffSelectorsFromShared()
+    : Object.fromEntries(roles.map(role => [role, selectorFromCard(roleCard(role))]));
   return {
     repo: document.querySelector("#repo").value,
     branch: document.querySelector("#branch").value,
@@ -235,8 +323,10 @@ function collectForm() {
     briefPath: document.querySelector("#brief-path").value,
     brief: document.querySelector("#brief").value,
     push: document.querySelector("#push").checked,
-    models: Object.fromEntries(roles.map(role => [role, selectorFromCard(roleCard(role))])),
+    models,
     coder_models: coderSelectors(),
+    shared_staff_model: shared,
+    backup: shared && backupOn ? selectorFromCard(document.querySelector("#staff-backup .model-card")) : "",
   };
 }
 
@@ -273,8 +363,12 @@ function applyForm(value) {
   document.querySelector("#brief").value = value.brief || "";
   document.querySelector("#push").checked = value.push !== false;
   roles.forEach(role => applySelector(roleCard(role), value.models?.[role] || defaults[role]));
+  const shared = inferSharedStaff(value);
+  document.querySelector("#shared-staff").checked = shared;
+  applySharedFromModels(value.models || defaults, value.backup || "");
   replaceCoderPool(savedCoderPool(value));
   setBranches([value.branch || "main"], value.branch || "main");
+  syncStaffMode();
 }
 
 function restoreForm() {
@@ -490,7 +584,7 @@ function detail(run) {
       <button class="button ghost" data-action="pause" ${run.status !== "running" ? "disabled" : ""}>Pause</button>
       <button class="button ghost" data-action="resume" ${run.status !== "paused" ? "disabled" : ""}>Resume</button>
       <button class="button ghost" data-action="cancel" ${!controllable ? "disabled" : ""}>Cancel</button>
-      <button class="button secondary" data-action="recover" ${run.status !== "failed" || run.alive ? "disabled" : ""}>Recover same run</button>
+      <button class="button secondary" data-action="recover" ${!["failed", "paused", "cancelled"].includes(run.status) || run.alive ? "disabled" : ""}>${run.recovery?.kind === "resume_review" ? `Resume review (batch ${run.recovery.cycle})` : "Recover same run"}</button>
     </div>
     ${activeAgents(run)}
     ${warnings ? `<ul class="warnings">${warnings}</ul>` : ""}
@@ -638,6 +732,23 @@ document.querySelector("#fs-list").addEventListener("keydown", event => {
   if (!item || item.classList.contains("inert")) return;
   chooseExplorerEntry(item.dataset.path, item.dataset.kind);
 });
+document.querySelector("#shared-staff").addEventListener("change", () => {
+  if (document.querySelector("#shared-staff").checked) {
+    applySharedFromModels(
+      Object.fromEntries(roles.map(role => [role, selectorFromCard(roleCard(role))])),
+      collectForm().backup
+    );
+  } else {
+    const models = staffSelectorsFromShared();
+    roles.forEach(role => applySelector(roleCard(role), models[role]));
+  }
+  syncStaffMode();
+  saveForm();
+});
+document.querySelector("#enable-backup").addEventListener("change", () => {
+  syncStaffMode();
+  saveForm();
+});
 document.querySelector("#add-coder").addEventListener("click", () => {
   addCoderCard();
   saveForm();
@@ -662,17 +773,30 @@ document.querySelector("#run-form").addEventListener("submit", async event => {
   event.preventDefault();
   const error = document.querySelector("#form-error");
   const button = event.submitter;
-  const models = Object.fromEntries(roles.map(role => [role, selectorFromCard(roleCard(role))]));
+  const form = collectForm();
   const payload = {
     repo: document.querySelector("#repo").value.trim(),
     branch: document.querySelector("#branch").value,
     brief_path: document.querySelector("#brief-path").value.trim(),
     brief_text: document.querySelector("#brief").value.trim(),
     push: document.querySelector("#push").checked,
-    models,
-    coder_models: coderSelectors(),
+    models: form.models,
+    coder_models: form.coder_models,
+    shared_staff_model: form.shared_staff_model,
+    backup: form.backup,
   };
   if (!payload.brief_path && !payload.brief_text) { error.textContent = "Choose a brief file or paste the product brief."; return; }
+  try {
+    const runs = await api("/api/runs");
+    const captured = runs.find(run => run.recovery?.kind === "resume_review" && !run.alive);
+    if (captured && !window.confirm(
+      `Batch ${captured.recovery.cycle} already has a captured review. Starting a new run discards that coding work.`
+    )) {
+      return;
+    }
+  } catch {
+    /* listing is best-effort; the start request still proceeds */
+  }
   button.disabled = true;
   button.firstElementChild.textContent = "Starting…";
   try {

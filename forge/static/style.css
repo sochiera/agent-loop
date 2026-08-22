@@ -125,6 +125,18 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 .model-remove:hover:not(:disabled) { color: var(--red); }
 .model-remove:disabled { opacity: .35; cursor: not-allowed; }
 .coder-pool-help { margin: -4px 0 12px; color: var(--muted); font-size: 12px; }
+.staff-share { margin: 0 0 16px; }
+.shared-staff { display: grid; gap: 12px; margin-bottom: 16px; }
+.staff-efforts { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+.staff-effort { display: flex; flex-direction: column; gap: 6px; padding: 10px; border: 1px solid var(--line); border-radius: 11px; background: var(--soft); }
+.staff-effort span { font-size: 12px; font-weight: 750; }
+.staff-effort select { padding: 8px 10px; font-size: 12px; }
+.backup-toggle { margin-top: 4px; }
+#staff-backup .model-card { border-color: #dfcca9; }
+
+@media (max-width: 900px) {
+  .staff-efforts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 
 .submit-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-top: 24px; }
 .toggle { display: grid; grid-template-columns: auto 1fr; column-gap: 11px; align-items: center; cursor: pointer; }

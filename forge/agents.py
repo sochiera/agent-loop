@@ -30,6 +30,18 @@ class AgentConfigurationFailure(AgentFailure):
     """A deterministic CLI/configuration error that retrying cannot fix."""
 
 
+class AgentUsageLimit(AgentConfigurationFailure):
+    """Provider quota/usage limit; retrying the same model will not help."""
+
+
+_USAGE_LIMIT_MARKERS = (
+    "you've hit your usage limit",
+    "purchase more credits",
+    "insufficient_quota",
+    "quota exceeded",
+    "usage limit",
+)
+
 _NON_RETRYABLE_ERRORS = (
     "error loading config.toml",
     "unexpected argument",
@@ -39,10 +51,22 @@ _NON_RETRYABLE_ERRORS = (
     "invalid_json_schema",
     "invalid schema for response_format",
     "not inside a trusted directory",
-    "you've hit your usage limit",
-    "purchase more credits",
-    "insufficient_quota",
+    *_USAGE_LIMIT_MARKERS,
 )
+
+
+def is_usage_limit(message: str, raw_output: str = "") -> bool:
+    text = f"{message}\n{raw_output}".lower()
+    return any(marker in text for marker in _USAGE_LIMIT_MARKERS)
+
+
+def failure_type_for(raw: str) -> type[AgentFailure]:
+    lowered = raw.lower()
+    if any(marker in lowered for marker in _USAGE_LIMIT_MARKERS):
+        return AgentUsageLimit
+    if any(marker in lowered for marker in _NON_RETRYABLE_ERRORS):
+        return AgentConfigurationFailure
+    return AgentFailure
 
 _CODEX_LEAN_FEATURES = (
     "apps",
@@ -220,12 +244,7 @@ class AgentRunner:
             raise
         elapsed = time.monotonic() - started
         if process.returncode != 0:
-            failure_type = (
-                AgentConfigurationFailure
-                if any(marker in raw.lower() for marker in _NON_RETRYABLE_ERRORS)
-                else AgentFailure
-            )
-            raise failure_type(
+            raise failure_type_for(raw)(
                 f"{request.role} exited with code {process.returncode}", raw_output=raw
             )
         events = _json_lines(raw)

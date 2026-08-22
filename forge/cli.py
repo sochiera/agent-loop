@@ -26,6 +26,12 @@ def _parser() -> argparse.ArgumentParser:
             default=DEFAULT_MODEL_SELECTORS[role] if optional else None,
             metavar="PROVIDER:MODEL[:EFFORT]",
         )
+    run.add_argument(
+        "--backup",
+        default=None,
+        metavar="PROVIDER:MODEL[:EFFORT]",
+        help="fallback model used when a staff model hits a usage limit",
+    )
     run.add_argument("--no-push", action="store_true", help="commit locally without pushing")
     run.add_argument("--agent-timeout", type=int, default=3600, metavar="SECONDS")
     run.add_argument(
@@ -92,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         push=not args.no_push,
         agent_timeout_seconds=args.agent_timeout,
         shuffle_coders=args.shuffle_coders,
+        backup=ModelSpec.parse(args.backup) if args.backup else None,
     )
     orchestrator = ForgeOrchestrator(config, on_event=on_event)
     state = orchestrator.run()

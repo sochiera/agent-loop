@@ -52,7 +52,8 @@ final verifier and no mechanical product-completion threshold.
 ## Design principles
 
 - **One persistent brain session.** Forge always resumes its original provider session. Native
-  context compaction may occur, but Forge never silently starts a replacement brain.
+  context compaction may occur. The only intentional replacement is a usage-limit failover onto
+  a configured backup model, which starts a new brain session rather than aborting the run.
 - **The brain cannot inspect the repository.** It runs in a separate state directory. OpenCode
   receives an empty/denied tool surface. Codex starts with user configuration ignored,
   shell, unified exec, apps/plugins, browser/computer, multi-agent, image, and web tools disabled,
@@ -142,12 +143,20 @@ IDs (`openai/gpt-5.6-sol`) are both accepted. The fixed selections are `brain`, 
 `coder_explore`, and `coder_classic`, but the control room sends a coder model pool and Forge
 draws those three assignments from it.
 
-Before the first start, Forge pings every unique selected model with a one-word, no-tool prompt.
-A quota, auth, or API failure stops the run during preflight instead of during the first expensive
-role. Recovery does not repeat the probe.
+Before the first start, and again before every later cycle, Forge pings every unique selected
+model with a one-word, no-tool prompt. Auth or API failures still stop the run when no usable
+roster remains. A usage-limit failure does not abort the run when a backup or a healthy clone
+exists: staff roles switch to the backup model, and coder slots that hit a limit are replaced by
+clones of the models that still work. A later preflight that succeeds restores the original
+selections after a quota reset. Recovery repeats this roster refresh so a captured review can
+resume on a healthy reviewer.
 
 The UI coder pool and the three CLI coder fields default to `codex:gpt-5.6-luna:high`. CLI
 flags still override each tactic; `--shuffle-coders` randomly assigns those three models.
+
+The control room can pin one model for the staff roles (brain, planner, reviewer, tester,
+whitebox) and choose only effort per role. That shared-model mode also accepts an optional backup
+provider/model. The CLI equivalent is `--backup provider:model[:effort]`.
 
 Use strong models for the brain and planner, medium models for review, white-box, and black-box
 testing, and cheaper coding models in the coder pool. Every third cycle is a housekeeping batch.
@@ -235,13 +244,17 @@ derived from tokens.
 
 ## Failure behavior
 
-- A transient process crash is retried with an explicit explanation. Deterministic CLI errors,
-  provider usage limits, and agent timeouts are not immediately retried.
+- A transient process crash is retried with an explicit explanation. Deterministic CLI errors
+  and agent timeouts are not immediately retried. A usage limit switches staff roles to the
+  configured backup and resumes the same prompt; the parallel coder pool is not cancelled.
 - An invalid brain, reviewer, tester, or planner response receives contract feedback and is resumed.
 - A coder with repeated turns that do not change plan progress is marked `stalled`; its artifacts
   remain available and the other candidates continue.
+- If one coder hits a limit or crashes, the other candidates finish and the cycle continues when
+  at least one patch exists. Before the next cycle Forge preflights again and clones a working
+  coder model into the empty slot.
 - If all candidates produce no code, the run fails visibly instead of manufacturing progress.
-- Forge refuses to start when a selected model fails the no-tool preflight ping, when the
+- Forge refuses to start when no usable model roster remains after preflight, when the
   repository is dirty, or when delivery would not be a fast-forward. A failed push is reported
   without rewriting history.
 - Pause, resume, and cancel take effect at safe phase/agent-call boundaries. They do not kill an
@@ -250,9 +263,14 @@ derived from tokens.
   and run once after review. This is intended for live, external, destructive, or long acceptance
   checks. Their recorded result is passed to the winner and black-box tester so neither repeats an
   unchanged expensive timeout.
-- A failed run keeps candidate worktrees. `forge resume` continues from the last checkpoint:
-  review reuses existing candidates, a single dead coder restarts alone, and the whole cycle is
-  reset only when the worktrees are gone and cannot be restored from patches.
+- A failed run keeps candidate worktrees. `forge resume`, `forge recover`, and the control-room
+  recover action inspect artifacts in this order: a captured review (`review-bundle.json` plus
+  three patches and outcomes, no `delivery.json`) resumes at review even when no batch has been
+  recorded yet; a delivered batch with no further capture asks the brain for the next action; a
+  plan without a full capture keeps the plan and recodes only candidates that still lack a patch.
+  Nothing else starts a new run. After candidates are captured, the checkpoint `resume_phase` is
+  `review`. The control room labels that case **Resume review (batch N)** and warns before a new
+  run would throw away that coding work.
 
 ## Development
 

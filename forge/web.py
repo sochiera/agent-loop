@@ -47,6 +47,7 @@ def sanitize_preferences(payload: dict[str, Any]) -> dict[str, Any]:
             coder_models.append(value)
             if len(coder_models) >= MAX_CODER_PREFERENCES:
                 break
+    backup = str(payload.get("backup") or "").strip()
     return {
         "repo": str(payload.get("repo") or ""),
         "branch": str(payload.get("branch") or ""),
@@ -55,6 +56,8 @@ def sanitize_preferences(payload: dict[str, Any]) -> dict[str, Any]:
         "push": payload.get("push") is not False,
         "models": models,
         "coder_models": coder_models,
+        "shared_staff_model": payload.get("shared_staff_model") is True,
+        "backup": backup,
     }
 
 
@@ -75,6 +78,8 @@ def preferences_from_config(config: RunConfig) -> dict[str, Any]:
             for role in CODER_ROLES
             if role in config.models
         ],
+        "shared_staff_model": False,
+        "backup": config.backup.display() if config.backup is not None else "",
     }
 
 
@@ -202,6 +207,7 @@ class RunRegistry:
         else:
             raise ValueError("brief_path or brief_text is required")
         models, shuffle_coders = models_from_payload(payload)
+        backup_raw = str(payload.get("backup") or "").strip()
         config = RunConfig(
             repo=str(repo),
             brief=str(brief_path),
@@ -210,6 +216,7 @@ class RunRegistry:
             push=bool(payload.get("push", True)),
             agent_timeout_seconds=int(payload.get("agent_timeout_seconds", 3600)),
             shuffle_coders=shuffle_coders,
+            backup=ModelSpec.parse(backup_raw) if backup_raw else None,
         )
         orchestrator = ForgeOrchestrator(config, state_home=self.state_home)
         live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())
@@ -425,6 +432,8 @@ class RunRegistry:
         value = live.orchestrator.state.to_dict()
         value["alive"] = live.thread.is_alive()
         value["artifact_dir"] = str(live.orchestrator.store.root)
+        hint = getattr(live.orchestrator, "recovery_hint", None)
+        value["recovery"] = hint() if callable(hint) else {}
         if live.error:
             value["error"] = live.error
         if detailed:
