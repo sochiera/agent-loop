@@ -8,8 +8,10 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
+from pathlib import Path
+
 from forge.models import ROLE_NAMES, RunState
-from forge.web import ForgeHandler, RunRegistry, restart_payload
+from forge.web import ForgeHandler, RunRegistry, browse_filesystem, read_text_file, restart_payload
 
 
 def test_web_control_room_serves_ui_and_api(tmp_path):
@@ -38,8 +40,13 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert "model-provider" in html
         assert "Coder model pool" in html
         assert 'id="restart"' in html
+        assert 'id="browse-repo"' in html
+        assert 'id="browse-brief"' in html
+        assert 'id="fs-explorer"' in html
         script = urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
         assert "/api/catalog" in script
+        assert "/api/browse" in script
+        assert "/api/file" in script
         runs = json.loads(urllib.request.urlopen(base + "/api/runs", timeout=2).read())
         assert runs == []
         encoded_repo = urllib.parse.quote(str(repo))
@@ -61,6 +68,21 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert "Coder draw" in urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
         assert "opencode" in catalog["providers"]
         assert "claude" not in catalog["providers"]
+        listing = json.loads(
+            urllib.request.urlopen(
+                base + f"/api/browse?path={encoded_repo}", timeout=2
+            ).read()
+        )
+        assert listing["path"] == str(repo)
+        names = {item["name"]: item for item in listing["entries"]}
+        assert names["goal.md"]["kind"] == "file"
+        preview = json.loads(
+            urllib.request.urlopen(
+                base + f"/api/file?path={urllib.parse.quote(str(repo / 'goal.md'))}",
+                timeout=2,
+            ).read()
+        )
+        assert preview["text"] == "# Build it\n"
         health = json.loads(urllib.request.urlopen(base + "/api/health", timeout=2).read())
         assert health == {"ok": True, "active_runs": 0}
         restart = json.loads(
@@ -156,3 +178,47 @@ def test_post_runs_assigns_coder_models(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_browse_filesystem_lists_dirs_and_files(tmp_path):
+    (tmp_path / "alpha").mkdir()
+    (tmp_path / "zeta.md").write_text("hello\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    listing = browse_filesystem(str(tmp_path))
+    assert listing["path"] == str(tmp_path.resolve())
+    assert listing["parent"] == str(tmp_path.resolve().parent)
+    assert listing["home"] == str(Path.home().resolve())
+    assert listing["truncated"] is False
+    assert [item["name"] for item in listing["entries"]] == ["alpha", "project", "zeta.md"]
+    by_name = {item["name"]: item for item in listing["entries"]}
+    assert by_name["alpha"] == {
+        "name": "alpha",
+        "path": str((tmp_path / "alpha").resolve()),
+        "kind": "dir",
+        "is_repo": False,
+    }
+    assert by_name["project"]["kind"] == "dir"
+    assert by_name["project"]["is_repo"] is True
+    assert by_name["zeta.md"]["kind"] == "file"
+    nested = browse_filesystem(str(tmp_path / "zeta.md"))
+    assert nested["path"] == str(tmp_path.resolve())
+    home = browse_filesystem("")
+    assert home["path"] == str(Path.home().resolve())
+
+
+def test_read_text_file_rejects_missing_and_binary(tmp_path):
+    path = tmp_path / "goal.md"
+    path.write_text("# Build it\n", encoding="utf-8")
+    assert read_text_file(str(path)) == {"path": str(path.resolve()), "text": "# Build it\n"}
+    with pytest.raises(ValueError, match="path is required"):
+        read_text_file("")
+    with pytest.raises(ValueError, match="file does not exist"):
+        read_text_file(str(tmp_path / "missing.md"))
+    binary = tmp_path / "blob.bin"
+    binary.write_bytes(b"\xff\xfe")
+    with pytest.raises(ValueError, match="not valid UTF-8"):
+        read_text_file(str(binary))
+    with pytest.raises(ValueError, match="path does not exist"):
+        browse_filesystem(str(tmp_path / "missing"))

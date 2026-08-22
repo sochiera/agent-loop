@@ -24,6 +24,79 @@ from .orchestrator import ForgeOrchestrator
 
 
 STATIC = Path(__file__).with_name("static")
+MAX_BROWSE_ENTRIES = 1000
+MAX_PREVIEW_BYTES = 2_000_000
+
+
+def browse_filesystem(raw_path: str = "") -> dict[str, Any]:
+    requested = (raw_path or "").strip()
+    if requested:
+        current = Path(requested).expanduser()
+        try:
+            current = current.resolve()
+        except OSError as exc:
+            raise ValueError(f"cannot resolve path: {requested}") from exc
+    else:
+        current = Path.home().resolve()
+    if current.is_file():
+        current = current.parent
+    if not current.exists():
+        raise ValueError(f"path does not exist: {current}")
+    if not current.is_dir():
+        raise ValueError(f"not a directory: {current}")
+    try:
+        children = list(current.iterdir())
+    except OSError as exc:
+        raise ValueError(f"cannot read directory: {current}") from exc
+
+    def sort_key(path: Path) -> tuple[bool, str]:
+        try:
+            return (not path.is_dir(), path.name.casefold())
+        except OSError:
+            return (True, path.name.casefold())
+
+    entries: list[dict[str, Any]] = []
+    truncated = len(children) > MAX_BROWSE_ENTRIES
+    for child in sorted(children, key=sort_key)[:MAX_BROWSE_ENTRIES]:
+        try:
+            is_dir = child.is_dir()
+            is_file = child.is_file()
+        except OSError:
+            continue
+        if not is_dir and not is_file:
+            continue
+        entries.append(
+            {
+                "name": child.name,
+                "path": str(child),
+                "kind": "dir" if is_dir else "file",
+                "is_repo": is_dir and (child / ".git").exists(),
+            }
+        )
+    parent = current.parent
+    return {
+        "path": str(current),
+        "parent": None if parent == current else str(parent),
+        "home": str(Path.home().resolve()),
+        "entries": entries,
+        "truncated": truncated,
+    }
+
+
+def read_text_file(raw_path: str) -> dict[str, Any]:
+    requested = (raw_path or "").strip()
+    if not requested:
+        raise ValueError("path is required")
+    path = Path(requested).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"file does not exist: {path}")
+    if path.stat().st_size > MAX_PREVIEW_BYTES:
+        raise ValueError(f"file is too large: {path}")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"file is not valid UTF-8: {path}") from exc
+    return {"path": str(path), "text": text}
 
 
 def restart_payload(active_runs: int, confirm: bool) -> dict[str, Any]:
@@ -290,6 +363,18 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 return self._json({"error": "run not found"}, HTTPStatus.NOT_FOUND)
         if parsed.path == "/api/catalog":
             return self._json(catalog_payload())
+        if parsed.path == "/api/browse":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                return self._json(browse_filesystem(query.get("path", [""])[0]))
+            except Exception as exc:
+                return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        if parsed.path == "/api/file":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                return self._json(read_text_file(query.get("path", [""])[0]))
+            except Exception as exc:
+                return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         if parsed.path == "/api/branches":
             query = urllib.parse.parse_qs(parsed.query)
             try:

@@ -257,6 +257,75 @@ function setBranches(branches, selectedBranch) {
   select.innerHTML = values.map(branch => `<option${branch === selectedBranch ? " selected" : ""}>${escapeHtml(branch)}</option>`).join("");
 }
 
+const explorer = {mode: "dir", current: "", parent: null, home: "", onSelect: null};
+
+function closeExplorer() {
+  document.querySelector("#fs-explorer").close();
+}
+
+function renderExplorer(value) {
+  explorer.current = value.path;
+  explorer.parent = value.parent;
+  explorer.home = value.home;
+  document.querySelector("#fs-path").value = value.path;
+  document.querySelector("#fs-up").disabled = !value.parent;
+  const error = document.querySelector("#fs-error");
+  error.textContent = value.truncated ? "Showing the first 1000 entries." : "";
+  const list = document.querySelector("#fs-list");
+  if (!value.entries.length) {
+    list.innerHTML = `<li class="empty" style="padding:18px 20px">Empty directory.</li>`;
+    return;
+  }
+  list.innerHTML = value.entries.map(entry => {
+    const inert = explorer.mode === "dir" && entry.kind === "file";
+    const icon = entry.kind === "dir" ? (entry.is_repo ? "repo" : "dir") : "file";
+    return `<li class="fs-item ${entry.kind}${inert ? " inert" : ""}" tabindex="${inert ? "-1" : "0"}" data-path="${escapeHtml(entry.path)}" data-kind="${entry.kind}">
+      <span class="fs-icon ${icon}"></span>
+      <span class="fs-name">${escapeHtml(entry.name)}</span>
+      ${entry.is_repo ? `<span class="fs-tag">git</span>` : ""}
+    </li>`;
+  }).join("");
+}
+
+async function loadExplorer(path) {
+  const error = document.querySelector("#fs-error");
+  const list = document.querySelector("#fs-list");
+  list.innerHTML = `<li class="empty" style="padding:18px 20px">Loading…</li>`;
+  try {
+    const value = await api(`/api/browse?path=${encodeURIComponent(path || "")}`);
+    renderExplorer(value);
+  } catch (exception) {
+    error.textContent = exception.message;
+    if (path) {
+      try {
+        renderExplorer(await api("/api/browse"));
+      } catch {
+        /* keep the original error */
+      }
+    }
+  }
+}
+
+async function openExplorer({mode, start, title, onSelect}) {
+  explorer.mode = mode;
+  explorer.onSelect = onSelect;
+  document.querySelector("#fs-title").textContent = title;
+  document.querySelector("#fs-select").classList.toggle("hidden", mode !== "dir");
+  document.querySelector("#fs-error").textContent = "";
+  document.querySelector("#fs-explorer").showModal();
+  await loadExplorer(start);
+}
+
+async function chooseExplorerEntry(path, kind) {
+  if (kind === "dir") {
+    await loadExplorer(path);
+    return;
+  }
+  if (explorer.mode !== "file" || !explorer.onSelect) return;
+  explorer.onSelect(path);
+  closeExplorer();
+}
+
 async function inspectRepository() {
   const error = document.querySelector("#form-error");
   const button = document.querySelector("#inspect-repo");
@@ -475,7 +544,66 @@ async function restartForge(confirm = false) {
 }
 
 document.querySelector("#recommended").addEventListener("click", restoreRecommended);
+document.querySelector("#browse-repo").addEventListener("click", () => {
+  openExplorer({
+    mode: "dir",
+    start: document.querySelector("#repo").value.trim(),
+    title: "Choose a repository",
+    onSelect: path => {
+      document.querySelector("#repo").value = path;
+      saveForm();
+      inspectRepository();
+    },
+  });
+});
+document.querySelector("#browse-brief").addEventListener("click", () => {
+  const briefPath = document.querySelector("#brief-path").value.trim();
+  openExplorer({
+    mode: "file",
+    start: briefPath || document.querySelector("#repo").value.trim(),
+    title: "Choose a brief",
+    onSelect: async path => {
+      document.querySelector("#brief-path").value = path;
+      try {
+        const file = await api(`/api/file?path=${encodeURIComponent(path)}`);
+        document.querySelector("#brief").value = file.text || "";
+        document.querySelector("#brief-hint").textContent = `Using ${path}. Editing the preview switches to pasted text.`;
+      } catch (exception) {
+        document.querySelector("#form-error").textContent = exception.message;
+      }
+      saveForm();
+    },
+  });
+});
 document.querySelector("#inspect-repo").addEventListener("click", inspectRepository);
+document.querySelector("#fs-close").addEventListener("click", closeExplorer);
+document.querySelector("#fs-cancel").addEventListener("click", closeExplorer);
+document.querySelector("#fs-home").addEventListener("click", () => loadExplorer(explorer.home));
+document.querySelector("#fs-up").addEventListener("click", () => {
+  if (explorer.parent) loadExplorer(explorer.parent);
+});
+document.querySelector("#fs-select").addEventListener("click", () => {
+  if (explorer.mode !== "dir" || !explorer.current || !explorer.onSelect) return;
+  explorer.onSelect(explorer.current);
+  closeExplorer();
+});
+document.querySelector("#fs-path").addEventListener("keydown", event => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    loadExplorer(event.target.value.trim());
+  }
+});
+document.querySelector("#fs-list").addEventListener("click", event => {
+  const item = event.target.closest(".fs-item");
+  if (!item || item.classList.contains("inert")) return;
+  chooseExplorerEntry(item.dataset.path, item.dataset.kind);
+});
+document.querySelector("#fs-list").addEventListener("keydown", event => {
+  if (event.key !== "Enter") return;
+  const item = event.target.closest(".fs-item");
+  if (!item || item.classList.contains("inert")) return;
+  chooseExplorerEntry(item.dataset.path, item.dataset.kind);
+});
 document.querySelector("#add-coder").addEventListener("click", () => {
   addCoderCard();
   saveForm();

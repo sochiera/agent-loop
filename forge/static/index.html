@@ -36,7 +36,7 @@
         <div class="grid two">
           <label class="field grow">
             <span>Target repository</span>
-            <div class="joined"><input id="repo" required autocomplete="off" placeholder="/absolute/path/to/repository"><button type="button" id="inspect-repo" class="button secondary">Inspect</button></div>
+            <div class="joined"><input id="repo" required autocomplete="off" placeholder="/absolute/path/to/repository"><button type="button" id="browse-repo" class="button ghost">Browse</button><button type="button" id="inspect-repo" class="button secondary">Inspect</button></div>
             <small id="repo-hint">Forge requires a Git repository. Empty repositories are supported.</small>
           </label>
           <label class="field">
@@ -54,7 +54,7 @@
         </div>
         <label class="field">
           <span>Brief file <em>optional</em></span>
-          <input id="brief-path" autocomplete="off" placeholder="/path/to/goal.md">
+          <div class="joined"><input id="brief-path" autocomplete="off" placeholder="/path/to/goal.md"><button type="button" id="browse-brief" class="button ghost">Browse</button></div>
         </label>
         <label class="field">
           <span>Brief preview / pasted brief</span>
@@ -93,6 +93,26 @@
       <div id="detail-body"></div>
     </section>
   </main>
+
+  <dialog id="fs-explorer" aria-labelledby="fs-title">
+    <div class="fs-sheet">
+      <div class="fs-head">
+        <div><span class="eyebrow">Local filesystem</span><h2 id="fs-title">Choose a folder</h2></div>
+        <button type="button" id="fs-close" class="button ghost">Close</button>
+      </div>
+      <div class="fs-toolbar">
+        <button type="button" id="fs-up" class="button ghost">Up</button>
+        <button type="button" id="fs-home" class="button ghost">Home</button>
+        <input id="fs-path" spellcheck="false" autocomplete="off">
+      </div>
+      <p id="fs-error" class="error" role="alert"></p>
+      <ul id="fs-list" class="fs-list"></ul>
+      <div class="fs-foot">
+        <button type="button" id="fs-cancel" class="button ghost">Cancel</button>
+        <button type="button" id="fs-select" class="button primary"><span>Use this folder</span></button>
+      </div>
+    </div>
+  </dialog>
 
   <template id="model-template">
     <label class="model-card">
