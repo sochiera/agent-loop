@@ -3,11 +3,26 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
+
+_LONG = re.compile(
+    r"(?:^|[\s/_:-])(live|e2e|scrape|integration)(?:$|[\s/_:-])"
+    r"|import:(?:full|incremental|resume)"
+    r"|full[-_]?scan"
+    r"|validate:full",
+    re.IGNORECASE,
+)
+
+
+def classify_command(command: str) -> str:
+    if _LONG.search(command) or "http://" in command or "https://" in command:
+        return "long"
+    return "short"
 
 
 def _session_process_groups(session_id: int) -> set[int]:
@@ -42,10 +57,19 @@ def _signal_session(session_id: int, sent_signal: signal.Signals) -> None:
 
 
 def run_commands(
-    commands: tuple[str, ...], cwd: Path, *, timeout_seconds: int = 900
+    commands: tuple[str, ...],
+    cwd: Path,
+    *,
+    timeout_seconds: int | None = None,
+    short_timeout_seconds: int = 120,
+    long_timeout_seconds: int = 900,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for command in commands:
+        kind = classify_command(command)
+        limit = timeout_seconds
+        if limit is None:
+            limit = short_timeout_seconds if kind == "short" else long_timeout_seconds
         started = time.monotonic()
         process = subprocess.Popen(
             ["bash", "-lc", command],
@@ -57,7 +81,7 @@ def run_commands(
         )
         timed_out = False
         try:
-            output, _ = process.communicate(timeout=timeout_seconds)
+            output, _ = process.communicate(timeout=limit)
         except subprocess.TimeoutExpired:
             timed_out = True
             _signal_session(process.pid, signal.SIGTERM)
@@ -74,6 +98,7 @@ def run_commands(
         results.append(
             {
                 "command": command,
+                "kind": kind,
                 "return_code": process.returncode,
                 "timed_out": timed_out,
                 "elapsed_seconds": round(time.monotonic() - started, 3),

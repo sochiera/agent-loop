@@ -32,12 +32,18 @@ same plan      same plan           same plan
 reviewer compares code, tests, diffs, and validation evidence
                   │
                   ▼
-winner fixes findings ──► commit ──► fast-forward selected branch ──► push
-                  │
-                  ▼
-black-box tester (public behavior, runtime output, screenshots)
-                  │ report
-                  └──────────────────────────────► persistent brain
+winner fixes findings and may borrow concrete pieces from losers
+                   │
+                   ▼
+commit ──► fast-forward selected branch ──► push
+                   │
+       ┌───────────┴───────────┐
+       ▼                       ▼
+white-box reporter      black-box tester
+(short + long tests)    (public behavior)
+       └───────────┬───────────┘
+                   ▼
+        compact product report ──► persistent brain
 ```
 
 The loop ends only when the brain calls `forge.finish`. There is intentionally no independent
@@ -47,8 +53,8 @@ final verifier and no mechanical product-completion threshold.
 
 - **One persistent brain session.** Forge always resumes its original provider session. Native
   context compaction may occur, but Forge never silently starts a replacement brain.
-- **The brain cannot inspect the repository.** It runs in a separate state directory. Claude and
-  OpenCode receive an empty/denied tool surface. Codex starts with user configuration ignored,
+- **The brain cannot inspect the repository.** It runs in a separate state directory. OpenCode
+  receives an empty/denied tool surface. Codex starts with user configuration ignored,
   shell, unified exec, apps/plugins, browser/computer, multi-agent, image, and web tools disabled,
   a read-only sandbox, and a contract gate that rejects any remaining tool event.
 - **Large batches, not a micro-loop.** The brain requests a cohesive feature, refactor, bug batch,
@@ -67,9 +73,8 @@ final verifier and no mechanical product-completion threshold.
 
 - Linux or macOS with Git and Python 3.12 or newer.
 - At least one authenticated supported agent CLI:
-  - `codex`
-  - `claude`
-  - `opencode`
+  - `codex` (GPT family)
+  - `opencode` (GPT family, Grok 4.6, Qwen 3.8 Max, GLM 5.3)
 - A clean target Git repository. Forge can bootstrap an unborn selected branch in a repository
   with no commits. When push is enabled the repository must have an `origin` remote.
 
@@ -111,20 +116,23 @@ Examples:
 
 ```text
 codex:gpt-5.6-sol:high
-claude:opus:high
-opencode:neuralwatt/kimi-k2.7-code-flex
+opencode:gpt-5.6-luna:high
+opencode:grok-4.6
+opencode:qwen-3.8-max
+opencode:glm-5.3
 ```
 
-The model part may be empty to use the CLI's configured default, for example `opencode:`. The
-seven selections are `brain`, `planner`, `coder_tdd`, `coder_explore`, `coder_classic`, `reviewer`,
-and `tester`.
+GPT-family models may run on Codex or OpenCode. Grok 4.6, Qwen 3.8 Max, and GLM 5.3 run on
+OpenCode only. Catalog keys (`gpt-5.6-sol`) and provider IDs (`openai/gpt-5.6-sol`) are both
+accepted. The eight selections are `brain`, `planner`, `coder_tdd`, `coder_explore`,
+`coder_classic`, `reviewer`, `tester`, and `whitebox`.
 
 All three coder fields default to `codex:gpt-5.6-luna:high` in the UI and CLI. They can still be
 overridden independently.
 
-Use strong models for the brain and planner, medium models for review and black-box testing, and
-cheaper coding models for the three competitors. Forge records the actual configured provider,
-model, effort, elapsed time, session ID, and reported token counts for every invocation.
+Use strong models for the brain and planner, medium models for review, white-box, and black-box
+testing, and cheaper coding models for the three competitors. `--shuffle-coders` randomly assigns
+the three chosen coder models to the three tactics. Every third cycle is a housekeeping batch.
 
 ## Command-line run
 
@@ -135,13 +143,22 @@ python3 -m forge run \
   --branch main \
   --brain codex:gpt-5.6-sol:high \
   --planner codex:gpt-5.6-sol:high \
+  --coder-tdd opencode:gpt-5.6-luna:high \
+  --coder-explore opencode:grok-4.6 \
+  --coder-classic opencode:qwen-3.8-max \
   --reviewer codex:gpt-5.6-terra:high \
-  --tester codex:gpt-5.6-terra:high
+  --tester codex:gpt-5.6-terra:high \
+  --whitebox codex:gpt-5.6-terra:high
 ```
 
 The three omitted coder selectors use the default `codex:gpt-5.6-luna:high`.
 
 Add `--no-push` for a local-only run. Forge still commits and fast-forwards the selected branch.
+Recover a failed run from its last checkpoint without wiping surviving worktrees:
+
+```bash
+python3 -m forge resume --repo /path/to/product --run-id 20260820-100909-19c10671
+```
 
 If the controller process fails or is interrupted after at least one batch was delivered, resume
 the same brain session and run history after fixing the cause:
@@ -214,6 +231,9 @@ derived from tokens.
   and run once after review. This is intended for live, external, destructive, or long acceptance
   checks. Their recorded result is passed to the winner and black-box tester so neither repeats an
   unchanged expensive timeout.
+- A failed run keeps candidate worktrees. `forge resume` continues from the last checkpoint:
+  review reuses existing candidates, a single dead coder restarts alone, and the whole cycle is
+  reset only when the worktrees are gone and cannot be restored from patches.
 
 ## Development
 

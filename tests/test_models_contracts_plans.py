@@ -3,6 +3,9 @@ from pathlib import Path
 
 import pytest
 
+import random
+
+from forge.catalog import shuffle_coder_models
 from forge.cli import _parser
 from forge.contracts import (
     BRAIN_SCHEMA,
@@ -11,6 +14,7 @@ from forge.contracts import (
     parse_brain,
     parse_review,
     parse_test,
+    parse_whitebox,
 )
 from forge.models import ModelSpec
 from forge.plans import (
@@ -20,19 +24,57 @@ from forge.plans import (
     validation_commands,
 )
 from forge.prompts import planner_prompt, tester_prompt as _tester_prompt, winner_fix_prompt
+from forge.validation import classify_command as classify
 
 
 def test_model_spec_round_trip():
-    value = ModelSpec.parse("opencode:provider/model:high")
+    value = ModelSpec.parse("opencode:gpt-5.6-luna:high")
     assert value.provider == "opencode"
-    assert value.model == "provider/model"
+    assert value.model == "openai/gpt-5.6-luna"
     assert value.effort == "high"
-    assert value.display() == "opencode:provider/model:high"
+    assert value.display() == "opencode:openai/gpt-5.6-luna:high"
+
+
+def test_model_spec_accepts_catalog_key_for_codex():
+    value = ModelSpec.parse("codex:gpt-5.6-sol:high")
+    assert value.model == "gpt-5.6-sol"
 
 
 def test_model_spec_rejects_unknown_provider():
     with pytest.raises(ValueError):
-        ModelSpec.parse("other:model")
+        ModelSpec.parse("claude:opus")
+
+
+def test_model_spec_rejects_grok_on_codex():
+    with pytest.raises(ValueError, match="unsupported model"):
+        ModelSpec.parse("codex:grok-4.6")
+
+
+def test_shuffle_coder_models_preserves_the_pool():
+    models = {
+        "coder_tdd": ModelSpec.parse("opencode:gpt-5.6-luna"),
+        "coder_explore": ModelSpec.parse("opencode:grok-4.6"),
+        "coder_classic": ModelSpec.parse("opencode:glm-5.3"),
+        "brain": ModelSpec.parse("codex:gpt-5.6-sol:high"),
+    }
+    shuffled = shuffle_coder_models(models, rng=random.Random(0))
+    pool = {
+        models["coder_tdd"].display(),
+        models["coder_explore"].display(),
+        models["coder_classic"].display(),
+    }
+    assigned = {
+        shuffled["coder_tdd"].display(),
+        shuffled["coder_explore"].display(),
+        shuffled["coder_classic"].display(),
+    }
+    assert assigned == pool
+    assert shuffled["brain"].display() == models["brain"].display()
+
+
+def test_model_spec_accepts_grok_on_opencode():
+    value = ModelSpec.parse("opencode:grok-4.6")
+    assert value.model == "xai/grok-4.6"
 
 
 def test_cli_defaults_all_coders_to_codex_luna_high():
@@ -96,12 +138,28 @@ def test_review_requires_all_competitors_and_scores():
         "winner": "tdd",
         "reason": "best",
         "feedback": [],
+        "borrow": [{"from": "explore", "what": "better comparison table"}],
         "candidates": {
             name: {"score": score, "summary": "ok"}
             for name, score in (("tdd", 90), ("explore", 80), ("classic", 70))
         },
     }
-    assert parse_review(json.dumps(review))["winner"] == "tdd"
+    parsed = parse_review(json.dumps(review))
+    assert parsed["winner"] == "tdd"
+    assert parsed["borrow"][0]["from"] == "explore"
+
+
+def test_review_defaults_empty_borrow():
+    review = {
+        "winner": "classic",
+        "reason": "ok",
+        "feedback": [],
+        "candidates": {
+            name: {"score": 50, "summary": "ok"}
+            for name in ("tdd", "explore", "classic")
+        },
+    }
+    assert parse_review(json.dumps(review))["borrow"] == []
 
 
 def test_black_box_contract():
@@ -111,8 +169,24 @@ def test_black_box_contract():
         "missing": [],
         "observations": ["fast"],
         "evidence": ["screenshot.png"],
+        "happy_path": "unreachable",
     }
-    assert parse_test(json.dumps(report)) == report
+    assert parse_test(json.dumps(report))["happy_path"] == "unreachable"
+
+
+def test_whitebox_contract():
+    report = parse_whitebox(
+        json.dumps(
+            {
+                "summary": "tests ran",
+                "short": ["lint passed"],
+                "long": ["import timed out"],
+                "red_flags": ["import timed out"],
+                "recommendation": "repair the importer next",
+            }
+        )
+    )
+    assert "import" in report["red_flags"][0]
 
 
 def test_tester_prompt_reuses_expensive_validation_evidence(tmp_path: Path):
@@ -183,3 +257,11 @@ def test_planner_receives_mechanical_repo_and_toolchain_context():
     assert "MECHANICAL REPOSITORY SNAPSHOT" in prompt
     assert "no tracked product files" in prompt
     assert "Available commands: git, python3" in prompt
+
+
+def test_classify_long_validation_commands():
+    assert classify("npm test") == "short"
+    assert classify("python3 -c 'import json'") == "short"
+    assert classify("npm run import:full") == "long"
+    assert classify("npm run test:e2e") == "long"
+    assert classify("LIVE_TEST=1 npm run test:integration") == "long"

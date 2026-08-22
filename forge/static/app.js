@@ -1,4 +1,4 @@
-const roles = ["brain", "planner", "coder_tdd", "coder_explore", "coder_classic", "reviewer", "tester"];
+const roles = ["brain", "planner", "coder_tdd", "coder_explore", "coder_classic", "reviewer", "tester", "whitebox"];
 const roleMeta = {
   brain: ["Persistent brain", "Product direction · strongest model"],
   planner: ["Planner", "Repository-aware batch design"],
@@ -7,6 +7,7 @@ const roleMeta = {
   coder_classic: ["Coder · classic", "Independent conventional approach"],
   reviewer: ["Reviewer", "Compares all candidates"],
   tester: ["Black-box tester", "Public behavior only"],
+  whitebox: ["White-box reporter", "Interprets short and long tests"],
 };
 const defaults = {
   brain: "codex:gpt-5.6-sol:high",
@@ -16,9 +17,10 @@ const defaults = {
   coder_classic: "codex:gpt-5.6-luna:high",
   reviewer: "codex:gpt-5.6-terra:high",
   tester: "codex:gpt-5.6-terra:high",
+  whitebox: "codex:gpt-5.6-terra:high",
 };
-const phases = ["preflight", "brain", "planning", "coding", "review", "winner-fix", "delivery", "black-box"];
-const phaseLabels = ["Preflight", "Brain", "Plan", "Code ×3", "Review", "Fix", "Deliver", "Black-box"];
+const phases = ["preflight", "brain", "planning", "coding", "review", "winner-fix", "delivery", "whitebox", "black-box"];
+const phaseLabels = ["Preflight", "Brain", "Plan", "Code ×3", "Review", "Fix", "Deliver", "White-box", "Black-box"];
 const storageKey = "forge-control-room-v2";
 let selected = null;
 
@@ -273,6 +275,7 @@ document.querySelector("#run-form").addEventListener("submit", async event => {
     brief_path: document.querySelector("#brief-path").value.trim(),
     brief_text: document.querySelector("#brief").value.trim(),
     push: document.querySelector("#push").checked,
+    shuffle_coders: document.querySelector("#shuffle")?.checked === true,
     models,
   };
   if (!payload.brief_path && !payload.brief_text) { error.textContent = "Choose a brief file or paste the product brief."; return; }

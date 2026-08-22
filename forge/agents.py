@@ -7,7 +7,6 @@ import os
 import signal
 import subprocess
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -153,27 +152,6 @@ def _codex_parse(events: list[dict[str, Any]]) -> tuple[str, Usage, int]:
     return text, usage, tool_calls
 
 
-def _claude_parse(events: list[dict[str, Any]]) -> tuple[str, Usage, int]:
-    text = ""
-    usage = Usage()
-    tool_ids: set[str] = set()
-    for event in events:
-        if event.get("type") == "result":
-            structured = event.get("structured_output")
-            if isinstance(structured, dict):
-                text = json.dumps(structured)
-            elif isinstance(event.get("result"), str):
-                text = event["result"]
-            if isinstance(event.get("usage"), dict):
-                usage = _normalized_usage(event["usage"], cost=event.get("total_cost_usd"))
-        for item in _walk(event):
-            if not isinstance(item, dict) or item.get("type") != "tool_use":
-                continue
-            identifier = str(item.get("id") or id(item))
-            tool_ids.add(identifier)
-    return text, usage, len(tool_ids)
-
-
 def _opencode_parse(events: list[dict[str, Any]]) -> tuple[str, Usage, int]:
     texts: list[str] = []
     usage = Usage()
@@ -253,7 +231,6 @@ class AgentRunner:
         events = _json_lines(raw)
         parser = {
             "codex": _codex_parse,
-            "claude": _claude_parse,
             "opencode": _opencode_parse,
         }[request.model.provider]
         text, usage, tool_calls = parser(events)
@@ -277,8 +254,6 @@ class AgentRunner:
     def _command(self, request: AgentRequest) -> list[str]:
         if request.model.provider == "codex":
             return self._codex_command(request)
-        if request.model.provider == "claude":
-            return self._claude_command(request)
         if request.model.provider == "opencode":
             return self._opencode_command(request)
         raise ValueError(f"unsupported provider: {request.model.provider}")
@@ -336,43 +311,6 @@ class AgentRunner:
             command += [request.session_id, "-"]
         else:
             command += ["-"]
-        return command
-
-    def _claude_command(self, request: AgentRequest) -> list[str]:
-        command = [
-            "claude",
-            "--print",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--permission-mode",
-            "auto" if request.access == "write" else "dontAsk",
-        ]
-        if request.session_id:
-            command += ["--resume", request.session_id]
-        else:
-            command += ["--session-id", str(uuid.uuid4())]
-        if request.model.model:
-            command += ["--model", request.model.model]
-        if request.model.effort:
-            command += ["--effort", request.model.effort]
-        if request.access == "none":
-            command += [
-                "--safe-mode",
-                "--disable-slash-commands",
-                "--no-chrome",
-                "--strict-mcp-config",
-                "--mcp-config",
-                '{"mcpServers":{}}',
-                "--tools",
-                "",
-            ]
-        elif request.access == "read":
-            command += ["--tools", "Read,Glob,Grep"]
-        for path in request.extra_writable_dirs:
-            command += ["--add-dir", str(path)]
-        if request.schema:
-            command += ["--json-schema", json.dumps(request.schema, separators=(",", ":"))]
         return command
 
     def _opencode_command(self, request: AgentRequest) -> list[str]:

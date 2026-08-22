@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/jan/Sources/total-battle-brothers-for-wesnoth/**)"
+    ]
+  }
+}

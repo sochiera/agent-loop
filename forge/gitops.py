@@ -118,7 +118,9 @@ class GitCompetition:
             path = self.worktree_root / name
             branch = f"forge/{self.run_id}/{name}"
             if path.exists():
-                shutil.rmtree(path)
+                _run(self.repo, "worktree", "remove", "--force", str(path), check=False)
+                shutil.rmtree(path, ignore_errors=True)
+            _run(self.repo, "branch", "-D", branch, check=False)
             _run(self.repo, "worktree", "add", "-b", branch, str(path), self.base_sha)
             self.candidates[name] = CandidateWorktree(name, path, branch)
         return dict(self.candidates)
@@ -141,6 +143,36 @@ class GitCompetition:
             if result.returncode != 0:
                 raise GitError(f"could not restore {name} candidate patch:\n{result.stdout.strip()}")
         return candidates
+
+    def reattach_candidates(self) -> dict[str, CandidateWorktree]:
+        for name in ("tdd", "explore", "classic"):
+            path = self.worktree_root / name
+            branch = f"forge/{self.run_id}/{name}"
+            if not path.exists():
+                raise GitError(f"missing candidate worktree: {path}")
+            self.candidates[name] = CandidateWorktree(name, path, branch)
+        return dict(self.candidates)
+
+    def restore_from_patches(
+        self, patches: dict[str, Path]
+    ) -> tuple[dict[str, CandidateWorktree], list[str]]:
+        worktrees = self.create_candidates()
+        warnings: list[str] = []
+        for name, candidate in worktrees.items():
+            patch = patches.get(name)
+            if patch is None or not patch.is_file():
+                continue
+            text = patch.read_text(encoding="utf-8", errors="replace")
+            if not text.strip():
+                continue
+            applied = _run(candidate.path, "apply", str(patch), check=False)
+            if applied.returncode != 0:
+                retry = _run(candidate.path, "apply", "--3way", str(patch), check=False)
+                if retry.returncode != 0:
+                    warnings.append(
+                        f"could not apply saved {name} patch; candidate worktree is empty"
+                    )
+        return worktrees, warnings
 
     def capture(self, candidate: CandidateWorktree) -> dict[str, Any]:
         # Intent-to-add makes untracked source files visible in the patch without staging content.

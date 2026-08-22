@@ -72,11 +72,22 @@ Deliver an observable greeting.
                     "winner": "tdd",
                     "reason": "best tests and behavior",
                     "feedback": ["Add a reviewed marker"],
+                    "borrow": [{"from": "classic", "what": "clearer greeting wording"}],
                     "candidates": {
                         "tdd": {"score": 95, "summary": "best", "strengths": [], "problems": []},
                         "explore": {"score": 80, "summary": "good", "strengths": [], "problems": []},
                         "classic": {"score": 75, "summary": "ok", "strengths": [], "problems": []},
                     },
+                }
+            )
+        elif request.role == "whitebox":
+            text = json.dumps(
+                {
+                    "summary": "Short checks passed",
+                    "short": ["feature.txt exists"],
+                    "long": [],
+                    "red_flags": [],
+                    "recommendation": "Continue the brief",
                 }
             )
         elif request.role == "tester":
@@ -88,6 +99,7 @@ Deliver an observable greeting.
                     "missing": [],
                     "observations": ["reviewed"],
                     "evidence": ["feature.txt public output"],
+                    "happy_path": "exercised",
                 }
             )
         else:
@@ -183,7 +195,7 @@ def test_full_competition_flow_without_model_calls(tmp_path: Path):
     git(repo, "commit", "-m", "base")
     brief = tmp_path / "brief.md"
     brief.write_text("Build a greeting feature.\n", encoding="utf-8")
-    models = {role: ModelSpec("codex", "fake", "low") for role in ROLE_NAMES}
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
     config = RunConfig(str(repo), str(brief), "main", models, push=False)
     orchestrator = ForgeOrchestrator(
         config,
@@ -199,6 +211,8 @@ def test_full_competition_flow_without_model_calls(tmp_path: Path):
     assert "reviewed" in (repo / "feature.txt").read_text(encoding="utf-8")
     batch = state.batches[0]
     assert batch["winner"] == "tdd"
+    assert batch["brain_report"]["winner"] == "tdd"
+    assert batch["whitebox"]["recommendation"]
     assert batch["candidate_metrics"]["tdd"]["selected"] is True
     assert batch["candidate_metrics"]["tdd"]["total_tokens"] >= 15
     artifacts = repo / ".forge" / "runs" / "integration-run"
@@ -206,6 +220,8 @@ def test_full_competition_flow_without_model_calls(tmp_path: Path):
     assert (artifacts / "batches/001/candidates/tdd/metrics.json").is_file()
     assert (artifacts / "batches/001/review.json").is_file()
     assert (artifacts / "batches/001/black-box.json").is_file()
+    assert (artifacts / "batches/001/whitebox.json").is_file()
+    assert (artifacts / "batches/001/brain-report.json").is_file()
     assert (artifacts / "usage.jsonl").is_file()
     assert git(repo, "status", "--porcelain") == ""
 
@@ -247,7 +263,7 @@ def test_brain_must_return_a_resumable_session(tmp_path: Path):
     git(repo, "commit", "-m", "base")
     brief = tmp_path / "brief.md"
     brief.write_text("Build a greeting feature.\n", encoding="utf-8")
-    models = {role: ModelSpec("codex", "fake", "low") for role in ROLE_NAMES}
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
     orchestrator = ForgeOrchestrator(
         RunConfig(str(repo), str(brief), "main", models, push=False),
         run_id="missing-brain-session",
@@ -273,7 +289,7 @@ def test_recovery_restores_captured_candidates_and_resumes_review(tmp_path: Path
     git(repo, "commit", "-m", "base")
     brief = tmp_path / "brief.md"
     brief.write_text("Build a greeting feature.\n", encoding="utf-8")
-    models = {role: ModelSpec("codex", "fake", "low") for role in ROLE_NAMES}
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
     orchestrator = ForgeOrchestrator(
         RunConfig(str(repo), str(brief), "main", models, push=False),
         run_id="captured-review",
@@ -287,7 +303,6 @@ def test_recovery_restores_captured_candidates_and_resumes_review(tmp_path: Path
 
     artifacts = repo / ".forge" / "runs" / "captured-review" / "batches" / "001"
     assert (artifacts / "review-bundle.json").is_file()
-    assert not (tmp_path / "state" / "worktrees" / "captured-review" / "tdd").exists()
     orchestrator.state.batches = [{"cycle": 0}]
     orchestrator.store.save_state(orchestrator.state)
     orchestrator.runner = CapturedReviewRecoveryRunner()
@@ -299,3 +314,124 @@ def test_recovery_restores_captured_candidates_and_resumes_review(tmp_path: Path
     assert recovered.batches[-1]["winner"] == "tdd"
     assert "hello from tdd" in (repo / "feature.txt").read_text(encoding="utf-8")
     assert git(repo, "status", "--porcelain") == ""
+
+
+class BoomReviewer(FakeRunner):
+    def __init__(self):
+        super().__init__()
+        self.reviews = 0
+
+    def run(self, request: AgentRequest) -> AgentResult:
+        if request.role == "reviewer":
+            self.reviews += 1
+            if self.reviews == 1:
+                raise RuntimeError("reviewer exploded")
+        return super().run(request)
+
+
+def test_recover_continues_from_existing_candidates_after_reviewer_crash(tmp_path: Path):
+    repo = tmp_path / "target"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "forge@example.test")
+    git(repo, "config", "user.name", "Forge Test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Build a greeting feature.\n", encoding="utf-8")
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
+    runner = BoomReviewer()
+    first = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="recover-review",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    with pytest.raises(RuntimeError, match="reviewer exploded"):
+        first.run()
+    assert first.state.status == "failed"
+    assert (tmp_path / "state" / "worktrees" / "recover-review" / "tdd").is_dir()
+
+    recovered = ForgeOrchestrator.from_existing(
+        repo,
+        "recover-review",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    state = recovered.recover()
+    assert state.status == "complete"
+    assert "hello from tdd" in (repo / "feature.txt").read_text(encoding="utf-8")
+
+
+class CrashAfterDelivery(ForgeOrchestrator):
+    def _finish_delivered_batch(self, *args, **kwargs):
+        raise RuntimeError("post-delivery crash")
+
+
+def test_recover_skips_recommit_after_delivery(tmp_path: Path):
+    repo = tmp_path / "target"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "forge@example.test")
+    git(repo, "config", "user.name", "Forge Test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    first_sha = git(repo, "rev-parse", "HEAD")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Build a greeting feature.\n", encoding="utf-8")
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
+    runner = FakeRunner()
+    first = CrashAfterDelivery(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="recover-delivery",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    with pytest.raises(RuntimeError, match="post-delivery crash"):
+        first.run()
+    delivered = git(repo, "rev-parse", "HEAD")
+    assert delivered != first_sha
+    assert (
+        repo / ".forge" / "runs" / "recover-delivery" / "batches" / "001" / "delivery.json"
+    ).is_file()
+
+    recovered = ForgeOrchestrator.from_existing(
+        repo,
+        "recover-delivery",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    state = recovered.recover()
+    assert state.status == "complete"
+    assert git(repo, "rev-parse", "HEAD") == delivered
+    assert "hello from tdd" in (repo / "feature.txt").read_text(encoding="utf-8")
+
+
+def test_recover_rejects_a_completed_run(tmp_path: Path):
+    repo = tmp_path / "target"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "forge@example.test")
+    git(repo, "config", "user.name", "Forge Test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Build a greeting feature.\n", encoding="utf-8")
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="complete-then-recover",
+        runner=FakeRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    orchestrator.run()
+    with pytest.raises(RuntimeError, match="only failed or paused"):
+        orchestrator.recover()

@@ -56,12 +56,13 @@
 
         <div class="model-head">
           <div><span class="eyebrow">Routing</span><h2>Models by role</h2></div>
-          <p><code>provider:model:effort</code></p>
+          <p>GPT: Codex or OpenCode. Grok, Qwen, GLM: OpenCode only.</p>
         </div>
         <div id="models" class="model-grid"></div>
 
         <div class="submit-row">
           <label class="toggle"><input id="push" type="checkbox" checked><span></span><div><strong>Push the winner</strong><small>Push the selected branch to <code>origin</code></small></div></label>
+          <label class="toggle"><input id="shuffle" type="checkbox"><span></span><div><strong>Shuffle coder models</strong><small>Randomly assign the three coder models to TDD, explore, and classic</small></div></label>
           <button type="submit" class="button primary"><span>Start Forge</span><span aria-hidden="true">→</span></button>
         </div>
         <p id="form-error" class="error" role="alert"></p>

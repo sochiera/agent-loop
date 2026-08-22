@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import atomic_write
+from .catalog import catalog_payload, DEFAULTS
 from .gitops import list_branches, repository_summary
 from .models import ModelSpec, ROLE_NAMES, RunConfig
 from .orchestrator import ForgeOrchestrator
@@ -52,7 +53,10 @@ class RunRegistry:
         raw_models = payload.get("models")
         if not isinstance(raw_models, dict):
             raise ValueError("models must be an object")
-        models = {role: ModelSpec.parse(str(raw_models.get(role, ""))) for role in ROLE_NAMES}
+        models = {
+            role: ModelSpec.parse(str(raw_models.get(role) or DEFAULTS[role]))
+            for role in ROLE_NAMES
+        }
         config = RunConfig(
             repo=str(repo),
             brief=str(brief_path),
@@ -60,6 +64,7 @@ class RunRegistry:
             models=models,
             push=bool(payload.get("push", True)),
             agent_timeout_seconds=int(payload.get("agent_timeout_seconds", 3600)),
+            shuffle_coders=bool(payload.get("shuffle_coders", False)),
         )
         orchestrator = ForgeOrchestrator(config, state_home=self.state_home)
         live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())
@@ -98,6 +103,55 @@ class RunRegistry:
         if live is None:
             raise KeyError(run_id)
         return self._describe(live, detailed=True)
+
+    def recover(self, payload: dict[str, Any]) -> dict[str, Any]:
+        repo = Path(str(payload["repo"])).expanduser().resolve()
+        run_id = str(payload["run_id"])
+        with self._lock:
+            existing = self._runs.get(run_id)
+        if existing is not None and existing.thread.is_alive():
+            raise ValueError("run is still running")
+        if existing is not None and existing.orchestrator.state.status == "complete":
+            raise ValueError("run is already complete")
+        orchestrator = ForgeOrchestrator.from_existing(repo, run_id, state_home=self.state_home)
+        if orchestrator.state.status == "complete":
+            raise ValueError("run is already complete")
+        live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())
+
+        def target() -> None:
+            try:
+                orchestrator.recover()
+            except Exception:
+                live.error = traceback.format_exc()
+
+        live.thread = threading.Thread(
+            target=target, name=f"forge-recover-{run_id}", daemon=True
+        )
+        with self._lock:
+            self._runs[run_id] = live
+        live.thread.start()
+        return orchestrator.state.to_dict()
+
+    def recover_live(self, run_id: str) -> dict[str, Any]:
+        with self._lock:
+            live = self._runs.get(run_id)
+        if live is None:
+            raise KeyError(run_id)
+        if live.thread.is_alive():
+            raise ValueError("run is still running")
+        live.error = ""
+
+        def target() -> None:
+            try:
+                live.orchestrator.recover()
+            except Exception:
+                live.error = traceback.format_exc()
+
+        live.thread = threading.Thread(
+            target=target, name=f"forge-recover-{run_id}", daemon=True
+        )
+        live.thread.start()
+        return self._describe(live)
 
     def control(self, run_id: str, action: str) -> dict[str, Any]:
         with self._lock:
@@ -144,6 +198,8 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 return self._json(self.registry.get(run_id))
             except KeyError:
                 return self._json({"error": "run not found"}, HTTPStatus.NOT_FOUND)
+        if parsed.path == "/api/catalog":
+            return self._json(catalog_payload())
         if parsed.path == "/api/branches":
             query = urllib.parse.parse_qs(parsed.query)
             try:
@@ -172,7 +228,11 @@ class ForgeHandler(BaseHTTPRequestHandler):
             payload = self._body()
             if self.path == "/api/runs":
                 return self._json(self.registry.start(payload), HTTPStatus.CREATED)
+            if self.path == "/api/runs/recover":
+                return self._json(self.registry.recover(payload), HTTPStatus.CREATED)
             parts = self.path.strip("/").split("/")
+            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "recover":
+                return self._json(self.registry.recover_live(parts[2]))
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] in {
                 "pause",
                 "resume",

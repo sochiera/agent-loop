@@ -15,7 +15,10 @@ ROLE_NAMES = (
     "coder_classic",
     "reviewer",
     "tester",
+    "whitebox",
 )
+
+CODER_ROLES = ("coder_tdd", "coder_explore", "coder_classic")
 
 DEFAULT_MODEL_SELECTORS = {
     "brain": "codex:gpt-5.6-sol:high",
@@ -25,6 +28,7 @@ DEFAULT_MODEL_SELECTORS = {
     "coder_classic": "codex:gpt-5.6-luna:high",
     "reviewer": "codex:gpt-5.6-terra:high",
     "tester": "codex:gpt-5.6-terra:high",
+    "whitebox": "codex:gpt-5.6-terra:high",
 }
 
 
@@ -36,15 +40,20 @@ class ModelSpec:
 
     @classmethod
     def parse(cls, value: str) -> "ModelSpec":
+        from .catalog import resolve_identity
+
         parts = value.strip().split(":", 2)
-        if not parts or parts[0] not in {"codex", "claude", "opencode"}:
+        if not parts or not parts[0]:
             raise ValueError(
                 "model must use provider:model[:effort], where provider is "
-                "codex, claude, or opencode"
+                "codex or opencode"
             )
+        provider, model = resolve_identity(
+            parts[0], parts[1] if len(parts) > 1 else ""
+        )
         return cls(
-            provider=parts[0],
-            model=parts[1] if len(parts) > 1 else "",
+            provider=provider,
+            model=model,
             effort=parts[2] if len(parts) > 2 else "",
         )
 
@@ -63,8 +72,11 @@ class RunConfig:
     agent_timeout_seconds: int = 3600
     retry_count: int = 2
     stalled_turns: int = 3
+    shuffle_coders: bool = False
 
     def validate(self) -> None:
+        from .catalog import validate_spec
+
         repo = Path(self.repo).expanduser().resolve()
         brief = Path(self.brief).expanduser().resolve()
         if not (repo / ".git").exists():
@@ -74,6 +86,8 @@ class RunConfig:
         missing = sorted(set(ROLE_NAMES) - set(self.models))
         if missing:
             raise ValueError(f"missing model selections: {', '.join(missing)}")
+        for spec in self.models.values():
+            validate_spec(spec)
         if not self.branch.strip():
             raise ValueError("branch cannot be empty")
         if self.agent_timeout_seconds < 1:
@@ -95,6 +109,7 @@ class RunConfig:
             agent_timeout_seconds=int(value.get("agent_timeout_seconds", 3600)),
             retry_count=int(value.get("retry_count", 2)),
             stalled_turns=int(value.get("stalled_turns", 3)),
+            shuffle_coders=bool(value.get("shuffle_coders", False)),
         )
 
 
@@ -142,6 +157,8 @@ class RunState:
     paused: bool = False
     cancel_requested: bool = False
     active_agents: dict[str, dict[str, Any]] = field(default_factory=dict)
+    checkpoint: dict[str, Any] = field(default_factory=dict)
+    last_red_flags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

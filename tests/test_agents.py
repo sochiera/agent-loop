@@ -5,7 +5,6 @@ from forge.agents import (
     AgentRequest,
     AgentRunner,
     _NON_RETRYABLE_ERRORS,
-    _claude_parse,
     _codex_parse,
     _opencode_parse,
 )
@@ -30,22 +29,6 @@ def test_codex_event_parser_counts_real_tools_only():
     assert tools == 1
 
 
-def test_claude_event_parser_prefers_structured_output():
-    text, usage, tools = _claude_parse(
-        [
-            {
-                "type": "result",
-                "structured_output": {"ok": True},
-                "usage": {"input_tokens": 7, "output_tokens": 2},
-                "total_cost_usd": 0.01,
-            }
-        ]
-    )
-    assert json.loads(text) == {"ok": True}
-    assert usage.cost_usd == 0.01
-    assert tools == 0
-
-
 def test_opencode_event_parser_sums_steps():
     text, usage, tools = _opencode_parse(
         [
@@ -61,20 +44,24 @@ def test_opencode_event_parser_sums_steps():
 def test_brain_commands_are_restricted(tmp_path: Path):
     runner = AgentRunner()
     codex = runner._command(
-        AgentRequest("brain", ModelSpec("codex", "gpt", "high"), "x", tmp_path, access="none")
+        AgentRequest(
+            "brain",
+            ModelSpec.parse("codex:gpt-5.6-sol:high"),
+            "x",
+            tmp_path,
+            access="none",
+        )
     )
     assert "read-only" in codex
     assert "shell_tool" in codex
     assert "image_generation" in codex
     assert "plugins" in codex
-    claude = runner._command(
-        AgentRequest("brain", ModelSpec("claude", "sonnet", ""), "x", tmp_path, access="none")
-    )
-    assert claude[claude.index("--tools") + 1] == ""
-    assert "--safe-mode" in claude
-    assert "--strict-mcp-config" in claude
     request = AgentRequest(
-        "brain", ModelSpec("opencode", "provider/model", ""), "x", tmp_path, access="none"
+        "brain",
+        ModelSpec.parse("opencode:gpt-5.6-sol"),
+        "x",
+        tmp_path,
+        access="none",
     )
     command = runner._command(request)
     assert "forge-brain" in command
@@ -87,7 +74,7 @@ def test_codex_resume_uses_configured_sandbox_not_unsupported_flag(tmp_path: Pat
     command = AgentRunner()._command(
         AgentRequest(
             "coder_tdd",
-            ModelSpec("codex", "gpt", "medium"),
+            ModelSpec.parse("codex:gpt-5.6-luna:medium"),
             "continue",
             tmp_path,
             session_id="session-1",
@@ -98,13 +85,15 @@ def test_codex_resume_uses_configured_sandbox_not_unsupported_flag(tmp_path: Pat
     assert "--skip-git-repo-check" in command
     assert "--sandbox" not in command
     assert any("sandbox_mode" in item for item in command)
+    assert "openai/gpt-5.6-luna" not in command
+    assert "gpt-5.6-luna" in command
 
 
 def test_codex_coder_uses_lean_cached_tool_surface(tmp_path: Path):
     command = AgentRunner()._command(
         AgentRequest(
             "coder_tdd",
-            ModelSpec("codex", "gpt-5.6-luna", "high"),
+            ModelSpec.parse("codex:gpt-5.6-luna:high"),
             "implement",
             tmp_path,
             access="write",

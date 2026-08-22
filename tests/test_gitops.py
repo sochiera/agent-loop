@@ -98,3 +98,26 @@ def test_capture_excludes_generated_dependency_trees(tmp_path: Path):
     assert "node_modules" not in captured["patch"]
     assert "node_modules" not in captured["status"]
     competition.cleanup()
+
+
+def test_reattach_and_restore_from_patches(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    root = tmp_path / "worktrees"
+    competition = GitCompetition(repo, "main", "run", root)
+    competition.prepare(require_remote=False)
+    candidates = competition.create_candidates()
+    (candidates["explore"].path / "note.txt").write_text("kept\n", encoding="utf-8")
+    captured = competition.capture(candidates["explore"])
+    patch = tmp_path / "explore.patch"
+    patch.write_text(captured["patch"], encoding="utf-8")
+    attached = GitCompetition(repo, "main", "run", root)
+    attached.prepare(require_remote=False)
+    again = attached.reattach_candidates()
+    assert (again["explore"].path / "note.txt").read_text(encoding="utf-8") == "kept\n"
+    attached.cleanup()
+    restored = GitCompetition(repo, "main", "run-2", tmp_path / "restored")
+    restored.prepare(require_remote=False)
+    trees, warnings = restored.restore_from_patches({"explore": patch})
+    assert warnings == []
+    assert (trees["explore"].path / "note.txt").read_text(encoding="utf-8") == "kept\n"
+    restored.cleanup()

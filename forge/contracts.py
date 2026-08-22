@@ -45,6 +45,18 @@ REVIEW_SCHEMA: dict[str, Any] = {
         "winner": {"type": "string", "enum": ["tdd", "explore", "classic"]},
         "reason": {"type": "string"},
         "feedback": {"type": "array", "items": {"type": "string"}},
+        "borrow": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "from": {"type": "string", "enum": ["tdd", "explore", "classic"]},
+                    "what": {"type": "string"},
+                },
+                "required": ["from", "what"],
+            },
+        },
         "candidates": {
             "type": "object",
             "additionalProperties": False,
@@ -69,8 +81,25 @@ TEST_SCHEMA: dict[str, Any] = {
         "missing": {"type": "array", "items": {"type": "string"}},
         "observations": {"type": "array", "items": {"type": "string"}},
         "evidence": {"type": "array", "items": {"type": "string"}},
+        "happy_path": {
+            "type": "string",
+            "enum": ["exercised", "unreachable", "missing"],
+        },
     },
     "required": ["summary", "working", "missing", "observations", "evidence"],
+}
+
+WHITEBOX_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "summary": {"type": "string"},
+        "short": {"type": "array", "items": {"type": "string"}},
+        "long": {"type": "array", "items": {"type": "string"}},
+        "red_flags": {"type": "array", "items": {"type": "string"}},
+        "recommendation": {"type": "string"},
+    },
+    "required": ["summary", "short", "long", "red_flags", "recommendation"],
 }
 
 
@@ -144,6 +173,21 @@ def parse_review(text: str) -> dict[str, Any]:
         raise ContractError("review reason is required")
     if not isinstance(value.get("feedback"), list):
         raise ContractError("review feedback must be an array")
+    borrow = value.get("borrow", [])
+    if not isinstance(borrow, list):
+        raise ContractError("review borrow must be an array")
+    normalized_borrow: list[dict[str, str]] = []
+    for item in borrow:
+        if not isinstance(item, dict):
+            raise ContractError("each borrow item must be an object")
+        source = item.get("from")
+        what = item.get("what")
+        if source not in {"tdd", "explore", "classic"}:
+            raise ContractError("borrow.from must be tdd, explore, or classic")
+        if not isinstance(what, str) or not what.strip():
+            raise ContractError("borrow.what must be a non-empty string")
+        normalized_borrow.append({"from": source, "what": what.strip()})
+    value["borrow"] = normalized_borrow
     candidates = value.get("candidates")
     if not isinstance(candidates, dict) or set(candidates) != {"tdd", "explore", "classic"}:
         raise ContractError("review must assess all three candidates")
@@ -168,4 +212,23 @@ def parse_test(text: str) -> dict[str, Any]:
             isinstance(item, str) for item in value[key]
         ):
             raise ContractError(f"black-box {key} must be an array of strings")
+    happy_path = value.get("happy_path", "exercised")
+    if happy_path not in {"exercised", "unreachable", "missing"}:
+        raise ContractError("happy_path must be exercised, unreachable, or missing")
+    value["happy_path"] = happy_path
+    return value
+
+
+def parse_whitebox(text: str) -> dict[str, Any]:
+    value = _extract_json(text)
+    for key in ("summary", "recommendation"):
+        if not isinstance(value.get(key), str) or not value[key].strip():
+            raise ContractError(f"whitebox {key} must be a non-empty string")
+    for key in ("short", "long", "red_flags"):
+        if key not in value:
+            raise ContractError(f"whitebox report is missing {key}")
+        if not isinstance(value[key], list) or not all(
+            isinstance(item, str) for item in value[key]
+        ):
+            raise ContractError(f"whitebox {key} must be an array of strings")
     return value

@@ -32,6 +32,10 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert summary["has_head"] is False
         assert summary["brief_path"] == str(repo / "goal.md")
         assert summary["brief_text"] == "# Build it\n"
+        catalog = json.loads(urllib.request.urlopen(base + "/api/catalog", timeout=2).read())
+        assert "gpt-5.6-sol" in {item["key"] for item in catalog["models"]}
+        assert "opencode" in catalog["providers"]
+        assert "claude" not in catalog["providers"]
     finally:
         server.shutdown()
         server.server_close()
