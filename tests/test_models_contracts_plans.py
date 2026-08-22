@@ -99,6 +99,11 @@ def test_model_spec_accepts_grok_on_opencode():
     assert value.model == "xai/grok-4.6"
 
 
+def test_model_spec_accepts_kimi_k3_on_opencode():
+    value = ModelSpec.parse("opencode:kimi-k3")
+    assert value.model == "kimi-for-coding/k3"
+
+
 def test_model_spec_accepts_qwen_cloud_deepseek():
     flash = ModelSpec.parse("opencode:deepseek-v4-flash-0731")
     pro = ModelSpec.parse("opencode:deepseek-v4-pro-0813")
@@ -311,6 +316,36 @@ def test_tester_prompt_reuses_expensive_validation_evidence(tmp_path: Path):
     assert "TIMED OUT after 900.8s" in prompt
     assert "motherboard page 20" in prompt
     assert "Do not repeat an already-recorded expensive or timed-out command" in prompt
+    assert "OPTIONAL PRIVATE DISPLAY" in prompt
+    assert "nothing is required" in prompt
+    assert "FORGE_VIRTUAL_DISPLAY" not in prompt
+
+
+def test_tester_prompt_suggests_started_virtual_display(tmp_path: Path):
+    prompt = _tester_prompt(
+        objective="Play the game",
+        criteria=("Window opens",),
+        commands=("make run",),
+        validation=[],
+        evidence_dir=tmp_path,
+        virtual_display=":99",
+    )
+    assert "DISPLAY=:99" in prompt
+    assert "FORGE_VIRTUAL_DISPLAY" in prompt
+    assert "nothing is required" in prompt
+    assert "host DISPLAY" in prompt
+
+
+def test_planner_mentions_optional_virtual_display():
+    prompt = planner_prompt(
+        "Build it",
+        ("It works",),
+        Path("plan.md"),
+        repository_context="empty",
+        environment_context="Available commands: git, Xvfb.",
+    )
+    assert "GUI checks may use Xvfb" in prompt
+    assert "this is optional" in prompt
 
 
 def test_winner_fix_prompt_does_not_repeat_unchanged_timeout():

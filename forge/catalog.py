@@ -127,6 +127,13 @@ CATALOG: tuple[CatalogEntry, ...] = (
         providers=("opencode",),
         ids={"opencode": "zai-coding-plan/glm-5.3"},
     ),
+    CatalogEntry(
+        key="kimi-k3",
+        label="Kimi K3",
+        family="kimi",
+        providers=("opencode",),
+        ids={"opencode": "kimi-for-coding/k3"},
+    ),
 )
 
 DEFAULTS = {
@@ -174,7 +181,7 @@ def resolve_identity(provider: str, model: str) -> tuple[str, str]:
     if entry is None:
         raise ValueError(
             f"unsupported model {provider}:{model or '(empty)'}; "
-            "choose a catalog model (GPT family, Grok 4.6, Qwen, DeepSeek, Gemini, GLM)"
+            "choose a catalog model (GPT family, Grok 4.6, Qwen, DeepSeek, Gemini, GLM, Kimi)"
         )
     return provider, entry.id_for(provider)
 

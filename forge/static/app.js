@@ -20,7 +20,7 @@ const phases = ["preflight", "brain", "planning", "coding", "review", "winner-fi
 const phaseLabels = ["Preflight", "Brain", "Plan", "Code ×3", "Review", "Fix", "Deliver", "White-box", "Black-box"];
 const storageKey = "forge-control-room-v4";
 const providerLabels = {codex: "Codex", opencode: "OpenCode"};
-const familyLabels = {gpt: "GPT", grok: "Grok", qwen: "Qwen", deepseek: "DeepSeek", gemini: "Gemini", glm: "GLM"};
+const familyLabels = {gpt: "GPT", grok: "Grok", qwen: "Qwen", deepseek: "DeepSeek", gemini: "Gemini", glm: "GLM", kimi: "Kimi"};
 const effortLabels = {"": "Default", low: "Low", medium: "Medium", high: "High"};
 const fallbackCatalog = {
   providers: ["codex", "opencode"],
@@ -40,6 +40,7 @@ const fallbackCatalog = {
     {key: "or-deepseek-v4-pro", label: "DeepSeek V4 Pro OR", family: "deepseek", providers: ["opencode"], ids: {opencode: "openrouter/deepseek/deepseek-v4-pro"}, efforts: ["", "low", "medium", "high"]},
     {key: "or-deepseek-v4-pro-0813", label: "DeepSeek V4 Pro 0813 OR", family: "deepseek", providers: ["opencode"], ids: {opencode: "openrouter/deepseek/deepseek-v4-pro-0813"}, efforts: ["", "low", "medium", "high"]},
     {key: "glm-5.3", label: "GLM 5.3", family: "glm", providers: ["opencode"], ids: {opencode: "zai-coding-plan/glm-5.3"}, efforts: ["", "low", "medium", "high"]},
+    {key: "kimi-k3", label: "Kimi K3", family: "kimi", providers: ["opencode"], ids: {opencode: "kimi-for-coding/k3"}, efforts: ["", "low", "medium", "high"]},
   ],
 };
 let catalog = fallbackCatalog;

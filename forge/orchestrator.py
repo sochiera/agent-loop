@@ -44,6 +44,7 @@ from .contracts import (
     parse_test,
     parse_whitebox,
 )
+from .display import optional_virtual_display
 from .gitops import CandidateWorktree, GitCompetition, GitError
 from .models import CODER_ROLES, STAFF_ROLES, ModelSpec, RunConfig, RunState
 from .plans import (
@@ -1200,6 +1201,9 @@ class ForgeOrchestrator:
             "cargo",
             "java",
             "docker",
+            "Xvfb",
+            "xvfb-run",
+            "Xephyr",
         )
         available = [command for command in commands if shutil.which(command)]
         unavailable = [command for command in commands if command not in available]
@@ -1518,36 +1522,40 @@ class ForgeOrchestrator:
     ) -> dict[str, Any]:
         evidence = self.store.root / batch_rel / "black-box-evidence"
         evidence.mkdir(parents=True, exist_ok=True)
-        prompt = tester_prompt(
-            objective=decision.objective,
-            criteria=decision.success_criteria,
-            commands=commands,
-            validation=validation,
-            evidence_dir=evidence,
-        )
-        session: str | None = None
-        for attempt in range(1, 4):
-            result = self._invoke(
-                role="tester",
-                model=self.config.models["tester"],
-                prompt=prompt,
-                cwd=product_worktree,
-                session_id=session,
-                access="write",
-                schema=TEST_SCHEMA,
-                extra_writable_dirs=(evidence,),
-                relative=f"{batch_rel}/black-box/attempt-{attempt}",
+        with optional_virtual_display() as server:
+            prompt = tester_prompt(
+                objective=decision.objective,
+                criteria=decision.success_criteria,
+                commands=commands,
+                validation=validation,
+                evidence_dir=evidence,
+                virtual_display=None if server is None else server.display,
             )
-            session = result.session_id
-            try:
-                report = parse_test(result.text)
-            except ContractError as exc:
-                prompt = contract_feedback(
-                    str(exc), expected="the required black-box report JSON"
+            environment = {} if server is None else server.environment()
+            session: str | None = None
+            for attempt in range(1, 4):
+                result = self._invoke(
+                    role="tester",
+                    model=self.config.models["tester"],
+                    prompt=prompt,
+                    cwd=product_worktree,
+                    session_id=session,
+                    access="write",
+                    schema=TEST_SCHEMA,
+                    extra_writable_dirs=(evidence,),
+                    environment=environment,
+                    relative=f"{batch_rel}/black-box/attempt-{attempt}",
                 )
-                continue
-            self.store.write_data(f"{batch_rel}/black-box.json", report)
-            return report
+                session = result.session_id
+                try:
+                    report = parse_test(result.text)
+                except ContractError as exc:
+                    prompt = contract_feedback(
+                        str(exc), expected="the required black-box report JSON"
+                    )
+                    continue
+                self.store.write_data(f"{batch_rel}/black-box.json", report)
+                return report
         raise RuntimeError("black-box tester failed its report contract")
 
     def _candidate_metrics(
@@ -1651,6 +1659,7 @@ class ForgeOrchestrator:
         access: str = "write",
         schema: dict[str, Any] | None = None,
         extra_writable_dirs: tuple[Path, ...] = (),
+        environment: dict[str, str] | None = None,
         relative: str,
         candidate: str = "",
         invocation: int = 1,
@@ -1689,6 +1698,7 @@ class ForgeOrchestrator:
                         access=access,
                         schema=schema,
                         extra_writable_dirs=extra_writable_dirs,
+                        environment=dict(environment or {}),
                         timeout_seconds=role_timeout,
                     )
                 )

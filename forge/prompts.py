@@ -128,6 +128,7 @@ all three candidates and winner-only checks once after review. Do not edit the r
 Choose a technology supported by the detected toolchain. If another runtime is genuinely needed,
 include an explicit reproducible setup task and do not assume a temporary agent-only PATH will be
 available to Forge validation or the black-box tester.
+GUI checks may use Xvfb or another private display when the toolchain has one; this is optional.
 """
 
 
@@ -275,6 +276,7 @@ def tester_prompt(
     commands: tuple[str, ...],
     validation: list[dict[str, object]],
     evidence_dir: Path,
+    virtual_display: str | None = None,
 ) -> str:
     criteria_text = "\n".join(f"- {item}" for item in criteria)
     command_text = "\n".join(f"- {item}" for item in commands)
@@ -294,12 +296,27 @@ def tester_prompt(
             if output:
                 validation_lines.append(f"  Last output: {output[-1200:]}")
     validation_text = "\n".join(validation_lines) or "- No delivery validation was recorded."
+    if virtual_display:
+        display_note = f"""
+OPTIONAL PRIVATE DISPLAY
+Forge started a disposable Xvfb at DISPLAY={virtual_display} and exported it as FORGE_VIRTUAL_DISPLAY.
+Prefer it for GUI launch, input, and screenshots if you want isolation from the host session. The
+host DISPLAY and any desktop portals remain available if you choose them; nothing is required.
+"""
+    else:
+        display_note = """
+OPTIONAL PRIVATE DISPLAY
+Forge did not start a virtual framebuffer (Xvfb missing or it failed to start). You may start
+Xvfb or Xephyr yourself if you want a private display. The host session remains available;
+nothing is required.
+"""
     return f"""You are Forge's black-box product tester. Evaluate the delivered product only
 through its public interfaces and observable behavior. Do not read source code, diffs, internal
 implementation files, or test source. You may build, launch, drive, and observe the product. Use
 browser automation and screenshots for web/UI products, public commands for CLI products, and
 network/public API interactions for services. Save useful screenshots and observations under
 {evidence_dir}.
+{display_note}
 
 DELIVERED BATCH OBJECTIVE
 {objective}

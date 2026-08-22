@@ -49,6 +49,9 @@ white-box reporter      black-box tester
 The loop ends only when the brain calls `forge.finish`. There is intentionally no independent
 final verifier and no mechanical product-completion threshold.
 
+If `Xvfb` is on `PATH`, Forge starts a private display for the black-box tester and exports it as
+`FORGE_VIRTUAL_DISPLAY`. The tester may use that display or the host session; nothing is required.
+
 ## Design principles
 
 - **One persistent brain session.** Forge always resumes its original provider session. Native
@@ -75,7 +78,7 @@ final verifier and no mechanical product-completion threshold.
 - Linux or macOS with Git and Python 3.12 or newer.
 - At least one authenticated supported agent CLI:
   - `codex` (GPT family)
-  - `opencode` (GPT family, Grok 4.6, Qwen 3.8 Max, DeepSeek Flash/Pro, GLM 5.3)
+  - `opencode` (GPT family, Grok 4.6, Qwen 3.8 Max, DeepSeek Flash/Pro, GLM 5.3, Kimi K3)
 - A clean target Git repository. Forge can bootstrap an unborn selected branch in a repository
   with no commits. When push is enabled the repository must have an `origin` remote.
 
@@ -133,9 +136,10 @@ opencode:or-deepseek-v4-flash-0731
 opencode:or-deepseek-v4-pro
 opencode:or-deepseek-v4-pro-0813
 opencode:glm-5.3
+opencode:kimi-k3
 ```
 
-GPT-family models may run on Codex or OpenCode. Grok 4.6, Qwen, DeepSeek, Gemini, and GLM
+GPT-family models may run on Codex or OpenCode. Grok 4.6, Qwen, DeepSeek, Gemini, GLM, and Kimi
 models run on OpenCode only. OpenRouter entries use the `or-` catalog keys and require an
 OpenRouter credential in OpenCode. Catalog keys (`gpt-5.6-sol`) and provider
 IDs (`openai/gpt-5.6-sol`) are both accepted. The fixed selections are `brain`, `planner`,

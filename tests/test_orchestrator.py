@@ -818,3 +818,37 @@ def test_capture_marks_review_resume_phase(tmp_path: Path):
     hint = orchestrator.recovery_hint()
     assert hint["kind"] == "resume_review"
     assert hint["cycle"] == 1
+
+
+def test_black_box_offers_virtual_display_without_overriding_host(tmp_path: Path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from forge.display import VIRTUAL_DISPLAY_ENV
+
+    offered = SimpleNamespace(
+        display=":94",
+        environment=lambda: {VIRTUAL_DISPLAY_ENV: ":94"},
+    )
+
+    @contextmanager
+    def fake_display():
+        yield offered
+
+    monkeypatch.setattr("forge.orchestrator.optional_virtual_display", fake_display)
+    repo, brief = _repo_with_brief(tmp_path)
+    runner = RecordingRunner()
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", _mixed_models(), push=False),
+        run_id="virtual-display",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    assert orchestrator.run().status == "complete"
+    testers = [request for request in runner.requests if request.role == "tester"]
+    assert testers
+    assert testers[0].environment == {VIRTUAL_DISPLAY_ENV: ":94"}
+    assert "DISPLAY" not in testers[0].environment
+    assert "DISPLAY=:94" in testers[0].prompt
+    assert "nothing is required" in testers[0].prompt
