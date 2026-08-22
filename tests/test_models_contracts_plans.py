@@ -81,8 +81,8 @@ def test_model_spec_accepts_grok_on_opencode():
 def test_model_spec_accepts_qwen_cloud_deepseek():
     flash = ModelSpec.parse("opencode:deepseek-v4-flash-0731")
     pro = ModelSpec.parse("opencode:deepseek-v4-pro-0813")
-    assert flash.model == "qwencloud-token-plan/deepseek-v4-flash-0731"
-    assert pro.model == "qwencloud-token-plan/deepseek-v4-pro"
+    assert flash.model == "alibaba-token-plan/deepseek-v4-flash-0731"
+    assert pro.model == "alibaba-token-plan/deepseek-v4-pro-0813"
 
 
 def test_assign_coder_models_rejects_empty_pool():

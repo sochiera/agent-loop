@@ -31,9 +31,9 @@ const fallbackCatalog = {
     {key: "gpt-5.5", label: "GPT-5.5", family: "gpt", providers: ["opencode"], ids: {opencode: "openai/gpt-5.5"}, efforts: ["", "low", "medium", "high"]},
     {key: "gpt-5.4", label: "GPT-5.4", family: "gpt", providers: ["opencode"], ids: {opencode: "openai/gpt-5.4"}, efforts: ["", "low", "medium", "high"]},
     {key: "grok-4.6", label: "Grok 4.6", family: "grok", providers: ["opencode"], ids: {opencode: "xai/grok-4.6"}, efforts: ["", "low", "medium", "high"]},
-    {key: "qwen-3.8-max", label: "Qwen 3.8 Max", family: "qwen", providers: ["opencode"], ids: {opencode: "qwencloud-token-plan/qwen3.8-max"}, efforts: ["", "low", "medium", "high"]},
-    {key: "deepseek-v4-flash-0731", label: "DeepSeek Flash 0731", family: "deepseek", providers: ["opencode"], ids: {opencode: "qwencloud-token-plan/deepseek-v4-flash-0731"}, efforts: ["", "low", "medium", "high"]},
-    {key: "deepseek-v4-pro-0813", label: "DeepSeek Pro 0813", family: "deepseek", providers: ["opencode"], ids: {opencode: "qwencloud-token-plan/deepseek-v4-pro"}, efforts: ["", "low", "medium", "high"]},
+    {key: "qwen-3.8-max", label: "Qwen 3.8 Max", family: "qwen", providers: ["opencode"], ids: {opencode: "alibaba-token-plan/qwen3.8-max"}, efforts: ["", "low", "medium", "high"]},
+    {key: "deepseek-v4-flash-0731", label: "DeepSeek Flash 0731", family: "deepseek", providers: ["opencode"], ids: {opencode: "alibaba-token-plan/deepseek-v4-flash-0731"}, efforts: ["", "low", "medium", "high"]},
+    {key: "deepseek-v4-pro-0813", label: "DeepSeek Pro 0813", family: "deepseek", providers: ["opencode"], ids: {opencode: "alibaba-token-plan/deepseek-v4-pro-0813"}, efforts: ["", "low", "medium", "high"]},
     {key: "glm-5.3", label: "GLM 5.3", family: "glm", providers: ["opencode"], ids: {opencode: "zai-coding-plan/glm-5.3"}, efforts: ["", "low", "medium", "high"]},
   ],
 };
