@@ -565,6 +565,25 @@ function coderDraw(run) {
   return `<h3>Coder draw</h3><ul class="coder-draw">${rows}</ul>`;
 }
 
+function eventsBox() {
+  return document.querySelector("#detail-body .events");
+}
+
+function captureEventsScroll() {
+  const box = eventsBox();
+  if (!box) return null;
+  return {
+    top: box.scrollTop,
+    atBottom: box.scrollHeight - box.scrollTop - box.clientHeight < 24,
+  };
+}
+
+function restoreEventsScroll(state) {
+  const box = eventsBox();
+  if (!box || !state) return;
+  box.scrollTop = state.atBottom ? box.scrollHeight : state.top;
+}
+
 function detail(run) {
   const usage = usageSummary(run);
   const warnings = (run.warnings || []).slice(-20).map(item => `<li>${escapeHtml(item)}</li>`).join("");
@@ -606,7 +625,9 @@ async function refresh() {
     const indicator = document.querySelector("#live-indicator");
     indicator.textContent = run.alive ? "Live" : "Stopped";
     indicator.classList.toggle("live", run.alive);
+    const eventsScroll = captureEventsScroll();
     document.querySelector("#detail-body").innerHTML = detail(run);
+    restoreEventsScroll(eventsScroll);
     document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", async () => {
       button.disabled = true;
       try { await api(`/api/runs/${selected}/${button.dataset.action}`, {method: "POST", body: "{}"}); }
