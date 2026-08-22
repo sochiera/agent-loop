@@ -65,6 +65,9 @@ class RunCancelled(RuntimeError):
     pass
 
 
+PROBE_PROMPT = "Reply with the single word ready."
+
+
 @dataclass
 class CandidateOutcome:
     name: str
@@ -155,6 +158,14 @@ class ForgeOrchestrator:
             self._control.notify_all()
             self._save("Cancellation requested.")
 
+    def mark_interrupted(self, message: str) -> None:
+        with self._activity_lock:
+            self.state.active_agents.clear()
+        if self.state.status in {"running", "paused", "created"}:
+            self.state.status = "failed"
+            self.state.paused = False
+            self._save(message)
+
     @classmethod
     def from_existing(
         cls,
@@ -188,6 +199,7 @@ class ForgeOrchestrator:
         self._save("Starting Forge run.")
         try:
             self._preflight()
+            self._probe_models()
             decision = self._brain_decision(
                 brain_initial(self.brief_path.read_text(encoding="utf-8"))
             )
@@ -285,7 +297,10 @@ class ForgeOrchestrator:
                 f"only failed or interrupted runs can be recovered (status: {self.state.status})"
             )
         if self.state.status == "running" and self.state.active_agents:
-            raise RuntimeError("interrupted run still records active agents; stop them before recovery")
+            self._warning(
+                "Clearing stale active agents left by an interrupted controller."
+            )
+            self.state.active_agents.clear()
         if not self.state.brain_session_id:
             raise RuntimeError("failed run has no persistent brain session to resume")
         if not self.state.batches:
@@ -446,6 +461,57 @@ class ForgeOrchestrator:
         base = self._competition.prepare(require_remote=self.config.push)
         self.store.write_data("git.json", {"branch": self.config.branch, "base_sha": base})
         self._save(f"Preflight passed at {base[:12]} on {self.config.branch}.")
+
+    def _unique_run_models(self) -> list[tuple[str, ModelSpec]]:
+        unique: list[tuple[str, ModelSpec]] = []
+        seen: set[str] = set()
+        for role, spec in self.config.models.items():
+            key = spec.display()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((role, spec))
+        return unique
+
+    def _probe_models(self) -> None:
+        unique = self._unique_run_models()
+        self._phase(
+            "preflight",
+            f"Probing {len(unique)} unique model(s) with a no-tool ping.",
+        )
+        probe_root = self.state_home / "probes" / self.run_id
+        probe_root.mkdir(parents=True, exist_ok=True)
+        failures: list[str] = []
+
+        def probe(item: tuple[str, ModelSpec]) -> str | None:
+            role, spec = item
+            slug = spec.display().replace("/", "_").replace(":", "_")
+            try:
+                self._invoke(
+                    role="probe",
+                    model=spec,
+                    prompt=PROBE_PROMPT,
+                    cwd=probe_root / slug,
+                    access="none",
+                    relative=f"preflight/probe-{slug}",
+                    candidate=spec.display(),
+                )
+            except RunCancelled:
+                raise
+            except Exception as exc:
+                return f"{spec.display()} (from {role}): {exc}"
+            return None
+
+        workers = min(len(unique), 8) or 1
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(probe, item) for item in unique]
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    failures.append(result)
+        if failures:
+            raise ValueError("model preflight failed: " + "; ".join(failures))
+        self._save(f"Model preflight passed for {len(unique)} unique model(s).")
 
     def _brain_decision(self, prompt: str) -> BrainDecision:
         self._phase("brain", "Persistent brain is choosing the next Forge action.")

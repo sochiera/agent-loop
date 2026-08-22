@@ -5,7 +5,8 @@ import pytest
 
 import random
 
-from forge.catalog import shuffle_coder_models
+from forge.catalog import assign_coder_models, shuffle_coder_models
+from forge.web import models_from_payload, restart_payload
 from forge.cli import _parser
 from forge.contracts import (
     BRAIN_SCHEMA,
@@ -75,6 +76,74 @@ def test_shuffle_coder_models_preserves_the_pool():
 def test_model_spec_accepts_grok_on_opencode():
     value = ModelSpec.parse("opencode:grok-4.6")
     assert value.model == "xai/grok-4.6"
+
+
+def test_model_spec_accepts_qwen_cloud_deepseek():
+    flash = ModelSpec.parse("opencode:deepseek-v4-flash-0731")
+    pro = ModelSpec.parse("opencode:deepseek-v4-pro-0813")
+    assert flash.model == "qwencloud-token-plan/deepseek-v4-flash-0731"
+    assert pro.model == "qwencloud-token-plan/deepseek-v4-pro"
+
+
+def test_assign_coder_models_rejects_empty_pool():
+    with pytest.raises(ValueError, match="at least one coder model"):
+        assign_coder_models({}, [])
+
+
+def test_assign_coder_models_reuses_a_short_pool():
+    models = {"brain": ModelSpec.parse("codex:gpt-5.6-sol:high")}
+    pool = [ModelSpec.parse("opencode:grok-4.6")]
+    assigned = assign_coder_models(models, pool, rng=random.Random(0))
+    assert assigned["coder_tdd"].display() == "opencode:xai/grok-4.6"
+    assert assigned["coder_explore"].display() == "opencode:xai/grok-4.6"
+    assert assigned["coder_classic"].display() == "opencode:xai/grok-4.6"
+    assert assigned["brain"].display() == models["brain"].display()
+
+
+def test_assign_coder_models_samples_from_a_larger_pool():
+    models = {"brain": ModelSpec.parse("codex:gpt-5.6-sol:high")}
+    pool = [
+        ModelSpec.parse("opencode:gpt-5.6-luna"),
+        ModelSpec.parse("opencode:grok-4.6"),
+        ModelSpec.parse("opencode:glm-5.3"),
+        ModelSpec.parse("opencode:qwen-3.8-max"),
+        ModelSpec.parse("opencode:deepseek-v4-flash-0731"),
+    ]
+    assigned = assign_coder_models(models, pool, rng=random.Random(1))
+    chosen = {
+        assigned["coder_tdd"].display(),
+        assigned["coder_explore"].display(),
+        assigned["coder_classic"].display(),
+    }
+    assert len(chosen) == 3
+    assert chosen <= {item.display() for item in pool}
+
+
+def test_restart_payload_requires_confirm_when_a_run_is_live():
+    assert restart_payload(1, False) == {"needs_confirm": True, "active_runs": 1}
+    assert restart_payload(2, True) == {"restarting": True, "active_runs": 2}
+    assert restart_payload(0, False) == {"restarting": True, "active_runs": 0}
+
+
+def test_models_from_payload_draws_coder_pool():
+    models, shuffle = models_from_payload(
+        {
+            "models": {
+                "brain": "codex:gpt-5.6-sol:high",
+                "planner": "codex:gpt-5.6-sol:high",
+                "reviewer": "codex:gpt-5.6-terra:high",
+                "tester": "codex:gpt-5.6-terra:high",
+                "whitebox": "codex:gpt-5.6-terra:high",
+            },
+            "coder_models": ["opencode:grok-4.6"],
+            "shuffle_coders": True,
+        }
+    )
+    assert shuffle is False
+    assert models["coder_tdd"].display() == "opencode:xai/grok-4.6"
+    assert models["coder_explore"].display() == "opencode:xai/grok-4.6"
+    assert models["coder_classic"].display() == "opencode:xai/grok-4.6"
+    assert models["brain"].display() == "codex:gpt-5.6-sol:high"
 
 
 def test_cli_defaults_all_coders_to_codex_luna_high():

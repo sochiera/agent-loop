@@ -6,7 +6,7 @@ import pytest
 
 from forge.agents import AgentConfigurationFailure, AgentRequest, AgentTimeout
 from forge.models import AgentResult, ModelSpec, ROLE_NAMES, RunConfig, Usage
-from forge.orchestrator import ForgeOrchestrator
+from forge.orchestrator import PROBE_PROMPT, ForgeOrchestrator
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -21,6 +21,15 @@ class FakeRunner:
 
     def run(self, request: AgentRequest) -> AgentResult:
         session = request.session_id or f"{request.role}-session"
+        if request.role == "probe":
+            assert request.access == "none"
+            return AgentResult(
+                text="ready",
+                session_id=session,
+                usage=Usage(input_tokens=1, output_tokens=1),
+                elapsed_seconds=0.01,
+                raw_output="ready",
+            )
         if request.role == "brain":
             self.brain_calls += 1
             if self.brain_calls == 1:
@@ -435,3 +444,144 @@ def test_recover_rejects_a_completed_run(tmp_path: Path):
     orchestrator.run()
     with pytest.raises(RuntimeError, match="only failed or paused"):
         orchestrator.recover()
+
+
+def test_mark_interrupted_clears_live_agents(tmp_path: Path):
+    repo = tmp_path / "target"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "forge@example.test")
+    git(repo, "config", "user.name", "Forge Test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Build a greeting feature.\n", encoding="utf-8")
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="interrupt-run",
+        runner=FakeRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    orchestrator.state.status = "running"
+    orchestrator.state.active_agents["coder_tdd"] = {"role": "coder_tdd"}
+    orchestrator.mark_interrupted("Controller restarted.")
+    assert orchestrator.state.status == "failed"
+    assert orchestrator.state.active_agents == {}
+    assert "Controller restarted" in orchestrator.state.message
+
+
+def test_recover_failed_clears_stale_active_agents(tmp_path: Path):
+    repo = tmp_path / "target"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "forge@example.test")
+    git(repo, "config", "user.name", "Forge Test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Build a greeting feature.\n", encoding="utf-8")
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="stale-agents",
+        runner=FakeRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    orchestrator.run()
+    orchestrator.state.status = "running"
+    orchestrator.state.active_agents["coder_tdd"] = {"role": "coder_tdd"}
+    orchestrator.store.save_state(orchestrator.state)
+    orchestrator.runner = FinishRecoveryRunner()
+    recovered = orchestrator.recover_failed()
+    assert recovered.status == "complete"
+    assert recovered.active_agents == {}
+
+
+class RecordingRunner(FakeRunner):
+    def __init__(self):
+        super().__init__()
+        self.requests: list[AgentRequest] = []
+
+    def run(self, request: AgentRequest) -> AgentResult:
+        self.requests.append(request)
+        return super().run(request)
+
+
+def _repo_with_brief(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "target"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "forge@example.test")
+    git(repo, "config", "user.name", "Forge Test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Build a greeting feature.\n", encoding="utf-8")
+    return repo, brief
+
+
+def test_first_start_probes_each_unique_model_without_tools(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    models = {
+        "brain": ModelSpec.parse("codex:gpt-5.6-sol:high"),
+        "planner": ModelSpec.parse("codex:gpt-5.6-sol:high"),
+        "coder_tdd": ModelSpec.parse("codex:gpt-5.6-luna:high"),
+        "coder_explore": ModelSpec.parse("codex:gpt-5.6-luna:high"),
+        "coder_classic": ModelSpec.parse("opencode:grok-4.6"),
+        "reviewer": ModelSpec.parse("codex:gpt-5.6-terra:high"),
+        "tester": ModelSpec.parse("codex:gpt-5.6-terra:high"),
+        "whitebox": ModelSpec.parse("codex:gpt-5.6-terra:high"),
+    }
+    runner = RecordingRunner()
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="probe-unique",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    state = orchestrator.run()
+    assert state.status == "complete"
+    probes = [request for request in runner.requests if request.role == "probe"]
+    assert {request.model.display() for request in probes} == {
+        "codex:gpt-5.6-sol:high",
+        "codex:gpt-5.6-luna:high",
+        "opencode:xai/grok-4.6",
+        "codex:gpt-5.6-terra:high",
+    }
+    assert len(probes) == 4
+    assert all(request.access == "none" for request in probes)
+    assert all(request.prompt == PROBE_PROMPT for request in probes)
+    assert (repo / ".forge" / "runs" / "probe-unique" / "preflight").is_dir()
+
+
+def test_failed_model_probe_stops_before_brain(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    models = {role: ModelSpec.parse("codex:gpt-5.6-sol:high") for role in ROLE_NAMES}
+
+    class FailingProbe(RecordingRunner):
+        def run(self, request: AgentRequest) -> AgentResult:
+            if request.role == "probe":
+                self.requests.append(request)
+                raise AgentConfigurationFailure("usage limit", raw_output="quota")
+            return super().run(request)
+
+    runner = FailingProbe()
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="probe-fail",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    with pytest.raises(ValueError, match="model preflight failed"):
+        orchestrator.run()
+    assert runner.brain_calls == 0
+    assert orchestrator.state.status == "failed"
+    assert not any(request.role == "brain" for request in runner.requests)

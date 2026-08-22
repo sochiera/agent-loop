@@ -50,8 +50,10 @@ code { font: .92em ui-monospace, SFMono-Regular, Consolas, monospace; }
 .mast-copy { display: flex; flex-direction: column; }
 .mast-copy strong { font-size: 14px; }
 .mast-copy span { color: var(--muted); font-size: 12px; }
+.mast-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex-wrap: wrap; }
 .local-badge { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; font-weight: 650; }
 .local-badge > span { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px var(--green-soft); }
+.restart-confirm { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--amber); font-size: 12px; font-weight: 650; }
 
 main {
   width: min(1480px, 94vw);
@@ -114,9 +116,14 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 .model-head { margin: 28px 0 13px; padding-top: 24px; border-top: 1px solid var(--line); }
 
 .model-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-.model-card { display: grid; grid-template-columns: 1fr auto; gap: 1px 12px; padding: 12px; border: 1px solid var(--line); border-radius: 11px; background: var(--soft); }
-.model-card input { grid-column: 1 / -1; margin-top: 7px; padding: 9px 10px; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.model-card { display: grid; grid-template-columns: 1fr auto auto; gap: 1px 12px; padding: 12px; border: 1px solid var(--line); border-radius: 11px; background: var(--soft); }
+.model-picks { grid-column: 1 / -1; display: grid; grid-template-columns: 7.6rem minmax(0, 1fr) 6.6rem; gap: 6px; margin-top: 7px; }
+.model-card select { padding: 8px 10px; font-size: 12px; }
 .model-card small { align-self: center; }
+.model-remove { justify-self: end; align-self: start; border: 0; border-radius: 7px; padding: 5px 8px; background: white; color: var(--muted); cursor: pointer; font-size: 11px; font-weight: 700; }
+.model-remove:hover:not(:disabled) { color: var(--red); }
+.model-remove:disabled { opacity: .35; cursor: not-allowed; }
+.coder-pool-help { margin: -4px 0 12px; color: var(--muted); font-size: 12px; }
 
 .submit-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-top: 24px; }
 .toggle { display: grid; grid-template-columns: auto 1fr; column-gap: 11px; align-items: center; cursor: pointer; }
@@ -158,6 +165,9 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 .stat small { display: block; overflow: hidden; color: var(--muted); font-size: 9px; font-weight: 750; letter-spacing: .08em; text-overflow: ellipsis; text-transform: uppercase; }
 .stat strong { display: block; margin-top: 3px; overflow: hidden; font: 600 18px Georgia, serif; text-overflow: ellipsis; }
 .run-message { margin: 0 0 14px; color: var(--muted); }
+.coder-draw { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0 0 16px; padding: 0; list-style: none; }
+.coder-draw li { min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--soft); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+.coder-draw strong { display: block; margin-bottom: 3px; font-size: 10px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
 .artifact-path { padding: 9px 11px; overflow: auto; border-radius: 8px; background: var(--soft); white-space: nowrap; font-size: 11px; }
 .run-actions { display: flex; gap: 8px; margin: 14px 0 20px; }
 
@@ -198,9 +208,9 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
   .local-badge { justify-self: end; }
   main { width: min(94vw, 650px); margin-top: 16px; }
   .panel { padding: 18px; border-radius: 12px; }
-  .grid.two, .model-grid { grid-template-columns: 1fr; }
+  .grid.two, .model-grid, .model-picks { grid-template-columns: 1fr; }
   .section-title, .brief-head, .model-head, .submit-row { align-items: stretch; flex-direction: column; }
   .phase-rail { grid-template-columns: repeat(4, 1fr); }
-  .stats { grid-template-columns: repeat(2, 1fr); }
+  .stats, .coder-draw { grid-template-columns: repeat(2, 1fr); }
   .candidate-table { display: block; overflow-x: auto; }
 }

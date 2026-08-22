@@ -72,6 +72,20 @@ CATALOG: tuple[CatalogEntry, ...] = (
         ids={"opencode": "qwencloud-token-plan/qwen3.8-max"},
     ),
     CatalogEntry(
+        key="deepseek-v4-flash-0731",
+        label="DeepSeek Flash 0731",
+        family="deepseek",
+        providers=("opencode",),
+        ids={"opencode": "qwencloud-token-plan/deepseek-v4-flash-0731"},
+    ),
+    CatalogEntry(
+        key="deepseek-v4-pro-0813",
+        label="DeepSeek Pro 0813",
+        family="deepseek",
+        providers=("opencode",),
+        ids={"opencode": "qwencloud-token-plan/deepseek-v4-pro"},
+    ),
+    CatalogEntry(
         key="glm-5.3",
         label="GLM 5.3",
         family="glm",
@@ -83,9 +97,9 @@ CATALOG: tuple[CatalogEntry, ...] = (
 DEFAULTS = {
     "brain": "codex:gpt-5.6-sol:high",
     "planner": "codex:gpt-5.6-sol:high",
-    "coder_tdd": "opencode:gpt-5.6-luna:high",
-    "coder_explore": "opencode:gpt-5.6-luna:high",
-    "coder_classic": "opencode:gpt-5.6-luna:high",
+    "coder_tdd": "codex:gpt-5.6-luna:high",
+    "coder_explore": "codex:gpt-5.6-luna:high",
+    "coder_classic": "codex:gpt-5.6-luna:high",
     "reviewer": "codex:gpt-5.6-terra:high",
     "tester": "codex:gpt-5.6-terra:high",
     "whitebox": "codex:gpt-5.6-terra:high",
@@ -100,6 +114,7 @@ ROLE_TIMEOUTS = {
     "reviewer": 600,
     "tester": 1800,
     "whitebox": 1800,
+    "probe": 60,
 }
 
 
@@ -124,7 +139,7 @@ def resolve_identity(provider: str, model: str) -> tuple[str, str]:
     if entry is None:
         raise ValueError(
             f"unsupported model {provider}:{model or '(empty)'}; "
-            "choose a catalog model (GPT family, Grok 4.6, Qwen 3.8 Max, GLM 5.3)"
+            "choose a catalog model (GPT family, Grok 4.6, Qwen, DeepSeek, GLM 5.3)"
         )
     return provider, entry.id_for(provider)
 
@@ -133,20 +148,38 @@ def validate_spec(spec: Any) -> None:
     resolve_identity(spec.provider, spec.model)
 
 
-def shuffle_coder_models(
-    models: dict[str, Any], *, rng: Any = None
+def assign_coder_models(
+    models: dict[str, Any],
+    pool: list[Any] | None = None,
+    *,
+    rng: Any = None,
 ) -> dict[str, Any]:
     import random
 
     from .models import CODER_ROLES
 
-    pool = rng or random.Random()
-    assigned = [models[role] for role in CODER_ROLES]
-    pool.shuffle(assigned)
+    source = list(pool) if pool is not None else [models[role] for role in CODER_ROLES]
+    if not source:
+        raise ValueError("at least one coder model is required")
+    picker = rng or random.Random()
+    needed = len(CODER_ROLES)
+    if len(source) >= needed:
+        chosen = picker.sample(source, needed)
+    else:
+        chosen = list(source)
+        while len(chosen) < needed:
+            chosen.append(picker.choice(source))
+        picker.shuffle(chosen)
     updated = dict(models)
-    for role, spec in zip(CODER_ROLES, assigned):
+    for role, spec in zip(CODER_ROLES, chosen):
         updated[role] = spec
     return updated
+
+
+def shuffle_coder_models(
+    models: dict[str, Any], *, rng: Any = None
+) -> dict[str, Any]:
+    return assign_coder_models(models, rng=rng)
 
 
 def catalog_payload() -> dict[str, Any]:

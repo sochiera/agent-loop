@@ -1,10 +1,7 @@
-const roles = ["brain", "planner", "coder_tdd", "coder_explore", "coder_classic", "reviewer", "tester", "whitebox"];
+const roles = ["brain", "planner", "reviewer", "tester", "whitebox"];
 const roleMeta = {
   brain: ["Persistent brain", "Product direction · strongest model"],
   planner: ["Planner", "Repository-aware batch design"],
-  coder_tdd: ["Coder · TDD", "Test-first competitor"],
-  coder_explore: ["Coder · exploratory", "Prototype, refactor, test"],
-  coder_classic: ["Coder · classic", "Independent conventional approach"],
   reviewer: ["Reviewer", "Compares all candidates"],
   tester: ["Black-box tester", "Public behavior only"],
   whitebox: ["White-box reporter", "Interprets short and long tests"],
@@ -12,16 +9,35 @@ const roleMeta = {
 const defaults = {
   brain: "codex:gpt-5.6-sol:high",
   planner: "codex:gpt-5.6-sol:high",
-  coder_tdd: "codex:gpt-5.6-luna:high",
-  coder_explore: "codex:gpt-5.6-luna:high",
-  coder_classic: "codex:gpt-5.6-luna:high",
   reviewer: "codex:gpt-5.6-terra:high",
   tester: "codex:gpt-5.6-terra:high",
   whitebox: "codex:gpt-5.6-terra:high",
 };
+const defaultCoder = "codex:gpt-5.6-luna:high";
+const defaultCoderPool = [defaultCoder, defaultCoder, defaultCoder];
+const maxCoderModels = 12;
 const phases = ["preflight", "brain", "planning", "coding", "review", "winner-fix", "delivery", "whitebox", "black-box"];
 const phaseLabels = ["Preflight", "Brain", "Plan", "Code ×3", "Review", "Fix", "Deliver", "White-box", "Black-box"];
-const storageKey = "forge-control-room-v2";
+const storageKey = "forge-control-room-v3";
+const providerLabels = {codex: "Codex", opencode: "OpenCode"};
+const familyLabels = {gpt: "GPT", grok: "Grok", qwen: "Qwen", deepseek: "DeepSeek", glm: "GLM"};
+const effortLabels = {"": "Default", low: "Low", medium: "Medium", high: "High"};
+const fallbackCatalog = {
+  providers: ["codex", "opencode"],
+  models: [
+    {key: "gpt-5.6-sol", label: "GPT-5.6 Sol", family: "gpt", providers: ["codex", "opencode"], ids: {codex: "gpt-5.6-sol", opencode: "openai/gpt-5.6-sol"}, efforts: ["", "low", "medium", "high"]},
+    {key: "gpt-5.6-terra", label: "GPT-5.6 Terra", family: "gpt", providers: ["codex", "opencode"], ids: {codex: "gpt-5.6-terra", opencode: "openai/gpt-5.6-terra"}, efforts: ["", "low", "medium", "high"]},
+    {key: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "gpt", providers: ["codex", "opencode"], ids: {codex: "gpt-5.6-luna", opencode: "openai/gpt-5.6-luna"}, efforts: ["", "low", "medium", "high"]},
+    {key: "gpt-5.5", label: "GPT-5.5", family: "gpt", providers: ["opencode"], ids: {opencode: "openai/gpt-5.5"}, efforts: ["", "low", "medium", "high"]},
+    {key: "gpt-5.4", label: "GPT-5.4", family: "gpt", providers: ["opencode"], ids: {opencode: "openai/gpt-5.4"}, efforts: ["", "low", "medium", "high"]},
+    {key: "grok-4.6", label: "Grok 4.6", family: "grok", providers: ["opencode"], ids: {opencode: "xai/grok-4.6"}, efforts: ["", "low", "medium", "high"]},
+    {key: "qwen-3.8-max", label: "Qwen 3.8 Max", family: "qwen", providers: ["opencode"], ids: {opencode: "qwencloud-token-plan/qwen3.8-max"}, efforts: ["", "low", "medium", "high"]},
+    {key: "deepseek-v4-flash-0731", label: "DeepSeek Flash 0731", family: "deepseek", providers: ["opencode"], ids: {opencode: "qwencloud-token-plan/deepseek-v4-flash-0731"}, efforts: ["", "low", "medium", "high"]},
+    {key: "deepseek-v4-pro-0813", label: "DeepSeek Pro 0813", family: "deepseek", providers: ["opencode"], ids: {opencode: "qwencloud-token-plan/deepseek-v4-pro"}, efforts: ["", "low", "medium", "high"]},
+    {key: "glm-5.3", label: "GLM 5.3", family: "glm", providers: ["opencode"], ids: {opencode: "zai-coding-plan/glm-5.3"}, efforts: ["", "low", "medium", "high"]},
+  ],
+};
+let catalog = fallbackCatalog;
 let selected = null;
 
 function escapeHtml(value) {
@@ -44,22 +60,165 @@ async function api(path, options = {}) {
   return value;
 }
 
+function roleCard(role) {
+  return document.querySelector(`.model-card[data-role="${role}"]`);
+}
+
+function resolveEntry(modelValue) {
+  return catalog.models.find(entry =>
+    entry.key === modelValue || Object.values(entry.ids || {}).includes(modelValue)
+  ) || null;
+}
+
+function parseSelector(value) {
+  const parts = String(value || "").trim().split(":");
+  const provider = catalog.providers.includes(parts[0]) ? parts[0] : (catalog.providers[0] || "codex");
+  return {provider, entry: resolveEntry(parts[1] || ""), effort: parts.length > 2 ? parts.slice(2).join(":") : ""};
+}
+
+function providerOptions(selectedProvider) {
+  return catalog.providers.map(provider =>
+    `<option value="${escapeHtml(provider)}"${provider === selectedProvider ? " selected" : ""}>${escapeHtml(providerLabels[provider] || provider)}</option>`
+  ).join("");
+}
+
+function modelOptions(provider, selectedKey) {
+  const available = catalog.models.filter(entry => entry.providers.includes(provider));
+  const groups = [];
+  available.forEach(entry => {
+    const last = groups[groups.length - 1];
+    if (!last || last.family !== entry.family) groups.push({family: entry.family, items: [entry]});
+    else last.items.push(entry);
+  });
+  return groups.map(group =>
+    `<optgroup label="${escapeHtml(familyLabels[group.family] || group.family)}">${group.items.map(entry =>
+      `<option value="${escapeHtml(entry.key)}"${entry.key === selectedKey ? " selected" : ""}>${escapeHtml(entry.label)}</option>`
+    ).join("")}</optgroup>`
+  ).join("");
+}
+
+function effortOptions(entry, selectedEffort) {
+  const efforts = entry?.efforts?.length ? entry.efforts : ["", "low", "medium", "high"];
+  const chosen = efforts.includes(selectedEffort) ? selectedEffort : (efforts.includes("high") ? "high" : efforts[0]);
+  return efforts.map(value =>
+    `<option value="${escapeHtml(value)}"${value === chosen ? " selected" : ""}>${escapeHtml(effortLabels[value] || value || "Default")}</option>`
+  ).join("");
+}
+
+function applySelector(card, value) {
+  const parsed = parseSelector(value);
+  let provider = parsed.provider;
+  let entry = parsed.entry;
+  if (entry && !entry.providers.includes(provider)) provider = entry.providers[0];
+  if (!entry || !entry.providers.includes(provider)) {
+    entry = catalog.models.find(item => item.providers.includes(provider)) || catalog.models[0];
+  }
+  const providerSelect = card.querySelector(".model-provider");
+  const modelSelect = card.querySelector(".model-name");
+  const effortSelect = card.querySelector(".model-effort");
+  providerSelect.innerHTML = providerOptions(provider);
+  providerSelect.value = provider;
+  modelSelect.innerHTML = modelOptions(provider, entry?.key);
+  if (entry) modelSelect.value = entry.key;
+  effortSelect.innerHTML = effortOptions(entry, parsed.effort);
+}
+
+function selectorFromCard(card) {
+  const provider = card.querySelector(".model-provider").value;
+  const model = card.querySelector(".model-name").value;
+  const effort = card.querySelector(".model-effort").value;
+  return effort ? `${provider}:${model}:${effort}` : `${provider}:${model}`;
+}
+
+function syncModelCard(card) {
+  const provider = card.querySelector(".model-provider").value;
+  const currentModel = card.querySelector(".model-name").value;
+  const currentEffort = card.querySelector(".model-effort").value;
+  const entry = resolveEntry(currentModel);
+  const nextKey = entry && entry.providers.includes(provider)
+    ? entry.key
+    : (catalog.models.find(item => item.providers.includes(provider)) || catalog.models[0])?.key;
+  card.querySelector(".model-name").innerHTML = modelOptions(provider, nextKey);
+  if (nextKey) card.querySelector(".model-name").value = nextKey;
+  card.querySelector(".model-effort").innerHTML = effortOptions(resolveEntry(nextKey), currentEffort);
+}
+
+function coderCards() {
+  return [...document.querySelectorAll("#coder-models .model-card")];
+}
+
+function coderSelectors() {
+  return coderCards().map(selectorFromCard);
+}
+
+function relabelCoderCards() {
+  const cards = coderCards();
+  cards.forEach((card, index) => {
+    card.querySelector(".model-label").textContent = `Coder ${index + 1}`;
+    const remove = card.querySelector(".model-remove");
+    if (remove) remove.disabled = cards.length <= 1;
+  });
+  const add = document.querySelector("#add-coder");
+  if (add) add.disabled = cards.length >= maxCoderModels;
+}
+
+function addCoderCard(value = defaultCoder) {
+  if (coderCards().length >= maxCoderModels) return;
+  const template = document.querySelector("#model-template");
+  const fragment = template.content.cloneNode(true);
+  const card = fragment.querySelector(".model-card");
+  card.dataset.role = "coder";
+  fragment.querySelector(".model-help").textContent = "Drawn into TDD / explore / classic";
+  const remove = fragment.querySelector(".model-remove");
+  remove.classList.remove("hidden");
+  remove.addEventListener("click", event => {
+    event.preventDefault();
+    removeCoderCard(card);
+  });
+  applySelector(card, value);
+  document.querySelector("#coder-models").appendChild(fragment);
+  relabelCoderCards();
+}
+
+function removeCoderCard(card) {
+  if (coderCards().length <= 1) return;
+  card.remove();
+  relabelCoderCards();
+  saveForm();
+}
+
+function replaceCoderPool(values) {
+  document.querySelector("#coder-models").innerHTML = "";
+  const pool = values.length ? values : defaultCoderPool;
+  pool.slice(0, maxCoderModels).forEach(value => addCoderCard(value));
+}
+
+function savedCoderPool(value) {
+  if (Array.isArray(value.coder_models) && value.coder_models.length) return value.coder_models;
+  const previous = ["coder_tdd", "coder_explore", "coder_classic"]
+    .map(role => value.models?.[role])
+    .filter(Boolean);
+  return previous.length ? previous : defaultCoderPool;
+}
+
 function buildModelFields() {
   const box = document.querySelector("#models");
   const template = document.querySelector("#model-template");
   roles.forEach(role => {
     const fragment = template.content.cloneNode(true);
+    const card = fragment.querySelector(".model-card");
+    card.dataset.role = role;
     fragment.querySelector(".model-label").textContent = roleMeta[role][0];
     fragment.querySelector(".model-help").textContent = roleMeta[role][1];
-    const input = fragment.querySelector("input");
-    input.id = `model-${role}`;
-    input.value = defaults[role];
+    applySelector(card, defaults[role]);
     box.appendChild(fragment);
   });
+  replaceCoderPool(defaultCoderPool);
 }
 
 function restoreRecommended() {
-  roles.forEach(role => { document.querySelector(`#model-${role}`).value = defaults[role]; });
+  roles.forEach(role => applySelector(roleCard(role), defaults[role]));
+  replaceCoderPool(defaultCoderPool);
   saveForm();
 }
 
@@ -70,22 +229,22 @@ function saveForm() {
     briefPath: document.querySelector("#brief-path").value,
     brief: document.querySelector("#brief").value,
     push: document.querySelector("#push").checked,
-    models: Object.fromEntries(roles.map(role => [role, document.querySelector(`#model-${role}`).value])),
+    models: Object.fromEntries(roles.map(role => [role, selectorFromCard(roleCard(role))])),
+    coder_models: coderSelectors(),
   };
   localStorage.setItem(storageKey, JSON.stringify(value));
 }
 
 function restoreForm() {
   try {
-    const value = JSON.parse(localStorage.getItem(storageKey));
+    const value = JSON.parse(localStorage.getItem(storageKey) || localStorage.getItem("forge-control-room-v2"));
     if (!value) return;
     document.querySelector("#repo").value = value.repo || "";
     document.querySelector("#brief-path").value = value.briefPath || "";
     document.querySelector("#brief").value = value.brief || "";
     document.querySelector("#push").checked = value.push !== false;
-    roles.forEach(role => {
-      document.querySelector(`#model-${role}`).value = value.models?.[role] || defaults[role];
-    });
+    roles.forEach(role => applySelector(roleCard(role), value.models?.[role] || defaults[role]));
+    replaceCoderPool(savedCoderPool(value));
     setBranches([value.branch || "main"], value.branch || "main");
   } catch (error) {
     console.warn("Could not restore Forge form", error);
@@ -200,6 +359,19 @@ function eventRows(run) {
   }).join("");
 }
 
+function coderDraw(run) {
+  const models = run.config?.models || {};
+  const labels = {coder_tdd: "TDD", coder_explore: "Explore", coder_classic: "Classic"};
+  const rows = Object.entries(labels).map(([role, label]) => {
+    const spec = models[role];
+    const text = spec
+      ? `${spec.provider}:${spec.model}${spec.effort ? `:${spec.effort}` : ""}`
+      : "—";
+    return `<li><strong>${escapeHtml(label)}</strong> ${escapeHtml(text)}</li>`;
+  }).join("");
+  return `<h3>Coder draw</h3><ul class="coder-draw">${rows}</ul>`;
+}
+
 function detail(run) {
   const usage = usageSummary(run);
   const warnings = (run.warnings || []).slice(-20).map(item => `<li>${escapeHtml(item)}</li>`).join("");
@@ -213,6 +385,7 @@ function detail(run) {
       <div class="stat"><small>Output tokens</small><strong>${formatTokens(usage.output)}</strong></div>
     </div>
     <p class="run-message">${escapeHtml(run.message)}</p>
+    ${coderDraw(run)}
     <div class="artifact-path"><code>${escapeHtml(run.artifact_dir)}</code></div>
     <div class="run-actions">
       <button class="button ghost" data-action="pause" ${run.status !== "running" ? "disabled" : ""}>Pause</button>
@@ -252,10 +425,64 @@ async function refresh() {
   }
 }
 
-buildModelFields();
-restoreForm();
+async function boot() {
+  const button = document.querySelector("#run-form button[type=submit]");
+  button.disabled = true;
+  try { catalog = await api("/api/catalog"); }
+  catch (error) { console.warn("Could not load model catalog", error); }
+  buildModelFields();
+  restoreForm();
+  button.disabled = false;
+}
+
+function showRestartConfirm(visible) {
+  document.querySelector("#restart-confirm").classList.toggle("hidden", !visible);
+  document.querySelector("#restart").classList.toggle("hidden", visible);
+}
+
+async function waitForRestart() {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 400));
+    try {
+      await api("/api/health");
+      location.reload();
+      return;
+    } catch {
+      /* server is bouncing */
+    }
+  }
+  document.querySelector("#form-error").textContent = "Forge did not come back after restart.";
+}
+
+async function restartForge(confirm = false) {
+  const error = document.querySelector("#form-error");
+  const button = document.querySelector("#restart");
+  button.disabled = true;
+  try {
+    const result = await api("/api/restart", {method: "POST", body: JSON.stringify({confirm})});
+    if (result.needs_confirm) {
+      showRestartConfirm(true);
+      return;
+    }
+    showRestartConfirm(false);
+    button.textContent = "Restarting…";
+    await waitForRestart();
+  } catch (exception) {
+    error.textContent = exception.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 document.querySelector("#recommended").addEventListener("click", restoreRecommended);
 document.querySelector("#inspect-repo").addEventListener("click", inspectRepository);
+document.querySelector("#add-coder").addEventListener("click", () => {
+  addCoderCard();
+  saveForm();
+});
+document.querySelector("#restart").addEventListener("click", () => restartForge(false));
+document.querySelector("#restart-yes").addEventListener("click", () => restartForge(true));
+document.querySelector("#restart-no").addEventListener("click", () => showRestartConfirm(false));
 document.querySelector("#brief").addEventListener("input", () => {
   if (document.querySelector("#brief-path").value) {
     document.querySelector("#brief-path").value = "";
@@ -263,20 +490,25 @@ document.querySelector("#brief").addEventListener("input", () => {
   }
   saveForm();
 });
-document.querySelector("#run-form").addEventListener("change", saveForm);
+document.querySelector("#run-form").addEventListener("change", event => {
+  if (event.target.classList.contains("model-provider") || event.target.classList.contains("model-name")) {
+    syncModelCard(event.target.closest(".model-card"));
+  }
+  saveForm();
+});
 document.querySelector("#run-form").addEventListener("submit", async event => {
   event.preventDefault();
   const error = document.querySelector("#form-error");
   const button = event.submitter;
-  const models = Object.fromEntries(roles.map(role => [role, document.querySelector(`#model-${role}`).value.trim()]));
+  const models = Object.fromEntries(roles.map(role => [role, selectorFromCard(roleCard(role))]));
   const payload = {
     repo: document.querySelector("#repo").value.trim(),
     branch: document.querySelector("#branch").value,
     brief_path: document.querySelector("#brief-path").value.trim(),
     brief_text: document.querySelector("#brief").value.trim(),
     push: document.querySelector("#push").checked,
-    shuffle_coders: document.querySelector("#shuffle")?.checked === true,
     models,
+    coder_models: coderSelectors(),
   };
   if (!payload.brief_path && !payload.brief_text) { error.textContent = "Choose a brief file or paste the product brief."; return; }
   button.disabled = true;
@@ -295,5 +527,6 @@ document.querySelector("#run-form").addEventListener("submit", async event => {
   }
 });
 
+boot();
 refresh();
 setInterval(refresh, 3000);

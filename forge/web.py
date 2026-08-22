@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
 import traceback
 import urllib.parse
@@ -12,16 +14,42 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .artifacts import atomic_write
-from .catalog import catalog_payload, DEFAULTS
+from .catalog import assign_coder_models, catalog_payload, DEFAULTS
 from .gitops import list_branches, repository_summary
 from .models import ModelSpec, ROLE_NAMES, RunConfig
 from .orchestrator import ForgeOrchestrator
 
 
 STATIC = Path(__file__).with_name("static")
+
+
+def restart_payload(active_runs: int, confirm: bool) -> dict[str, Any]:
+    if active_runs and not confirm:
+        return {"needs_confirm": True, "active_runs": active_runs}
+    return {"restarting": True, "active_runs": active_runs}
+
+
+def models_from_payload(payload: dict[str, Any]) -> tuple[dict[str, ModelSpec], bool]:
+    raw_models = payload.get("models")
+    if not isinstance(raw_models, dict):
+        raise ValueError("models must be an object")
+    models = {
+        role: ModelSpec.parse(str(raw_models.get(role) or DEFAULTS[role]))
+        for role in ROLE_NAMES
+    }
+    raw_pool = payload.get("coder_models")
+    shuffle_coders = bool(payload.get("shuffle_coders", False))
+    if raw_pool is not None:
+        if not isinstance(raw_pool, list) or not raw_pool:
+            raise ValueError("coder_models must be a non-empty list")
+        models = assign_coder_models(
+            models, [ModelSpec.parse(str(item)) for item in raw_pool]
+        )
+        shuffle_coders = False
+    return models, shuffle_coders
 
 
 @dataclass
@@ -50,13 +78,7 @@ class RunRegistry:
             atomic_write(brief_path, brief_text + "\n")
         else:
             raise ValueError("brief_path or brief_text is required")
-        raw_models = payload.get("models")
-        if not isinstance(raw_models, dict):
-            raise ValueError("models must be an object")
-        models = {
-            role: ModelSpec.parse(str(raw_models.get(role) or DEFAULTS[role]))
-            for role in ROLE_NAMES
-        }
+        models, shuffle_coders = models_from_payload(payload)
         config = RunConfig(
             repo=str(repo),
             brief=str(brief_path),
@@ -64,12 +86,13 @@ class RunRegistry:
             models=models,
             push=bool(payload.get("push", True)),
             agent_timeout_seconds=int(payload.get("agent_timeout_seconds", 3600)),
-            shuffle_coders=bool(payload.get("shuffle_coders", False)),
+            shuffle_coders=shuffle_coders,
         )
         orchestrator = ForgeOrchestrator(config, state_home=self.state_home)
         live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())
         with self._lock:
             self._runs[orchestrator.run_id] = live
+        self.persist_session()
         self._launch(live, recover=False)
         return orchestrator.state.to_dict()
 
@@ -91,6 +114,69 @@ class RunRegistry:
             daemon=True,
         )
         live.thread.start()
+
+    def active_count(self) -> int:
+        with self._lock:
+            return sum(1 for live in self._runs.values() if live.thread.is_alive())
+
+    def _session_path(self) -> Path:
+        root = self.state_home or Path.home() / ".local/state/forge"
+        return Path(root) / "ui-session.json"
+
+    def persist_session(self) -> None:
+        with self._lock:
+            items = [
+                {
+                    "repo": live.orchestrator.config.repo,
+                    "run_id": live.orchestrator.run_id,
+                }
+                for live in self._runs.values()
+            ]
+        path = self._session_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, json.dumps(items, indent=2) + "\n")
+
+    def restore_session(self) -> None:
+        path = self._session_path()
+        if not path.is_file():
+            return
+        try:
+            items = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            repo = str(item.get("repo") or "")
+            run_id = str(item.get("run_id") or "")
+            if not repo or not run_id:
+                continue
+            try:
+                self._adopt(Path(repo), run_id)
+            except Exception:
+                continue
+
+    def _adopt(self, repo: Path, run_id: str) -> None:
+        with self._lock:
+            if run_id in self._runs:
+                return
+        orchestrator = ForgeOrchestrator.from_existing(
+            repo, run_id, state_home=self.state_home
+        )
+        live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())
+        with self._lock:
+            self._runs[run_id] = live
+
+    def interrupt_live(self) -> None:
+        with self._lock:
+            lives = list(self._runs.values())
+        for live in lives:
+            live.orchestrator.mark_interrupted(
+                "Controller restarted. Use Recover same run to continue."
+            )
+        self.persist_session()
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -129,6 +215,7 @@ class RunRegistry:
         )
         with self._lock:
             self._runs[run_id] = live
+        self.persist_session()
         live.thread.start()
         return orchestrator.state.to_dict()
 
@@ -187,9 +274,12 @@ class RunRegistry:
 
 class ForgeHandler(BaseHTTPRequestHandler):
     registry: RunRegistry
+    request_restart: Callable[[bool], dict[str, Any]] | None = None
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/health":
+            return self._json({"ok": True, "active_runs": self.registry.active_count()})
         if parsed.path == "/api/runs":
             return self._json(self.registry.list())
         if parsed.path.startswith("/api/runs/"):
@@ -226,6 +316,10 @@ class ForgeHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         try:
             payload = self._body()
+            if self.path == "/api/restart":
+                if self.request_restart is None:
+                    return self._json({"error": "restart is unavailable"}, HTTPStatus.BAD_REQUEST)
+                return self._json(self.request_restart(bool(payload.get("confirm"))))
             if self.path == "/api/runs":
                 return self._json(self.registry.start(payload), HTTPStatus.CREATED)
             if self.path == "/api/runs/recover":
@@ -286,8 +380,26 @@ class ForgeHandler(BaseHTTPRequestHandler):
 
 def serve(host: str = "127.0.0.1", port: int = 8787, *, open_browser: bool = True) -> None:
     registry = RunRegistry()
-    handler = type("BoundForgeHandler", (ForgeHandler,), {"registry": registry})
+    registry.restore_session()
+    ctl: dict[str, Any] = {"server": None, "pending": False}
+
+    def request_restart(confirm: bool) -> dict[str, Any]:
+        result = restart_payload(registry.active_count(), confirm)
+        if result.get("restarting"):
+            registry.interrupt_live()
+            ctl["pending"] = True
+            server = ctl["server"]
+            if server is not None:
+                threading.Thread(target=server.shutdown, daemon=True).start()
+        return result
+
+    handler = type(
+        "BoundForgeHandler",
+        (ForgeHandler,),
+        {"registry": registry, "request_restart": staticmethod(request_restart)},
+    )
     server = ThreadingHTTPServer((host, port), handler)
+    ctl["server"] = server
     url = f"http://{host}:{server.server_port}"
     print(f"Forge UI: {url}", flush=True)
     if open_browser:
@@ -298,3 +410,18 @@ def serve(host: str = "127.0.0.1", port: int = 8787, *, open_browser: bool = Tru
         pass
     finally:
         server.server_close()
+    if ctl["pending"]:
+        os.execv(
+            sys.executable,
+            [
+                sys.executable,
+                "-m",
+                "forge",
+                "ui",
+                "--host",
+                host,
+                "--port",
+                str(server.server_port),
+                "--no-browser",
+            ],
+        )

@@ -1,11 +1,15 @@
 import json
 import subprocess
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 
-from forge.web import ForgeHandler, RunRegistry
+import pytest
+
+from forge.models import ROLE_NAMES, RunState
+from forge.web import ForgeHandler, RunRegistry, restart_payload
 
 
 def test_web_control_room_serves_ui_and_api(tmp_path):
@@ -14,7 +18,16 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
     subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
     (repo / "goal.md").write_text("# Build it\n", encoding="utf-8")
     registry = RunRegistry(state_home=tmp_path)
-    handler = type("TestForgeHandler", (ForgeHandler,), {"registry": registry})
+    handler = type(
+        "TestForgeHandler",
+        (ForgeHandler,),
+        {
+            "registry": registry,
+            "request_restart": staticmethod(
+                lambda confirm: restart_payload(registry.active_count(), confirm)
+            ),
+        },
+    )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
@@ -22,6 +35,11 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         base = f"http://127.0.0.1:{server.server_port}"
         html = urllib.request.urlopen(base + "/", timeout=2).read().decode()
         assert "Forge Control Room" in html
+        assert "model-provider" in html
+        assert "Coder model pool" in html
+        assert 'id="restart"' in html
+        script = urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
+        assert "/api/catalog" in script
         runs = json.loads(urllib.request.urlopen(base + "/api/runs", timeout=2).read())
         assert runs == []
         encoded_repo = urllib.parse.quote(str(repo))
@@ -33,9 +51,107 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert summary["brief_path"] == str(repo / "goal.md")
         assert summary["brief_text"] == "# Build it\n"
         catalog = json.loads(urllib.request.urlopen(base + "/api/catalog", timeout=2).read())
-        assert "gpt-5.6-sol" in {item["key"] for item in catalog["models"]}
+        by_key = {item["key"]: item for item in catalog["models"]}
+        assert "gpt-5.6-sol" in by_key
+        assert by_key["deepseek-v4-flash-0731"]["family"] == "deepseek"
+        assert by_key["deepseek-v4-pro-0813"]["family"] == "deepseek"
+        assert catalog["defaults"]["coder_tdd"] == "codex:gpt-5.6-luna:high"
+        assert "model-effort" in html
+        assert 'class="model-effort" required' not in html
+        assert "Coder draw" in urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
         assert "opencode" in catalog["providers"]
         assert "claude" not in catalog["providers"]
+        health = json.loads(urllib.request.urlopen(base + "/api/health", timeout=2).read())
+        assert health == {"ok": True, "active_runs": 0}
+        restart = json.loads(
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    base + "/api/restart",
+                    data=b'{"confirm": false}',
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                ),
+                timeout=2,
+            ).read()
+        )
+        assert restart == {"restarting": True, "active_runs": 0}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_post_runs_assigns_coder_models(tmp_path, monkeypatch):
+    repo = tmp_path / "empty-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
+    (repo / "goal.md").write_text("# Build it\n", encoding="utf-8")
+
+    class DummyOrchestrator:
+        def __init__(self, config, state_home=None):
+            self.config = config
+            self.run_id = "pool-run"
+            self.state = RunState(
+                run_id=self.run_id,
+                status="created",
+                phase="preflight",
+                created_at="now",
+                updated_at="now",
+                config=config.to_dict(),
+            )
+            self.store = type("Store", (), {"root": tmp_path / "artifacts"})()
+
+        def run(self) -> None:
+            self.state.status = "running"
+
+        def activity_snapshot(self) -> dict:
+            return {}
+
+    monkeypatch.setattr("forge.web.ForgeOrchestrator", DummyOrchestrator)
+    registry = RunRegistry(state_home=tmp_path)
+    payload = {
+        "repo": str(repo),
+        "brief_path": str(repo / "goal.md"),
+        "push": False,
+        "models": {role: "codex:gpt-5.6-sol:high" for role in ROLE_NAMES},
+        "coder_models": ["opencode:grok-4.6"],
+    }
+    created = registry.start(payload)
+    models = created["config"]["models"]
+    assert models["coder_tdd"]["model"] == "xai/grok-4.6"
+    assert models["coder_explore"]["model"] == "xai/grok-4.6"
+    assert models["coder_classic"]["model"] == "xai/grok-4.6"
+    assert models["brain"]["model"] == "gpt-5.6-sol"
+    listed = registry.list()
+    assert listed[0]["run_id"] == "pool-run"
+
+    handler = type(
+        "TestForgeHandler",
+        (ForgeHandler,),
+        {"registry": registry, "request_restart": None},
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        request = urllib.request.Request(
+            base + "/api/runs",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        posted = json.loads(urllib.request.urlopen(request, timeout=2).read())
+        assert posted["config"]["models"]["coder_tdd"]["model"] == "xai/grok-4.6"
+        bad = urllib.request.Request(
+            base + "/api/runs",
+            data=json.dumps({**payload, "coder_models": []}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(bad, timeout=2)
+        assert error.value.code == 400
     finally:
         server.shutdown()
         server.server_close()

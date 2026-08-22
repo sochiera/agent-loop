@@ -14,7 +14,15 @@
       <strong>Competitive delivery, under control.</strong>
       <span>One persistent brain · Three implementations · One shipped winner</span>
     </div>
-    <div class="local-badge"><span></span> Local control room</div>
+    <div class="mast-actions">
+      <button type="button" id="restart" class="button ghost">Restart</button>
+      <div id="restart-confirm" class="restart-confirm hidden">
+        <span>A run is in progress. Restart interrupts it; recover afterwards.</span>
+        <button type="button" id="restart-yes" class="button secondary">Restart anyway</button>
+        <button type="button" id="restart-no" class="button ghost">Cancel</button>
+      </div>
+      <div class="local-badge"><span></span> Local control room</div>
+    </div>
   </header>
 
   <main>
@@ -56,13 +64,19 @@
 
         <div class="model-head">
           <div><span class="eyebrow">Routing</span><h2>Models by role</h2></div>
-          <p>GPT: Codex or OpenCode. Grok, Qwen, GLM: OpenCode only.</p>
+          <p>Pick provider, catalog model, and effort. Grok, Qwen, DeepSeek, and GLM run on OpenCode only.</p>
         </div>
         <div id="models" class="model-grid"></div>
 
+        <div class="model-head">
+          <div><span class="eyebrow">Competitors</span><h2>Coder model pool</h2></div>
+          <button type="button" id="add-coder" class="button ghost">Add model</button>
+        </div>
+        <p class="coder-pool-help">TDD, exploratory, and classic each draw one model from this pool. Add more or fewer than three; leftovers are unused, shortages are reused.</p>
+        <div id="coder-models" class="model-grid"></div>
+
         <div class="submit-row">
           <label class="toggle"><input id="push" type="checkbox" checked><span></span><div><strong>Push the winner</strong><small>Push the selected branch to <code>origin</code></small></div></label>
-          <label class="toggle"><input id="shuffle" type="checkbox"><span></span><div><strong>Shuffle coder models</strong><small>Randomly assign the three coder models to TDD, explore, and classic</small></div></label>
           <button type="submit" class="button primary"><span>Start Forge</span><span aria-hidden="true">→</span></button>
         </div>
         <p id="form-error" class="error" role="alert"></p>
@@ -81,7 +95,16 @@
   </main>
 
   <template id="model-template">
-    <label class="model-card"><span class="model-label"></span><small class="model-help"></small><input required spellcheck="false"></label>
+    <label class="model-card">
+      <span class="model-label"></span>
+      <small class="model-help"></small>
+      <button type="button" class="model-remove hidden" aria-label="Remove coder model">Remove</button>
+      <div class="model-picks">
+        <select class="model-provider" required></select>
+        <select class="model-name" required></select>
+        <select class="model-effort"></select>
+      </div>
+    </label>
   </template>
   <script src="/app.js"></script>
 </body>

@@ -74,7 +74,7 @@ final verifier and no mechanical product-completion threshold.
 - Linux or macOS with Git and Python 3.12 or newer.
 - At least one authenticated supported agent CLI:
   - `codex` (GPT family)
-  - `opencode` (GPT family, Grok 4.6, Qwen 3.8 Max, GLM 5.3)
+  - `opencode` (GPT family, Grok 4.6, Qwen 3.8 Max, DeepSeek Flash/Pro, GLM 5.3)
 - A clean target Git repository. Forge can bootstrap an unborn selected branch in a repository
   with no commits. When push is enabled the repository must have an `origin` remote.
 
@@ -102,7 +102,10 @@ On Ubuntu, install the matching `python3-venv` package first if `python3 -m venv
 
 The UI listens only on `127.0.0.1` by default and opens `http://127.0.0.1:8787`. It accepts exactly
 the operational inputs Forge needs: target repository, delivery branch, product brief, model
-selection for every role, and whether to push.
+selection for every role, a coder model pool, and whether to push. Closing the browser tab does
+not stop Forge; use **Restart** in the control room after code changes. A live run requires
+confirmation before restart. The control room loads the closed catalog from `/api/catalog` and
+offers provider, model, and effort dropdowns instead of free-text selectors.
 
 ## Model selection
 
@@ -119,20 +122,27 @@ codex:gpt-5.6-sol:high
 opencode:gpt-5.6-luna:high
 opencode:grok-4.6
 opencode:qwen-3.8-max
+opencode:deepseek-v4-flash-0731
+opencode:deepseek-v4-pro-0813
 opencode:glm-5.3
 ```
 
-GPT-family models may run on Codex or OpenCode. Grok 4.6, Qwen 3.8 Max, and GLM 5.3 run on
-OpenCode only. Catalog keys (`gpt-5.6-sol`) and provider IDs (`openai/gpt-5.6-sol`) are both
-accepted. The eight selections are `brain`, `planner`, `coder_tdd`, `coder_explore`,
-`coder_classic`, `reviewer`, `tester`, and `whitebox`.
+GPT-family models may run on Codex or OpenCode. Grok 4.6, Qwen 3.8 Max, DeepSeek Flash 0731,
+DeepSeek Pro 0813, and GLM 5.3 run on OpenCode only. Catalog keys (`gpt-5.6-sol`) and provider
+IDs (`openai/gpt-5.6-sol`) are both accepted. The fixed selections are `brain`, `planner`,
+`reviewer`, `tester`, and `whitebox`. The three coder tactics still exist as `coder_tdd`,
+`coder_explore`, and `coder_classic`, but the control room sends a coder model pool and Forge
+draws those three assignments from it.
 
-All three coder fields default to `codex:gpt-5.6-luna:high` in the UI and CLI. They can still be
-overridden independently.
+Before the first start, Forge pings every unique selected model with a one-word, no-tool prompt.
+A quota, auth, or API failure stops the run during preflight instead of during the first expensive
+role. Recovery does not repeat the probe.
+
+The UI coder pool and the three CLI coder fields default to `codex:gpt-5.6-luna:high`. CLI
+flags still override each tactic; `--shuffle-coders` randomly assigns those three models.
 
 Use strong models for the brain and planner, medium models for review, white-box, and black-box
-testing, and cheaper coding models for the three competitors. `--shuffle-coders` randomly assigns
-the three chosen coder models to the three tactics. Every third cycle is a housekeeping batch.
+testing, and cheaper coding models in the coder pool. Every third cycle is a housekeeping batch.
 
 ## Command-line run
 
@@ -223,8 +233,9 @@ derived from tokens.
 - A coder with repeated turns that do not change plan progress is marked `stalled`; its artifacts
   remain available and the other candidates continue.
 - If all candidates produce no code, the run fails visibly instead of manufacturing progress.
-- Forge refuses to start in a dirty repository, refuses a non-fast-forward delivery, and reports a
-  failed push without rewriting history.
+- Forge refuses to start when a selected model fails the no-tool preflight ping, when the
+  repository is dirty, or when delivery would not be a fast-forward. A failed push is reported
+  without rewriting history.
 - Pause, resume, and cancel take effect at safe phase/agent-call boundaries. They do not kill an
   active provider process in the middle of a filesystem operation.
 - Planner commands marked `[winner-only]` are omitted from the three candidate validation passes
