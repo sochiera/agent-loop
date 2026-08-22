@@ -85,6 +85,17 @@ def test_model_spec_accepts_qwen_cloud_deepseek():
     assert pro.model == "alibaba-token-plan/deepseek-v4-pro-0813"
 
 
+def test_model_spec_accepts_openrouter_deepseek_and_peers():
+    flash = ModelSpec.parse("opencode:or-deepseek-v4-flash")
+    latest = ModelSpec.parse("opencode:or-deepseek-v4-flash-latest")
+    pro = ModelSpec.parse("opencode:or-deepseek-v4-pro-0813")
+    coder = ModelSpec.parse("opencode:or-qwen-3-coder-next")
+    assert flash.model == "openrouter/deepseek/deepseek-v4-flash"
+    assert latest.model == "openrouter/~deepseek/deepseek-v4-flash-latest"
+    assert pro.model == "openrouter/deepseek/deepseek-v4-pro-0813"
+    assert coder.model == "openrouter/qwen/qwen3-coder-next"
+
+
 def test_assign_coder_models_rejects_empty_pool():
     with pytest.raises(ValueError, match="at least one coder model"):
         assign_coder_models({}, [])

@@ -86,6 +86,76 @@ CATALOG: tuple[CatalogEntry, ...] = (
         ids={"opencode": "alibaba-token-plan/deepseek-v4-pro-0813"},
     ),
     CatalogEntry(
+        key="or-deepseek-v4-flash",
+        label="DeepSeek V4 Flash OR",
+        family="deepseek",
+        providers=("opencode",),
+        ids={"opencode": "openrouter/deepseek/deepseek-v4-flash"},
+    ),
+    CatalogEntry(
+        key="or-deepseek-v4-flash-0731",
+        label="DeepSeek Flash 0731 OR",
+        family="deepseek",
+        providers=("opencode",),
+        ids={"opencode": "openrouter/deepseek/deepseek-v4-flash-0731"},
+    ),
+    CatalogEntry(
+        key="or-deepseek-v4-flash-latest",
+        label="DeepSeek Flash latest OR",
+        family="deepseek",
+        providers=("opencode",),
+        ids={"opencode": "openrouter/~deepseek/deepseek-v4-flash-latest"},
+    ),
+    CatalogEntry(
+        key="or-deepseek-v3.2",
+        label="DeepSeek V3.2 OR",
+        family="deepseek",
+        providers=("opencode",),
+        ids={"opencode": "openrouter/deepseek/deepseek-v3.2"},
+    ),
+    CatalogEntry(
+        key="or-deepseek-v4-pro",
+        label="DeepSeek V4 Pro OR",
+        family="deepseek",
+        providers=("opencode",),
+        ids={"opencode": "openrouter/deepseek/deepseek-v4-pro"},
+    ),
+    CatalogEntry(
+        key="or-deepseek-v4-pro-0813",
+        label="DeepSeek V4 Pro 0813 OR",
+        family="deepseek",
+        providers=("opencode",),
+        ids={"opencode": "openrouter/deepseek/deepseek-v4-pro-0813"},
+    ),
+    CatalogEntry(
+        key="or-qwen-3.5-flash",
+        label="Qwen 3.5 Flash OR",
+        family="qwen",
+        providers=("opencode",),
+        ids={"opencode": "openrouter/qwen/qwen3.5-flash-02-23"},
+    ),
+    CatalogEntry(
+        key="or-qwen-3-coder-next",
+        label="Qwen 3 Coder Next OR",
+        family="qwen",
+        providers=("opencode",),
+        ids={"opencode": "openrouter/qwen/qwen3-coder-next"},
+    ),
+    CatalogEntry(
+        key="or-glm-4.7-flash",
+        label="GLM 4.7 Flash OR",
+        family="glm",
+        providers=("opencode",),
+        ids={"opencode": "openrouter/z-ai/glm-4.7-flash"},
+    ),
+    CatalogEntry(
+        key="or-minimax-m2.5",
+        label="MiniMax M2.5 OR",
+        family="minimax",
+        providers=("opencode",),
+        ids={"opencode": "openrouter/minimax/minimax-m2.5"},
+    ),
+    CatalogEntry(
         key="glm-5.3",
         label="GLM 5.3",
         family="glm",
@@ -139,7 +209,7 @@ def resolve_identity(provider: str, model: str) -> tuple[str, str]:
     if entry is None:
         raise ValueError(
             f"unsupported model {provider}:{model or '(empty)'}; "
-            "choose a catalog model (GPT family, Grok 4.6, Qwen, DeepSeek, GLM 5.3)"
+            "choose a catalog model (GPT family, Grok 4.6, Qwen, DeepSeek, GLM, MiniMax)"
         )
     return provider, entry.id_for(provider)
 

@@ -70,6 +70,7 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert "gpt-5.6-sol" in by_key
         assert by_key["deepseek-v4-flash-0731"]["family"] == "deepseek"
         assert by_key["deepseek-v4-pro-0813"]["family"] == "deepseek"
+        assert by_key["or-deepseek-v4-flash"]["ids"]["opencode"] == "openrouter/deepseek/deepseek-v4-flash"
         assert catalog["defaults"]["coder_tdd"] == "codex:gpt-5.6-luna:high"
         assert "model-effort" in html
         assert 'class="model-effort" required' not in html
