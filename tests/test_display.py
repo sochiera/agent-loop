@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from forge.display import VIRTUAL_DISPLAY_ENV, start_virtual_display
@@ -10,6 +11,10 @@ def _install_fake_xvfb(directory: Path, script: str) -> Path:
     return path
 
 
+def _path_with(directory: Path) -> str:
+    return f"{directory}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
 def test_start_virtual_display_returns_none_without_xvfb(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("PATH", str(tmp_path))
     assert start_virtual_display() is None
@@ -18,7 +23,7 @@ def test_start_virtual_display_returns_none_without_xvfb(monkeypatch, tmp_path: 
 def test_start_virtual_display_uses_displayfd(monkeypatch, tmp_path: Path):
     _install_fake_xvfb(
         tmp_path,
-        """#!/usr/bin/env python3
+        """#!/usr/bin/python3
 import os, sys, time
 args = sys.argv[1:]
 fd = int(args[args.index("-displayfd") + 1])
@@ -27,7 +32,7 @@ os.close(fd)
 time.sleep(30)
 """,
     )
-    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("PATH", _path_with(tmp_path))
     server = start_virtual_display()
     assert server is not None
     try:
@@ -43,7 +48,7 @@ time.sleep(30)
 def test_start_virtual_display_falls_back_to_numbered_slot(monkeypatch, tmp_path: Path):
     _install_fake_xvfb(
         tmp_path,
-        """#!/usr/bin/env python3
+        """#!/usr/bin/python3
 import sys, time
 if sys.argv[1].startswith(":"):
     time.sleep(30)
@@ -51,7 +56,7 @@ if sys.argv[1].startswith(":"):
 raise SystemExit(2)
 """,
     )
-    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("PATH", _path_with(tmp_path))
     server = start_virtual_display()
     assert server is not None
     try:
