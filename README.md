@@ -78,7 +78,7 @@ If `Xvfb` is on `PATH`, Forge starts a private display for the black-box tester 
 - Linux or macOS with Git and Python 3.12 or newer.
 - At least one authenticated supported agent CLI:
   - `codex` (GPT family)
-  - `opencode` (GPT family, Grok 4.6, Qwen 3.8 Max, DeepSeek Flash/Pro, GLM 5.3, Kimi K3)
+  - `opencode` (GPT family, Grok 4.6, Qwen 3.8 Max, DeepSeek Flash/Pro, Kimi K3)
 - A clean target Git repository. Forge can bootstrap an unborn selected branch in a repository
   with no commits. When push is enabled the repository must have an `origin` remote.
 
@@ -135,11 +135,10 @@ opencode:or-gpt-5.6-luna
 opencode:or-deepseek-v4-flash-0731
 opencode:or-deepseek-v4-pro
 opencode:or-deepseek-v4-pro-0813
-opencode:glm-5.3
 opencode:kimi-k3
 ```
 
-GPT-family models may run on Codex or OpenCode. Grok 4.6, Qwen, DeepSeek, Gemini, GLM, and Kimi
+GPT-family models may run on Codex or OpenCode. Grok 4.6, Qwen, DeepSeek, Gemini, and Kimi
 models run on OpenCode only. OpenRouter entries use the `or-` catalog keys and require an
 OpenRouter credential in OpenCode. Catalog keys (`gpt-5.6-sol`) and provider
 IDs (`openai/gpt-5.6-sol`) are both accepted. The fixed selections are `brain`, `planner`,
@@ -151,9 +150,12 @@ Before the first start, and again before every later cycle, Forge pings every un
 model with a one-word, no-tool prompt. Auth or API failures still stop the run when no usable
 roster remains. A usage-limit failure does not abort the run when a backup or a healthy clone
 exists: staff roles switch to the backup model, and coder slots that hit a limit are replaced by
-clones of the models that still work. A later preflight that succeeds restores the original
-selections after a quota reset. Recovery repeats this roster refresh so a captured review can
-resume on a healthy reviewer.
+clones of the models that still work. Forge prefers a replacement from another model family or
+subscription so the same quota wall is not hit twice. A later preflight keeps a healthy failover
+or operator swap; it only writes an original model back into a slot whose current model is still
+disabled. Recovery repeats this roster refresh so a captured review can resume on a healthy
+reviewer. A winner-fix timeout or usage limit failovers onto that replacement and, if nothing
+usable remains, delivers the captured winner tree instead of aborting the run.
 
 The UI coder pool and the three CLI coder fields default to `codex:gpt-5.6-luna:high`. CLI
 flags still override each tactic; `--shuffle-coders` randomly assigns those three models.
@@ -249,14 +251,19 @@ derived from tokens.
 ## Failure behavior
 
 - A transient process crash is retried with an explicit explanation. Deterministic CLI errors
-  and agent timeouts are not immediately retried. A usage limit switches staff roles to the
-  configured backup and resumes the same prompt; the parallel coder pool is not cancelled.
+  and agent timeouts are not immediately retried, except winner-fix, which first switches to a
+  backup from another family. A usage limit switches the role to the configured backup or a
+  healthy coder clone and resumes the same prompt on a new session; the parallel coder pool is
+  not cancelled. A stale session after a model swap is dropped and retried once.
 - An invalid brain, reviewer, tester, or planner response receives contract feedback and is resumed.
 - A coder with repeated turns that do not change plan progress is marked `stalled`; its artifacts
   remain available and the other candidates continue.
 - If one coder hits a limit or crashes, the other candidates finish and the cycle continues when
   at least one patch exists. Before the next cycle Forge preflights again and clones a working
   coder model into the empty slot.
+- If the winning coder times out or hits a limit while applying review feedback, Forge switches
+  that slot to a different-family backup when one exists. If the fix still fails, the already
+  captured winner is committed instead of failing the run.
 - If all candidates produce no code, the run fails visibly instead of manufacturing progress.
 - Forge refuses to start when no usable model roster remains after preflight, when the
   repository is dirty, or when delivery would not be a fast-forward. A failed push is reported

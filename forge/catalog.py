@@ -121,13 +121,6 @@ CATALOG: tuple[CatalogEntry, ...] = (
         ids={"opencode": "openrouter/deepseek/deepseek-v4-pro-0813"},
     ),
     CatalogEntry(
-        key="glm-5.3",
-        label="GLM 5.3",
-        family="glm",
-        providers=("opencode",),
-        ids={"opencode": "zai-coding-plan/glm-5.3"},
-    ),
-    CatalogEntry(
         key="kimi-k3",
         label="Kimi K3",
         family="kimi",
@@ -181,7 +174,7 @@ def resolve_identity(provider: str, model: str) -> tuple[str, str]:
     if entry is None:
         raise ValueError(
             f"unsupported model {provider}:{model or '(empty)'}; "
-            "choose a catalog model (GPT family, Grok 4.6, Qwen, DeepSeek, Gemini, GLM, Kimi)"
+            "choose a catalog model (GPT family, Grok 4.6, Qwen, DeepSeek, Gemini, Kimi)"
         )
     return provider, entry.id_for(provider)
 
@@ -192,6 +185,11 @@ def validate_spec(spec: Any) -> None:
 
 def model_identity(spec: Any) -> str:
     return f"{spec.provider}:{spec.model}"
+
+
+def model_family(spec: Any) -> str:
+    entry = find_entry(spec.provider, spec.model)
+    return entry.family if entry is not None else spec.provider
 
 
 def spec_with_effort(spec: Any, effort: str = "") -> Any:

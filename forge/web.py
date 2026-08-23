@@ -353,7 +353,9 @@ class RunRegistry:
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
             values = list(self._runs.values())
-        return [self._describe(value) for value in values]
+        described = [self._describe(value) for value in values]
+        described.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return described
 
     def get(self, run_id: str) -> dict[str, Any]:
         with self._lock:
@@ -429,6 +431,11 @@ class RunRegistry:
 
     @staticmethod
     def _describe(live: LiveRun, detailed: bool = False) -> dict[str, Any]:
+        if not live.thread.is_alive():
+            try:
+                live.orchestrator.state = live.orchestrator.store.load_state()
+            except Exception:
+                pass
         value = live.orchestrator.state.to_dict()
         value["alive"] = live.thread.is_alive()
         value["artifact_dir"] = str(live.orchestrator.store.root)

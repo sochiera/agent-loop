@@ -109,7 +109,7 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
                     data=json.dumps(
                         {
                             "models": {"brain": "opencode:grok-4.6:high"},
-                            "coder_models": ["opencode:glm-5.3:high"],
+                            "coder_models": ["opencode:kimi-k3:high"],
                             "push": False,
                         }
                     ).encode(),
@@ -121,7 +121,7 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         )
         assert saved_prefs["models"]["brain"] == "opencode:grok-4.6:high"
         loaded_prefs = json.loads(urllib.request.urlopen(base + "/api/preferences", timeout=2).read())
-        assert loaded_prefs["coder_models"] == ["opencode:glm-5.3:high"]
+        assert loaded_prefs["coder_models"] == ["opencode:kimi-k3:high"]
         health = json.loads(urllib.request.urlopen(base + "/api/health", timeout=2).read())
         assert health == {"ok": True, "active_runs": 0}
         restart = json.loads(
@@ -269,7 +269,7 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
             "repo": "/tmp/repo",
             "briefPath": "/tmp/goal.md",
             "models": {"brain": "opencode:grok-4.6:high", "coder_tdd": "ignored"},
-            "coder_models": ["opencode:glm-5.3:high", "", "codex:gpt-5.6-luna:high"],
+            "coder_models": ["opencode:kimi-k3:high", "", "codex:gpt-5.6-luna:high"],
             "push": False,
             "ignore": True,
         }
@@ -280,7 +280,7 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
         "brief": "",
         "push": False,
         "models": {"brain": "opencode:grok-4.6:high"},
-        "coder_models": ["opencode:glm-5.3:high", "codex:gpt-5.6-luna:high"],
+        "coder_models": ["opencode:kimi-k3:high", "codex:gpt-5.6-luna:high"],
         "shared_staff_model": False,
         "backup": "",
     }
@@ -326,11 +326,11 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
     saved = registry.save_preferences(
         {
             "models": {"brain": "opencode:grok-4.6:high"},
-            "coder_models": ["opencode:glm-5.3:high"],
+            "coder_models": ["opencode:kimi-k3:high"],
         }
     )
     assert saved["models"]["brain"] == "opencode:grok-4.6:high"
-    assert registry.load_preferences()["coder_models"] == ["opencode:glm-5.3:high"]
+    assert registry.load_preferences()["coder_models"] == ["opencode:kimi-k3:high"]
 
     registry.start(
         {

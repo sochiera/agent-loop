@@ -1,7 +1,10 @@
 import json
+import threading
+import time
 from pathlib import Path
 
 from forge.agents import (
+    AgentCancelled,
     AgentRequest,
     AgentRunner,
     AgentUsageLimit,
@@ -108,8 +111,43 @@ def test_codex_coder_uses_lean_cached_tool_surface(tmp_path: Path):
     assert "shell_tool" not in command
 
 
+def test_runner_cancel_stops_live_process(tmp_path: Path):
+    runner = AgentRunner()
+    runner._command = lambda request: ["sleep", "30"]
+    request = AgentRequest(
+        "planner",
+        ModelSpec.parse("opencode:grok-4.6"),
+        "x",
+        tmp_path,
+    )
+
+    def stop() -> None:
+        time.sleep(0.2)
+        runner.cancel()
+
+    threading.Thread(target=stop, daemon=True).start()
+    started = time.monotonic()
+    try:
+        runner.run(request)
+        raise AssertionError("cancelled runner returned")
+    except AgentCancelled:
+        pass
+    assert time.monotonic() - started < 5
+    runner.allow()
+    assert runner._cancelled.is_set() is False
+
+
 def test_usage_limit_is_classified_as_non_retryable():
     message = "You've hit your usage limit. Purchase more credits or try again next week."
     assert any(marker in message.lower() for marker in _NON_RETRYABLE_ERRORS)
+    assert is_usage_limit(message)
+    assert failure_type_for(message) is AgentUsageLimit
+
+
+def test_kimi_billing_cycle_limit_is_usage_limit():
+    message = (
+        "You've reached your usage limit for this billing cycle. "
+        "Your quota will be refreshed in the next cycle."
+    )
     assert is_usage_limit(message)
     assert failure_type_for(message) is AgentUsageLimit

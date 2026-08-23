@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,11 +35,18 @@ class AgentUsageLimit(AgentConfigurationFailure):
     """Provider quota/usage limit; retrying the same model will not help."""
 
 
+class AgentCancelled(AgentFailure):
+    """Operator cancelled the run while this process was still working."""
+
+
 _USAGE_LIMIT_MARKERS = (
     "you've hit your usage limit",
+    "you've reached your usage limit",
     "purchase more credits",
     "insufficient_quota",
     "quota exceeded",
+    "quota will be refreshed",
+    "billing cycle",
     "usage limit",
 )
 
@@ -204,7 +212,34 @@ def _opencode_parse(events: list[dict[str, Any]]) -> tuple[str, Usage, int]:
 class AgentRunner:
     """Invoke Codex, Claude Code, or OpenCode without a shell."""
 
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._processes: list[subprocess.Popen[str]] = []
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        with self._lock:
+            processes = list(self._processes)
+        for process in processes:
+            if process.poll() is None:
+                _signal_session(process.pid, signal.SIGTERM)
+
+        def kill_later() -> None:
+            time.sleep(2)
+            for child in processes:
+                if child.poll() is None:
+                    _signal_session(child.pid, signal.SIGKILL)
+
+        if processes:
+            threading.Thread(target=kill_later, name="forge-agent-kill", daemon=True).start()
+
+    def allow(self) -> None:
+        self._cancelled.clear()
+
     def run(self, request: AgentRequest) -> AgentResult:
+        if self._cancelled.is_set():
+            raise AgentCancelled(f"{request.role} cancelled")
         request.cwd.mkdir(parents=True, exist_ok=True)
         command = self._command(request)
         environment = os.environ.copy()
@@ -220,6 +255,8 @@ class AgentRunner:
             text=True,
             start_new_session=True,
         )
+        with self._lock:
+            self._processes.append(process)
         try:
             raw, _ = process.communicate(request.prompt, timeout=request.timeout_seconds)
         except subprocess.TimeoutExpired:
@@ -242,6 +279,12 @@ class AgentRunner:
                 _signal_session(process.pid, signal.SIGKILL)
                 process.communicate()
             raise
+        finally:
+            with self._lock:
+                if process in self._processes:
+                    self._processes.remove(process)
+        if self._cancelled.is_set():
+            raise AgentCancelled(f"{request.role} cancelled", raw_output=raw)
         elapsed = time.monotonic() - started
         if process.returncode != 0:
             raise failure_type_for(raw)(

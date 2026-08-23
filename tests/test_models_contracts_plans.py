@@ -76,7 +76,7 @@ def test_shuffle_coder_models_preserves_the_pool():
     models = {
         "coder_tdd": ModelSpec.parse("opencode:gpt-5.6-luna"),
         "coder_explore": ModelSpec.parse("opencode:grok-4.6"),
-        "coder_classic": ModelSpec.parse("opencode:glm-5.3"),
+        "coder_classic": ModelSpec.parse("opencode:kimi-k3"),
         "brain": ModelSpec.parse("codex:gpt-5.6-sol:high"),
     }
     shuffled = shuffle_coder_models(models, rng=random.Random(0))
@@ -102,6 +102,14 @@ def test_model_spec_accepts_grok_on_opencode():
 def test_model_spec_accepts_kimi_k3_on_opencode():
     value = ModelSpec.parse("opencode:kimi-k3")
     assert value.model == "kimi-for-coding/k3"
+
+
+def test_model_family_uses_catalog_family():
+    from forge.catalog import model_family
+
+    assert model_family(ModelSpec.parse("opencode:kimi-k3")) == "kimi"
+    assert model_family(ModelSpec.parse("codex:gpt-5.6-luna")) == "gpt"
+    assert model_family(ModelSpec.parse("opencode:grok-4.6")) == "grok"
 
 
 def test_model_spec_accepts_qwen_cloud_deepseek():
@@ -144,7 +152,7 @@ def test_assign_coder_models_samples_from_a_larger_pool():
     pool = [
         ModelSpec.parse("opencode:gpt-5.6-luna"),
         ModelSpec.parse("opencode:grok-4.6"),
-        ModelSpec.parse("opencode:glm-5.3"),
+        ModelSpec.parse("opencode:kimi-k3"),
         ModelSpec.parse("opencode:qwen-3.8-max"),
         ModelSpec.parse("opencode:deepseek-v4-flash-0731"),
     ]

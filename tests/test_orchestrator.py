@@ -5,13 +5,14 @@ from pathlib import Path
 import pytest
 
 from forge.agents import (
+    AgentCancelled,
     AgentConfigurationFailure,
     AgentRequest,
     AgentTimeout,
     AgentUsageLimit,
 )
 from forge.models import AgentResult, ModelSpec, ROLE_NAMES, RunConfig, Usage
-from forge.orchestrator import PROBE_PROMPT, ForgeOrchestrator
+from forge.orchestrator import PROBE_PROMPT, ForgeOrchestrator, RunCancelled
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -476,6 +477,78 @@ def test_mark_interrupted_clears_live_agents(tmp_path: Path):
     assert "Controller restarted" in orchestrator.state.message
 
 
+def test_pause_enables_immediate_resume(tmp_path: Path):
+    repo = tmp_path / "target"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "forge@example.test")
+    git(repo, "config", "user.name", "Forge Test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Build a greeting feature.\n", encoding="utf-8")
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
+    runner = FakeRunner()
+    runner.cancelled = False
+
+    def cancel() -> None:
+        runner.cancelled = True
+
+    runner.cancel = cancel
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="pause-run",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    orchestrator.state.status = "running"
+    orchestrator.pause()
+    assert orchestrator.state.paused is True
+    assert orchestrator.state.status == "paused"
+    orchestrator.resume()
+    assert orchestrator.state.paused is False
+    assert orchestrator.state.status == "running"
+    orchestrator.cancel()
+    assert orchestrator.state.cancel_requested is True
+    assert runner.cancelled is True
+
+
+def test_invoke_turns_agent_cancel_into_run_cancel(tmp_path: Path):
+    repo = tmp_path / "target"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "forge@example.test")
+    git(repo, "config", "user.name", "Forge Test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    brief = tmp_path / "brief.md"
+    brief.write_text("Build a greeting feature.\n", encoding="utf-8")
+
+    class CancelRunner:
+        def run(self, request: AgentRequest) -> AgentResult:
+            raise AgentCancelled(f"{request.role} cancelled")
+
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="cancel-invoke",
+        runner=CancelRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    with pytest.raises(RunCancelled):
+        orchestrator._invoke(
+            role="planner",
+            model=models["planner"],
+            prompt="plan",
+            cwd=repo,
+            relative="batches/001/planner/attempt-1",
+        )
+
+
 def test_recover_failed_clears_stale_active_agents(tmp_path: Path):
     repo = tmp_path / "target"
     repo.mkdir()
@@ -852,3 +925,166 @@ def test_black_box_offers_virtual_display_without_overriding_host(tmp_path: Path
     assert "DISPLAY" not in testers[0].environment
     assert "DISPLAY=:94" in testers[0].prompt
     assert "nothing is required" in testers[0].prompt
+
+
+class WinnerFixTimeoutRunner(FakeRunner):
+    def run(self, request: AgentRequest) -> AgentResult:
+        if request.role.startswith("coder_") and "selected your implementation" in request.prompt:
+            raise AgentTimeout("winner-fix timeout", raw_output="timed out")
+        return super().run(request)
+
+
+class WinnerFixLimitRunner(FakeRunner):
+    def __init__(self):
+        super().__init__()
+        self.fix_models: list[str] = []
+
+    def run(self, request: AgentRequest) -> AgentResult:
+        if request.role.startswith("coder_") and "selected your implementation" in request.prompt:
+            self.fix_models.append(request.model.display())
+            if "kimi" in request.model.display():
+                raise AgentUsageLimit(
+                    "usage limit",
+                    raw_output="You've reached your usage limit for this billing cycle.",
+                )
+        return super().run(request)
+
+
+def test_winner_fix_timeout_delivers_captured_tree(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:high") for role in ROLE_NAMES}
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="winner-fix-timeout",
+        runner=WinnerFixTimeoutRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    state = orchestrator.run()
+    assert state.status == "complete"
+    assert "hello from tdd" in (repo / "feature.txt").read_text(encoding="utf-8")
+    assert "reviewed" not in (repo / "feature.txt").read_text(encoding="utf-8")
+    assert any("delivering the current captured tree" in item for item in state.warnings)
+
+
+def test_winner_fix_usage_limit_switches_to_other_family(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:high") for role in ROLE_NAMES}
+    models["coder_tdd"] = ModelSpec.parse("opencode:kimi-k3:high")
+    runner = WinnerFixLimitRunner()
+    orchestrator = ForgeOrchestrator(
+        RunConfig(
+            str(repo),
+            str(brief),
+            "main",
+            models,
+            push=False,
+            backup=ModelSpec.parse("opencode:grok-4.6"),
+        ),
+        run_id="winner-fix-limit",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    state = orchestrator.run()
+    assert state.status == "complete"
+    assert runner.fix_models[0].startswith("opencode:kimi-for-coding/k3")
+    assert any(not item.startswith("opencode:kimi-for-coding/k3") for item in runner.fix_models)
+    assert "reviewed" in (repo / "feature.txt").read_text(encoding="utf-8")
+    assert orchestrator.config.models["coder_tdd"].model != "kimi-for-coding/k3"
+
+
+def test_refresh_roster_keeps_healthy_operator_swap(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    models = _mixed_models()
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="keep-swap",
+        runner=FakeRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    orchestrator._preflight()
+    orchestrator.config.models["coder_classic"] = ModelSpec.parse("opencode:kimi-k3:high")
+    orchestrator._refresh_roster(reason="resume review 1", require_coders=False)
+    assert orchestrator.config.models["coder_classic"].model == "kimi-for-coding/k3"
+
+
+def test_replacement_prefers_different_family(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:high") for role in ROLE_NAMES}
+    models["coder_explore"] = ModelSpec.parse("opencode:grok-4.6")
+    orchestrator = ForgeOrchestrator(
+        RunConfig(
+            str(repo),
+            str(brief),
+            "main",
+            models,
+            push=False,
+            backup=ModelSpec.parse("opencode:kimi-k3"),
+        ),
+        run_id="family-backup",
+        runner=FakeRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    replacement = orchestrator._replacement_for(
+        "coder_tdd",
+        models["coder_tdd"],
+    )
+    assert replacement is not None
+    assert replacement.model == "kimi-for-coding/k3"
+
+
+def test_review_reuses_captured_json(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+
+    class CountingReviewer(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.reviews = 0
+
+        def run(self, request: AgentRequest) -> AgentResult:
+            if request.role == "reviewer":
+                self.reviews += 1
+            return super().run(request)
+
+    runner = CountingReviewer()
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", _mixed_models(), push=False),
+        run_id="reuse-review",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    orchestrator._preflight()
+    batch = repo / ".forge" / "runs" / "reuse-review" / "batches" / "001"
+    batch.mkdir(parents=True)
+    (batch / "review.json").write_text(
+        json.dumps(
+            {
+                "winner": "tdd",
+                "reason": "captured",
+                "feedback": [],
+                "borrow": [],
+                "candidates": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    worktree = type("Tree", (), {"path": repo})()
+    outcomes = {
+        "tdd": type(
+            "Out",
+            (),
+            {"status": "complete", "worktree": worktree},
+        )()
+    }
+    review = orchestrator._review(
+        type("Dec", (), {"objective": "x", "success_criteria": ()})(),
+        outcomes,
+        {},
+        "batches/001",
+    )
+    assert review["winner"] == "tdd"
+    assert runner.reviews == 0

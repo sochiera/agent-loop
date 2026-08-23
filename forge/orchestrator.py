@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .agents import (
+    AgentCancelled,
     AgentConfigurationFailure,
     AgentFailure,
     AgentRequest,
@@ -28,6 +29,7 @@ from .artifacts import ArtifactStore, atomic_write, utc_now
 from .catalog import (
     ROLE_TIMEOUTS,
     assign_coder_models,
+    model_family,
     model_identity,
     shuffle_coder_models,
     spec_with_effort,
@@ -46,7 +48,7 @@ from .contracts import (
 )
 from .display import optional_virtual_display
 from .gitops import CandidateWorktree, GitCompetition, GitError
-from .models import CODER_ROLES, STAFF_ROLES, ModelSpec, RunConfig, RunState
+from .models import AgentResult, CODER_ROLES, STAFF_ROLES, ModelSpec, RunConfig, RunState, Usage
 from .plans import (
     PlanProgress,
     candidate_validation_commands,
@@ -161,11 +163,15 @@ class ForgeOrchestrator:
     def pause(self) -> None:
         with self._control:
             self.state.paused = True
+            if self.state.status == "running":
+                self.state.status = "paused"
             self._save("Pause requested; Forge will pause at the next phase boundary.")
 
     def resume(self) -> None:
         with self._control:
             self.state.paused = False
+            if self.state.status == "paused" and not self.state.cancel_requested:
+                self.state.status = "running"
             self._control.notify_all()
             self._save("Run resumed.")
 
@@ -175,6 +181,7 @@ class ForgeOrchestrator:
             self.state.paused = False
             self._control.notify_all()
             self._save("Cancellation requested.")
+        self._runner_cancel()
 
     def mark_interrupted(self, message: str) -> None:
         with self._activity_lock:
@@ -183,6 +190,17 @@ class ForgeOrchestrator:
             self.state.status = "failed"
             self.state.paused = False
             self._save(message)
+        self._runner_cancel()
+
+    def _runner_cancel(self) -> None:
+        cancel = getattr(self.runner, "cancel", None)
+        if callable(cancel):
+            cancel()
+
+    def _runner_allow(self) -> None:
+        allow = getattr(self.runner, "allow", None)
+        if callable(allow):
+            allow()
 
     @classmethod
     def from_existing(
@@ -211,6 +229,7 @@ class ForgeOrchestrator:
         )
 
     def run(self) -> RunState:
+        self._runner_allow()
         self.store.write_data("config.json", self.config.to_dict())
         self.store.write_text("brief.md", self.brief_path.read_text(encoding="utf-8"))
         self.state.status = "running"
@@ -244,6 +263,7 @@ class ForgeOrchestrator:
             raise RuntimeError(
                 f"run {self.run_id} is {self.state.status}; only failed, paused, or cancelled runs recover"
             )
+        self._runner_allow()
         self.state.status = "running"
         self.state.cancel_requested = False
         self.state.paused = False
@@ -283,6 +303,7 @@ class ForgeOrchestrator:
             self.state.active_agents.clear()
         if not self.state.brain_session_id:
             raise RuntimeError("failed run has no persistent brain session to resume")
+        self._runner_allow()
         self.state.status = "running"
         self.state.cancel_requested = False
         self.state.paused = False
@@ -609,9 +630,12 @@ class ForgeOrchestrator:
         self.state.disabled_models = sorted(disabled)
         previous_brain = model_identity(self.config.models["brain"])
         originals = self._original_models()
-        for role, spec in originals.items():
+        for role, spec in list(self.config.models.items()):
             if model_identity(spec) not in disabled:
-                self.config.models[role] = spec
+                continue
+            original = originals.get(role)
+            if original is not None and model_identity(original) not in disabled:
+                self.config.models[role] = original
 
         backup = self.config.backup
         backup_ok = (
@@ -885,22 +909,16 @@ class ForgeOrchestrator:
         self._phase("winner-fix", f"The winning coder is applying review feedback.")
         winner = outcomes[winner_name]
         winner_model = self.config.models[f"coder_{winner_name}"]
-        fix_result = self._invoke(
-            role=f"coder_{winner_name}",
-            model=winner_model,
-            prompt=winner_fix_prompt(
-                review["feedback"],
-                winner.validation,
-                borrow=review.get("borrow") or [],
-            ),
-            cwd=winner.worktree.path,
-            session_id=winner.session_id,
-            access="write",
-            relative=f"{batch_rel}/candidates/{winner_name}/winner-fix",
-            candidate=winner_name,
+        fix_result = self._apply_winner_fix(
+            winner=winner,
+            winner_name=winner_name,
+            review=review,
+            batch_rel=batch_rel,
         )
         current_winner_model = self.config.models[f"coder_{winner_name}"]
-        if not winner.session_id or fix_result.session_id != winner.session_id:
+        if fix_result.raw_output and (
+            not winner.session_id or fix_result.session_id != winner.session_id
+        ):
             if model_identity(current_winner_model) == model_identity(winner_model):
                 raise RuntimeError(
                     "winning coder provider did not preserve its original session"
@@ -1386,6 +1404,46 @@ class ForgeOrchestrator:
         compact["validation"] = compact_validation
         return compact
 
+    def _apply_winner_fix(
+        self,
+        *,
+        winner: CandidateOutcome,
+        winner_name: str,
+        review: dict[str, Any],
+        batch_rel: str,
+    ) -> AgentResult:
+        role = f"coder_{winner_name}"
+        try:
+            return self._invoke(
+                role=role,
+                model=self.config.models[role],
+                prompt=winner_fix_prompt(
+                    review["feedback"],
+                    winner.validation,
+                    borrow=review.get("borrow") or [],
+                ),
+                cwd=winner.worktree.path,
+                session_id=winner.session_id,
+                access="write",
+                relative=f"{batch_rel}/candidates/{winner_name}/winner-fix",
+                candidate=winner_name,
+                failover_on_timeout=True,
+            )
+        except (AgentTimeout, AgentUsageLimit, AgentConfigurationFailure, AgentFailure) as exc:
+            warning = (
+                f"Winner {winner_name} fix failed ({exc}); "
+                "delivering the current captured tree."
+            )
+            winner.warnings.append(warning)
+            self._warning(warning)
+            return AgentResult(
+                text=warning,
+                session_id=winner.session_id or "",
+                usage=Usage(),
+                elapsed_seconds=0,
+                raw_output="",
+            )
+
     def _review(
         self,
         decision: BrainDecision,
@@ -1393,6 +1451,14 @@ class ForgeOrchestrator:
         bundle: dict[str, dict[str, Any]],
         batch_rel: str,
     ) -> dict[str, Any]:
+        captured = self._read_json(f"{batch_rel}/review.json")
+        if isinstance(captured, dict) and captured.get("winner"):
+            winner = str(captured["winner"])
+            if winner in outcomes and outcomes[winner].status != "failed":
+                self._warning(
+                    f"Reusing captured review for {batch_rel}; winner={winner}."
+                )
+                return captured
         source_bundle = self.store.root / batch_rel / "review-bundle.json"
         review_dir = self.worktree_root / "review-evidence"
         review_dir.mkdir(parents=True, exist_ok=True)
@@ -1608,22 +1674,29 @@ class ForgeOrchestrator:
 
     def _replacement_for(self, role: str, current: ModelSpec) -> ModelSpec | None:
         disabled = set(self.state.disabled_models)
+        current_id = model_identity(current)
+        current_family = model_family(current)
+        candidates: list[ModelSpec] = []
         backup = self.config.backup
         if (
             backup is not None
-            and model_identity(backup) != model_identity(current)
+            and model_identity(backup) != current_id
             and model_identity(backup) not in disabled
         ):
-            return spec_with_effort(backup, current.effort)
+            candidates.append(backup)
         if role.startswith("coder_"):
             for other in CODER_ROLES:
                 spec = self.config.models[other]
-                if (
-                    model_identity(spec) != model_identity(current)
-                    and model_identity(spec) not in disabled
-                ):
-                    return spec_with_effort(spec, current.effort)
-        return None
+                identity = model_identity(spec)
+                if identity == current_id or identity in disabled:
+                    continue
+                if all(model_identity(item) != identity for item in candidates):
+                    candidates.append(spec)
+        different = [item for item in candidates if model_family(item) != current_family]
+        chosen = (different or candidates)
+        if not chosen:
+            return None
+        return spec_with_effort(chosen[0], current.effort)
 
     def _reset_brain_session_if_changed(self, previous_identity: str) -> None:
         current = self.config.models.get("brain")
@@ -1664,11 +1737,13 @@ class ForgeOrchestrator:
         candidate: str = "",
         invocation: int = 1,
         allow_failover: bool = True,
+        failover_on_timeout: bool = False,
     ) -> AgentResult:
         current_prompt = prompt
         current_model = model
         current_session = session_id
         failover_used = False
+        session_dropped = False
         role_timeout = ROLE_TIMEOUTS.get(role, self.config.agent_timeout_seconds)
         if role.startswith("coder_"):
             role_timeout = ROLE_TIMEOUTS.get(role, ROLE_TIMEOUTS.get("coder_tdd", 3600))
@@ -1702,6 +1777,8 @@ class ForgeOrchestrator:
                         timeout_seconds=role_timeout,
                     )
                 )
+            except AgentCancelled:
+                raise RunCancelled()
             except AgentUsageLimit as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
                 self._warning(f"{role} hit a usage limit on {current_model.display()}: {exc}")
@@ -1726,6 +1803,14 @@ class ForgeOrchestrator:
                 raise
             except AgentConfigurationFailure as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
+                if current_session and not session_dropped:
+                    self._warning(
+                        f"{role} dropping stale session after configuration error: {exc}"
+                    )
+                    current_session = None
+                    session_dropped = True
+                    attempt = 0
+                    continue
                 self._warning(f"{role} has a non-retryable provider/CLI error: {exc}")
                 raise
             except AgentTimeout as exc:
@@ -1734,6 +1819,22 @@ class ForgeOrchestrator:
                     f"{role} reached its {role_timeout}s limit; "
                     "the candidate will continue without another costly agent process"
                 )
+                if allow_failover and failover_on_timeout and not failover_used:
+                    replacement = self._replacement_for(role, current_model)
+                    if replacement is not None:
+                        self._apply_replacement(current_model, replacement)
+                        if role in self.config.models:
+                            current_model = self.config.models[role]
+                        else:
+                            current_model = replacement
+                        current_session = None
+                        failover_used = True
+                        attempt = 0
+                        self._warning(
+                            f"{role} switching to backup {current_model.display()} "
+                            "after timeout and resuming."
+                        )
+                        continue
                 raise
             except AgentFailure as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
