@@ -950,6 +950,30 @@ class WinnerFixLimitRunner(FakeRunner):
         return super().run(request)
 
 
+class WinnerFixNewSessionRunner(FakeRunner):
+    def run(self, request: AgentRequest) -> AgentResult:
+        result = super().run(request)
+        if request.role.startswith("coder_") and "selected your implementation" in request.prompt:
+            result.session_id = "fresh-winner-fix-session"
+        return result
+
+
+def test_winner_fix_new_session_still_delivers(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:high") for role in ROLE_NAMES}
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="winner-fix-new-session",
+        runner=WinnerFixNewSessionRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    state = orchestrator.run()
+    assert state.status == "complete"
+    assert "reviewed" in (repo / "feature.txt").read_text(encoding="utf-8")
+    assert any("new session" in item for item in state.warnings)
+
+
 def test_winner_fix_timeout_delivers_captured_tree(tmp_path: Path):
     repo, brief = _repo_with_brief(tmp_path)
     models = {role: ModelSpec.parse("codex:gpt-5.6-luna:high") for role in ROLE_NAMES}

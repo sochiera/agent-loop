@@ -916,18 +916,18 @@ class ForgeOrchestrator:
             batch_rel=batch_rel,
         )
         current_winner_model = self.config.models[f"coder_{winner_name}"]
-        if fix_result.raw_output and (
-            not winner.session_id or fix_result.session_id != winner.session_id
-        ):
-            if model_identity(current_winner_model) == model_identity(winner_model):
-                raise RuntimeError(
-                    "winning coder provider did not preserve its original session"
+        if fix_result.raw_output and fix_result.session_id != winner.session_id:
+            if model_identity(current_winner_model) != model_identity(winner_model):
+                self._warning(
+                    f"Winner {winner_name} continued on replacement "
+                    f"{current_winner_model.display()} with a new session."
                 )
-            winner.session_id = fix_result.session_id
-            self._warning(
-                f"Winner {winner_name} continued on replacement "
-                f"{current_winner_model.display()} with a new session."
-            )
+            elif winner.session_id:
+                self._warning(
+                    f"Winner {winner_name} continued on a new session "
+                    f"{fix_result.session_id}."
+                )
+            winner.session_id = fix_result.session_id or winner.session_id
         final_validation = run_commands(commands, winner.worktree.path)
         failed_final_checks = [
             item
