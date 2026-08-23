@@ -293,6 +293,76 @@ def test_brain_must_return_a_resumable_session(tmp_path: Path):
     assert orchestrator.state.status == "failed"
 
 
+class RotatingBrainSessionRunner(FakeRunner):
+    def run(self, request: AgentRequest) -> AgentResult:
+        result = super().run(request)
+        if request.role == "brain":
+            result.session_id = f"brain-session-{self.brain_calls}"
+        return result
+
+
+def test_brain_session_change_does_not_abort(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="brain-new-session",
+        runner=RotatingBrainSessionRunner(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    state = orchestrator.run()
+    assert state.status == "complete"
+    assert state.brain_session_id == "brain-session-2"
+    assert any("new session" in item for item in state.warnings)
+
+
+class TwoTurnSessionCoder(FakeRunner):
+    def __init__(self):
+        super().__init__()
+        self.turns: dict[str, int] = {}
+
+    def run(self, request: AgentRequest) -> AgentResult:
+        if request.role.startswith("coder_") and "selected your implementation" not in request.prompt:
+            name = request.role.removeprefix("coder_")
+            self.turns[name] = self.turns.get(name, 0) + 1
+            plan = request.cwd / ".forge" / "plan.md"
+            if self.turns[name] == 1:
+                (request.cwd / "feature.txt").write_text("wip\n", encoding="utf-8")
+                return AgentResult(
+                    text="still working",
+                    session_id="coder-s1",
+                    usage=Usage(input_tokens=2, output_tokens=1),
+                    elapsed_seconds=0.01,
+                    raw_output="still working",
+                )
+            (request.cwd / "feature.txt").write_text(f"hello from {name}\n", encoding="utf-8")
+            plan.write_text(plan.read_text(encoding="utf-8").replace("[ ]", "[x]"), encoding="utf-8")
+            return AgentResult(
+                text="done",
+                session_id="coder-s2",
+                usage=Usage(input_tokens=2, output_tokens=1),
+                elapsed_seconds=0.01,
+                raw_output="done",
+            )
+        return super().run(request)
+
+
+def test_coder_session_change_does_not_abort_the_candidate(tmp_path: Path):
+    repo, brief = _repo_with_brief(tmp_path)
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
+    orchestrator = ForgeOrchestrator(
+        RunConfig(str(repo), str(brief), "main", models, push=False),
+        run_id="coder-new-session",
+        runner=TwoTurnSessionCoder(),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+    state = orchestrator.run()
+    assert state.status == "complete"
+    assert any("coder tdd continued on a new session coder-s2" in item for item in state.warnings)
+
+
 def test_recovery_restores_captured_candidates_and_resumes_review(tmp_path: Path):
     repo = tmp_path / "target"
     repo.mkdir()

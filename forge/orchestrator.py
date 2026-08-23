@@ -722,11 +722,11 @@ class ForgeOrchestrator:
                 schema=BRAIN_SCHEMA,
                 relative=f"brain/decision-{self.state.cycle:03d}-{contract_attempt}",
             )
-            if self.state.brain_session_id and result.session_id != self.state.brain_session_id:
-                raise RuntimeError("brain provider did not preserve the original session")
-            if not result.session_id:
-                raise RuntimeError("brain provider did not return a resumable session id")
-            self.state.brain_session_id = result.session_id
+            self.state.brain_session_id = self._adopt_session(
+                self.state.brain_session_id,
+                result.session_id,
+                role="brain",
+            )
             try:
                 if result.tool_calls:
                     raise ContractError(
@@ -1278,13 +1278,11 @@ class ForgeOrchestrator:
                 invocation=turns,
                 allow_failover=False,
             )
-            if not result.session_id:
-                raise RuntimeError(
-                    f"coder {candidate.name} provider did not return a resumable session id"
-                )
-            if session and result.session_id != session:
-                raise RuntimeError(f"coder {candidate.name} provider changed its session id")
-            session = result.session_id
+            session = self._adopt_session(
+                session,
+                result.session_id,
+                role=f"coder {candidate.name}",
+            )
             final_text = result.text
             if not plan_path.exists():
                 raise RuntimeError("coder removed the Markdown goal plan")
@@ -1671,6 +1669,13 @@ class ForgeOrchestrator:
             if identity not in self.state.disabled_models:
                 self.state.disabled_models.append(identity)
                 self._persist_models()
+
+    def _adopt_session(self, previous: str | None, current: str | None, *, role: str) -> str:
+        if not current:
+            raise RuntimeError(f"{role} provider did not return a resumable session id")
+        if previous and current != previous:
+            self._warning(f"{role} continued on a new session {current}.")
+        return current
 
     def _replacement_for(self, role: str, current: ModelSpec) -> ModelSpec | None:
         disabled = set(self.state.disabled_models)
