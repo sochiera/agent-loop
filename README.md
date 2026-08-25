@@ -96,7 +96,7 @@ but cannot be resumed by the sprint controller.
 - Linux or macOS, Git, and Python 3.12 or newer.
 - At least one authenticated supported agent CLI:
   - `codex` for GPT-family catalog models;
-  - `opencode` for GPT, Grok, Qwen, DeepSeek, Gemini, and Kimi catalog models.
+  - `opencode` for GPT, Grok, Qwen, DeepSeek, Gemini, Kimi, and GLM catalog models.
 - A clean target Git repository. Forge can initialize an unborn selected branch. Push-enabled runs
   also require an `origin` remote.
 
@@ -157,7 +157,7 @@ commands exit with status `0` after an operator pause or cancellation and `1` af
 `stalled`; continuous runs otherwise keep executing.
 
 Selectors use `provider:model[:effort]`. The control room exposes the closed catalog, including
-Codex/OpenCode GPT models and OpenCode-only Grok, Qwen, DeepSeek, Gemini, and Kimi models. Before
+Codex/OpenCode GPT models and OpenCode-only Grok, Qwen, DeepSeek, Gemini, Kimi, and GLM models. Before
 the first sprint Forge probes each unique model once. A usage-limit failure can move a role to the
 configured backup or another healthy selected model without changing the sprint contract.
 

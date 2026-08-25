@@ -147,6 +147,8 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert by_key["or-gemini-3.7-flash"]["ids"]["opencode"] == (
             "openrouter/google/gemini-3.7-flash"
         )
+        assert by_key["glm-5.3"]["family"] == "glm"
+        assert by_key["glm-5.3"]["ids"]["opencode"] == "zai-coding-plan/glm-5.3"
         assert catalog["defaults"]["coder"] == "codex:gpt-5.6-luna:high"
         assert "model-effort" in html
         assert 'class="model-effort" required' not in html

@@ -38,6 +38,7 @@ def test_model_spec_round_trip_and_catalog_aliases():
     assert ModelSpec.parse("codex:gpt-5.6-sol:high").model == "gpt-5.6-sol"
     assert ModelSpec.parse("opencode:grok-4.6").model == "xai/grok-4.6"
     assert ModelSpec.parse("opencode:kimi-k3").model == "kimi-for-coding/k3"
+    assert ModelSpec.parse("opencode:glm-5.3").model == "zai-coding-plan/glm-5.3"
 
 
 def test_model_spec_rejects_unknown_or_provider_incompatible_models():
@@ -74,6 +75,7 @@ def test_model_family_groups_failover_candidates_by_model_family():
     assert model_family(ModelSpec.parse("codex:gpt-5.6-sol")) == "gpt"
     assert model_family(ModelSpec.parse("opencode:or-gpt-5.6-luna")) == "gpt"
     assert model_family(ModelSpec.parse("opencode:grok-4.6")) == "grok"
+    assert model_family(ModelSpec.parse("opencode:glm-5.3")) == "glm"
 
 
 def test_role_roster_has_one_coder_and_one_unified_tester():
