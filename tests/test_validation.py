@@ -1,7 +1,13 @@
 import time
 from pathlib import Path
 
-from forge.validation import run_commands
+from forge.validation import classify_command, run_commands
+
+
+def test_validation_command_timeout_classification():
+    assert classify_command("python3 -m pytest -q") == "short"
+    assert classify_command("npm run test:e2e") == "long"
+    assert classify_command("curl https://example.test/health") == "long"
 
 
 def _is_running(pid: int) -> bool:

@@ -1,4 +1,4 @@
-"""Forge competitive coding-agent orchestrator."""
+"""Forge continuous product-sprint orchestrator."""
 
 from .models import ModelSpec, RunConfig
 

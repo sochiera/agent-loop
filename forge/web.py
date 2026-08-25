@@ -17,17 +17,73 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .artifacts import atomic_write
-from .catalog import assign_coder_models, catalog_payload, DEFAULTS
+from .catalog import catalog_payload, DEFAULTS
 from .gitops import list_branches, repository_summary
-from .models import CODER_ROLES, ModelSpec, ROLE_NAMES, RunConfig
+from .locking import ExecutionLocked
+from .models import ModelSpec, ROLE_NAMES, RunConfig
 from .orchestrator import ForgeOrchestrator
 
 
 STATIC = Path(__file__).with_name("static")
 MAX_BROWSE_ENTRIES = 1000
 MAX_PREVIEW_BYTES = 2_000_000
-PREFERENCE_ROLES = ("brain", "planner", "reviewer", "tester", "whitebox")
-MAX_CODER_PREFERENCES = 12
+PREFERENCE_ROLES = ROLE_NAMES
+RECOVERABLE_STATUSES = frozenset({"failed", "cancelled", "running", "paused"})
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def read_last_lines(
+    path: Path, limit: int = 200, max_bytes: int = 512 * 1024
+) -> list[str]:
+    if limit <= 0 or max_bytes <= 0 or not path.is_file():
+        return []
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        data = b""
+        while (
+            position > 0
+            and len(data) < max_bytes
+            and data.count(b"\n") <= limit
+        ):
+            size = min(64 * 1024, position, max_bytes - len(data))
+            position -= size
+            handle.seek(position)
+            data = handle.read(size) + data
+    if position > 0:
+        separator = data.find(b"\n")
+        data = data[separator + 1 :] if separator >= 0 else b""
+    return [line.decode("utf-8", errors="replace") for line in data.splitlines()[-limit:]]
+
+
+def recovery_hint_from_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    if not is_recoverable_snapshot(state):
+        return {}
+    active = state.get("active_iteration")
+    active = active if isinstance(active, dict) else {}
+    return {
+        "kind": "recover",
+        "action": active.get("phase")
+        or ("product_owner" if state.get("needs_product_owner") else "planning"),
+        "cycle": _safe_int(state.get("cycle")),
+        "sprint": _safe_int(state.get("sprint_number"), 1),
+        "slot": _safe_int(
+            active.get("slot"), _safe_int(state.get("sprint_iteration")) + 1
+        ),
+    }
+
+
+def is_recoverable_snapshot(state: dict[str, Any]) -> bool:
+    status = state.get("status")
+    return status in RECOVERABLE_STATUSES or (
+        status == "stalled" and state.get("stalled_recoverable") is True
+    )
 
 
 def sanitize_preferences(payload: dict[str, Any]) -> dict[str, Any]:
@@ -38,15 +94,14 @@ def sanitize_preferences(payload: dict[str, Any]) -> dict[str, Any]:
             value = str(models_raw.get(role) or "").strip()
             if value:
                 models[role] = value
-    coder_models: list[str] = []
-    if isinstance(payload.get("coder_models"), list):
-        for item in payload["coder_models"]:
-            value = str(item or "").strip()
-            if not value:
-                continue
-            coder_models.append(value)
-            if len(coder_models) >= MAX_CODER_PREFERENCES:
-                break
+    # Import the first old pool entry when loading pre-sprint UI preferences.
+    if "coder" not in models and isinstance(payload.get("coder_models"), list):
+        legacy_coder = next(
+            (str(item).strip() for item in payload["coder_models"] if str(item).strip()),
+            "",
+        )
+        if legacy_coder:
+            models["coder"] = legacy_coder
     backup = str(payload.get("backup") or "").strip()
     return {
         "repo": str(payload.get("repo") or ""),
@@ -55,7 +110,6 @@ def sanitize_preferences(payload: dict[str, Any]) -> dict[str, Any]:
         "brief": str(payload.get("brief") or payload.get("brief_text") or ""),
         "push": payload.get("push") is not False,
         "models": models,
-        "coder_models": coder_models,
         "shared_staff_model": payload.get("shared_staff_model") is True,
         "backup": backup,
     }
@@ -73,11 +127,6 @@ def preferences_from_config(config: RunConfig) -> dict[str, Any]:
             for role in PREFERENCE_ROLES
             if role in config.models
         },
-        "coder_models": [
-            config.models[role].display()
-            for role in CODER_ROLES
-            if role in config.models
-        ],
         "shared_staff_model": False,
         "backup": config.backup.display() if config.backup is not None else "",
     }
@@ -160,24 +209,21 @@ def restart_payload(active_runs: int, confirm: bool) -> dict[str, Any]:
     return {"restarting": True, "active_runs": active_runs}
 
 
-def models_from_payload(payload: dict[str, Any]) -> tuple[dict[str, ModelSpec], bool]:
+def models_from_payload(payload: dict[str, Any]) -> dict[str, ModelSpec]:
     raw_models = payload.get("models")
     if not isinstance(raw_models, dict):
         raise ValueError("models must be an object")
+    raw_pool = payload.get("coder_models")
+    legacy_coder = ""
+    if isinstance(raw_pool, list):
+        legacy_coder = next((str(item).strip() for item in raw_pool if str(item).strip()), "")
     models = {
-        role: ModelSpec.parse(str(raw_models.get(role) or DEFAULTS[role]))
+        role: ModelSpec.parse(
+            str(raw_models.get(role) or (legacy_coder if role == "coder" else "") or DEFAULTS[role])
+        )
         for role in ROLE_NAMES
     }
-    raw_pool = payload.get("coder_models")
-    shuffle_coders = bool(payload.get("shuffle_coders", False))
-    if raw_pool is not None:
-        if not isinstance(raw_pool, list) or not raw_pool:
-            raise ValueError("coder_models must be a non-empty list")
-        models = assign_coder_models(
-            models, [ModelSpec.parse(str(item)) for item in raw_pool]
-        )
-        shuffle_coders = False
-    return models, shuffle_coders
+    return models
 
 
 @dataclass
@@ -185,6 +231,7 @@ class LiveRun:
     orchestrator: ForgeOrchestrator
     thread: threading.Thread
     error: str = ""
+    starting: bool = False
 
 
 class RunRegistry:
@@ -206,7 +253,7 @@ class RunRegistry:
             atomic_write(brief_path, brief_text + "\n")
         else:
             raise ValueError("brief_path or brief_text is required")
-        models, shuffle_coders = models_from_payload(payload)
+        models = models_from_payload(payload)
         backup_raw = str(payload.get("backup") or "").strip()
         config = RunConfig(
             repo=str(repo),
@@ -215,7 +262,6 @@ class RunRegistry:
             models=models,
             push=bool(payload.get("push", True)),
             agent_timeout_seconds=int(payload.get("agent_timeout_seconds", 3600)),
-            shuffle_coders=shuffle_coders,
             backup=ModelSpec.parse(backup_raw) if backup_raw else None,
         )
         orchestrator = ForgeOrchestrator(config, state_home=self.state_home)
@@ -231,10 +277,12 @@ class RunRegistry:
             }
         )
         self._launch(live, recover=False)
-        return orchestrator.state.to_dict()
+        return self._describe(live)
 
-    @staticmethod
-    def _launch(live: LiveRun, *, recover: bool) -> None:
+    def _launch_locked(self, live: LiveRun, *, recover: bool) -> None:
+        if live.starting or live.thread.is_alive():
+            raise ValueError("run is still running")
+
         def target() -> None:
             try:
                 if recover:
@@ -245,16 +293,28 @@ class RunRegistry:
                 live.error = traceback.format_exc()
 
         live.error = ""
+        live.starting = True
         live.thread = threading.Thread(
             target=target,
             name=f"forge-{live.orchestrator.run_id}",
             daemon=True,
         )
-        live.thread.start()
+        try:
+            live.thread.start()
+        finally:
+            live.starting = False
+
+    def _launch(self, live: LiveRun, *, recover: bool) -> None:
+        with self._lock:
+            self._launch_locked(live, recover=recover)
 
     def active_count(self) -> int:
         with self._lock:
-            return sum(1 for live in self._runs.values() if live.thread.is_alive())
+            return sum(
+                1
+                for live in self._runs.values()
+                if live.starting or live.thread.is_alive()
+            )
 
     def _session_path(self) -> Path:
         root = self.state_home or Path.home() / ".local/state/forge"
@@ -273,7 +333,7 @@ class RunRegistry:
 
     def load_preferences(self) -> dict[str, Any]:
         stored = self._read_preferences()
-        if stored.get("models") or stored.get("coder_models"):
+        if stored.get("models"):
             return stored
         return self._preferences_from_runs() or stored or sanitize_preferences({})
 
@@ -339,15 +399,20 @@ class RunRegistry:
         )
         live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())
         with self._lock:
-            self._runs[run_id] = live
+            if run_id not in self._runs:
+                self._runs[run_id] = live
 
     def interrupt_live(self) -> None:
         with self._lock:
             lives = list(self._runs.values())
         for live in lives:
-            live.orchestrator.mark_interrupted(
-                "Controller restarted. Use Recover same run to continue."
-            )
+            try:
+                live.orchestrator.mark_interrupted(
+                    "Controller restarted. Use Recover same run to continue."
+                )
+            except ExecutionLocked:
+                # This UI may have adopted a run that another controller owns.
+                continue
         self.persist_session()
 
     def list(self) -> list[dict[str, Any]]:
@@ -367,89 +432,68 @@ class RunRegistry:
     def recover(self, payload: dict[str, Any]) -> dict[str, Any]:
         repo = Path(str(payload["repo"])).expanduser().resolve()
         run_id = str(payload["run_id"])
+        orchestrator = ForgeOrchestrator.from_existing(repo, run_id, state_home=self.state_home)
+        live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())
         with self._lock:
             existing = self._runs.get(run_id)
-        if existing is not None and existing.thread.is_alive():
-            raise ValueError("run is still running")
-        if existing is not None and existing.orchestrator.state.status == "complete":
-            raise ValueError("run is already complete")
-        orchestrator = ForgeOrchestrator.from_existing(repo, run_id, state_home=self.state_home)
-        if orchestrator.state.status == "complete":
-            raise ValueError("run is already complete")
-        live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())
-
-        def target() -> None:
-            try:
-                orchestrator.recover()
-            except Exception:
-                live.error = traceback.format_exc()
-
-        live.thread = threading.Thread(
-            target=target, name=f"forge-recover-{run_id}", daemon=True
-        )
-        with self._lock:
+            if existing is not None and (
+                existing.starting or existing.thread.is_alive()
+            ):
+                raise ValueError("run is still running")
             self._runs[run_id] = live
+            self._launch_locked(live, recover=True)
         self.persist_session()
-        live.thread.start()
-        return orchestrator.state.to_dict()
+        return self._describe(live)
 
     def recover_live(self, run_id: str) -> dict[str, Any]:
         with self._lock:
             live = self._runs.get(run_id)
-        if live is None:
-            raise KeyError(run_id)
-        if live.thread.is_alive():
-            raise ValueError("run is still running")
-        live.error = ""
-
-        def target() -> None:
-            try:
-                live.orchestrator.recover()
-            except Exception:
-                live.error = traceback.format_exc()
-
-        live.thread = threading.Thread(
-            target=target, name=f"forge-recover-{run_id}", daemon=True
-        )
-        live.thread.start()
+            if live is None:
+                raise KeyError(run_id)
+            self._launch_locked(live, recover=True)
         return self._describe(live)
 
     def control(self, run_id: str, action: str) -> dict[str, Any]:
+        if action == "recover":
+            with self._lock:
+                live = self._runs.get(run_id)
+                if live is None:
+                    raise KeyError(run_id)
+                if live.starting or live.thread.is_alive():
+                    raise ValueError("run process is still active")
+                if not is_recoverable_snapshot(live.orchestrator.state.to_dict()):
+                    raise ValueError("only a failed or interrupted run can be recovered")
+                self._launch_locked(live, recover=True)
+            return self._describe(live)
         with self._lock:
             live = self._runs.get(run_id)
         if live is None:
             raise KeyError(run_id)
-        if action == "recover":
-            if live.thread.is_alive():
-                raise ValueError("run process is still active")
-            if live.orchestrator.state.status not in {"failed", "cancelled", "running"}:
-                raise ValueError("only a failed or interrupted run can be recovered")
-            self._launch(live, recover=True)
-            return self._describe(live)
         {"pause": live.orchestrator.pause, "resume": live.orchestrator.resume, "cancel": live.orchestrator.cancel}[action]()
         return self._describe(live)
 
     @staticmethod
     def _describe(live: LiveRun, detailed: bool = False) -> dict[str, Any]:
-        if not live.thread.is_alive():
+        alive = live.starting or live.thread.is_alive()
+        state = live.orchestrator.state
+        if not alive:
             try:
-                live.orchestrator.state = live.orchestrator.store.load_state()
+                state = live.orchestrator.store.load_state()
             except Exception:
                 pass
-        value = live.orchestrator.state.to_dict()
-        value["alive"] = live.thread.is_alive()
+        snapshot = getattr(live.orchestrator, "state_snapshot", None)
+        value = snapshot() if alive and callable(snapshot) else state.to_dict()
+        value["alive"] = alive
+        value["recoverable"] = not alive and is_recoverable_snapshot(value)
         value["artifact_dir"] = str(live.orchestrator.store.root)
-        hint = getattr(live.orchestrator, "recovery_hint", None)
-        value["recovery"] = hint() if callable(hint) else {}
+        value["recovery"] = recovery_hint_from_snapshot(value)
         if live.error:
             value["error"] = live.error
         if detailed:
             value["active_agents"] = live.orchestrator.activity_snapshot()
             for name in ("events.jsonl", "usage.jsonl"):
                 path = live.orchestrator.store.root / name
-                value[name.removesuffix(".jsonl")] = (
-                    path.read_text(encoding="utf-8").splitlines()[-200:] if path.exists() else []
-                )
+                value[name.removesuffix(".jsonl")] = read_last_lines(path)
         return value
 
 

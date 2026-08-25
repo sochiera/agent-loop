@@ -132,23 +132,17 @@ CATALOG: tuple[CatalogEntry, ...] = (
 DEFAULTS = {
     "brain": "codex:gpt-5.6-sol:high",
     "planner": "codex:gpt-5.6-sol:high",
-    "coder_tdd": "codex:gpt-5.6-luna:high",
-    "coder_explore": "codex:gpt-5.6-luna:high",
-    "coder_classic": "codex:gpt-5.6-luna:high",
+    "coder": "codex:gpt-5.6-luna:high",
     "reviewer": "codex:gpt-5.6-terra:high",
     "tester": "codex:gpt-5.6-terra:high",
-    "whitebox": "codex:gpt-5.6-terra:high",
 }
 
 ROLE_TIMEOUTS = {
-    "brain": 180,
+    "brain": 1800,
     "planner": 900,
-    "coder_tdd": 3600,
-    "coder_explore": 3600,
-    "coder_classic": 3600,
+    "coder": 3600,
     "reviewer": 1800,
     "tester": 1800,
-    "whitebox": 1800,
     "probe": 60,
 }
 
@@ -196,40 +190,6 @@ def spec_with_effort(spec: Any, effort: str = "") -> Any:
     from .models import ModelSpec
 
     return ModelSpec(spec.provider, spec.model, effort or spec.effort)
-
-
-def assign_coder_models(
-    models: dict[str, Any],
-    pool: list[Any] | None = None,
-    *,
-    rng: Any = None,
-) -> dict[str, Any]:
-    import random
-
-    from .models import CODER_ROLES
-
-    source = list(pool) if pool is not None else [models[role] for role in CODER_ROLES]
-    if not source:
-        raise ValueError("at least one coder model is required")
-    picker = rng or random.Random()
-    needed = len(CODER_ROLES)
-    if len(source) >= needed:
-        chosen = picker.sample(source, needed)
-    else:
-        chosen = list(source)
-        while len(chosen) < needed:
-            chosen.append(picker.choice(source))
-        picker.shuffle(chosen)
-    updated = dict(models)
-    for role, spec in zip(CODER_ROLES, chosen):
-        updated[role] = spec
-    return updated
-
-
-def shuffle_coder_models(
-    models: dict[str, Any], *, rng: Any = None
-) -> dict[str, Any]:
-    return assign_coder_models(models, rng=rng)
 
 
 def catalog_payload() -> dict[str, Any]:

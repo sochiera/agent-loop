@@ -13,12 +13,77 @@ from pathlib import Path
 from forge.models import ROLE_NAMES, RunState
 from forge.web import (
     ForgeHandler,
+    LiveRun,
     RunRegistry,
     browse_filesystem,
+    is_recoverable_snapshot,
     read_text_file,
+    read_last_lines,
+    recovery_hint_from_snapshot,
     restart_payload,
     sanitize_preferences,
 )
+
+
+def test_recovery_hint_uses_same_state_snapshot() -> None:
+    hint = recovery_hint_from_snapshot(
+        {
+            "status": "failed",
+            "cycle": 7,
+            "sprint_number": 3,
+            "sprint_iteration": 4,
+            "needs_product_owner": False,
+            "active_iteration": {"phase": "testing", "slot": 5},
+        }
+    )
+
+    assert hint == {
+        "kind": "recover",
+        "action": "testing",
+        "cycle": 7,
+        "sprint": 3,
+        "slot": 5,
+    }
+
+
+def test_recovery_hint_tolerates_malformed_numeric_state() -> None:
+    hint = recovery_hint_from_snapshot(
+        {
+            "status": "failed",
+            "cycle": "broken",
+            "sprint_number": None,
+            "sprint_iteration": "also-broken",
+            "active_iteration": {"slot": "invalid"},
+        }
+    )
+
+    assert hint["cycle"] == 0
+    assert hint["sprint"] == 1
+    assert hint["slot"] == 1
+
+
+def test_only_external_stalls_are_advertised_as_recoverable() -> None:
+    assert is_recoverable_snapshot(
+        {"status": "stalled", "stalled_recoverable": True}
+    )
+    assert not is_recoverable_snapshot(
+        {"status": "stalled", "stalled_recoverable": False}
+    )
+
+
+def test_read_last_lines_reads_only_requested_tail(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(f"line-{index}\n" for index in range(500)), encoding="utf-8")
+
+    lines = read_last_lines(path, 200)
+
+    assert len(lines) == 200
+    assert lines[0] == "line-300"
+    assert lines[-1] == "line-499"
+
+    oversized = tmp_path / "oversized.jsonl"
+    oversized.write_bytes(b"x" * (2 * 1024 * 1024))
+    assert read_last_lines(oversized, max_bytes=1024) == []
 
 
 def test_web_control_room_serves_ui_and_api(tmp_path):
@@ -45,15 +110,18 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         html = urllib.request.urlopen(base + "/", timeout=2).read().decode()
         assert "Forge Control Room" in html
         assert "model-provider" in html
-        assert "Coder model pool" in html
+        assert "Coder model" in html
         assert 'id="shared-staff"' in html
         assert 'id="enable-backup"' in html
+        assert 'id="add-coder"' not in html
+        assert "model-remove" not in html
         assert 'id="restart"' in html
         assert 'id="browse-repo"' in html
         assert 'id="browse-brief"' in html
         assert 'id="fs-explorer"' in html
         script = urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
         assert "/api/catalog" in script
+        assert 'data-action="recover" ${!run.recoverable ? "disabled" : ""}' in script
         assert "/api/browse" in script
         assert "/api/file" in script
         assert "/api/preferences" in script
@@ -79,10 +147,10 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert by_key["or-gemini-3.7-flash"]["ids"]["opencode"] == (
             "openrouter/google/gemini-3.7-flash"
         )
-        assert catalog["defaults"]["coder_tdd"] == "codex:gpt-5.6-luna:high"
+        assert catalog["defaults"]["coder"] == "codex:gpt-5.6-luna:high"
         assert "model-effort" in html
         assert 'class="model-effort" required' not in html
-        assert "Coder draw" in urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
+        assert "Implementation model" in urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
         assert "opencode" in catalog["providers"]
         assert "claude" not in catalog["providers"]
         listing = json.loads(
@@ -121,7 +189,7 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         )
         assert saved_prefs["models"]["brain"] == "opencode:grok-4.6:high"
         loaded_prefs = json.loads(urllib.request.urlopen(base + "/api/preferences", timeout=2).read())
-        assert loaded_prefs["coder_models"] == ["opencode:kimi-k3:high"]
+        assert loaded_prefs["models"]["coder"] == "opencode:kimi-k3:high"
         health = json.loads(urllib.request.urlopen(base + "/api/health", timeout=2).read())
         assert health == {"ok": True, "active_runs": 0}
         restart = json.loads(
@@ -142,7 +210,7 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         thread.join()
 
 
-def test_post_runs_assigns_coder_models(tmp_path, monkeypatch):
+def test_post_runs_uses_single_coder_model(tmp_path, monkeypatch):
     repo = tmp_path / "empty-repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
@@ -174,14 +242,14 @@ def test_post_runs_assigns_coder_models(tmp_path, monkeypatch):
         "repo": str(repo),
         "brief_path": str(repo / "goal.md"),
         "push": False,
-        "models": {role: "codex:gpt-5.6-sol:high" for role in ROLE_NAMES},
+        "models": {
+            role: "codex:gpt-5.6-sol:high" for role in ROLE_NAMES if role != "coder"
+        },
         "coder_models": ["opencode:grok-4.6"],
     }
     created = registry.start(payload)
     models = created["config"]["models"]
-    assert models["coder_tdd"]["model"] == "xai/grok-4.6"
-    assert models["coder_explore"]["model"] == "xai/grok-4.6"
-    assert models["coder_classic"]["model"] == "xai/grok-4.6"
+    assert models["coder"]["model"] == "xai/grok-4.6"
     assert models["brain"]["model"] == "gpt-5.6-sol"
     listed = registry.list()
     assert listed[0]["run_id"] == "pool-run"
@@ -203,10 +271,12 @@ def test_post_runs_assigns_coder_models(tmp_path, monkeypatch):
             method="POST",
         )
         posted = json.loads(urllib.request.urlopen(request, timeout=2).read())
-        assert posted["config"]["models"]["coder_tdd"]["model"] == "xai/grok-4.6"
+        assert posted["config"]["models"]["coder"]["model"] == "xai/grok-4.6"
         bad = urllib.request.Request(
             base + "/api/runs",
-            data=json.dumps({**payload, "coder_models": []}).encode(),
+            data=json.dumps(
+                {**payload, "models": {**payload["models"], "coder": "invalid"}}
+            ).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -279,8 +349,10 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
         "brief_path": "/tmp/goal.md",
         "brief": "",
         "push": False,
-        "models": {"brain": "opencode:grok-4.6:high"},
-        "coder_models": ["opencode:kimi-k3:high", "codex:gpt-5.6-luna:high"],
+        "models": {
+            "brain": "opencode:grok-4.6:high",
+            "coder": "opencode:kimi-k3:high",
+        },
         "shared_staff_model": False,
         "backup": "",
     }
@@ -319,33 +391,153 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
         "brief": "",
         "push": True,
         "models": {},
-        "coder_models": [],
         "shared_staff_model": False,
         "backup": "",
     }
     saved = registry.save_preferences(
         {
-            "models": {"brain": "opencode:grok-4.6:high"},
-            "coder_models": ["opencode:kimi-k3:high"],
+            "models": {
+                "brain": "opencode:grok-4.6:high",
+                "coder": "opencode:kimi-k3:high",
+            },
         }
     )
     assert saved["models"]["brain"] == "opencode:grok-4.6:high"
-    assert registry.load_preferences()["coder_models"] == ["opencode:kimi-k3:high"]
+    assert registry.load_preferences()["models"]["coder"] == "opencode:kimi-k3:high"
 
     registry.start(
         {
             "repo": str(repo),
             "brief_path": str(repo / "goal.md"),
             "push": False,
-            "models": {role: "codex:gpt-5.6-sol:high" for role in ROLE_NAMES},
+            "models": {
+                role: "codex:gpt-5.6-sol:high" for role in ROLE_NAMES if role != "coder"
+            },
             "coder_models": ["opencode:grok-4.6"],
         }
     )
     (tmp_path / "ui-preferences.json").unlink()
     fallback = registry.load_preferences()
     assert fallback["models"]["brain"] == "codex:gpt-5.6-sol:high"
-    assert fallback["coder_models"] == [
-        "opencode:xai/grok-4.6",
-        "opencode:xai/grok-4.6",
-        "opencode:xai/grok-4.6",
-    ]
+    assert fallback["models"]["coder"] == "opencode:xai/grok-4.6"
+
+
+def test_concurrent_recover_live_launches_exactly_one_thread(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingOrchestrator:
+        run_id = "recover-race"
+
+        def __init__(self):
+            self.state = RunState(
+                run_id=self.run_id,
+                status="failed",
+                phase="review",
+                created_at="now",
+                updated_at="now",
+                config={},
+            )
+            self.store = type("Store", (), {"root": tmp_path / "artifacts"})()
+
+        def recover_failed(self) -> None:
+            entered.set()
+            release.wait(2)
+
+        def activity_snapshot(self) -> dict:
+            return {}
+
+        def recovery_hint(self) -> dict:
+            return {"kind": "recover", "action": "review"}
+
+    registry = RunRegistry(state_home=tmp_path)
+    live = LiveRun(BlockingOrchestrator(), threading.Thread())
+    registry._runs[live.orchestrator.run_id] = live
+    callers = threading.Barrier(3)
+    outcomes: list[str] = []
+
+    def recover() -> None:
+        callers.wait()
+        try:
+            registry.recover_live(live.orchestrator.run_id)
+        except ValueError:
+            outcomes.append("blocked")
+        else:
+            outcomes.append("started")
+
+    threads = [threading.Thread(target=recover) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    callers.wait()
+    assert entered.wait(1)
+    for thread in threads:
+        thread.join(timeout=1)
+    release.set()
+    live.thread.join(timeout=1)
+
+    assert sorted(outcomes) == ["blocked", "started"]
+
+
+def test_restore_session_exposes_dead_running_run_as_recoverable(
+    tmp_path, monkeypatch
+):
+    recovered = threading.Event()
+    release = threading.Event()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    class DeadRunningOrchestrator:
+        run_id = "dead-running"
+
+        def __init__(self):
+            self.config = type("Config", (), {"repo": str(repo)})()
+            self.state = RunState(
+                run_id=self.run_id,
+                status="running",
+                phase="coding",
+                created_at="now",
+                updated_at="now",
+                config={},
+            )
+            self.store = type(
+                "Store",
+                (),
+                {
+                    "root": tmp_path / "artifacts",
+                    "load_state": lambda store: self.state,
+                },
+            )()
+
+        @classmethod
+        def from_existing(cls, _repo, _run_id, **_kwargs):
+            return cls()
+
+        def recover_failed(self) -> None:
+            recovered.set()
+            release.wait(2)
+
+        def recovery_hint(self) -> dict:
+            return {"kind": "recover", "action": "coding"}
+
+        def activity_snapshot(self) -> dict:
+            return {}
+
+    monkeypatch.setattr("forge.web.ForgeOrchestrator", DeadRunningOrchestrator)
+    (tmp_path / "ui-session.json").write_text(
+        json.dumps([{"repo": str(repo), "run_id": "dead-running"}]),
+        encoding="utf-8",
+    )
+    registry = RunRegistry(state_home=tmp_path)
+
+    registry.restore_session()
+
+    restored = registry.get("dead-running")
+    assert restored["status"] == "running"
+    assert restored["alive"] is False
+    assert restored["recoverable"] is True
+    launched = registry.control("dead-running", "recover")
+    assert recovered.wait(1)
+    assert launched["alive"] is True
+    assert launched["recoverable"] is False
+    release.set()
+    registry._runs["dead-running"].thread.join(timeout=1)

@@ -1,24 +1,21 @@
-const roles = ["brain", "planner", "reviewer", "tester", "whitebox"];
+const roles = ["brain", "planner", "reviewer", "tester"];
 const roleMeta = {
-  brain: ["Persistent brain", "Product direction · strongest model"],
-  planner: ["Planner", "Repository-aware batch design"],
-  reviewer: ["Reviewer", "Compares all candidates"],
-  tester: ["Black-box tester", "Public behavior only"],
-  whitebox: ["White-box reporter", "Interprets short and long tests"],
+  brain: ["Product Owner", "Inspects the product and owns the backlog"],
+  planner: ["Planner", "Turns one prioritized story into bounded tasks"],
+  reviewer: ["Reviewer", "Pragmatic serious-defect gate"],
+  tester: ["Unified tester", "White-box and public-behavior acceptance"],
 };
 const defaults = {
   brain: "codex:gpt-5.6-sol:high",
   planner: "codex:gpt-5.6-sol:high",
   reviewer: "codex:gpt-5.6-terra:high",
   tester: "codex:gpt-5.6-terra:high",
-  whitebox: "codex:gpt-5.6-terra:high",
 };
 const defaultCoder = "codex:gpt-5.6-luna:high";
-const defaultCoderPool = [defaultCoder, defaultCoder, defaultCoder];
-const maxCoderModels = 12;
-const phases = ["preflight", "brain", "planning", "coding", "review", "winner-fix", "delivery", "whitebox", "black-box"];
-const phaseLabels = ["Preflight", "Brain", "Plan", "Code ×3", "Review", "Fix", "Deliver", "White-box", "Black-box"];
-const storageKey = "forge-control-room-v4";
+const defaultCoderPool = [defaultCoder];
+const phases = ["preflight", "product-owner", "planning", "coding", "review", "testing", "delivery", "finalizing"];
+const phaseLabels = ["Preflight", "Product owner", "Plan", "Code", "Review", "Test", "Deliver", "Finalize"];
+const storageKey = "forge-control-room-v5";
 const providerLabels = {codex: "Codex", opencode: "OpenCode"};
 const familyLabels = {gpt: "GPT", grok: "Grok", qwen: "Qwen", deepseek: "DeepSeek", gemini: "Gemini", kimi: "Kimi"};
 const effortLabels = {"": "Default", low: "Low", medium: "Medium", high: "High"};
@@ -49,6 +46,11 @@ function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, character => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   })[character]);
+}
+
+function safeInteger(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : fallback;
 }
 
 function formatTokens(value) {
@@ -157,53 +159,36 @@ function coderSelectors() {
 }
 
 function relabelCoderCards() {
-  const cards = coderCards();
-  cards.forEach((card, index) => {
-    card.querySelector(".model-label").textContent = `Coder ${index + 1}`;
-    const remove = card.querySelector(".model-remove");
-    if (remove) remove.disabled = cards.length <= 1;
+  coderCards().forEach(card => {
+    card.querySelector(".model-label").textContent = "Coder";
   });
-  const add = document.querySelector("#add-coder");
-  if (add) add.disabled = cards.length >= maxCoderModels;
 }
 
 function addCoderCard(value = defaultCoder) {
-  if (coderCards().length >= maxCoderModels) return;
+  if (coderCards().length) return;
   const template = document.querySelector("#model-template");
   const fragment = template.content.cloneNode(true);
   const card = fragment.querySelector(".model-card");
   card.dataset.role = "coder";
-  fragment.querySelector(".model-help").textContent = "Drawn into TDD / explore / classic";
-  const remove = fragment.querySelector(".model-remove");
-  remove.classList.remove("hidden");
-  remove.addEventListener("click", event => {
-    event.preventDefault();
-    removeCoderCard(card);
-  });
+  fragment.querySelector(".model-help").textContent = "Implements one immutable iteration plan";
   applySelector(card, value);
   document.querySelector("#coder-models").appendChild(fragment);
   relabelCoderCards();
 }
 
-function removeCoderCard(card) {
-  if (coderCards().length <= 1) return;
-  card.remove();
-  relabelCoderCards();
-  saveForm();
-}
-
 function replaceCoderPool(values) {
   document.querySelector("#coder-models").innerHTML = "";
   const pool = values.length ? values : defaultCoderPool;
-  pool.slice(0, maxCoderModels).forEach(value => addCoderCard(value));
+  addCoderCard(pool[0]);
 }
 
 function savedCoderPool(value) {
+  if (value.models?.coder) return [value.models.coder];
   if (Array.isArray(value.coder_models) && value.coder_models.length) return value.coder_models;
   const previous = ["coder_tdd", "coder_explore", "coder_classic"]
     .map(role => value.models?.[role])
     .filter(Boolean);
-  return previous.length ? previous : defaultCoderPool;
+  return previous.length ? [previous[0]] : defaultCoderPool;
 }
 
 function staffIdentity(value) {
@@ -275,7 +260,7 @@ function buildModelFields() {
   const staffCard = staffFragment.querySelector(".model-card");
   staffCard.dataset.role = "staff";
   staffFragment.querySelector(".model-label").textContent = "Staff model";
-  staffFragment.querySelector(".model-help").textContent = "Shared by brain, planner, reviewer, tester, whitebox";
+  staffFragment.querySelector(".model-help").textContent = "Shared by Product Owner, planner, reviewer, and tester";
   applySelector(staffCard, defaults.brain);
   staffBox.appendChild(staffFragment);
   const efforts = document.querySelector("#staff-efforts");
@@ -316,6 +301,7 @@ function collectForm() {
   const models = shared
     ? staffSelectorsFromShared()
     : Object.fromEntries(roles.map(role => [role, selectorFromCard(roleCard(role))]));
+  models.coder = coderSelectors()[0] || defaultCoder;
   return {
     repo: document.querySelector("#repo").value,
     branch: document.querySelector("#branch").value,
@@ -324,7 +310,6 @@ function collectForm() {
     brief: document.querySelector("#brief").value,
     push: document.querySelector("#push").checked,
     models,
-    coder_models: coderSelectors(),
     shared_staff_model: shared,
     backup: shared && backupOn ? selectorFromCard(document.querySelector("#staff-backup .model-card")) : "",
   };
@@ -492,12 +477,13 @@ function phaseRail(run) {
 }
 
 function runCard(run) {
-  const index = phases.indexOf(run.phase);
-  const progress = run.status === "complete" ? 100 : Math.max(4, ((index + 1) / phases.length) * 100);
+  const sprint = safeInteger(run.sprint_number);
+  const iteration = safeInteger(run.sprint_iteration);
+  const progress = Math.max(4, Math.min(100, (iteration / 10) * 100));
   const active = Object.keys(run.active_agents || {}).length;
   return `<article class="run-card ${selected === run.run_id ? "selected" : ""}" data-id="${escapeHtml(run.run_id)}">
     <div class="run-top"><span class="run-id">${escapeHtml(run.run_id)}</span><span class="badge ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></div>
-    <p class="phase">${escapeHtml(run.phase)} · batch ${run.cycle}${active ? ` · ${active} active` : ""}</p>
+    <p class="phase">${escapeHtml(run.phase)} · sprint ${sprint} · iteration ${iteration}/10${active ? ` · ${active} active` : ""}</p>
     <div class="run-progress ${run.alive ? "animated" : ""}"><span style="width:${progress}%"></span></div>
   </article>`;
 }
@@ -519,24 +505,18 @@ function activeAgents(run) {
   return `<h3>Active agents</h3><div class="active-grid">${entries.map(([key, agent]) => {
     const elapsed = Math.max(0, Math.round((Date.now() - Date.parse(agent.started_at)) / 1000));
     const progress = agent.tasks_total ? `${agent.tasks_completed || 0}/${agent.tasks_total} tasks` : `attempt ${agent.attempt}`;
-    return `<article class="agent-card"><strong>${escapeHtml(agent.role || key)}</strong><span>${escapeHtml(agent.model)}</span><div class="agent-meta"><b>${progress}</b><b>${agent.changed_files ?? 0} files · ${elapsed}s</b></div></article>`;
+    const files = `${agent.changed_files ?? 0} files · ${elapsed}s`;
+    return `<article class="agent-card"><strong>${escapeHtml(agent.role || key)}</strong><span>${escapeHtml(agent.model)}</span><div class="agent-meta"><b>${escapeHtml(progress)}</b><b>${escapeHtml(files)}</b></div></article>`;
   }).join("")}</div>`;
 }
 
-function candidateRows(metrics = {}) {
-  return Object.entries(metrics).map(([name, metric]) => `<tr>
-    <td><strong>${escapeHtml(name)}${metric.selected ? " ★" : ""}</strong></td><td>${escapeHtml(metric.status)}</td>
-    <td>${metric.tasks_completed}/${metric.tasks_total}</td><td>${metric.review_score ?? "—"}</td>
-    <td>${formatTokens(metric.total_tokens)}</td><td>${metric.validation_passed}/${metric.validation_total}</td>
-  </tr>`).join("");
-}
-
-function batches(run) {
-  if (!(run.batches || []).length) return `<p class="empty">No batch has been delivered yet.</p>`;
-  return run.batches.map(batch => `<article class="batch">
-    <div class="batch-head"><div><h3>Batch ${batch.cycle}: ${escapeHtml(batch.objective)}</h3><p>Commit <code>${escapeHtml(batch.commit).slice(0, 12)}</code></p></div><strong class="winner">${escapeHtml(batch.winner)} won</strong></div>
-    <table class="candidate-table"><thead><tr><th>Candidate</th><th>Status</th><th>Tasks</th><th>Review</th><th>Tokens</th><th>Checks</th></tr></thead><tbody>${candidateRows(batch.candidate_metrics)}</tbody></table>
-    <p><strong>Black-box:</strong> ${escapeHtml(batch.black_box?.summary || "No report")}</p>
+function iterations(run) {
+  if (!(run.iterations || []).length) return `<p class="empty">No iteration has been accepted yet.</p>`;
+  return run.iterations.map(iteration => `<article class="batch">
+    <div class="batch-head"><div><h3>${escapeHtml(iteration.id)}: ${escapeHtml(iteration.objective)}</h3><p>Story ${escapeHtml(iteration.story_id)} · commit <code>${escapeHtml(iteration.commit).slice(0, 12)}</code></p></div><strong class="iteration-kind">${escapeHtml(iteration.kind)}</strong></div>
+    <p><strong>Review:</strong> ${escapeHtml(iteration.review_summary || "Accepted")}</p>
+    <p><strong>Unified test:</strong> ${escapeHtml(iteration.test_summary || "Accepted")}</p>
+    <p>${safeInteger(iteration.coder_rounds)} coder round(s) · ${safeInteger(iteration.review_rounds)} review round(s) · ${safeInteger(iteration.tester_rounds)} test round(s)</p>
   </article>`).join("");
 }
 
@@ -554,15 +534,9 @@ function eventRows(run) {
 
 function coderDraw(run) {
   const models = run.config?.models || {};
-  const labels = {coder_tdd: "TDD", coder_explore: "Explore", coder_classic: "Classic"};
-  const rows = Object.entries(labels).map(([role, label]) => {
-    const spec = models[role];
-    const text = spec
-      ? `${spec.provider}:${spec.model}${spec.effort ? `:${spec.effort}` : ""}`
-      : "—";
-    return `<li><strong>${escapeHtml(label)}</strong> ${escapeHtml(text)}</li>`;
-  }).join("");
-  return `<h3>Coder draw</h3><ul class="coder-draw">${rows}</ul>`;
+  const spec = models.coder;
+  const text = spec ? `${spec.provider}:${spec.model}${spec.effort ? `:${spec.effort}` : ""}` : "—";
+  return `<h3>Implementation model</h3><ul class="coder-draw"><li><strong>Coder</strong> ${escapeHtml(text)}</li></ul>`;
 }
 
 function eventsBox() {
@@ -592,7 +566,7 @@ function detail(run) {
     <div class="stats">
       <div class="stat"><small>Status</small><strong>${escapeHtml(run.status)}</strong></div>
       <div class="stat"><small>Phase</small><strong>${escapeHtml(run.phase)}</strong></div>
-      <div class="stat"><small>Batch</small><strong>${run.cycle}</strong></div>
+      <div class="stat"><small>Sprint progress</small><strong>${safeInteger(run.sprint_iteration)}/10</strong></div>
       <div class="stat"><small>Input / cached</small><strong>${formatTokens(usage.input)} / ${formatTokens(usage.cached)}</strong></div>
       <div class="stat"><small>Output tokens</small><strong>${formatTokens(usage.output)}</strong></div>
     </div>
@@ -603,12 +577,12 @@ function detail(run) {
       <button class="button ghost" data-action="pause" ${run.status !== "running" ? "disabled" : ""}>Pause</button>
       <button class="button ghost" data-action="resume" ${run.status !== "paused" && !run.paused ? "disabled" : ""}>Resume</button>
       <button class="button ghost" data-action="cancel" ${!controllable ? "disabled" : ""}>Cancel</button>
-      <button class="button secondary" data-action="recover" ${!["failed", "paused", "cancelled"].includes(run.status) || run.alive ? "disabled" : ""}>${run.recovery?.kind === "resume_review" ? `Resume review (batch ${run.recovery.cycle})` : "Recover same run"}</button>
+      <button class="button secondary" data-action="recover" ${!run.recoverable ? "disabled" : ""}>Recover same sprint</button>
     </div>
     ${activeAgents(run)}
     ${warnings ? `<ul class="warnings">${warnings}</ul>` : ""}
     ${run.error ? `<details><summary>Process error</summary><pre class="error-detail">${escapeHtml(run.error)}</pre></details>` : ""}
-    ${batches(run)}
+    ${iterations(run)}
     <h3>Recent events</h3><div class="events">${eventRows(run) || "No events yet."}</div>`;
 }
 
@@ -770,10 +744,6 @@ document.querySelector("#enable-backup").addEventListener("change", () => {
   syncStaffMode();
   saveForm();
 });
-document.querySelector("#add-coder").addEventListener("click", () => {
-  addCoderCard();
-  saveForm();
-});
 document.querySelector("#restart").addEventListener("click", () => restartForge(false));
 document.querySelector("#restart-yes").addEventListener("click", () => restartForge(true));
 document.querySelector("#restart-no").addEventListener("click", () => showRestartConfirm(false));
@@ -802,22 +772,10 @@ document.querySelector("#run-form").addEventListener("submit", async event => {
     brief_text: document.querySelector("#brief").value.trim(),
     push: document.querySelector("#push").checked,
     models: form.models,
-    coder_models: form.coder_models,
     shared_staff_model: form.shared_staff_model,
     backup: form.backup,
   };
   if (!payload.brief_path && !payload.brief_text) { error.textContent = "Choose a brief file or paste the product brief."; return; }
-  try {
-    const runs = await api("/api/runs");
-    const captured = runs.find(run => run.recovery?.kind === "resume_review" && !run.alive);
-    if (captured && !window.confirm(
-      `Batch ${captured.recovery.cycle} already has a captured review. Starting a new run discards that coding work.`
-    )) {
-      return;
-    }
-  } catch {
-    /* listing is best-effort; the start request still proceeds */
-  }
   button.disabled = true;
   button.firstElementChild.textContent = "Starting…";
   try {

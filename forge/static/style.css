@@ -121,9 +121,6 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 .model-picks { grid-column: 1 / -1; display: grid; grid-template-columns: 7.6rem minmax(0, 1fr) 6.6rem; gap: 6px; margin-top: 7px; }
 .model-card select { padding: 8px 10px; font-size: 12px; }
 .model-card small { align-self: center; }
-.model-remove { justify-self: end; align-self: start; border: 0; border-radius: 7px; padding: 5px 8px; background: white; color: var(--muted); cursor: pointer; font-size: 11px; font-weight: 700; }
-.model-remove:hover:not(:disabled) { color: var(--red); }
-.model-remove:disabled { opacity: .35; cursor: not-allowed; }
 .coder-pool-help { margin: -4px 0 12px; color: var(--muted); font-size: 12px; }
 .staff-share { margin: 0 0 16px; }
 .shared-staff { display: grid; gap: 12px; margin-bottom: 16px; }
@@ -227,10 +224,7 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 .batch { margin-top: 16px; padding: 18px; border: 1px solid var(--line); border-radius: 12px; }
 .batch-head { display: flex; justify-content: space-between; gap: 14px; }
 .batch-head p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
-.winner { color: var(--green); }
-.candidate-table { width: 100%; margin-top: 13px; border-collapse: collapse; font-size: 12px; }
-.candidate-table th, .candidate-table td { padding: 8px; border-bottom: 1px solid var(--line); text-align: left; }
-.candidate-table th { color: var(--muted); font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
+.iteration-kind { color: var(--green); }
 .events { max-height: 320px; margin-top: 10px; overflow: auto; border-radius: 10px; background: #202722; color: #e4ebe5; padding: 12px; font: 11px/1.55 ui-monospace, monospace; }
 .event { display: grid; grid-template-columns: 64px 90px 1fr; gap: 9px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,.06); }
 .event time { color: #8fa198; }
@@ -254,5 +248,4 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
   .section-title, .brief-head, .model-head, .submit-row { align-items: stretch; flex-direction: column; }
   .phase-rail { grid-template-columns: repeat(4, 1fr); }
   .stats, .coder-draw { grid-template-columns: repeat(2, 1fr); }
-  .candidate-table { display: block; overflow-x: auto; }
 }

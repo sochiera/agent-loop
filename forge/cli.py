@@ -12,40 +12,32 @@ from .web import serve
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="forge", description="Competitive coding-agent orchestrator")
+    parser = argparse.ArgumentParser(prog="forge", description="Continuous product sprint orchestrator")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="run Forge in the foreground")
     run.add_argument("--repo", required=True, help="target Git repository")
     run.add_argument("--brief", required=True, help="final product brief in Markdown")
     run.add_argument("--branch", default="main", help="local branch to fast-forward and push")
     for role in ROLE_NAMES:
-        optional = role.startswith("coder_") or role == "whitebox"
         run.add_argument(
             "--" + role.replace("_", "-"),
-            required=not optional,
-            default=DEFAULT_MODEL_SELECTORS[role] if optional else None,
+            default=DEFAULT_MODEL_SELECTORS[role],
             metavar="PROVIDER:MODEL[:EFFORT]",
         )
     run.add_argument(
         "--backup",
         default=None,
         metavar="PROVIDER:MODEL[:EFFORT]",
-        help="fallback model used when a staff model hits a usage limit",
+        help="fallback model used when a role model hits a usage limit",
     )
     run.add_argument("--no-push", action="store_true", help="commit locally without pushing")
     run.add_argument("--agent-timeout", type=int, default=3600, metavar="SECONDS")
-    run.add_argument(
-        "--shuffle-coders",
-        action="store_true",
-        help="randomly assign the three coder models to TDD, explore, and classic",
-    )
-
     resume = sub.add_parser("resume", help="recover a failed run from its last checkpoint")
     resume.add_argument("--repo", required=True, help="target Git repository")
     resume.add_argument("--run-id", required=True, help="existing Forge run id")
 
     recover = sub.add_parser(
-        "recover", help="resume a failed or interrupted run after its latest delivered batch"
+        "recover", help="resume a failed or interrupted run at its durable sprint phase"
     )
     recover.add_argument("--repo", required=True, help="target Git repository")
     recover.add_argument("--run-id", required=True, help="existing Forge run identifier")
@@ -85,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             state = orchestrator.recover()
         print(json.dumps(state.to_dict(), indent=2))
-        return 0 if state.status == "complete" else 1
+        return 0 if state.status in {"cancelled", "paused"} else 1
     models = {
         role: ModelSpec.parse(getattr(args, role))
         for role in ROLE_NAMES
@@ -97,10 +89,9 @@ def main(argv: list[str] | None = None) -> int:
         models=models,
         push=not args.no_push,
         agent_timeout_seconds=args.agent_timeout,
-        shuffle_coders=args.shuffle_coders,
         backup=ModelSpec.parse(args.backup) if args.backup else None,
     )
     orchestrator = ForgeOrchestrator(config, on_event=on_event)
     state = orchestrator.run()
     print(json.dumps(state.to_dict(), indent=2))
-    return 0 if state.status == "complete" else 1
+    return 0 if state.status in {"cancelled", "paused"} else 1

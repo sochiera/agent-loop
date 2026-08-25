@@ -95,8 +95,9 @@ class AgentRequest:
     prompt: str
     cwd: Path
     session_id: str | None = None
-    access: str = "write"  # none, read, or write
+    access: str = "write"  # none, read, inspect, or write
     schema: dict[str, Any] | None = None
+    schema_dir: Path | None = None
     extra_writable_dirs: tuple[Path, ...] = ()
     timeout_seconds: int = 3600
     environment: dict[str, str] = field(default_factory=dict)
@@ -118,26 +119,17 @@ def _json_lines(raw: str) -> list[dict[str, Any]]:
     return values
 
 
-def _walk(value: Any):
-    yield value
-    if isinstance(value, dict):
-        for child in value.values():
-            yield from _walk(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _walk(child)
-
-
-def _session_id(events: list[dict[str, Any]]) -> str | None:
+def _session_id(
+    events: list[dict[str, Any]], requested_session_id: str | None = None
+) -> str | None:
+    if requested_session_id:
+        return requested_session_id
     keys = ("thread_id", "threadId", "session_id", "sessionId", "sessionID")
     for event in events:
-        for item in _walk(event):
-            if not isinstance(item, dict):
-                continue
-            for key in keys:
-                value = item.get(key)
-                if isinstance(value, str) and value:
-                    return value
+        for key in keys:
+            value = event.get(key)
+            if isinstance(value, str) and value:
+                return value
     return None
 
 
@@ -218,44 +210,54 @@ class AgentRunner:
         self._cancelled = threading.Event()
 
     def cancel(self) -> None:
-        self._cancelled.set()
         with self._lock:
+            self._cancelled.set()
             processes = list(self._processes)
         for process in processes:
             if process.poll() is None:
                 _signal_session(process.pid, signal.SIGTERM)
-
-        def kill_later() -> None:
-            time.sleep(2)
-            for child in processes:
-                if child.poll() is None:
-                    _signal_session(child.pid, signal.SIGKILL)
-
-        if processes:
-            threading.Thread(target=kill_later, name="forge-agent-kill", daemon=True).start()
+        deadline = time.monotonic() + 2
+        while any(process.poll() is None for process in processes):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        for process in processes:
+            # The session can still contain grandchildren after its leader exits.
+            _signal_session(process.pid, signal.SIGKILL)
+        for process in processes:
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
 
     def allow(self) -> None:
-        self._cancelled.clear()
+        with self._lock:
+            self._cancelled.clear()
 
     def run(self, request: AgentRequest) -> AgentResult:
         if self._cancelled.is_set():
             raise AgentCancelled(f"{request.role} cancelled")
+        if request.access not in {"none", "read", "inspect", "write", "test"}:
+            raise ValueError(f"unsupported agent access profile: {request.access}")
         request.cwd.mkdir(parents=True, exist_ok=True)
         command = self._command(request)
         environment = os.environ.copy()
         environment.update(request.environment)
         started = time.monotonic()
-        process = subprocess.Popen(
-            command,
-            cwd=request.cwd,
-            env=environment,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
         with self._lock:
+            if self._cancelled.is_set():
+                raise AgentCancelled(f"{request.role} cancelled")
+            process = subprocess.Popen(
+                command,
+                cwd=request.cwd,
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
             self._processes.append(process)
         try:
             raw, _ = process.communicate(request.prompt, timeout=request.timeout_seconds)
@@ -296,7 +298,7 @@ class AgentRunner:
             "opencode": _opencode_parse,
         }[request.model.provider]
         text, usage, tool_calls = parser(events)
-        session_id = request.session_id or _session_id(events)
+        session_id = _session_id(events, request.session_id)
         if not text.strip():
             # A custom wrapper or future CLI version may print plain text.
             non_json = [line for line in raw.splitlines() if not line.lstrip().startswith("{")]
@@ -323,7 +325,9 @@ class AgentRunner:
     def _schema_file(self, request: AgentRequest) -> Path | None:
         if request.schema is None:
             return None
-        path = request.cwd / f".forge-{request.role}-schema.json"
+        root = request.schema_dir or request.cwd
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f".forge-{request.role}-schema.json"
         atomic_write(path, json.dumps(request.schema, sort_keys=True))
         return path
 
@@ -337,7 +341,13 @@ class AgentRunner:
         if request.model.effort:
             command += ["--config", f'model_reasoning_effort="{request.model.effort}"']
         command += ["--config", 'approval_policy="never"']
-        sandbox = "danger-full-access" if request.access == "write" else "read-only"
+        sandbox = {
+            "write": "workspace-write",
+            "test": "workspace-write",
+            "inspect": "workspace-write",
+            "read": "read-only",
+            "none": "read-only",
+        }[request.access]
         if request.session_id:
             command += ["--config", f'sandbox_mode="{sandbox}"']
         else:
@@ -362,6 +372,13 @@ class AgentRunner:
                 "tools.web_search=false",
                 "--config",
                 "tools.view_image=false",
+            ]
+        elif request.access == "inspect":
+            command += [
+                "--config",
+                "tools.web_search=false",
+                "--config",
+                "tools.view_image=true",
             ]
         schema = self._schema_file(request)
         if schema:
@@ -391,13 +408,17 @@ class AgentRunner:
             command += ["--variant", request.model.effort]
         if request.session_id:
             command += ["--session", request.session_id]
-        if request.access == "write":
-            command += ["--auto"]
-        else:
-            request.environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
-                self._opencode_restricted_config()
-            )
-            command += ["--agent", "forge-brain" if request.access == "none" else "forge-readonly"]
+        request.environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+            self._opencode_restricted_config()
+        )
+        agent = {
+            "none": "forge-brain",
+            "read": "forge-readonly",
+            "inspect": "forge-product-owner",
+            "write": "forge-writer",
+            "test": "forge-tester",
+        }[request.access]
+        command += ["--agent", agent]
         return command
 
     @staticmethod
@@ -421,6 +442,60 @@ class AgentRunner:
                         "list": "allow",
                         "lsp": "allow",
                     },
-                }
+                },
+                "forge-product-owner": {
+                    "mode": "primary",
+                    "prompt": (
+                        "Inspect and exercise the disposable product snapshot. "
+                        "Never commit, push, or alter Git refs. Return the requested JSON."
+                    ),
+                    "permission": {
+                        "*": "deny",
+                        "read": "allow",
+                        "glob": "allow",
+                        "grep": "allow",
+                        "list": "allow",
+                        "lsp": "allow",
+                        "bash": "allow",
+                        "webfetch": "allow",
+                    },
+                },
+                "forge-writer": {
+                    "mode": "primary",
+                    "prompt": (
+                        "Work only in the current Forge workspace. Never commit, push, "
+                        "switch branches, alter Git refs, or access another worktree."
+                    ),
+                    "permission": {
+                        "*": "deny",
+                        "read": "allow",
+                        "edit": "allow",
+                        "glob": "allow",
+                        "grep": "allow",
+                        "list": "allow",
+                        "lsp": "allow",
+                        "bash": "deny",
+                        "external_directory": "deny",
+                    },
+                },
+                "forge-tester": {
+                    "mode": "primary",
+                    "prompt": (
+                        "Exercise the disposable product copy and record evidence. "
+                        "Never access another directory or claim unexecuted checks."
+                    ),
+                    "permission": {
+                        "*": "deny",
+                        "read": "allow",
+                        "edit": "allow",
+                        "glob": "allow",
+                        "grep": "allow",
+                        "list": "allow",
+                        "lsp": "allow",
+                        "bash": "allow",
+                        "webfetch": "allow",
+                        "external_directory": "deny",
+                    },
+                },
             },
         }

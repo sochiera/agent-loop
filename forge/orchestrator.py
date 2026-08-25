@@ -1,112 +1,95 @@
-"""The deliberately small Forge state machine."""
+"""Continuous sprint orchestration with durable product and quality gates."""
 
 from __future__ import annotations
 
 import json
 import os
+import queue
 import shutil
 import subprocess
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .agents import (
     AgentCancelled,
     AgentConfigurationFailure,
     AgentFailure,
     AgentRequest,
-    AgentResult,
     AgentRunner,
     AgentTimeout,
     AgentUsageLimit,
     is_usage_limit,
 )
-from .artifacts import ArtifactStore, atomic_write, utc_now
-from .catalog import (
-    ROLE_TIMEOUTS,
-    assign_coder_models,
-    model_family,
-    model_identity,
-    shuffle_coder_models,
-    spec_with_effort,
-)
+from .artifacts import ArtifactStore, utc_now
+from .catalog import ROLE_TIMEOUTS, model_family, model_identity, spec_with_effort
 from .contracts import (
-    BRAIN_SCHEMA,
-    REVIEW_SCHEMA,
-    TEST_SCHEMA,
-    WHITEBOX_SCHEMA,
-    BrainDecision,
+    ITERATION_PLAN_SCHEMA,
+    ITERATION_REVIEW_SCHEMA,
+    ITERATION_TEST_SCHEMA,
+    PRODUCT_OWNER_SCHEMA,
     ContractError,
-    parse_brain,
-    parse_review,
-    parse_test,
-    parse_whitebox,
+    parse_iteration_plan,
+    parse_iteration_review,
+    parse_iteration_test,
+    parse_product_owner,
 )
 from .display import optional_virtual_display
-from .gitops import CandidateWorktree, GitCompetition, GitError
-from .models import AgentResult, CODER_ROLES, STAFF_ROLES, ModelSpec, RunConfig, RunState, Usage
-from .plans import (
-    PlanProgress,
-    candidate_validation_commands,
-    progress,
-    validate_plan,
-    validation_commands,
-)
+from .gitops import CandidateWorktree, GitError, GitWorkspace, export_revision
+from .locking import RepositoryExecutionLock
+from .models import AgentResult, ModelSpec, ROLE_NAMES, RunConfig, RunState
 from .prompts import (
-    brain_feedback,
-    brain_initial,
-    coder_continuation,
-    coder_initial,
-    contract_feedback,
-    planner_prompt,
-    reviewer_prompt,
-    tester_prompt,
-    whitebox_prompt,
-    winner_fix_prompt,
+    implementation_prompt,
+    iteration_reviewer_prompt,
+    product_owner_prompt,
+    sprint_planner_prompt,
+    unified_tester_prompt,
 )
-from .report import build_brain_report
+from .sprint import SPRINT_SCHEDULE, assert_sprint_cursor, compact_iteration, ready_stories, slot_kind
 from .validation import run_commands
+
+
+PROBE_PROMPT = "Reply with the single word ready."
+EVENT_QUEUE_LIMIT = 256
+EVENT_SHUTDOWN_TIMEOUT_SECONDS = 1.0
+_EVENT_STOP = object()
+_NO_CALLBACK_CONTEXT = object()
+
+
+def _product_owner_retry_prompt(error: Exception, *, inspected: bool) -> str:
+    if not inspected:
+        return (
+            "Forge rejected this attempt because no product inspection tool call was observed. "
+            "Inspect and exercise the product with tools now, then return the complete corrected "
+            f"Product Owner JSON object only. Contract detail: {error}"
+        )
+    return (
+        "Your product inspection remains valid, but Forge rejected the final JSON: "
+        f"{error}. Return the complete corrected Product Owner JSON object only."
+    )
 
 
 class RunCancelled(RuntimeError):
     pass
 
 
-PROBE_PROMPT = "Reply with the single word ready."
+class RunInterrupted(RuntimeError):
+    pass
 
 
-@dataclass
-class CandidateOutcome:
-    name: str
-    worktree: CandidateWorktree
-    session_id: str | None
-    status: str
-    plan: PlanProgress
-    turns: int
-    validation: list[dict[str, Any]]
-    summary: str
-    warnings: list[str]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "worktree": str(self.worktree.path),
-            "branch": self.worktree.branch,
-            "session_id": self.session_id,
-            "status": self.status,
-            "tasks": {"completed": self.plan.completed, "total": self.plan.total},
-            "turns": self.turns,
-            "validation": self.validation,
-            "summary": self.summary,
-            "warnings": self.warnings,
-        }
+class IterationStalled(RuntimeError):
+    def __init__(self, message: str, *, recoverable: bool = False):
+        super().__init__(message)
+        self.recoverable = recoverable
 
 
 class ForgeOrchestrator:
+    """Drive Product Owner sprints until the operator pauses or cancels the run."""
+
     def __init__(
         self,
         config: RunConfig,
@@ -131,14 +114,16 @@ class ForgeOrchestrator:
         self.state_home = (state_home or default_home / "forge").expanduser().resolve()
         self.brain_dir = self.state_home / "brains" / self.run_id
         self.worktree_root = self.state_home / "worktrees" / self.run_id
+        self.tester_root = self.state_home / "testers" / self.run_id
         self.check_binaries = check_binaries
         now = utc_now()
         if resume:
             self.state = self.store.load_state()
             self.config = RunConfig.from_dict(self.state.config)
+            self.config.repo = str(self.repo)
+            self.state.config = self.config.to_dict()
+            self.brief_path = Path(self.config.brief).expanduser().resolve()
         else:
-            if config.shuffle_coders:
-                config.models = shuffle_coder_models(config.models)
             self.state = RunState(
                 run_id=self.run_id,
                 status="created",
@@ -153,54 +138,27 @@ class ForgeOrchestrator:
                         "effort": spec.effort,
                     }
                     for role, spec in config.models.items()
+                    if role in ROLE_NAMES
                 },
             )
         self._control = threading.Condition()
+        self._state_lock = threading.RLock()
         self._activity_lock = threading.Lock()
         self._roster_lock = threading.Lock()
-        self._competition: GitCompetition | None = None
-
-    def pause(self) -> None:
-        with self._control:
-            self.state.paused = True
-            if self.state.status == "running":
-                self.state.status = "paused"
-            self._save("Pause requested; Forge will pause at the next phase boundary.")
-
-    def resume(self) -> None:
-        with self._control:
-            self.state.paused = False
-            if self.state.status == "paused" and not self.state.cancel_requested:
-                self.state.status = "running"
-            self._control.notify_all()
-            self._save("Run resumed.")
-
-    def cancel(self) -> None:
-        with self._control:
-            self.state.cancel_requested = True
-            self.state.paused = False
-            self._control.notify_all()
-            self._save("Cancellation requested.")
-        self._runner_cancel()
-
-    def mark_interrupted(self, message: str) -> None:
-        with self._activity_lock:
-            self.state.active_agents.clear()
-        if self.state.status in {"running", "paused", "created"}:
-            self.state.status = "failed"
-            self.state.paused = False
-            self._save(message)
-        self._runner_cancel()
-
-    def _runner_cancel(self) -> None:
-        cancel = getattr(self.runner, "cancel", None)
-        if callable(cancel):
-            cancel()
-
-    def _runner_allow(self) -> None:
-        allow = getattr(self.runner, "allow", None)
-        if callable(allow):
-            allow()
+        self._event_lock = threading.Lock()
+        self._event_queue: queue.Queue[dict[str, Any] | object] | None = None
+        self._event_thread: threading.Thread | None = None
+        self._event_accepting = False
+        self._event_generation: int | None = None
+        self._execution_generation = 0
+        self._active_execution_generation: int | None = None
+        self._callback_context = threading.local()
+        self._control_revision = 0
+        self._last_execution_control_revision = 0
+        self._interrupt_requested = False
+        self._execution_controls_sealed = True
+        self._repository_lock_owned = False
+        self._workspace: GitWorkspace | None = None
 
     @classmethod
     def from_existing(
@@ -216,8 +174,7 @@ class ForgeOrchestrator:
         store = ArtifactStore(Path(repo), run_id)
         state = store.load_state()
         config = RunConfig.from_dict(state.config)
-        if "whitebox" not in config.models:
-            config.models["whitebox"] = config.models.get("tester") or config.models["reviewer"]
+        config.repo = str(Path(repo).expanduser().resolve())
         return cls(
             config,
             run_id=run_id,
@@ -228,941 +185,600 @@ class ForgeOrchestrator:
             resume=True,
         )
 
-    def run(self) -> RunState:
-        self._runner_allow()
-        self.store.write_data("config.json", self.config.to_dict())
-        self.store.write_text("brief.md", self.brief_path.read_text(encoding="utf-8"))
-        self.state.status = "running"
-        self._save("Starting Forge run.")
-        try:
-            self._preflight()
-            self._probe_models()
-            decision = self._brain_decision(
-                brain_initial(self.brief_path.read_text(encoding="utf-8"))
+    # Public controls -------------------------------------------------
+
+    def pause(self) -> None:
+        with self._control:
+            if self._control_is_from_stale_callback():
+                return
+            with self._control_persistence():
+                with self._state_lock:
+                    self._control_revision += 1
+                    self.state.paused = True
+                    if self.state.status == "running":
+                        self.state.status = "paused"
+                    self._save("Pause requested; Forge will wait at the next durable boundary.")
+
+    def resume(self) -> None:
+        with self._control:
+            if self._control_is_from_stale_callback():
+                return
+            with self._control_persistence():
+                with self._state_lock:
+                    self._control_revision += 1
+                    self.state.paused = False
+                    if self.state.status == "paused" and not self.state.cancel_requested:
+                        self.state.status = "running"
+                    self._control.notify_all()
+                    self._save("Run resumed.")
+
+    def cancel(self) -> None:
+        with self._control:
+            if self._control_is_from_stale_callback():
+                return
+            with self._control_persistence():
+                with self._state_lock:
+                    self._control_revision += 1
+                    self.state.cancel_requested = True
+                    self.state.paused = False
+                    self._control.notify_all()
+                    self._save("Cancellation requested.")
+        self._runner_cancel()
+
+    def mark_interrupted(self, message: str) -> None:
+        with self._control:
+            if self._control_is_from_stale_callback():
+                return
+            with self._control_persistence():
+                with self._state_lock:
+                    self._control_revision += 1
+                    self._interrupt_requested = True
+                    with self._activity_lock:
+                        self.state.active_agents.clear()
+                    if self.state.status in {"running", "paused", "created"}:
+                        self.state.status = "failed"
+                        self.state.paused = False
+                        self._control.notify_all()
+                        self._save(message)
+                        self._seal_execution_controls()
+        self._runner_cancel()
+
+    def _control_is_from_stale_callback(self) -> bool:
+        callback_generation = getattr(
+            self._callback_context, "execution_generation", _NO_CALLBACK_CONTEXT
+        )
+        return (
+            callback_generation is not _NO_CALLBACK_CONTEXT
+            and (
+                callback_generation != self._active_execution_generation
+                or self._execution_controls_sealed
             )
-            return self._run_from_decision(decision)
-        except RunCancelled:
-            self.state.status = "cancelled"
-            self.state.phase = "cancelled"
-            self._save("Run cancelled by the operator.")
-            return self.state
-        except Exception as exc:
-            self.state.status = "failed"
-            self._warning(f"Run failed: {exc}")
-            self._save(str(exc))
-            raise
+        )
+
+    @contextmanager
+    def _control_persistence(self) -> Iterator[None]:
+        execution_lock: RepositoryExecutionLock | None = None
+        if not (
+            self._active_execution_generation is not None
+            and self._repository_lock_owned
+        ):
+            execution_lock = RepositoryExecutionLock(
+                self.repo, self.config.branch, self.run_id
+            )
+            execution_lock.acquire()
+            try:
+                with self._state_lock:
+                    if self.store.state_path.is_file():
+                        self._reload_persisted_state()
+            except Exception:
+                execution_lock.release()
+                raise
+        try:
+            yield
         finally:
-            if self._competition is not None and self.state.status in {
-                "complete",
-                "cancelled",
-            }:
-                self._competition.cleanup()
+            if execution_lock is not None:
+                execution_lock.release()
+
+    def _reload_persisted_state(self) -> None:
+        state = self.store.load_state()
+        config = RunConfig.from_dict(state.config)
+        config.repo = str(self.repo)
+        state.config = config.to_dict()
+        self.state = state
+        self.config = config
+        self.brief_path = Path(config.brief).expanduser().resolve()
+
+    def _begin_execution(self, *, recover: bool) -> int:
+        with self._control:
+            with self._state_lock:
+                if self._active_execution_generation is not None:
+                    raise RuntimeError("this controller already has an active execution")
+                has_new_control = (
+                    self._control_revision != self._last_execution_control_revision
+                )
+                if not has_new_control:
+                    self._interrupt_requested = False
+                    if recover:
+                        self.state.cancel_requested = False
+                        self.state.paused = False
+                self._execution_generation += 1
+                self._active_execution_generation = self._execution_generation
+                self._execution_controls_sealed = False
+                return self._execution_generation
+
+    def _seal_execution_controls(self) -> None:
+        with self._control:
+            if (
+                self._active_execution_generation is not None
+                and not self._execution_controls_sealed
+            ):
+                self._last_execution_control_revision = self._control_revision
+                self._execution_controls_sealed = True
+
+    def _finish_execution(self, generation: int) -> None:
+        with self._control:
+            if self._active_execution_generation == generation:
+                self._active_execution_generation = None
+                self._execution_controls_sealed = True
+
+    def _acquire_execution(
+        self, *, recover: bool, reload_state: bool = False
+    ) -> tuple[RepositoryExecutionLock, int]:
+        execution_lock = RepositoryExecutionLock(
+            self.repo, self.config.branch, self.run_id
+        )
+        with self._control:
+            if self._active_execution_generation is not None:
+                raise RuntimeError("this controller already has an active execution")
+            execution_lock.acquire()
+            self._repository_lock_owned = True
+            try:
+                with self._state_lock:
+                    if reload_state:
+                        self._reload_persisted_state()
+                    if recover:
+                        self._validate_recoverable_state()
+                generation = self._begin_execution(recover=recover)
+            except Exception:
+                self._repository_lock_owned = False
+                execution_lock.release()
+                raise
+        return execution_lock, generation
+
+    def _release_execution(
+        self, execution_lock: RepositoryExecutionLock, generation: int
+    ) -> None:
+        with self._control:
+            self._finish_execution(generation)
+            self._repository_lock_owned = False
+            execution_lock.release()
+        self._shutdown_event_dispatcher()
+
+    def run(self) -> RunState:
+        if self.state.schema_version != 2:
+            raise RuntimeError("legacy Forge runs are read-only and cannot enter sprint mode")
+        execution_lock, generation = self._acquire_execution(recover=False)
+        try:
+            self._runner_allow()
+            self._ensure_event_dispatcher(generation)
+            self.store.write_data("config.json", self.config.to_dict())
+            self.store.write_text("brief.md", self.brief_path.read_text(encoding="utf-8"))
+            with self._state_lock:
+                if not self._interrupt_requested:
+                    self.state.status = "running"
+                    self.state.stalled_recoverable = False
+                    self._save("Starting continuous Forge sprint run.")
+            return self._execute(recover=False)
+        finally:
+            self._release_execution(execution_lock, generation)
 
     def recover(self) -> RunState:
-        if self.state.status not in {"failed", "paused", "cancelled"}:
+        execution_lock, generation = self._acquire_execution(
+            recover=True, reload_state=True
+        )
+        return self._recover_execution(execution_lock, generation)
+
+    def _validate_recoverable_state(self) -> None:
+        if self.state.schema_version != 2:
+            raise RuntimeError("legacy Forge runs cannot be recovered by the sprint orchestrator")
+        if self.state.status not in {"failed", "paused", "cancelled", "running", "stalled"}:
             raise RuntimeError(
-                f"run {self.run_id} is {self.state.status}; only failed, paused, or cancelled runs recover"
+                f"run {self.run_id} is {self.state.status}; it is not recoverable"
             )
-        self._runner_allow()
-        self.state.status = "running"
-        self.state.cancel_requested = False
-        self.state.paused = False
-        self._save("Recovering run from the last durable checkpoint.")
+        if self.state.status == "stalled" and not self.state.stalled_recoverable:
+            raise RuntimeError(
+                "this run stalled at a deterministic safety limit; start a new run "
+                "or change its durable product input instead of retrying the same phase"
+            )
+
+    def _recover_execution(
+        self, execution_lock: RepositoryExecutionLock, generation: int
+    ) -> RunState:
         try:
-            self._preflight()
-            return self._continue_from_artifacts()
-        except RunCancelled:
-            self.state.status = "cancelled"
-            self.state.phase = "cancelled"
-            self._save("Run cancelled by the operator.")
-            return self.state
-        except Exception as exc:
-            self.state.status = "failed"
-            self._warning(f"Run recovery failed: {exc}")
-            self._save(str(exc))
-            raise
+            self._runner_allow()
+            self._ensure_event_dispatcher(generation)
+            with self._state_lock:
+                self.state.active_agents.clear()
+                if not self._interrupt_requested:
+                    self.state.status = "running"
+                    self.state.stalled_recoverable = False
+                    self._save("Recovering the continuous sprint from its durable phase.")
+            return self._execute(recover=True)
         finally:
-            if self._competition is not None and self.state.status in {
-                "complete",
-                "cancelled",
-            }:
-                self._competition.cleanup()
+            self._release_execution(execution_lock, generation)
 
     def recover_failed(self) -> RunState:
-        """Continue a failed or interrupted run after its latest delivered batch."""
-        self.state = self.store.load_state()
-        recoverable = {"failed", "cancelled", "running"}
-        if self.state.status not in recoverable:
-            raise RuntimeError(
-                f"only failed or interrupted runs can be recovered (status: {self.state.status})"
-            )
-        if self.state.status == "running" and self.state.active_agents:
-            self._warning(
-                "Clearing stale active agents left by an interrupted controller."
-            )
-            self.state.active_agents.clear()
-        if not self.state.brain_session_id:
-            raise RuntimeError("failed run has no persistent brain session to resume")
-        self._runner_allow()
-        self.state.status = "running"
-        self.state.cancel_requested = False
-        self.state.paused = False
-        self.state.active_agents.clear()
-        self._save("Recovering run from captured artifacts or the last delivered batch.")
+        execution_lock, generation = self._acquire_execution(
+            recover=True, reload_state=True
+        )
+        return self._recover_execution(execution_lock, generation)
+
+    def activity_snapshot(self) -> dict[str, dict[str, Any]]:
+        with self._state_lock:
+            with self._activity_lock:
+                return {key: dict(value) for key, value in self.state.active_agents.items()}
+
+    def state_snapshot(self) -> dict[str, Any]:
+        with self._state_lock:
+            return self.state.to_dict()
+
+    # Run driver ------------------------------------------------------
+
+    def _execute(self, *, recover: bool) -> RunState:
         try:
+            self._checkpoint()
             self._preflight()
-            return self._continue_from_artifacts()
+            if not self.state.preflight_probed:
+                self._probe_models()
+            result = self._drive()
+            self._seal_execution_controls()
+            return result
         except RunCancelled:
-            self.state.status = "cancelled"
-            self.state.phase = "cancelled"
-            self._save("Run cancelled by the operator.")
+            with self._control:
+                with self._state_lock:
+                    self.state.status = "cancelled"
+                    self.state.phase = "cancelled"
+                    self._save("Run cancelled by the operator; the active sprint is preserved.")
+                self._seal_execution_controls()
+            return self.state
+        except RunInterrupted:
+            self._seal_execution_controls()
+            return self.state
+        except IterationStalled as exc:
+            with self._control:
+                with self._state_lock:
+                    self.state.status = "stalled"
+                    self.state.stalled_recoverable = exc.recoverable
+                    self._warning(f"Iteration stalled: {exc}")
+                    self._save(str(exc))
+                self._seal_execution_controls()
             return self.state
         except Exception as exc:
-            self.state.status = "failed"
-            self.state.phase = "failed"
-            self._warning(f"Run recovery failed: {exc}")
-            self._save(str(exc))
+            with self._control:
+                with self._state_lock:
+                    self.state.status = "failed"
+                    self._warning(f"Run failed: {exc}")
+                    self._save(str(exc))
+                self._seal_execution_controls()
             raise
-        finally:
-            if self._competition is not None:
-                self._competition.cleanup()
 
-    def _has_captured_batch(self, cycle: int) -> bool:
-        root = self.store.root / "batches" / f"{cycle:03d}"
-        required = [root / "objective.json", root / "plan.md", root / "review-bundle.json"]
-        for name in ("tdd", "explore", "classic"):
-            required.extend(
-                [
-                    root / "candidates" / name / "candidate.patch",
-                    root / "candidates" / name / "outcome.json",
-                ]
-            )
-        return all(path.is_file() for path in required) and not (root / "delivery.json").exists()
-
-    def _has_delivery(self, cycle: int) -> bool:
-        return (self.store.root / "batches" / f"{cycle:03d}" / "delivery.json").is_file()
-
-    def _has_plan(self, cycle: int) -> bool:
-        root = self.store.root / "batches" / f"{cycle:03d}"
-        return (root / "plan.md").is_file() or (root / "objective.json").is_file()
-
-    def _batch_recorded(self, cycle: int) -> bool:
-        return any(int(item.get("cycle") or 0) == cycle for item in self.state.batches)
-
-    def _candidate_cycles(self) -> list[int]:
-        cycles: set[int] = set()
-        if self.state.cycle > 0:
-            cycles.add(int(self.state.cycle))
-        for batch in self.state.batches:
-            try:
-                cycles.add(int(batch["cycle"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-        batches_dir = self.store.root / "batches"
-        if batches_dir.is_dir():
-            for child in batches_dir.iterdir():
-                if child.is_dir() and child.name.isdigit():
-                    cycles.add(int(child.name))
-        return sorted(cycles, reverse=True)
-
-    def _recovery_target(self) -> tuple[str, int]:
-        for cycle in self._candidate_cycles():
-            if self._has_captured_batch(cycle):
-                return "resume_review", cycle
-            if self._has_delivery(cycle):
-                if self._batch_recorded(cycle):
-                    return "next_brain", cycle
-                return "finish_batch", cycle
-            if self._has_plan(cycle):
-                return "recode", cycle
-        raise RuntimeError(
-            "run has nothing recoverable: no captured review, delivered batch, or plan"
-        )
-
-    def recovery_hint(self) -> dict[str, Any]:
-        if self.state.status == "complete":
-            return {}
-        try:
-            action, cycle = self._recovery_target()
-        except RuntimeError:
-            return {}
-        kind = "resume_review" if action == "resume_review" else "recover"
-        return {"kind": kind, "action": action, "cycle": cycle}
-
-    def _decision_from_cycle(self, cycle: int) -> BrainDecision:
-        path = self.store.root / "batches" / f"{cycle:03d}" / "objective.json"
-        if not path.is_file():
-            checkpoint = dict(self.state.checkpoint or {}).get("decision") or {}
-            return BrainDecision(
-                tool="forge.run_batch",
-                reason=str(checkpoint.get("reason") or "recovered batch"),
-                objective=str(checkpoint.get("objective") or ""),
-                success_criteria=tuple(checkpoint.get("success_criteria") or ()),
-            )
-        objective = json.loads(path.read_text(encoding="utf-8"))
-        return BrainDecision(
-            "forge.run_batch",
-            str(objective.get("brain_reason", "Resume captured batch.")),
-            str(objective.get("objective") or ""),
-            tuple(str(item) for item in objective.get("success_criteria") or ()),
-        )
-
-    def _continue_from_artifacts(self) -> RunState:
-        action, cycle = self._recovery_target()
-        self._save(f"Recovery target: {action} for batch {cycle}.")
-        if action == "resume_review":
-            self._refresh_roster(reason=f"resume review {cycle}", require_coders=False)
-            self.state.cycle = cycle
-            batch = self._resume_captured_batch(cycle)
-            self.state.batches.append(batch)
-            self._save(f"Batch {self.state.cycle} delivered and black-box tested.")
-            decision = self._brain_decision(
-                brain_feedback(
-                    cycle=self.state.cycle,
-                    report=self._brain_report_from_batch(batch),
-                )
-            )
-            return self._run_from_decision(decision)
-        if action in {"finish_batch", "recode"}:
-            if action == "recode":
-                self._refresh_roster(reason=f"recode batch {cycle}")
-            decision = self._decision_from_cycle(cycle)
-            self.state.cycle = max(cycle - 1, 0)
-            batch = self._run_batch(decision, recover=True)
-            self.state.batches.append(batch)
-            self._save(f"Batch {self.state.cycle} delivered and black-box tested.")
-            decision = self._brain_decision(
-                brain_feedback(
-                    cycle=self.state.cycle,
-                    report=self._brain_report_from_batch(batch),
-                )
-            )
-            return self._run_from_decision(decision)
-        last = next(
-            (item for item in reversed(self.state.batches) if int(item.get("cycle") or 0) == cycle),
-            None,
-        )
-        if last is None:
-            raise RuntimeError(f"delivered batch {cycle} is missing from run state")
-        self.state.cycle = cycle
-        decision = self._brain_decision(
-            brain_feedback(
-                cycle=cycle,
-                report=self._brain_report_from_batch(last),
-            )
-        )
-        return self._run_from_decision(decision)
-
-    def _resume_captured_batch(self, cycle: int) -> dict[str, Any]:
-        assert self._competition is not None
-        batch_rel = f"batches/{cycle:03d}"
-        root = self.store.root / batch_rel
-        objective = json.loads((root / "objective.json").read_text(encoding="utf-8"))
-        decision = BrainDecision(
-            "forge.run_batch",
-            str(objective.get("brain_reason", "Resume captured batch review.")),
-            str(objective["objective"]),
-            tuple(str(item) for item in objective["success_criteria"]),
-        )
-        plan = (root / "plan.md").read_text(encoding="utf-8")
-        patches = {
-            name: (root / "candidates" / name / "candidate.patch").read_text(
-                encoding="utf-8"
-            )
-            for name in ("tdd", "explore", "classic")
-        }
-        worktrees = self._competition.restore_candidates(patches)
-        outcomes: dict[str, CandidateOutcome] = {}
-        for name, worktree in worktrees.items():
-            plan_path = worktree.path / ".forge" / "plan.md"
-            plan_path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write(plan_path, plan)
-            value = json.loads(
-                (root / "candidates" / name / "outcome.json").read_text(encoding="utf-8")
-            )
-            tasks = value.get("tasks", {})
-            completed = int(tasks.get("completed", 0))
-            total = int(tasks.get("total", 0))
-            outcomes[name] = CandidateOutcome(
-                name=name,
-                worktree=worktree,
-                session_id=value.get("session_id"),
-                status=str(value.get("status", "failed")),
-                plan=PlanProgress(completed, total, ()),
-                turns=int(value.get("turns", 0)),
-                validation=list(value.get("validation", [])),
-                summary=str(value.get("summary", "")),
-                warnings=[str(item) for item in value.get("warnings", [])],
-            )
-        bundle = self._capture_candidates(outcomes, batch_rel)
-        self._save(f"Restored captured candidates for batch {cycle}; resuming review.")
-        return self._review_deliver_and_test(
-            decision=decision,
-            commands=validation_commands(plan),
-            outcomes=outcomes,
-            bundle=bundle,
-            batch_rel=batch_rel,
-            cycle=cycle,
-        )
-
-    def _run_from_decision(self, decision: BrainDecision) -> RunState:
-        while decision.tool != "forge.finish":
+    def _drive(self) -> RunState:
+        self._reconcile_sprint_state()
+        while True:
             self._checkpoint()
-            if self.state.cycle > 0:
-                self._refresh_roster(reason=f"before cycle {self.state.cycle + 1}")
-            batch = self._run_batch(decision)
-            self.state.batches.append(batch)
-            self._save(f"Batch {self.state.cycle} delivered and black-box tested.")
-            decision = self._brain_decision(
-                brain_feedback(
-                    cycle=self.state.cycle,
-                    report=self._brain_report_from_batch(batch),
-                )
+            assert_sprint_cursor(self.state.sprint_iteration)
+            if self.state.active_iteration:
+                self._run_iteration()
+                continue
+            if self.state.needs_product_owner:
+                self._run_product_owner()
+                continue
+            if self.state.sprint_iteration == len(SPRINT_SCHEDULE):
+                self._close_sprint()
+                continue
+            self._run_iteration()
+
+    def _reconcile_sprint_state(self) -> None:
+        """Derive cursors from accepted records after any interrupted state write."""
+
+        with self._state_lock:
+            changed = False
+            if self.state.cycle != len(self.state.iterations):
+                self.state.cycle = len(self.state.iterations)
+                changed = True
+            current = sorted(
+                (
+                    item
+                    for item in self.state.iterations
+                    if int(item.get("sprint") or -1) == self.state.sprint_number
+                ),
+                key=lambda item: int(item.get("slot") or 0),
             )
-        self.state.status = "complete"
-        self.state.phase = "complete"
-        self.state.final_summary = decision.summary
-        self._save(decision.reason)
-        self.store.write_text("final-summary.md", decision.summary + "\n")
-        return self.state
+            slots = [int(item.get("slot") or 0) for item in current]
+            if slots != list(range(1, len(current) + 1)):
+                raise RuntimeError(
+                    f"accepted iteration slots are not contiguous in sprint {self.state.sprint_number}: {slots}"
+                )
+            kinds = tuple(str(item.get("kind")) for item in current)
+            if kinds != SPRINT_SCHEDULE[: len(kinds)]:
+                raise RuntimeError(f"accepted iteration schedule drifted: {kinds}")
+            completed = any(
+                int(item.get("sprint") or -1) == self.state.sprint_number
+                for item in self.state.completed_sprints
+            )
+            expected_cursor = 0 if completed else len(current)
+            if self.state.sprint_iteration != expected_cursor:
+                self.state.sprint_iteration = expected_cursor
+                changed = True
+            if completed and not self.state.needs_product_owner:
+                self.state.needs_product_owner = True
+                changed = True
+            if changed:
+                self._save("Reconciled sprint cursor from durable accepted iterations.")
 
     def _preflight(self) -> None:
         self._phase("preflight", "Checking providers and target repository.")
         if self.check_binaries:
-            for role, model in self.config.models.items():
+            for role in ROLE_NAMES:
+                model = self.config.models[role]
                 if shutil.which(model.provider) is None:
                     raise ValueError(f"{role} provider executable is unavailable: {model.provider}")
-            if self.config.backup is not None and shutil.which(self.config.backup.provider) is None:
-                self._warning(
-                    f"backup provider executable is unavailable: {self.config.backup.provider}"
-                )
         self.brain_dir.mkdir(parents=True, exist_ok=True)
         self.worktree_root.mkdir(parents=True, exist_ok=True)
-        self._competition = GitCompetition(
+        self.tester_root.mkdir(parents=True, exist_ok=True)
+        self._workspace = GitWorkspace(
             self.repo,
             self.config.branch,
             self.run_id,
             self.worktree_root,
             local_excludes=self._brief_local_excludes(),
         )
-        base = self._competition.prepare(require_remote=self.config.push)
-        self.store.write_data("git.json", {"branch": self.config.branch, "base_sha": base})
-        self._save(f"Preflight passed at {base[:12]} on {self.config.branch}.")
+        head = self._workspace.prepare(require_remote=self.config.push)
+        self.store.write_data("git.json", {"branch": self.config.branch, "head": head})
+        self._save(f"Preflight passed at {head[:12]} on {self.config.branch}.")
 
-    def _unique_run_models(self) -> list[tuple[str, ModelSpec]]:
-        unique: list[tuple[str, ModelSpec]] = []
-        seen: set[str] = set()
-        items: list[tuple[str, ModelSpec]] = list(self.config.models.items())
-        originals = self._original_models()
-        for role, spec in originals.items():
-            items.append((f"original_{role}", spec))
-        if self.config.backup is not None:
-            items.append(("backup", self.config.backup))
-        for role, spec in items:
-            key = model_identity(spec)
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append((role, spec))
-        return unique
+    # Product Owner --------------------------------------------------
 
-    def _original_models(self) -> dict[str, ModelSpec]:
-        stored = self.state.original_models or {}
-        if stored:
-            return {role: ModelSpec(**spec) for role, spec in stored.items()}
-        return dict(self.config.models)
-
-    def _probe_models(self) -> None:
-        self._refresh_roster(reason="start")
-
-    def _probe_spec(self, spec: ModelSpec) -> Exception | None:
-        slug = spec.display().replace("/", "_").replace(":", "_")
-        probe_root = self.state_home / "probes" / self.run_id
-        probe_root.mkdir(parents=True, exist_ok=True)
-        try:
-            self._invoke(
-                role="probe",
-                model=spec,
-                prompt=PROBE_PROMPT,
-                cwd=probe_root / slug,
-                access="none",
-                relative=f"preflight/probe-{slug}",
-                candidate=spec.display(),
-                allow_failover=False,
-            )
-        except RunCancelled:
-            raise
-        except Exception as exc:
-            return exc
-        return None
-
-    def _refresh_roster(self, *, reason: str, require_coders: bool = True) -> None:
-        unique = self._unique_run_models()
-        self._phase(
-            "preflight",
-            f"Probing {len(unique)} unique model(s) with a no-tool ping ({reason}).",
+    def _run_product_owner(self) -> None:
+        assert self._workspace is not None
+        visit = self.state.backlog_revision + 1
+        self._phase("product-owner", f"Product Owner is inspecting the product for sprint {self.state.sprint_number + 1}.")
+        visit_root = self.brain_dir / f"visit-{visit:03d}"
+        snapshot = visit_root / "product"
+        commit = export_revision(self.repo, snapshot)
+        evidence = snapshot / ".forge-product-evidence"
+        evidence.mkdir(parents=True, exist_ok=True)
+        previous_ready = ready_stories(self.state.backlog)
+        prompt = product_owner_prompt(
+            brief=self._brief_text(),
+            commit=commit,
+            previous_backlog=previous_ready,
+            completed_iterations=[compact_iteration(item) for item in self.state.iterations],
+            quality_backlog=[item for item in self.state.quality_backlog if item.get("status") != "resolved"],
+            evidence_dir=evidence,
+            virtual_display=None,
         )
-        results: dict[str, Exception | None] = {}
-
-        def probe(item: tuple[str, ModelSpec]) -> tuple[str, Exception | None]:
-            _role, spec = item
-            return model_identity(spec), self._probe_spec(spec)
-
-        workers = min(len(unique), 8) or 1
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(probe, item) for item in unique]
-            for future in as_completed(futures):
-                identity, error = future.result()
-                results[identity] = error
-
-        disabled = set(self.state.disabled_models)
-        hard_failures: list[str] = []
-        for identity, error in results.items():
-            if error is None:
-                disabled.discard(identity)
-                continue
-            if is_usage_limit(str(error), getattr(error, "raw_output", "")):
-                disabled.add(identity)
-            else:
-                disabled.add(identity)
-                hard_failures.append(f"{identity}: {error}")
-
-        self.state.disabled_models = sorted(disabled)
-        previous_brain = model_identity(self.config.models["brain"])
-        originals = self._original_models()
-        for role, spec in list(self.config.models.items()):
-            if model_identity(spec) not in disabled:
-                continue
-            original = originals.get(role)
-            if original is not None and model_identity(original) not in disabled:
-                self.config.models[role] = original
-
-        backup = self.config.backup
-        backup_ok = (
-            backup is not None
-            and model_identity(backup) not in disabled
-            and (
-                not self.check_binaries
-                or shutil.which(backup.provider) is not None
-            )
-        )
-        staff_blocked: list[str] = []
-        for role in STAFF_ROLES:
-            current = self.config.models[role]
-            if model_identity(current) not in disabled:
-                continue
-            if backup_ok:
-                self.config.models[role] = spec_with_effort(backup, current.effort)
-                self._warning(
-                    f"{role} switched to backup {self.config.models[role].display()} ({reason})."
+        session = self.state.brain_session_id
+        inspected = self.state.product_owner_inspected
+        with optional_virtual_display() as server:
+            if server is not None:
+                prompt = product_owner_prompt(
+                    brief=self._brief_text(),
+                    commit=commit,
+                    previous_backlog=previous_ready,
+                    completed_iterations=[compact_iteration(item) for item in self.state.iterations],
+                    quality_backlog=[
+                        item for item in self.state.quality_backlog if item.get("status") != "resolved"
+                    ],
+                    evidence_dir=evidence,
+                    virtual_display=server.display,
                 )
-            else:
-                staff_blocked.append(f"{role}={current.display()}")
-
-        coder_needs_rebalance = any(
-            model_identity(self.config.models[role]) in disabled for role in CODER_ROLES
-        )
-        healthy_coders: list[ModelSpec] = []
-        seen_coders: set[str] = set()
-        for role in CODER_ROLES:
-            for spec in (originals.get(role), self.config.models.get(role)):
-                if spec is None:
-                    continue
-                identity = model_identity(spec)
-                if identity in disabled or identity in seen_coders:
-                    continue
-                healthy_coders.append(spec)
-                seen_coders.add(identity)
-        if not healthy_coders and backup_ok:
-            healthy_coders.append(backup)
-        if coder_needs_rebalance and healthy_coders:
-            previous = {
-                role: self.config.models[role].display() for role in CODER_ROLES
-            }
-            self.config.models = assign_coder_models(self.config.models, healthy_coders)
-            self._warning(
-                "Coder roster rebalanced after preflight: "
-                + ", ".join(
-                    f"{role}={self.config.models[role].display()}" for role in CODER_ROLES
+            environment = {} if server is None else server.environment()
+            for attempt in range(1, 4):
+                result = self._invoke(
+                    role="brain",
+                    model=self.config.models["brain"],
+                    prompt=prompt,
+                    cwd=snapshot,
+                    session_id=session,
+                    access="inspect",
+                    schema=PRODUCT_OWNER_SCHEMA,
+                    extra_writable_dirs=(snapshot, evidence),
+                    environment=environment,
+                    relative=f"product-owner/visit-{visit:03d}/attempt-{attempt}",
+                    invocation=attempt,
                 )
-                + f" (was {previous})."
-            )
-        coder_blocked = coder_needs_rebalance and not healthy_coders
-
-        self._reset_brain_session_if_changed(previous_brain)
-        self._persist_models()
-        if staff_blocked or (coder_blocked and require_coders):
-            detail = "; ".join(
-                hard_failures
-                or [f"disabled={', '.join(self.state.disabled_models) or 'none'}"]
-            )
-            if staff_blocked:
-                raise ValueError(
-                    "model preflight failed: "
-                    + ", ".join(staff_blocked)
-                    + f"; {detail}"
-                )
-            raise ValueError("model preflight failed: no healthy coder models remain; " + detail)
-        self._save(
-            f"Model preflight passed for {len(unique)} unique model(s); "
-            f"{len(self.state.disabled_models)} disabled."
-        )
-
-    def _brain_decision(self, prompt: str) -> BrainDecision:
-        self._phase("brain", "Persistent brain is choosing the next Forge action.")
-        current = prompt
-        for contract_attempt in range(1, 4):
-            result = self._invoke(
-                role="brain",
-                model=self.config.models["brain"],
-                prompt=current,
-                cwd=self.brain_dir,
-                session_id=self.state.brain_session_id,
-                access="none",
-                schema=BRAIN_SCHEMA,
-                relative=f"brain/decision-{self.state.cycle:03d}-{contract_attempt}",
-            )
-            self.state.brain_session_id = self._adopt_session(
-                self.state.brain_session_id,
-                result.session_id,
-                role="brain",
-            )
-            try:
-                if result.tool_calls:
-                    raise ContractError(
-                        f"brain attempted {result.tool_calls} provider tool call(s); only Forge JSON is allowed"
+                session = result.session_id or session
+                with self._state_lock:
+                    self.state.brain_session_id = session
+                    if result.tool_calls:
+                        inspected = True
+                        self.state.product_owner_inspected = True
+                    self.store.save_state(self.state)
+                try:
+                    if not inspected:
+                        raise ContractError(
+                            "Product Owner must inspect the product with at least one tool call"
+                        )
+                    decision = parse_product_owner(
+                        result.text,
+                        previous_ready=tuple(str(item["id"]) for item in previous_ready),
+                        accepted_story_ids=tuple(self.state.accepted_story_ids),
                     )
-                decision = parse_brain(result.text)
-            except ContractError as exc:
-                self._warning(f"Brain contract retry {contract_attempt}: {exc}")
-                current = contract_feedback(str(exc))
-                continue
-            self.store.write_data(
-                f"brain/decision-{self.state.cycle:03d}.json",
-                {
-                    "tool": decision.tool,
-                    "reason": decision.reason,
-                    "objective": decision.objective,
-                    "success_criteria": list(decision.success_criteria),
-                    "summary": decision.summary,
-                },
+                except ContractError as exc:
+                    self._warning(f"Product Owner contract retry {attempt}: {exc}")
+                    prompt = _product_owner_retry_prompt(exc, inspected=inspected)
+                    continue
+                self.store.write_data(f"product-owner/visit-{visit:03d}/decision.json", decision)
+                self.store.write_data(f"backlog/revision-{visit:03d}.json", decision["stories"])
+                artifact_evidence = self.store.root / f"product-owner/visit-{visit:03d}/evidence"
+                if evidence.is_dir():
+                    shutil.copytree(evidence, artifact_evidence, dirs_exist_ok=True)
+                with self._state_lock:
+                    self.state.backlog_revision = visit
+                    self.state.backlog = decision["stories"]
+                    self.state.sprint_goal = str(decision["sprint_goal"])
+                    self.state.sprint_number += 1
+                    self.state.sprint_iteration = 0
+                    self.state.sprint_started_at = utc_now()
+                    self.state.needs_product_owner = False
+                    self.state.brain_session_id = None
+                    self.state.product_owner_inspected = False
+                    self.state.active_iteration = {}
+                    self._save(
+                        f"Product Owner prepared {decision['capacity']['stories']} stories "
+                        f"({decision['capacity']['estimated_minutes']} estimated minutes)."
+                    )
+                return
+        raise RuntimeError("Product Owner failed its backlog contract three times")
+
+    def _close_sprint(self) -> None:
+        with self._state_lock:
+            if self.state.sprint_iteration != len(SPRINT_SCHEDULE):
+                raise RuntimeError("cannot close an incomplete sprint")
+            accepted = sorted(
+                (
+                    item
+                    for item in self.state.iterations
+                    if int(item.get("sprint") or -1) == self.state.sprint_number
+                ),
+                key=lambda item: int(item.get("slot") or 0),
             )
-            self._save(f"Brain selected {decision.tool}: {decision.reason}")
-            return decision
-        raise RuntimeError("brain failed the Forge tool-call contract three times")
-
-    def _run_batch(self, decision: BrainDecision, *, recover: bool = False) -> dict[str, Any]:
-        assert self._competition is not None
-        self.state.cycle += 1
-        cycle = self.state.cycle
-        batch_rel = f"batches/{cycle:03d}"
-        housekeeping = cycle % 3 == 0
-        self.state.checkpoint = {
-            "decision": {
-                "reason": decision.reason,
-                "objective": decision.objective,
-                "success_criteria": list(decision.success_criteria),
-            },
-            "resume_phase": "planning",
-            "housekeeping": housekeeping,
-        }
-        self.store.write_data(
-            f"{batch_rel}/objective.json",
-            {
-                "objective": decision.objective,
-                "success_criteria": list(decision.success_criteria),
-                "brain_reason": decision.reason,
-                "housekeeping": housekeeping,
-            },
-        )
-
-        self._phase("planning", f"Planning batch {cycle}.")
-        plan_file = self.store.root / batch_rel / "plan.md"
-        if recover and plan_file.is_file():
-            plan = plan_file.read_text(encoding="utf-8")
-        else:
-            plan = self._make_plan(decision, batch_rel, housekeeping=housekeeping)
-        commands = validation_commands(plan)
-        candidate_commands = candidate_validation_commands(plan)
-        prior_delivery = (
-            self._read_json(f"{batch_rel}/delivery.json") if recover else None
-        )
-        if prior_delivery and prior_delivery.get("commit"):
-            review = self._read_json(f"{batch_rel}/review.json") or {
-                "winner": prior_delivery.get("winner"),
-                "reason": "recovered after delivery",
-                "feedback": [],
-                "borrow": [],
-                "candidates": {},
+            kinds = tuple(str(item.get("kind")) for item in accepted)
+            if kinds != SPRINT_SCHEDULE:
+                raise RuntimeError(f"sprint schedule drifted: {kinds}")
+            existing = next(
+                (
+                    item
+                    for item in self.state.completed_sprints
+                    if int(item.get("sprint") or -1) == self.state.sprint_number
+                ),
+                None,
+            )
+            summary = existing or {
+                "sprint": self.state.sprint_number,
+                "started_at": self.state.sprint_started_at,
+                "completed_at": utc_now(),
+                "iterations": [str(item.get("id")) for item in accepted],
+                "kinds": list(kinds),
             }
-            winner_name = str(prior_delivery.get("winner") or review.get("winner") or "")
-            commit = str(prior_delivery["commit"])
-            final_validation = (
-                self._read_json(
-                    f"{batch_rel}/candidates/{winner_name}/final-validation.json"
-                )
-                or []
-            )
-            outcomes = {}
-            self._warning(
-                f"Batch {cycle} already has delivery {commit[:12]}; skipping re-commit."
-            )
-            return self._finish_delivered_batch(
-                decision,
-                cycle,
-                batch_rel,
-                commands,
-                winner_name,
-                review,
-                outcomes,
-                final_validation if isinstance(final_validation, list) else [],
-                commit,
-                housekeeping,
-            )
-
-        self.state.checkpoint["resume_phase"] = "coding"
-
-        self._phase("coding", f"Three coders are competing on batch {cycle}.")
-        worktrees = self._restore_or_create_worktrees(batch_rel, recover=recover)
-        for candidate in worktrees.values():
-            plan_path = candidate.path / ".forge" / "plan.md"
-            plan_path.parent.mkdir(parents=True, exist_ok=True)
-            if not plan_path.is_file():
-                atomic_write(plan_path, plan)
-
-        outcomes = self._load_outcomes(worktrees, batch_rel) if recover else {}
-        missing = {
-            name: candidate
-            for name, candidate in worktrees.items()
-            if name not in outcomes and not self._has_candidate_patch(batch_rel, name)
-        }
-        if missing:
-            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="forge-coder") as pool:
-                futures = {
-                    pool.submit(
-                        self._run_coder,
-                        candidate,
-                        decision,
-                        candidate_commands,
-                        batch_rel,
-                    ): name
-                    for name, candidate in missing.items()
-                }
-                for future in as_completed(futures):
-                    name = futures[future]
-                    try:
-                        outcomes[name] = future.result()
-                    except RunCancelled:
-                        raise
-                    except Exception as exc:
-                        self._warning(f"Candidate {name} failed: {exc}")
-                        plan_state = progress(
-                            (worktrees[name].path / ".forge" / "plan.md").read_text(
-                                encoding="utf-8", errors="replace"
-                            )
-                        )
-                        outcomes[name] = CandidateOutcome(
-                            name=name,
-                            worktree=worktrees[name],
-                            session_id=None,
-                            status="failed",
-                            plan=plan_state,
-                            turns=0,
-                            validation=[],
-                            summary=str(exc),
-                            warnings=[str(exc)],
-                        )
-
-        bundle = self._capture_candidates(outcomes, batch_rel)
-        if not any(item["git"]["patch"].strip() for item in bundle.values()):
-            raise RuntimeError("all three candidates produced no code changes")
-
-        return self._review_deliver_and_test(
-            decision=decision,
-            commands=commands,
-            outcomes=outcomes,
-            bundle=bundle,
-            batch_rel=batch_rel,
-            cycle=cycle,
-            housekeeping=housekeeping,
-        )
-
-    def _review_deliver_and_test(
-        self,
-        *,
-        decision: BrainDecision,
-        commands: tuple[str, ...],
-        outcomes: dict[str, CandidateOutcome],
-        bundle: dict[str, dict[str, Any]],
-        batch_rel: str,
-        cycle: int,
-        housekeeping: bool = False,
-    ) -> dict[str, Any]:
-        assert self._competition is not None
-
-        self._phase("review", f"Reviewing all candidates for batch {cycle}.")
-        review = self._review(decision, outcomes, bundle, batch_rel)
-        winner_name = review["winner"]
-        if outcomes[winner_name].status == "failed" or not bundle[winner_name]["git"]["patch"].strip():
-            raise RuntimeError(f"reviewer selected unusable candidate: {winner_name}")
-
-        self._phase("winner-fix", f"The winning coder is applying review feedback.")
-        winner = outcomes[winner_name]
-        winner_model = self.config.models[f"coder_{winner_name}"]
-        fix_result = self._apply_winner_fix(
-            winner=winner,
-            winner_name=winner_name,
-            review=review,
-            batch_rel=batch_rel,
-        )
-        current_winner_model = self.config.models[f"coder_{winner_name}"]
-        if fix_result.raw_output and fix_result.session_id != winner.session_id:
-            if model_identity(current_winner_model) != model_identity(winner_model):
-                self._warning(
-                    f"Winner {winner_name} continued on replacement "
-                    f"{current_winner_model.display()} with a new session."
-                )
-            elif winner.session_id:
-                self._warning(
-                    f"Winner {winner_name} continued on a new session "
-                    f"{fix_result.session_id}."
-                )
-            winner.session_id = fix_result.session_id or winner.session_id
-        final_validation = run_commands(commands, winner.worktree.path)
-        failed_final_checks = [
-            item
-            for item in final_validation
-            if item.get("kind") != "long" and (item["return_code"] != 0 or item["timed_out"])
-        ]
-        if failed_final_checks:
-            warning = (
-                f"Winner {winner_name} has {len(failed_final_checks)} failing or timed-out "
-                "post-review validation check(s); recorded for the brain without blocking delivery."
-            )
-            winner.warnings.append(warning)
-            self._warning(warning)
-        winner.validation = final_validation
-        winner.summary = fix_result.text
-        self.store.write_data(
-            f"{batch_rel}/candidates/{winner_name}/final-validation.json", final_validation
-        )
-        final_capture = self._competition.capture(winner.worktree)
-        self.store.write_text(
-            f"{batch_rel}/candidates/{winner_name}/final.patch", final_capture["patch"]
-        )
-
-        self._phase("delivery", f"Committing and delivering the batch {cycle} winner.")
-        commit = self._competition.commit_and_deliver(
-            winner.worktree,
-            f"Forge batch {cycle}: {decision.objective[:60]}",
-            push=self.config.push,
-        )
-        self.store.write_data(
-            f"{batch_rel}/delivery.json",
-            {"winner": winner_name, "commit": commit, "branch": self.config.branch, "pushed": self.config.push},
-        )
-
-        self._competition.cleanup()
-        self._competition = GitCompetition(
-            self.repo,
-            self.config.branch,
-            self.run_id,
-            self.worktree_root,
-            local_excludes=self._brief_local_excludes(),
-        )
-        self._competition.prepare(require_remote=self.config.push)
-
-        return self._finish_delivered_batch(
-            decision,
-            cycle,
-            batch_rel,
-            commands,
-            winner_name,
-            review,
-            outcomes,
-            final_validation,
-            commit,
-            housekeeping,
-        )
-
-    def _brain_report_from_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
-        if isinstance(batch.get("brain_report"), dict):
-            return batch["brain_report"]
-        return {
-            "cycle": batch.get("cycle"),
-            "completed_batch_objective": batch.get("objective"),
-            "winner": batch.get("winner"),
-            "review": batch.get("review") or {},
-            "black_box": batch.get("black_box") or {},
-            "candidate_metrics": batch.get("candidate_metrics") or {},
-            "red_flags": [],
-        }
-
-    def _read_json(self, relative: str) -> Any:
-        path = self.store.root / relative
-        if not path.is_file():
-            return None
-        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
-
-    def _brief_text(self) -> str:
-        stored = self.store.root / "brief.md"
-        if stored.is_file():
-            return stored.read_text(encoding="utf-8")
-        return self.brief_path.read_text(encoding="utf-8")
-
-    def _finish_delivered_batch(
-        self,
-        decision: BrainDecision,
-        cycle: int,
-        batch_rel: str,
-        commands: tuple[str, ...],
-        winner_name: str,
-        review: dict[str, Any],
-        outcomes: dict[str, CandidateOutcome],
-        final_validation: list[dict[str, Any]],
-        commit: str,
-        housekeeping: bool,
-    ) -> dict[str, Any]:
-        assert self._competition is not None
-        self._phase("whitebox", f"Reporting white-box validation for batch {cycle}.")
-        whitebox_worktree = self._competition.create_detached("whitebox")
-        try:
-            whitebox = self._whitebox(decision, commands, batch_rel, whitebox_worktree)
-        finally:
-            self._competition.remove_detached(whitebox_worktree)
-
-        self._phase("black-box", f"Testing delivered batch {cycle} through public interfaces.")
-        black_box_worktree = self._competition.create_detached("black-box")
-        try:
-            try:
-                black_box = self._black_box(
-                    decision, commands, final_validation, batch_rel, black_box_worktree
-                )
-            except RunCancelled:
-                raise
-            except Exception as exc:
-                warning = f"Black-box tester did not complete after retries: {exc}"
-                self._warning(warning)
-                black_box = {
-                    "summary": "Black-box testing did not complete.",
-                    "working": [],
-                    "missing": ["No black-box verdict is available for this delivered batch."],
-                    "observations": [warning],
-                    "evidence": [],
-                }
-                self.store.write_data(f"{batch_rel}/black-box.json", black_box)
-        finally:
-            self._competition.remove_detached(black_box_worktree)
-        saved_metrics = self._read_json(f"{batch_rel}/candidate-metrics.json")
-        metrics = (
-            saved_metrics
-            if isinstance(saved_metrics, dict) and saved_metrics
-            else self._candidate_metrics(outcomes, review, cycle)
-        )
-        self.store.write_data(f"{batch_rel}/candidate-metrics.json", metrics)
-        for name, candidate_metrics in metrics.items():
             self.store.write_data(
-                f"{batch_rel}/candidates/{name}/metrics.json", candidate_metrics
+                f"sprints/{self.state.sprint_number:03d}/summary.json", summary
             )
-        brain_report = build_brain_report(
-            cycle=cycle,
-            objective=decision.objective,
-            winner=winner_name,
-            review=review,
-            black_box=black_box,
-            whitebox=whitebox,
-            metrics=metrics,
-            winner_validation=final_validation,
-            housekeeping=housekeeping,
+            if existing is None:
+                self.state.completed_sprints.append(summary)
+            self.state.sprint_iteration = 0
+            self.state.sprint_started_at = ""
+            self.state.needs_product_owner = True
+            self.state.brain_session_id = None
+            self.state.product_owner_inspected = False
+            self.state.active_iteration = {}
+            self._save(
+                f"Sprint {self.state.sprint_number} completed; returning to a fresh Product Owner."
+            )
+
+    # Iteration state machine ---------------------------------------
+
+    def _run_iteration(self) -> None:
+        if not self.state.active_iteration:
+            self._start_iteration()
+        while self.state.active_iteration:
+            self._checkpoint()
+            phase = str(self.state.active_iteration.get("phase") or "planning")
+            if phase == "planning":
+                self._plan_iteration()
+            elif phase == "coding":
+                self._code_iteration()
+            elif phase == "review":
+                self._review_iteration()
+            elif phase == "testing":
+                self._test_iteration()
+            elif phase == "delivery":
+                self._deliver_iteration()
+            elif phase == "finalizing":
+                self._finalize_iteration()
+            else:
+                raise RuntimeError(f"unknown iteration phase: {phase}")
+
+    def _start_iteration(self) -> None:
+        assert self._workspace is not None
+        slot = self.state.sprint_iteration
+        kind = slot_kind(slot)
+        if not ready_stories(self.state.backlog, kind):
+            raise IterationStalled(
+                f"sprint {self.state.sprint_number} slot {slot + 1} has no ready {kind} story"
+            )
+        iteration_id = f"S{self.state.sprint_number:03d}-I{slot + 1:02d}"
+        with self._state_lock:
+            self.state.active_iteration = {
+                "id": iteration_id,
+                "sprint": self.state.sprint_number,
+                "slot": slot + 1,
+                "kind": kind,
+                "phase": "planning",
+                "base_sha": self._workspace.target_head(),
+                "story_id": "",
+                "plan": {},
+                "planner_session": None,
+                "coder_session": None,
+                "reviewer_session": None,
+                "tester_session": None,
+                "coder_round": 0,
+                "review_round": 0,
+                "tester_round": 0,
+                "unchanged_rounds": 0,
+                "coder_inflight": False,
+                "coder_start_fingerprint": "",
+                "fingerprint": "",
+                "tree": "",
+                "reviewed_fingerprint": "",
+                "reviewed_tree": "",
+                "tested_fingerprint": "",
+                "tested_tree": "",
+                "review_findings": [],
+                "test_findings": [],
+                "review": {},
+                "test": {},
+                "validation": [],
+                "delivery_commit": "",
+                "implementation_summary": "",
+                "nits": [],
+            }
+            self._save(
+                f"Started sprint {self.state.sprint_number} slot {slot + 1}/10 ({kind})."
+            )
+
+    def _iteration_rel(self) -> str:
+        active = self.state.active_iteration
+        return (
+            f"sprints/{int(active['sprint']):03d}/iterations/"
+            f"{int(active['slot']):02d}"
         )
-        self.state.last_red_flags = list(brain_report.get("red_flags") or [])
-        self.store.write_data(f"{batch_rel}/brain-report.json", brain_report)
-        self.state.checkpoint = {"resume_phase": "brain"}
-        return {
-            "cycle": cycle,
-            "objective": decision.objective,
-            "commit": commit,
-            "winner": winner_name,
-            "review": review,
-            "black_box": black_box,
-            "whitebox": whitebox,
-            "brain_report": brain_report,
-            "housekeeping": housekeeping,
-            "candidate_metrics": metrics,
-        }
 
-    def _has_candidate_patch(self, batch_rel: str, name: str) -> bool:
-        return (self.store.root / batch_rel / "candidates" / name / "candidate.patch").is_file()
-
-    def _load_outcomes(
-        self, worktrees: dict[str, CandidateWorktree], batch_rel: str
-    ) -> dict[str, CandidateOutcome]:
-        outcomes: dict[str, CandidateOutcome] = {}
-        for name, worktree in worktrees.items():
-            path = self.store.root / batch_rel / "candidates" / name / "outcome.json"
-            if not path.is_file():
-                continue
-            data = json.loads(path.read_text(encoding="utf-8"))
-            plan_file = worktree.path / ".forge" / "plan.md"
-            plan_state = (
-                progress(plan_file.read_text(encoding="utf-8"))
-                if plan_file.is_file()
-                else PlanProgress(0, 0, ())
-            )
-            if data.get("status") == "failed" and not self._has_candidate_patch(
-                batch_rel, name
-            ):
-                continue
-            outcomes[name] = CandidateOutcome(
-                name=name,
-                worktree=worktree,
-                session_id=data.get("session_id"),
-                status=str(data.get("status") or "complete"),
-                plan=plan_state,
-                turns=int(data.get("turns") or 1),
-                validation=list(data.get("validation") or []),
-                summary=str(data.get("summary") or ""),
-                warnings=list(data.get("warnings") or []),
-            )
-        return outcomes
-
-    def _restore_or_create_worktrees(
-        self, batch_rel: str, *, recover: bool
-    ) -> dict[str, CandidateWorktree]:
-        assert self._competition is not None
-        if recover:
-            try:
-                return self._competition.reattach_candidates()
-            except GitError:
-                patches = {
-                    name: self.store.root / batch_rel / "candidates" / name / "candidate.patch"
-                    for name in ("tdd", "explore", "classic")
-                }
-                if any(path.is_file() and path.stat().st_size > 0 for path in patches.values()):
-                    worktrees, warnings = self._competition.restore_from_patches(patches)
-                    for warning in warnings:
-                        self._warning(warning)
-                    return worktrees
-        return self._competition.create_candidates()
-
-    def _make_plan(
-        self,
-        decision: BrainDecision,
-        batch_rel: str,
-        *,
-        housekeeping: bool = False,
-    ) -> str:
-        repository_context, repository_is_empty = self._planner_context()
-        prompt = planner_prompt(
-            decision.objective,
-            decision.success_criteria,
-            Path("plan.md"),
-            repository_context=repository_context,
+    def _plan_iteration(self) -> None:
+        active = self.state.active_iteration
+        self._phase(
+            "planning",
+            f"Planner is preparing {active['kind']} slot {active['slot']}/10.",
+        )
+        context, _empty = self._planner_context()
+        prompt = sprint_planner_prompt(
+            brief=self._brief_text(),
+            sprint=int(active["sprint"]),
+            sprint_goal=self.state.sprint_goal,
+            slot=int(active["slot"]),
+            kind=str(active["kind"]),
+            backlog=ready_stories(self.state.backlog),
+            quality_backlog=[item for item in self.state.quality_backlog if item.get("status") != "resolved"],
+            repository_context=context,
             environment_context=self._environment_context(),
-            housekeeping=housekeeping,
-            previous_flags=tuple(self.state.last_red_flags),
         )
-        session: str | None = None
+        session = active.get("planner_session")
+        available_nits = tuple(
+            str(item["id"])
+            for item in self.state.quality_backlog
+            if item.get("status") != "resolved"
+        )
         for attempt in range(1, 4):
             result = self._invoke(
                 role="planner",
@@ -1170,22 +786,530 @@ class ForgeOrchestrator:
                 prompt=prompt,
                 cwd=self.repo,
                 session_id=session,
-                access="none" if repository_is_empty else "read",
-                relative=f"{batch_rel}/planner/attempt-{attempt}",
+                access="read",
+                schema=ITERATION_PLAN_SCHEMA,
+                relative=f"{self._iteration_rel()}/planner/attempt-{attempt}",
+                invocation=attempt,
             )
-            session = result.session_id
+            session = result.session_id or session
+            with self._state_lock:
+                active["planner_session"] = session
+                self.store.save_state(self.state)
             try:
-                validate_plan(result.text)
-            except ValueError as exc:
-                prompt = (
-                    "Forge rejected the previous Markdown plan: "
-                    f"{exc}. Return a corrected complete plan using the required headings, "
-                    "checkbox tasks, and backtick validation-command bullets."
+                plan = parse_iteration_plan(
+                    result.text,
+                    backlog=self.state.backlog,
+                    required_kind=str(active["kind"]),
+                    available_nit_ids=available_nits,
                 )
+            except ContractError as exc:
+                prompt = f"Forge rejected the plan JSON: {exc}. Return the complete corrected JSON only."
                 continue
-            self.store.write_text(f"{batch_rel}/plan.md", result.text.rstrip() + "\n")
-            return result.text.rstrip() + "\n"
-        raise RuntimeError("planner failed to produce a valid Markdown plan")
+            self.store.write_data(f"{self._iteration_rel()}/plan.json", plan)
+            with self._state_lock:
+                active["story_id"] = plan["story_id"]
+                active["plan"] = plan
+                active["phase"] = "coding"
+                for story in self.state.backlog:
+                    if story.get("id") == plan["story_id"]:
+                        story["status"] = "selected"
+                        break
+                self._save(f"Planner selected {plan['story_id']}: {plan['objective']}")
+            return
+        raise RuntimeError("planner failed its iteration contract three times")
+
+    def _candidate(self) -> CandidateWorktree:
+        assert self._workspace is not None
+        return self._workspace.create_or_reattach(
+            str(self.state.active_iteration["base_sha"]), recover=True
+        )
+
+    def _code_iteration(self) -> None:
+        assert self._workspace is not None
+        active = self.state.active_iteration
+        candidate = self._candidate()
+        current_capture = self._workspace.capture(candidate)
+        current_fingerprint = str(current_capture["fingerprint"])
+        if active.get("coder_inflight"):
+            before = str(active.get("coder_start_fingerprint") or "")
+            with self._state_lock:
+                active["coder_inflight"] = False
+                if before and current_fingerprint != before:
+                    active["fingerprint"] = current_fingerprint
+                    active["tree"] = str(current_capture["tree"])
+                    active["phase"] = "review"
+                    self._save(
+                        "Recovered edits left by an interrupted coder; reviewing instead of replaying them."
+                    )
+                    return
+        if int(active.get("coder_round") or 0) >= self.config.max_revision_rounds:
+            raise IterationStalled(
+                f"coder exceeded {self.config.max_revision_rounds} rounds for {active['id']}"
+            )
+
+        self._phase("coding", f"Coder is implementing {active['story_id']}.")
+        with self._state_lock:
+            active["coder_round"] = int(active.get("coder_round") or 0) + 1
+            active["coder_inflight"] = True
+            active["coder_start_fingerprint"] = current_fingerprint
+            self.store.save_state(self.state)
+            coder_round = int(active["coder_round"])
+        prompt = implementation_prompt(
+            plan=dict(active["plan"]),
+            blocking_findings=list(active.get("review_findings") or []),
+            tester_feedback=list(active.get("test_findings") or []),
+            previous_summary=str(active.get("implementation_summary") or ""),
+        )
+        result = self._invoke(
+            role="coder",
+            model=self.config.models["coder"],
+            prompt=prompt,
+            cwd=candidate.path,
+            session_id=active.get("coder_session"),
+            access="write",
+            relative=f"{self._iteration_rel()}/coder/round-{coder_round}",
+            invocation=coder_round,
+            failover_on_timeout=True,
+        )
+        capture = self._workspace.capture(candidate)
+        fingerprint = str(capture["fingerprint"])
+        self.store.write_text(
+            f"{self._iteration_rel()}/coder/round-{coder_round}.patch",
+            capture["patch"],
+        )
+        self.store.write_data(
+            f"{self._iteration_rel()}/coder/round-{coder_round}.json",
+            {
+                "summary": result.text,
+                "fingerprint": fingerprint,
+                "status": capture["status"],
+                "diffstat": capture["diffstat"],
+            },
+        )
+        with self._state_lock:
+            active["coder_session"] = result.session_id or active.get("coder_session")
+            active["implementation_summary"] = result.text.strip()
+            active["coder_inflight"] = False
+            if fingerprint == current_fingerprint:
+                active["unchanged_rounds"] = int(active.get("unchanged_rounds") or 0) + 1
+            else:
+                active["unchanged_rounds"] = 0
+            if int(active["unchanged_rounds"]) >= self.config.stalled_turns:
+                raise IterationStalled(
+                    f"coder made no workspace progress for {active['unchanged_rounds']} rounds"
+                )
+            active["fingerprint"] = fingerprint
+            active["tree"] = str(capture["tree"])
+            active["reviewed_fingerprint"] = ""
+            active["reviewed_tree"] = ""
+            active["tested_fingerprint"] = ""
+            active["tested_tree"] = ""
+            active["phase"] = "review"
+            self._save(f"Coder round {coder_round} is ready for review.")
+
+    def _validation_copy(self, candidate: CandidateWorktree, name: str) -> Path:
+        assert self._workspace is not None
+        destination = self.tester_root / f"{self.state.active_iteration['id']}-{name}"
+        if destination.exists():
+            shutil.rmtree(destination)
+        return self._workspace.create_disposable_copy(candidate, destination)
+
+    def _review_iteration(self) -> None:
+        assert self._workspace is not None
+        active = self.state.active_iteration
+        if int(active.get("review_round") or 0) >= self.config.max_revision_rounds:
+            raise IterationStalled(
+                f"reviewer exceeded {self.config.max_revision_rounds} rounds for {active['id']}"
+            )
+        candidate = self._candidate()
+        capture = self._workspace.capture(candidate)
+        fingerprint = str(capture["fingerprint"])
+        tree = str(capture["tree"])
+        validation_copy = self._validation_copy(candidate, "review-validation")
+        try:
+            validation = run_commands(
+                tuple(str(item) for item in active["plan"]["validation_commands"]),
+                validation_copy,
+            )
+        finally:
+            shutil.rmtree(validation_copy, ignore_errors=True)
+        self._checkpoint()
+        with self._state_lock:
+            active["fingerprint"] = fingerprint
+            active["tree"] = tree
+            active["validation"] = validation
+            active["review_round"] = int(active.get("review_round") or 0) + 1
+            review_round = int(active["review_round"])
+            self.state.phase = "review"
+            self._save(f"Reviewer is assessing coder round {active['coder_round']}.")
+        prompt = iteration_reviewer_prompt(
+            plan=dict(active["plan"]),
+            fingerprint=fingerprint,
+            validation=self._compact_validation(validation),
+            previous_findings=list(active.get("review_findings") or []),
+        )
+        session = active.get("reviewer_session")
+        task_ids = tuple(str(item["id"]) for item in active["plan"]["tasks"])
+        for attempt in range(1, 4):
+            result = self._invoke(
+                role="reviewer",
+                model=self.config.models["reviewer"],
+                prompt=prompt,
+                cwd=candidate.path,
+                session_id=session,
+                access="read",
+                schema=ITERATION_REVIEW_SCHEMA,
+                relative=f"{self._iteration_rel()}/review/round-{review_round}-attempt-{attempt}",
+                invocation=review_round,
+            )
+            session = result.session_id or session
+            with self._state_lock:
+                active["reviewer_session"] = session
+                self.store.save_state(self.state)
+            try:
+                review = parse_iteration_review(
+                    result.text,
+                    task_ids=task_ids,
+                    expected_fingerprint=fingerprint,
+                    validation_results=validation,
+                )
+            except ContractError as exc:
+                prompt = f"Forge rejected the review JSON: {exc}. Return the complete corrected JSON only."
+                continue
+            self.store.write_data(
+                f"{self._iteration_rel()}/review/round-{review_round}.json",
+                review,
+            )
+            with self._state_lock:
+                self._record_nits(review["nits"], source="review")
+                active["nits"].extend(
+                    item for item in review["nits"] if item not in active["nits"]
+                )
+                active["review"] = review
+                if review["verdict"] == "blocked":
+                    active["review_round"] = max(0, review_round - 1)
+                    raise IterationStalled(
+                        f"reviewer blocked: {review['blocker']}", recoverable=True
+                    )
+                if review["verdict"] == "reject":
+                    active["review_findings"] = review["blocking_findings"]
+                    active["test_findings"] = []
+                    active["phase"] = "coding"
+                    self._save(
+                        f"Reviewer rejected round {active['coder_round']} with "
+                        f"{len(review['blocking_findings'])} blocker(s)."
+                    )
+                    return
+                active["review_findings"] = []
+                active["reviewed_fingerprint"] = fingerprint
+                active["reviewed_tree"] = tree
+                active["phase"] = "testing"
+                self._save("Reviewer accepted the implementation; unified testing may begin.")
+                return
+        raise RuntimeError("reviewer failed its contract three times")
+
+    def _test_iteration(self) -> None:
+        assert self._workspace is not None
+        active = self.state.active_iteration
+        if int(active.get("tester_round") or 0) >= self.config.max_revision_rounds:
+            raise IterationStalled(
+                f"tester exceeded {self.config.max_revision_rounds} rounds for {active['id']}"
+            )
+        candidate = self._candidate()
+        capture = self._workspace.capture(candidate)
+        fingerprint = str(capture["fingerprint"])
+        tree = str(capture["tree"])
+        if fingerprint != active.get("reviewed_fingerprint") or tree != active.get(
+            "reviewed_tree"
+        ):
+            with self._state_lock:
+                active["phase"] = "review"
+                self._save("Implementation changed after review; returning to reviewer.")
+            return
+        self._checkpoint()
+        with self._state_lock:
+            active["tester_round"] = int(active.get("tester_round") or 0) + 1
+            tester_round = int(active["tester_round"])
+            self.state.phase = "testing"
+            self._save(f"Unified tester is checking {active['story_id']}.")
+        product_copy = self._validation_copy(candidate, "tester")
+        evidence = product_copy / ".forge-test-evidence"
+        evidence.mkdir(parents=True, exist_ok=True)
+        artifact_evidence = (
+            self.store.root
+            / self._iteration_rel()
+            / "tester"
+            / f"evidence-round-{tester_round}-{fingerprint[:12]}"
+        )
+        if artifact_evidence.exists():
+            shutil.rmtree(artifact_evidence)
+        validation = run_commands(
+            tuple(str(item) for item in active["plan"]["validation_commands"]),
+            product_copy,
+        )
+        with self._state_lock:
+            active["validation"] = validation
+            self.store.save_state(self.state)
+        task_ids = tuple(str(item["id"]) for item in active["plan"]["tasks"])
+        session = active.get("tester_session")
+        try:
+            with optional_virtual_display() as server:
+                prompt = unified_tester_prompt(
+                    plan=dict(active["plan"]),
+                    fingerprint=fingerprint,
+                    review=dict(active["review"]),
+                    validation=self._compact_validation(validation),
+                    evidence_dir=evidence,
+                    virtual_display=None if server is None else server.display,
+                )
+                environment = {} if server is None else server.environment()
+                for attempt in range(1, 4):
+                    result = self._invoke(
+                        role="tester",
+                        model=self.config.models["tester"],
+                        prompt=prompt,
+                        cwd=product_copy,
+                        session_id=session,
+                        access="test",
+                        schema=ITERATION_TEST_SCHEMA,
+                        environment=environment,
+                        relative=f"{self._iteration_rel()}/tester/round-{tester_round}-attempt-{attempt}",
+                        invocation=tester_round,
+                    )
+                    session = result.session_id or session
+                    with self._state_lock:
+                        active["tester_session"] = session
+                        self.store.save_state(self.state)
+                    try:
+                        report = parse_iteration_test(
+                            result.text,
+                            task_ids=task_ids,
+                            expected_fingerprint=fingerprint,
+                            validation_results=validation,
+                            public_checks=tuple(
+                                str(item) for item in active["plan"]["public_checks"]
+                            ),
+                        )
+                    except ContractError as exc:
+                        prompt = (
+                            f"Forge rejected the tester JSON: {exc}. "
+                            "Return the complete corrected JSON only."
+                        )
+                        continue
+                    self.store.write_data(
+                        f"{self._iteration_rel()}/tester/round-{tester_round}.json",
+                        report,
+                    )
+                    with self._state_lock:
+                        self._record_nits(report["nits"], source="tester")
+                        active["nits"].extend(
+                            item for item in report["nits"] if item not in active["nits"]
+                        )
+                        active["test"] = report
+                        if report["verdict"] == "blocked":
+                            active["tester_round"] = max(0, tester_round - 1)
+                            raise IterationStalled(
+                                f"tester blocked: {report['blocker']}", recoverable=True
+                            )
+                        if report["verdict"] == "reject":
+                            active["test_findings"] = report["blocking_findings"]
+                            active["review_findings"] = []
+                            active["reviewed_fingerprint"] = ""
+                            active["reviewed_tree"] = ""
+                            active["phase"] = "coding"
+                            self._save(
+                                f"Tester rejected the implementation with "
+                                f"{len(report['blocking_findings'])} blocker(s); returning to coder."
+                            )
+                            return
+                        active["test_findings"] = []
+                        active["tested_fingerprint"] = fingerprint
+                        active["tested_tree"] = tree
+                        active["phase"] = "delivery"
+                        self._save("Unified tester accepted the reviewed implementation.")
+                        return
+                raise RuntimeError("tester failed its contract three times")
+        finally:
+            if evidence.is_dir():
+                shutil.copytree(evidence, artifact_evidence, dirs_exist_ok=True)
+            shutil.rmtree(product_copy, ignore_errors=True)
+
+    def _deliver_iteration(self) -> None:
+        assert self._workspace is not None
+        active = self.state.active_iteration
+        candidate = self._candidate()
+        capture = self._workspace.capture(candidate)
+        fingerprint = str(capture["fingerprint"])
+        tree = str(capture["tree"])
+        if fingerprint != active.get("tested_fingerprint") or tree != active.get(
+            "tested_tree"
+        ):
+            with self._state_lock:
+                active["phase"] = "review"
+                self._save("Implementation changed after testing; invalidating acceptance.")
+            return
+        self._phase("delivery", f"Delivering accepted iteration {active['id']}.")
+        intent = {
+            "iteration": active["id"],
+            "expected_base": active["base_sha"],
+            "fingerprint": fingerprint,
+            "tree": tree,
+            "commit": active.get("delivery_commit") or "",
+        }
+        self.store.write_data(f"{self._iteration_rel()}/delivery-intent.json", intent)
+        commit = str(active.get("delivery_commit") or "")
+        if not commit:
+            commit = self._workspace.prepare_commit(
+                candidate,
+                f"Forge {active['kind']} {active['id']}: {active['plan']['objective'][:60]}",
+                expected_tree=tree,
+            )
+            intent["commit"] = commit
+            self.store.write_data(f"{self._iteration_rel()}/delivery-intent.json", intent)
+            with self._state_lock:
+                active["delivery_commit"] = commit
+                self.store.save_state(self.state)
+        delivered = self._workspace.reconcile_delivery(
+            candidate,
+            str(active["base_sha"]),
+            recorded_commit=commit,
+            push=self.config.push,
+        )
+        self.store.write_data(
+            f"{self._iteration_rel()}/delivery.json",
+            {"commit": delivered, "branch": self.config.branch, "pushed": self.config.push},
+        )
+        with self._state_lock:
+            active["delivery_commit"] = delivered
+            active["phase"] = "finalizing"
+            self._save(f"Iteration delivered at {delivered[:12]}.")
+
+    def _finalize_iteration(self) -> None:
+        assert self._workspace is not None
+        active = self.state.active_iteration
+        commit = str(active.get("delivery_commit") or "")
+        if not commit or self._workspace.target_head() != commit:
+            raise RuntimeError("cannot finalize an iteration that is not on the target branch")
+        story_id = str(active["story_id"])
+        record = {
+            "id": active["id"],
+            "sprint": active["sprint"],
+            "slot": active["slot"],
+            "kind": active["kind"],
+            "story_id": story_id,
+            "objective": active["plan"]["objective"],
+            "commit": commit,
+            "review_summary": active["review"].get("summary", ""),
+            "test_summary": active["test"].get("summary", ""),
+            "nits": list(active.get("nits") or []),
+            "coder_rounds": active["coder_round"],
+            "review_rounds": active["review_round"],
+            "tester_rounds": active["tester_round"],
+            "completed_at": utc_now(),
+        }
+        iteration_rel = self._iteration_rel_from_record(record)
+        self.store.write_data(
+            f"{iteration_rel}/delivery.json",
+            {"commit": commit, "branch": self.config.branch, "pushed": self.config.push},
+        )
+        self.store.write_data(f"{iteration_rel}/acceptance.json", record)
+        self._workspace.cleanup()
+        with self._state_lock:
+            existing = next(
+                (
+                    item
+                    for item in self.state.iterations
+                    if str(item.get("id")) == str(record["id"])
+                ),
+                None,
+            )
+            if existing is not None and (
+                existing.get("commit") != commit
+                or existing.get("story_id") != story_id
+                or existing.get("kind") != record["kind"]
+            ):
+                raise RuntimeError("accepted iteration record conflicts with finalizing delivery")
+            for story in self.state.backlog:
+                if story.get("id") == story_id:
+                    story["status"] = "accepted"
+                    story["accepted_commit"] = commit
+                    break
+            if story_id not in self.state.accepted_story_ids:
+                self.state.accepted_story_ids.append(story_id)
+            addressed = set(active["plan"].get("addressed_nit_ids") or [])
+            for nit in self.state.quality_backlog:
+                if nit.get("id") in addressed:
+                    nit["status"] = "resolved"
+                    nit["resolved_iteration"] = active["id"]
+            if existing is None:
+                self.state.iterations.append(record)
+            self.state.cycle = len(self.state.iterations)
+            self.state.sprint_iteration = max(
+                self.state.sprint_iteration, int(record["slot"])
+            )
+            self.state.active_iteration = {}
+            self.state.checkpoint = {
+                "next": "product-owner"
+                if self.state.sprint_iteration == len(SPRINT_SCHEDULE)
+                else "planning",
+                "sprint": self.state.sprint_number,
+                "slot": self.state.sprint_iteration,
+            }
+            self._save(
+                f"Accepted {record['id']}; sprint progress is {self.state.sprint_iteration}/10."
+            )
+
+    @staticmethod
+    def _iteration_rel_from_record(record: dict[str, Any]) -> str:
+        return f"sprints/{int(record['sprint']):03d}/iterations/{int(record['slot']):02d}"
+
+    # Small helpers --------------------------------------------------
+
+    def _record_nits(self, values: list[str], *, source: str) -> None:
+        with self._state_lock:
+            active = self.state.active_iteration
+            existing = {
+                str(item.get("text", "")).strip().casefold()
+                for item in self.state.quality_backlog
+                if item.get("status") != "resolved"
+            }
+            for text in values:
+                normalized = text.strip()
+                if not normalized or normalized.casefold() in existing:
+                    continue
+                nit_id = f"NIT-{len(self.state.quality_backlog) + 1:04d}"
+                self.state.quality_backlog.append(
+                    {
+                        "id": nit_id,
+                        "text": normalized,
+                        "source": source,
+                        "iteration": active.get("id"),
+                        "status": "ready",
+                    }
+                )
+                existing.add(normalized.casefold())
+
+    @staticmethod
+    def _compact_validation(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        compact: list[dict[str, Any]] = []
+        for item in results:
+            compact.append(
+                {
+                    "command": item.get("command"),
+                    "kind": item.get("kind"),
+                    "return_code": item.get("return_code"),
+                    "timed_out": item.get("timed_out"),
+                    "elapsed_seconds": item.get("elapsed_seconds"),
+                    "output_tail": str(item.get("output") or "")[-6000:],
+                }
+            )
+        return compact
+
+    def _brief_text(self) -> str:
+        stored = self.store.root / "brief.md"
+        if stored.is_file():
+            return stored.read_text(encoding="utf-8")
+        return self.brief_path.read_text(encoding="utf-8")
 
     def _planner_context(self) -> tuple[str, bool]:
         result = subprocess.run(
@@ -1197,13 +1321,9 @@ class ForgeOrchestrator:
         )
         files = [line for line in result.stdout.splitlines() if line]
         if not files:
-            return (
-                "The selected branch has no tracked product files. It contains only Forge-local "
-                "inputs/artifacts, so repository inspection would return no useful information.",
-                True,
-            )
+            return ("The selected branch has no tracked product files.", True)
         preview = "\n".join(f"- {name}" for name in files[:200])
-        suffix = "" if len(files) <= 200 else f"\n- ... and {len(files) - 200} more tracked files"
+        suffix = "" if len(files) <= 200 else f"\n- ... and {len(files) - 200} more"
         return (f"Tracked files ({len(files)} total):\n{preview}{suffix}", False)
 
     @staticmethod
@@ -1242,488 +1362,90 @@ class ForgeOrchestrator:
             value = value.replace(character, "\\" + character)
         return ("/" + value,)
 
-    def _run_coder(
-        self,
-        candidate: CandidateWorktree,
-        decision: BrainDecision,
-        commands: tuple[str, ...],
-        batch_rel: str,
-    ) -> CandidateOutcome:
-        model = self.config.models[f"coder_{candidate.name}"]
-        plan_path = candidate.path / ".forge" / "plan.md"
-        prompt = coder_initial(
-            candidate=candidate.name,
-            objective=decision.objective,
-            criteria=decision.success_criteria,
-            plan_path=Path(".forge/plan.md"),
-        )
-        session: str | None = None
-        previous_completed = -1
-        stalled = 0
-        warnings: list[str] = []
-        turns = 0
-        final_text = ""
-        while True:
-            self._checkpoint()
-            turns += 1
-            result = self._invoke(
-                role=f"coder_{candidate.name}",
-                model=model,
-                prompt=prompt,
-                cwd=candidate.path,
-                session_id=session,
-                access="write",
-                relative=f"{batch_rel}/candidates/{candidate.name}/turn-{turns}",
-                candidate=candidate.name,
-                invocation=turns,
-                allow_failover=False,
-            )
-            session = self._adopt_session(
-                session,
-                result.session_id,
-                role=f"coder {candidate.name}",
-            )
-            final_text = result.text
-            if not plan_path.exists():
-                raise RuntimeError("coder removed the Markdown goal plan")
-            state = progress(plan_path.read_text(encoding="utf-8"))
-            self.store.write_data(
-                f"{batch_rel}/candidates/{candidate.name}/progress-{turns}.json",
-                {"completed": state.completed, "total": state.total, "remaining": list(state.remaining)},
-            )
-            if state.done:
-                validation = run_commands(commands, candidate.path)
-                self.store.write_data(
-                    f"{batch_rel}/candidates/{candidate.name}/validation.json", validation
-                )
-                return CandidateOutcome(
-                    candidate.name,
-                    candidate,
-                    session,
-                    "complete",
-                    state,
-                    turns,
-                    validation,
-                    final_text,
-                    warnings,
-                )
-            if state.completed <= previous_completed:
-                stalled += 1
-                warning = (
-                    f"Coder {candidate.name} made no checkbox progress on turn {turns} "
-                    f"({state.completed}/{state.total})."
-                )
-                warnings.append(warning)
-                self._warning(warning)
-            else:
-                stalled = 0
-            previous_completed = state.completed
-            if stalled >= self.config.stalled_turns:
-                warning = f"Coder {candidate.name} stalled repeatedly; moving on with its current artifact."
-                warnings.append(warning)
-                self._warning(warning)
-                validation = run_commands(commands, candidate.path)
-                self.store.write_data(
-                    f"{batch_rel}/candidates/{candidate.name}/validation.json", validation
-                )
-                return CandidateOutcome(
-                    candidate.name,
-                    candidate,
-                    session,
-                    "stalled",
-                    state,
-                    turns,
-                    validation,
-                    final_text,
-                    warnings,
-                )
-            prompt = coder_continuation(
-                completed=state.completed,
-                total=state.total,
-                remaining=state.remaining,
-                reason="unchecked tasks remain in .forge/plan.md",
-            )
+    # Models and provider calls -------------------------------------
 
-    def _capture_candidates(
-        self, outcomes: dict[str, CandidateOutcome], batch_rel: str
-    ) -> dict[str, dict[str, Any]]:
-        assert self._competition is not None
-        bundle: dict[str, dict[str, Any]] = {}
-        for name, outcome in outcomes.items():
-            git = self._competition.capture(outcome.worktree)
-            self.store.write_text(f"{batch_rel}/candidates/{name}/candidate.patch", git["patch"])
-            self.store.write_text(
-                f"{batch_rel}/candidates/{name}/review.patch", git["review_patch"]
-            )
-            self.store.write_text(f"{batch_rel}/candidates/{name}/diffstat.txt", git["diffstat"])
-            self.store.write_text(f"{batch_rel}/candidates/{name}/status.txt", git["status"])
-            self.store.write_data(f"{batch_rel}/candidates/{name}/outcome.json", outcome.to_dict())
-            bundle[name] = {"outcome": outcome.to_dict(), "git": git}
-        review_bundle = {
-            name: {
-                "outcome": self._review_outcome(value["outcome"], batch_rel, name),
-                "git": {
-                    "status": value["git"]["status"],
-                    "diffstat": value["git"]["diffstat"],
-                    "patch_path": str(
-                        self.store.root / batch_rel / "candidates" / name / "review.patch"
-                    ),
-                    "review_patch_truncated": value["git"]["review_patch_truncated"],
-                },
-            }
-            for name, value in bundle.items()
-        }
-        self.store.write_data(f"{batch_rel}/review-bundle.json", review_bundle)
-        if isinstance(self.state.checkpoint, dict):
-            self.state.checkpoint["resume_phase"] = "review"
-        self._save(f"Captured {len(bundle)} candidates; ready for review.")
-        return bundle
+    def _probe_models(self) -> None:
+        unique: list[tuple[str, ModelSpec]] = []
+        seen: set[str] = set()
+        for role in ROLE_NAMES:
+            spec = self.config.models[role]
+            if model_identity(spec) not in seen:
+                unique.append((role, spec))
+                seen.add(model_identity(spec))
+        if self.config.backup is not None and model_identity(self.config.backup) not in seen:
+            unique.append(("backup", self.config.backup))
+        self._phase("preflight", f"Probing {len(unique)} unique model(s).")
+        failures: dict[str, Exception] = {}
 
-    def _review_outcome(
-        self, outcome: dict[str, Any], batch_rel: str, candidate: str
-    ) -> dict[str, Any]:
-        compact = dict(outcome)
-        compact_validation: list[dict[str, Any]] = []
-        for index, validation in enumerate(outcome.get("validation", []), start=1):
-            item = dict(validation)
-            output = str(item.get("output", ""))
-            if len(output) > 12_000:
-                item["output"] = output[-12_000:]
-                item["output_truncated"] = True
-                item["full_result_artifact"] = str(
-                    self.store.root
-                    / batch_rel
-                    / "candidates"
-                    / candidate
-                    / "validation.json"
-                )
-                item["validation_index"] = index
-            compact_validation.append(item)
-        compact["validation"] = compact_validation
-        return compact
-
-    def _apply_winner_fix(
-        self,
-        *,
-        winner: CandidateOutcome,
-        winner_name: str,
-        review: dict[str, Any],
-        batch_rel: str,
-    ) -> AgentResult:
-        role = f"coder_{winner_name}"
-        try:
-            return self._invoke(
-                role=role,
-                model=self.config.models[role],
-                prompt=winner_fix_prompt(
-                    review["feedback"],
-                    winner.validation,
-                    borrow=review.get("borrow") or [],
-                ),
-                cwd=winner.worktree.path,
-                session_id=winner.session_id,
-                access="write",
-                relative=f"{batch_rel}/candidates/{winner_name}/winner-fix",
-                candidate=winner_name,
-                failover_on_timeout=True,
-            )
-        except (AgentTimeout, AgentUsageLimit, AgentConfigurationFailure, AgentFailure) as exc:
-            warning = (
-                f"Winner {winner_name} fix failed ({exc}); "
-                "delivering the current captured tree."
-            )
-            winner.warnings.append(warning)
-            self._warning(warning)
-            return AgentResult(
-                text=warning,
-                session_id=winner.session_id or "",
-                usage=Usage(),
-                elapsed_seconds=0,
-                raw_output="",
-            )
-
-    def _review(
-        self,
-        decision: BrainDecision,
-        outcomes: dict[str, CandidateOutcome],
-        bundle: dict[str, dict[str, Any]],
-        batch_rel: str,
-    ) -> dict[str, Any]:
-        captured = self._read_json(f"{batch_rel}/review.json")
-        if isinstance(captured, dict) and captured.get("winner"):
-            winner = str(captured["winner"])
-            if winner in outcomes and outcomes[winner].status != "failed":
-                self._warning(
-                    f"Reusing captured review for {batch_rel}; winner={winner}."
-                )
-                return captured
-        source_bundle = self.store.root / batch_rel / "review-bundle.json"
-        review_dir = self.worktree_root / "review-evidence"
-        review_dir.mkdir(parents=True, exist_ok=True)
-        local_bundle = json.loads(source_bundle.read_text(encoding="utf-8"))
-        for name in outcomes:
-            source_patch = self.store.root / batch_rel / "candidates" / name / "review.patch"
-            local_patch = review_dir / f"{name}.patch"
-            atomic_write(local_patch, source_patch.read_text(encoding="utf-8"))
-            local_bundle[name]["git"]["patch_path"] = str(local_patch)
-        bundle_path = review_dir / "bundle.json"
-        atomic_write(bundle_path, json.dumps(local_bundle, indent=2, sort_keys=True) + "\n")
-        prompt = reviewer_prompt(
-            objective=decision.objective,
-            criteria=decision.success_criteria,
-            candidates={name: outcome.worktree.path for name, outcome in outcomes.items()},
-            bundle=bundle_path,
-        )
-        session: str | None = None
-        try:
-            for attempt in range(1, 4):
-                result = self._invoke(
-                    role="reviewer",
-                    model=self.config.models["reviewer"],
-                    prompt=prompt,
-                    cwd=self.worktree_root,
-                    session_id=session,
-                    access="read",
-                    schema=REVIEW_SCHEMA,
-                    relative=f"{batch_rel}/review/attempt-{attempt}",
-                )
-                session = result.session_id
-                try:
-                    review = parse_review(result.text)
-                    winner = review["winner"]
-                    if (
-                        outcomes[winner].status == "failed"
-                        or not bundle[winner]["git"]["patch"].strip()
-                    ):
-                        raise ContractError(f"selected candidate {winner} is unusable")
-                except ContractError as exc:
-                    prompt = contract_feedback(str(exc), expected="the required review JSON")
-                    continue
-                self.store.write_data(f"{batch_rel}/review.json", review)
-                return review
-            raise RuntimeError("reviewer failed the competition contract")
-        finally:
-            shutil.rmtree(review_dir, ignore_errors=True)
-
-    def _whitebox(
-        self,
-        decision: BrainDecision,
-        commands: tuple[str, ...],
-        batch_rel: str,
-        product_worktree: Path,
-    ) -> dict[str, Any]:
-        results = run_commands(commands, product_worktree)
-        compact = []
-        for item in results:
-            output = str(item.get("output") or "")
-            compact.append(
-                {
-                    "command": item.get("command"),
-                    "kind": item.get("kind"),
-                    "return_code": item.get("return_code"),
-                    "timed_out": item.get("timed_out"),
-                    "elapsed_seconds": item.get("elapsed_seconds"),
-                    "output_tail": output[-4000:],
-                }
-            )
-        self.store.write_data(f"{batch_rel}/whitebox-commands.json", compact)
-        prompt = whitebox_prompt(objective=decision.objective, results=compact)
-        session: str | None = None
-        try:
-            for attempt in range(1, 4):
-                result = self._invoke(
-                    role="whitebox",
-                    model=self.config.models["whitebox"],
-                    prompt=prompt,
-                    cwd=self.brain_dir,
-                    session_id=session,
+        def probe(item: tuple[str, ModelSpec]) -> tuple[str, Exception | None]:
+            role, spec = item
+            slug = spec.display().replace("/", "_").replace(":", "_")
+            try:
+                self._invoke(
+                    role="probe",
+                    model=spec,
+                    prompt=PROBE_PROMPT,
+                    cwd=self.state_home / "probes" / self.run_id / slug,
                     access="none",
-                    schema=WHITEBOX_SCHEMA,
-                    relative=f"{batch_rel}/whitebox/attempt-{attempt}",
+                    relative=f"preflight/probe-{slug}",
+                    candidate=role,
+                    allow_failover=False,
                 )
-                session = result.session_id
-                try:
-                    report = parse_whitebox(result.text)
-                except ContractError as exc:
-                    prompt = contract_feedback(
-                        str(exc), expected="the required whitebox report JSON"
-                    )
-                    continue
-                self.store.write_data(f"{batch_rel}/whitebox.json", report)
-                return report
-        except Exception as exc:
-            warning = f"White-box reporter did not complete after retries: {exc}"
-            self._warning(warning)
-        fallback = {
-            "summary": "White-box reporter used raw command results only.",
-            "short": [
-                f"{item['command']}: {'timeout' if item['timed_out'] else item['return_code']}"
-                for item in compact
-                if item.get("kind") != "long"
-            ],
-            "long": [
-                f"{item['command']}: {'timeout' if item['timed_out'] else item['return_code']}"
-                for item in compact
-                if item.get("kind") == "long"
-            ],
-            "red_flags": [
-                f"{item['kind']} timed out: {item['command']}"
-                for item in compact
-                if item.get("timed_out")
-            ],
-            "recommendation": "Inspect command results; long failures should not block delivery.",
-        }
-        self.store.write_data(f"{batch_rel}/whitebox.json", fallback)
-        return fallback
+            except (RunCancelled, RunInterrupted):
+                raise
+            except Exception as exc:
+                return role, exc
+            return role, None
 
-    def _black_box(
-        self,
-        decision: BrainDecision,
-        commands: tuple[str, ...],
-        validation: list[dict[str, Any]],
-        batch_rel: str,
-        product_worktree: Path,
-    ) -> dict[str, Any]:
-        evidence = self.store.root / batch_rel / "black-box-evidence"
-        evidence.mkdir(parents=True, exist_ok=True)
-        with optional_virtual_display() as server:
-            prompt = tester_prompt(
-                objective=decision.objective,
-                criteria=decision.success_criteria,
-                commands=commands,
-                validation=validation,
-                evidence_dir=evidence,
-                virtual_display=None if server is None else server.display,
-            )
-            environment = {} if server is None else server.environment()
-            session: str | None = None
-            for attempt in range(1, 4):
-                result = self._invoke(
-                    role="tester",
-                    model=self.config.models["tester"],
-                    prompt=prompt,
-                    cwd=product_worktree,
-                    session_id=session,
-                    access="write",
-                    schema=TEST_SCHEMA,
-                    extra_writable_dirs=(evidence,),
-                    environment=environment,
-                    relative=f"{batch_rel}/black-box/attempt-{attempt}",
-                )
-                session = result.session_id
-                try:
-                    report = parse_test(result.text)
-                except ContractError as exc:
-                    prompt = contract_feedback(
-                        str(exc), expected="the required black-box report JSON"
-                    )
-                    continue
-                self.store.write_data(f"{batch_rel}/black-box.json", report)
-                return report
-        raise RuntimeError("black-box tester failed its report contract")
-
-    def _candidate_metrics(
-        self, outcomes: dict[str, CandidateOutcome], review: dict[str, Any], cycle: int
-    ) -> dict[str, Any]:
-        rows: list[dict[str, Any]] = []
-        usage_path = self.store.root / "usage.jsonl"
-        if usage_path.exists():
-            for line in usage_path.read_text(encoding="utf-8").splitlines():
-                value = json.loads(line)
-                if value.get("cycle") == cycle and value.get("candidate"):
-                    rows.append(value)
-        metrics: dict[str, Any] = {}
-        for name, outcome in outcomes.items():
-            candidate_rows = [row for row in rows if row.get("candidate") == name]
-            metrics[name] = {
-                "status": outcome.status,
-                "turns": outcome.turns,
-                "tasks_completed": outcome.plan.completed,
-                "tasks_total": outcome.plan.total,
-                "review_score": review["candidates"][name]["score"],
-                "validation_passed": sum(
-                    result["return_code"] == 0 and not result["timed_out"]
-                    for result in outcome.validation
-                ),
-                "validation_total": len(outcome.validation),
-                "input_tokens": sum(row["usage"]["input_tokens"] for row in candidate_rows),
-                "cached_input_tokens": sum(
-                    row["usage"]["cached_input_tokens"] for row in candidate_rows
-                ),
-                "output_tokens": sum(row["usage"]["output_tokens"] for row in candidate_rows),
-                "total_tokens": sum(row["usage"]["total_tokens"] for row in candidate_rows),
-                "elapsed_seconds": round(sum(row["elapsed_seconds"] for row in candidate_rows), 3),
-                "warnings": outcome.warnings,
-                "selected": review["winner"] == name,
-            }
-        return metrics
-
-    def _persist_models(self) -> None:
-        self.state.config = self.config.to_dict()
-        self.store.write_data("config.json", self.config.to_dict())
-        self.store.save_state(self.state)
-
-    def _record_disabled(self, spec: ModelSpec) -> None:
-        identity = model_identity(spec)
-        with self._roster_lock:
-            if identity not in self.state.disabled_models:
-                self.state.disabled_models.append(identity)
-                self._persist_models()
-
-    def _adopt_session(self, previous: str | None, current: str | None, *, role: str) -> str:
-        if not current:
-            raise RuntimeError(f"{role} provider did not return a resumable session id")
-        if previous and current != previous:
-            self._warning(f"{role} continued on a new session {current}.")
-        return current
+        with ThreadPoolExecutor(max_workers=min(len(unique), 6) or 1) as pool:
+            futures = [pool.submit(probe, item) for item in unique]
+            for future in as_completed(futures):
+                role, error = future.result()
+                if error is not None:
+                    failures[role] = error
+        for role, error in failures.items():
+            if role == "backup":
+                self._warning(f"backup model probe failed: {error}")
+                continue
+            current = self.config.models[role]
+            replacement = self._replacement_for(role, current)
+            if replacement is None:
+                raise ValueError(f"model preflight failed for {role}: {error}")
+            self.config.models[role] = replacement
+            self._warning(f"{role} switched to backup {replacement.display()} after probe failure.")
+        self.state.preflight_probed = True
+        self._persist_models()
+        self._save(f"Model preflight passed with {len(failures)} replacement(s).")
 
     def _replacement_for(self, role: str, current: ModelSpec) -> ModelSpec | None:
         disabled = set(self.state.disabled_models)
-        current_id = model_identity(current)
-        current_family = model_family(current)
         candidates: list[ModelSpec] = []
-        backup = self.config.backup
-        if (
-            backup is not None
-            and model_identity(backup) != current_id
-            and model_identity(backup) not in disabled
-        ):
-            candidates.append(backup)
-        if role.startswith("coder_"):
-            for other in CODER_ROLES:
-                spec = self.config.models[other]
-                identity = model_identity(spec)
-                if identity == current_id or identity in disabled:
-                    continue
-                if all(model_identity(item) != identity for item in candidates):
-                    candidates.append(spec)
-        different = [item for item in candidates if model_family(item) != current_family]
-        chosen = (different or candidates)
-        if not chosen:
+        if self.config.backup is not None:
+            candidates.append(self.config.backup)
+        for other in ROLE_NAMES:
+            spec = self.config.models[other]
+            if model_identity(spec) != model_identity(current):
+                candidates.append(spec)
+        healthy = [
+            item
+            for item in candidates
+            if model_identity(item) not in disabled
+            and model_identity(item) != model_identity(current)
+        ]
+        if not healthy:
             return None
-        return spec_with_effort(chosen[0], current.effort)
-
-    def _reset_brain_session_if_changed(self, previous_identity: str) -> None:
-        current = self.config.models.get("brain")
-        if current is None or model_identity(current) == previous_identity:
-            return
-        if self.state.brain_session_id:
-            self._warning(
-                f"Brain model changed from {previous_identity} to {model_identity(current)}; "
-                "starting a replacement brain session."
-            )
-        self.state.brain_session_id = None
+        different = [item for item in healthy if model_family(item) != model_family(current)]
+        return spec_with_effort((different or healthy)[0], current.effort)
 
     def _apply_replacement(self, exhausted: ModelSpec, replacement: ModelSpec) -> None:
         with self._roster_lock:
             identity = model_identity(exhausted)
             if identity not in self.state.disabled_models:
                 self.state.disabled_models.append(identity)
-            previous_brain = model_identity(self.config.models["brain"])
-            for role, spec in list(self.config.models.items()):
+            for role in ROLE_NAMES:
+                spec = self.config.models[role]
                 if model_identity(spec) == identity:
                     self.config.models[role] = spec_with_effort(replacement, spec.effort)
-            self._reset_brain_session_if_changed(previous_brain)
             self._persist_models()
 
     def _invoke(
@@ -1749,13 +1471,12 @@ class ForgeOrchestrator:
         current_session = session_id
         failover_used = False
         session_dropped = False
-        role_timeout = ROLE_TIMEOUTS.get(role, self.config.agent_timeout_seconds)
-        if role.startswith("coder_"):
-            role_timeout = ROLE_TIMEOUTS.get(role, ROLE_TIMEOUTS.get("coder_tdd", 3600))
-        role_timeout = min(role_timeout, self.config.agent_timeout_seconds)
-        retries = self.config.retry_count
+        role_timeout = min(
+            ROLE_TIMEOUTS.get(role, self.config.agent_timeout_seconds),
+            self.config.agent_timeout_seconds,
+        )
         attempt = 0
-        while attempt < retries + 1:
+        while attempt < self.config.retry_count + 1:
             attempt += 1
             self._checkpoint()
             self.store.write_text(f"{relative}.prompt.md", current_prompt)
@@ -1777,6 +1498,7 @@ class ForgeOrchestrator:
                         session_id=current_session,
                         access=access,
                         schema=schema,
+                        schema_dir=self.brain_dir / "schemas",
                         extra_writable_dirs=extra_writable_dirs,
                         environment=dict(environment or {}),
                         timeout_seconds=role_timeout,
@@ -1786,77 +1508,53 @@ class ForgeOrchestrator:
                 raise RunCancelled()
             except AgentUsageLimit as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
-                self._warning(f"{role} hit a usage limit on {current_model.display()}: {exc}")
                 self._record_disabled(current_model)
                 if allow_failover and not failover_used:
                     replacement = self._replacement_for(role, current_model)
                     if replacement is not None:
                         self._apply_replacement(current_model, replacement)
-                        if role in self.config.models:
-                            current_model = self.config.models[role]
-                        else:
-                            current_model = replacement
+                        current_model = self.config.models.get(role, replacement)
                         current_session = None
-                        if role == "brain":
-                            self.state.brain_session_id = None
                         failover_used = True
                         attempt = 0
                         self._warning(
-                            f"{role} switching to backup {current_model.display()} and resuming."
+                            f"{role} switched to {current_model.display()} after a usage limit."
                         )
                         continue
                 raise
             except AgentConfigurationFailure as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
                 if current_session and not session_dropped:
-                    self._warning(
-                        f"{role} dropping stale session after configuration error: {exc}"
-                    )
                     current_session = None
                     session_dropped = True
                     attempt = 0
+                    self._warning(f"{role} dropped a stale provider session and will retry.")
                     continue
-                self._warning(f"{role} has a non-retryable provider/CLI error: {exc}")
                 raise
             except AgentTimeout as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
-                self._warning(
-                    f"{role} reached its {role_timeout}s limit; "
-                    "the candidate will continue without another costly agent process"
-                )
                 if allow_failover and failover_on_timeout and not failover_used:
                     replacement = self._replacement_for(role, current_model)
                     if replacement is not None:
                         self._apply_replacement(current_model, replacement)
-                        if role in self.config.models:
-                            current_model = self.config.models[role]
-                        else:
-                            current_model = replacement
+                        current_model = self.config.models.get(role, replacement)
                         current_session = None
                         failover_used = True
                         attempt = 0
-                        self._warning(
-                            f"{role} switching to backup {current_model.display()} "
-                            "after timeout and resuming."
-                        )
+                        self._warning(f"{role} switched model after timeout.")
                         continue
                 raise
             except AgentFailure as exc:
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
-                self._warning(f"{role} attempt {attempt} failed: {exc}")
-                timeout = isinstance(exc, AgentTimeout)
-                allowed = 1 if timeout else self.config.retry_count
-                if attempt > allowed:
+                if attempt > self.config.retry_count:
                     raise
                 current_prompt = (
-                    f"Forge retried this role because the previous process failed: {exc}. "
-                    "Continue the same assigned objective from the current workspace state.\n\n"
+                    f"Forge retried this role because the provider process failed: {exc}. "
+                    "Continue from the durable workspace and return the same requested contract.\n\n"
                     + prompt
                 )
                 continue
             finally:
-                # Do not leave a phantom live card behind when the runner raises
-                # an unexpected process or filesystem exception.
                 self._activity_finished(activity_key)
             self.store.write_text(f"{relative}.raw.jsonl", result.raw_output)
             self.store.write_text(f"{relative}.response.md", result.text.rstrip() + "\n")
@@ -1879,6 +1577,144 @@ class ForgeOrchestrator:
             return result
         raise AssertionError("unreachable")
 
+    def _record_disabled(self, spec: ModelSpec) -> None:
+        identity = model_identity(spec)
+        with self._roster_lock:
+            with self._state_lock:
+                if identity not in self.state.disabled_models:
+                    self.state.disabled_models.append(identity)
+                    self._persist_models()
+
+    def _persist_models(self) -> None:
+        with self._state_lock:
+            self.state.config = self.config.to_dict()
+            self.store.write_data("config.json", self.config.to_dict())
+            self.store.save_state(self.state)
+
+    # State/event plumbing ------------------------------------------
+
+    def _ensure_event_dispatcher(self, execution_generation: int) -> None:
+        if self.on_event is None:
+            return
+        with self._event_lock:
+            if self._event_thread is not None:
+                if self._event_thread.is_alive():
+                    if (
+                        self._event_accepting
+                        and self._event_generation == execution_generation
+                    ):
+                        return
+                    raise RuntimeError(
+                        "the previous event callback is still running; "
+                        "use a fresh controller instance or wait before recovery"
+                    )
+                self._event_thread = None
+                self._event_queue = None
+                self._event_generation = None
+            event_queue: queue.Queue[dict[str, Any] | object] = queue.Queue(
+                maxsize=EVENT_QUEUE_LIMIT
+            )
+            self._event_queue = event_queue
+            self._event_accepting = True
+            self._event_generation = execution_generation
+            self._event_thread = threading.Thread(
+                target=self._dispatch_events,
+                args=(event_queue, execution_generation),
+                name=f"forge-events-{self.run_id}",
+                daemon=True,
+            )
+            self._event_thread.start()
+
+    def _dispatch_events(
+        self,
+        event_queue: queue.Queue[dict[str, Any] | object],
+        execution_generation: int,
+    ) -> None:
+        while True:
+            event = event_queue.get()
+            if event is _EVENT_STOP:
+                return
+            callback = self.on_event
+            if callback is None:
+                continue
+            try:
+                assert isinstance(event, dict)
+                self._callback_context.execution_generation = execution_generation
+                callback(event)
+            except Exception:
+                # Monitoring callbacks must never break or deadlock delivery.
+                continue
+            finally:
+                try:
+                    del self._callback_context.execution_generation
+                except AttributeError:
+                    pass
+
+    def _queue_event(self, event: dict[str, Any]) -> None:
+        if self.on_event is None:
+            return
+        execution_generation = self._active_execution_generation
+        if execution_generation is None:
+            return
+        with self._event_lock:
+            if (
+                not self._event_accepting
+                and self._event_thread is not None
+                and self._event_thread.is_alive()
+            ):
+                return
+        self._ensure_event_dispatcher(execution_generation)
+        with self._event_lock:
+            event_queue = self._event_queue
+            if not self._event_accepting or event_queue is None:
+                return
+            try:
+                event_queue.put_nowait(event)
+            except queue.Full:
+                try:
+                    event_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                event_queue.put_nowait(event)
+
+    def _shutdown_event_dispatcher(self) -> None:
+        with self._event_lock:
+            event_queue = self._event_queue
+            thread = self._event_thread
+            self._event_accepting = False
+            if event_queue is not None:
+                latest: dict[str, Any] | None = None
+                while True:
+                    try:
+                        pending = event_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if isinstance(pending, dict):
+                        latest = pending
+                if latest is not None:
+                    event_queue.put_nowait(latest)
+                event_queue.put_nowait(_EVENT_STOP)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=EVENT_SHUTDOWN_TIMEOUT_SECONDS)
+        with self._event_lock:
+            if (
+                self._event_thread is thread
+                and (thread is None or not thread.is_alive())
+            ):
+                self._event_thread = None
+                self._event_queue = None
+                self._event_generation = None
+
+    def _runner_cancel(self) -> None:
+        cancel = getattr(self.runner, "cancel", None)
+        if callable(cancel):
+            cancel()
+
+    def _runner_allow(self) -> None:
+        allow = getattr(self.runner, "allow", None)
+        if callable(allow):
+            allow()
+
     def _activity_started(
         self,
         key: str,
@@ -1888,85 +1724,78 @@ class ForgeOrchestrator:
         model: ModelSpec,
         attempt: int,
     ) -> None:
-        with self._activity_lock:
-            self.state.active_agents[key] = {
-                "role": role,
-                "candidate": candidate,
-                "model": model.display(),
-                "attempt": attempt,
-                "started_at": utc_now(),
-            }
-            self.store.save_state(self.state)
+        with self._state_lock:
+            with self._activity_lock:
+                self.state.active_agents[key] = {
+                    "role": role,
+                    "candidate": candidate,
+                    "model": model.display(),
+                    "attempt": attempt,
+                    "started_at": utc_now(),
+                }
+                self.store.save_state(self.state)
 
     def _activity_finished(self, key: str) -> None:
-        with self._activity_lock:
-            self.state.active_agents.pop(key, None)
-            self.store.save_state(self.state)
+        with self._state_lock:
+            with self._activity_lock:
+                self.state.active_agents.pop(key, None)
+                self.store.save_state(self.state)
 
-    def activity_snapshot(self) -> dict[str, dict[str, Any]]:
-        with self._activity_lock:
-            snapshot = {key: dict(value) for key, value in self.state.active_agents.items()}
-        competition = self._competition
-        if competition is None:
-            return snapshot
-        for value in snapshot.values():
-            candidate_name = value.get("candidate")
-            candidate = competition.candidates.get(str(candidate_name))
-            if candidate is None:
-                continue
-            plan_path = candidate.path / ".forge" / "plan.md"
-            if plan_path.is_file():
-                state = progress(plan_path.read_text(encoding="utf-8", errors="replace"))
-                value["tasks_completed"] = state.completed
-                value["tasks_total"] = state.total
-            status = subprocess.run(
-                ["git", "status", "--short"],
-                cwd=candidate.path,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+    def _phase(self, phase: str, message: str) -> None:
+        self._checkpoint()
+        with self._state_lock:
+            self.state.phase = phase
+            self._save(message)
+
+    def _warning(self, message: str) -> None:
+        with self._state_lock:
+            self.state.warnings.append(message)
+            self.store.event(
+                "warning", message, phase=self.state.phase, status=self.state.status
             )
-            if status.returncode == 0:
-                value["changed_files"] = len(status.stdout.splitlines())
-        return snapshot
+            if self.on_event is not None:
+                self._queue_event(
+                    {
+                        "kind": "warning",
+                        "message": message,
+                        "phase": self.state.phase,
+                        "status": self.state.status,
+                    }
+                )
+
+    def _save(self, message: str) -> None:
+        with self._state_lock:
+            self.state.message = message
+            self.state.config = self.config.to_dict()
+            self.store.save_state(self.state)
+            event = {
+                "kind": "state",
+                "message": message,
+                "phase": self.state.phase,
+                "status": self.state.status,
+                "sprint": self.state.sprint_number,
+                "slot": self.state.sprint_iteration,
+            }
+            self.store.event(**event)
+            if self.on_event is not None:
+                self._queue_event(event)
 
     def _checkpoint(self) -> None:
         with self._control:
+            if self._interrupt_requested:
+                raise RunInterrupted()
             if self.state.cancel_requested:
                 raise RunCancelled()
             while self.state.paused:
-                self.state.status = "paused"
-                self.store.save_state(self.state)
-                self._control.wait(timeout=1)
+                with self._state_lock:
+                    self.state.status = "paused"
+                    self.store.save_state(self.state)
+                self._control.wait(timeout=0.5)
+                if self._interrupt_requested:
+                    raise RunInterrupted()
                 if self.state.cancel_requested:
                     raise RunCancelled()
             if self.state.status == "paused":
-                self.state.status = "running"
-                self.store.save_state(self.state)
-
-    def _warning(self, message: str) -> None:
-        self.state.warnings.append(message)
-        self.store.event("warning", message)
-        self._emit({"kind": "warning", "message": message})
-
-    def _phase(self, phase: str, message: str) -> None:
-        self.state.phase = phase
-        self._save(message)
-
-    def _save(self, message: str) -> None:
-        self.state.message = message
-        self.store.save_state(self.state)
-        self.store.event("state", message, status=self.state.status, phase=self.state.phase)
-        self._emit(
-            {
-                "kind": "state",
-                "message": message,
-                "status": self.state.status,
-                "phase": self.state.phase,
-                "run_id": self.run_id,
-            }
-        )
-
-    def _emit(self, event: dict[str, Any]) -> None:
-        if self.on_event:
-            self.on_event(event)
+                with self._state_lock:
+                    self.state.status = "running"
+                    self.store.save_state(self.state)

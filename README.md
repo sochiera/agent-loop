@@ -1,99 +1,115 @@
 # Forge
 
-Forge is a local orchestrator for long-running, high-quality software delivery. It keeps one
-powerful product brain alive for the entire run, asks that brain for substantial batches of work,
-and has three cheaper coding agents implement every batch independently. A reviewer chooses the
-best candidate, the winner fixes the review findings, Forge commits and pushes it to the selected
-branch, and a black-box tester reports observable product behavior back to the same brain session.
+Forge is a dependency-free local controller for continuous, Product Owner-led software delivery.
+It turns a product brief into durable ten-iteration sprints, keeps product decisions inside agent
+roles, and owns only execution, retries, persistence, contract checks, and safe Git delivery.
 
-The controller does not decide product scope, quality, or completion. It executes the brain's
-decisions, validates message contracts, retries failed processes, records evidence, and performs
-the Git operations required to deliver the selected candidate.
+Forge does not declare a product finished. It keeps running sprints until an operator pauses or
+cancels it, or until a concrete blocker puts the run in `stalled` or `failed` state.
 
-## Pipeline
+## Sprint loop
 
 ```text
-brief.md
-   │
-   ▼
-persistent brain (no repository and no tools)
-   │ forge.run_batch(objective, success criteria)
-   ▼
-planner ──► plan.md with micro-feature checkboxes and validation commands
-   │
-   ├──────────────┬──────────────────┐
-   ▼              ▼                  ▼
-TDD coder     exploratory coder   classic coder
-own worktree   own worktree        own worktree
-same plan      same plan           same plan
-   └──────────────┴──────────────────┘
-                  │
-                  ▼
-reviewer compares code, tests, diffs, and validation evidence
-                  │
-                  ▼
-winner fixes findings and may borrow concrete pieces from losers
-                   │
-                   ▼
-commit ──► fast-forward selected branch ──► push
-                   │
-       ┌───────────┴───────────┐
-       ▼                       ▼
-white-box reporter      black-box tester
-(short + long tests)    (public behavior)
-       └───────────┬───────────┘
-                   ▼
-        compact product report ──► persistent brain
+committed product snapshot
+          │
+          ▼
+fresh Product Owner ── inspect public behavior ── create deep backlog
+          │
+          ▼
+┌──────────────── one accepted iteration ────────────────┐
+│ planner ──► coder ──► reviewer ──► unified tester      │
+│               ▲          │                │             │
+│               └── reject ┴────────────────┘             │
+│                                      │ accept           │
+│                                      ▼                  │
+│                       exact-tree commit and delivery    │
+└─────────────────────────────────────────────────────────┘
+          │
+          ▼
+F F F F C F F F F C ──► fresh Product Owner ──► ...
 ```
 
-The loop ends only when the brain calls `forge.finish`. There is intentionally no independent
-final verifier and no mechanical product-completion threshold.
+`F` is a feature iteration and `C` is cleanup-only. A slot advances only after the reviewer and
+tester accept the same implementation fingerprint and Forge safely delivers it. Rejected work
+returns to the same coder context, then passes through review again before any retest.
 
-If `Xvfb` is on `PATH`, Forge starts a private display for the black-box tester and exports it as
-`FORGE_VIRTUAL_DISPLAY`. The tester may use that display or the host session; nothing is required.
+After ten accepted iterations Forge discards all role contexts and starts a fresh Product Owner
+visit against the newly delivered product.
 
-## Design principles
+## Roles and gates
 
-- **One persistent brain session.** Forge always resumes its original provider session. Native
-  context compaction may occur. The only intentional replacement is a usage-limit failover onto
-  a configured backup model, which starts a new brain session rather than aborting the run.
-- **The brain cannot inspect the repository.** It runs in a separate state directory. OpenCode
-  receives an empty/denied tool surface. Codex starts with user configuration ignored,
-  shell, unified exec, apps/plugins, browser/computer, multi-agent, image, and web tools disabled,
-  a read-only sandbox, and a contract gate that rejects any remaining tool event.
-- **Large batches, not a micro-loop.** The brain requests a cohesive feature, refactor, bug batch,
-  or product-level test effort. The planner expands it into implementation-sized checkboxes.
-- **Real competition.** All three coders start from the same commit and complete the same plan in
-  isolated Git worktrees. They do not see each other's work.
-- **Uniform goal behavior.** Forge does not depend on provider-specific `/goal` implementations.
-  A coder is resumed with the same session and an explicit reason while unchecked tasks remain.
-- **Warnings are evidence, not product decisions.** Forge records stalls, timeouts, failed checks,
-  and token use. A repeatedly hung or non-progressing coder is left as an incomplete candidate so
-  the process can continue; Forge does not reinterpret the final brief.
-- **Repository history is the delivery mechanism.** Only the selected candidate is committed. The
-  target branch is fast-forwarded and pushed directly to `origin` when push is enabled.
+- **Product Owner** works from a disposable committed snapshot with inspection tools. It launches
+  public workflows, may capture screenshots or other evidence, ignores internal code quality, and
+  creates at least twelve stories representing at least one hour of work. The backlog must cover
+  all eight feature slots and both cleanup slots, with reserve work left over.
+- **Planner** selects the highest-priority ready story of the controller-required type and converts
+  it into one immutable task plan. It must preserve every Product Owner acceptance criterion
+  verbatim and provide bounded validation commands and public checks.
+- **Coder** owns implementation and correction rounds in one recoverable Git worktree. It cannot
+  commit, push, switch branches, alter refs, or access another worktree.
+- **Reviewer** is a pragmatic release gate. Serious correctness, completeness, security,
+  regression, and test defects block. Taste and small polish issues become non-blocking nits for a
+  later cleanup iteration.
+- **Unified tester** combines white-box and black-box acceptance in a disposable copy. It receives
+  the accepted review and mechanical validation, exercises every public check, and must provide
+  task, white-box, and public evidence.
+
+Review and test reports must cover every planned task exactly once and name the exact prospective
+Git tree fingerprint. Empty evidence, stale fingerprints, failed validation, skipped public checks,
+or unresolved blockers cannot pass the controller contracts.
+
+Cleanup iterations may map accumulated nits to explicit tasks. A nit is resolved only after that
+cleanup plan passes the same review and test gates; nits never block a feature iteration.
+
+## Durability and Git safety
+
+Forge uses one implementation branch and worktree per run. It fingerprints the complete prospective
+tree, including staged, unstaged, untracked, binary, and already committed changes. Preparing the
+delivery commit does not change that identity. Before delivery Forge verifies all of the following:
+
+- reviewer and tester accepted the current tree;
+- the commit tree equals the accepted tree;
+- the implementation is exactly one non-empty commit over its recorded base;
+- the target checkout is clean and has not drifted;
+- delivery is a fast-forward.
+
+An OS-backed advisory lock in the canonical Git common directory gives one Forge process exclusive
+ownership of the repository for the complete run or recovery call. A second CLI process, duplicate
+web recovery request, or another run targeting the same repository fails before mutating run state,
+worktrees, or refs.
+
+Delivery is idempotent. Recovery reconciles crashes before commit recording, after commit creation,
+after target integration, and during finalization without replaying an accepted iteration or making
+a duplicate commit.
+
+Every role transition is persisted. A process restart resumes Product Owner correction, planning,
+coding, review, testing, delivery, or finalization at its durable phase. Edits left by an interrupted
+coder are fingerprinted and reviewed instead of being overwritten. Repeated no-progress rounds,
+exhausted revision budgets, unavailable required stories, and external blockers stop as `stalled`
+instead of creating an unbounded agent loop.
+
+Runs created by the former competitive architecture remain visible as schema-version-1 artifacts,
+but cannot be resumed by the sprint controller.
 
 ## Requirements
 
-- Linux or macOS with Git and Python 3.12 or newer.
+- Linux or macOS, Git, and Python 3.12 or newer.
 - At least one authenticated supported agent CLI:
-  - `codex` (GPT family)
-  - `opencode` (GPT family, Grok 4.6, Qwen 3.8 Max, DeepSeek Flash/Pro, Kimi K3)
-- A clean target Git repository. Forge can bootstrap an unborn selected branch in a repository
-  with no commits. When push is enabled the repository must have an `origin` remote.
+  - `codex` for GPT-family catalog models;
+  - `opencode` for GPT, Grok, Qwen, DeepSeek, Gemini, and Kimi catalog models.
+- A clean target Git repository. Forge can initialize an unborn selected branch. Push-enabled runs
+  also require an `origin` remote.
 
-Forge uses existing CLI authentication. It does not require API keys and has no runtime Python
-dependencies.
+Forge uses existing CLI authentication, has no runtime Python dependencies, and does not require
+API keys in its configuration.
 
-## Install
-
-Run directly from a checkout:
+## Run the control room
 
 ```bash
 python3 -m forge ui
 ```
 
-Or install an editable command in a virtual environment:
+Or install it in a virtual environment:
 
 ```bash
 python3 -m venv .venv
@@ -101,73 +117,22 @@ python3 -m venv .venv
 .venv/bin/forge ui
 ```
 
-On Ubuntu, install the matching `python3-venv` package first if `python3 -m venv` reports that
-`ensurepip` is unavailable.
+The UI listens on `127.0.0.1:8787` by default. It configures the repository, branch, brief, one
+model per role, an optional failover model, and push behavior. Closing the browser does not stop a
+run. Pause, resume, cancel, and same-run recovery are available from the run detail view.
 
-The UI listens only on `127.0.0.1` by default and opens `http://127.0.0.1:8787`. It accepts exactly
-the operational inputs Forge needs: target repository, delivery branch, product brief, model
-selection for every role, a coder model pool, and whether to push. **Browse** opens a local
-filesystem explorer to pick the repository directory or a brief file. Closing the browser tab does
-not stop Forge; use **Restart** in the control room after code changes. Model and form choices
-persist across control-room restarts. A live run requires
-confirmation before restart. The control room loads the closed catalog from `/api/catalog` and
-offers provider, model, and effort dropdowns instead of free-text selectors.
+External reviewer or tester blockers may be retried in place after the external condition changes.
+Deterministic stalls such as exhausted revision limits, repeated no-progress rounds, or a missing
+required story are intentionally not recoverable in place; change the product input or start a new
+run rather than repeating the same bounded phase.
 
-## Model selection
-
-Every role uses this selector:
-
-```text
-provider:model[:effort]
-```
-
-Examples:
-
-```text
-codex:gpt-5.6-sol:high
-opencode:gpt-5.6-luna:high
-opencode:grok-4.6
-opencode:qwen-3.8-max
-opencode:deepseek-v4-flash-0731
-opencode:deepseek-v4-pro-0813
-opencode:or-gemini-3.7-flash
-opencode:or-gpt-5.6-luna
-opencode:or-deepseek-v4-flash-0731
-opencode:or-deepseek-v4-pro
-opencode:or-deepseek-v4-pro-0813
-opencode:kimi-k3
-```
-
-GPT-family models may run on Codex or OpenCode. Grok 4.6, Qwen, DeepSeek, Gemini, and Kimi
-models run on OpenCode only. OpenRouter entries use the `or-` catalog keys and require an
-OpenRouter credential in OpenCode. Catalog keys (`gpt-5.6-sol`) and provider
-IDs (`openai/gpt-5.6-sol`) are both accepted. The fixed selections are `brain`, `planner`,
-`reviewer`, `tester`, and `whitebox`. The three coder tactics still exist as `coder_tdd`,
-`coder_explore`, and `coder_classic`, but the control room sends a coder model pool and Forge
-draws those three assignments from it.
-
-Before the first start, and again before every later cycle, Forge pings every unique selected
-model with a one-word, no-tool prompt. Auth or API failures still stop the run when no usable
-roster remains. A usage-limit failure does not abort the run when a backup or a healthy clone
-exists: staff roles switch to the backup model, and coder slots that hit a limit are replaced by
-clones of the models that still work. Forge prefers a replacement from another model family or
-subscription so the same quota wall is not hit twice. A later preflight keeps a healthy failover
-or operator swap; it only writes an original model back into a slot whose current model is still
-disabled. Recovery repeats this roster refresh so a captured review can resume on a healthy
-reviewer. A winner-fix timeout or usage limit failovers onto that replacement and, if nothing
-usable remains, delivers the captured winner tree instead of aborting the run.
-
-The UI coder pool and the three CLI coder fields default to `codex:gpt-5.6-luna:high`. CLI
-flags still override each tactic; `--shuffle-coders` randomly assigns those three models.
-
-The control room can pin one model for the staff roles (brain, planner, reviewer, tester,
-whitebox) and choose only effort per role. That shared-model mode also accepts an optional backup
-provider/model. The CLI equivalent is `--backup provider:model[:effort]`.
-
-Use strong models for the brain and planner, medium models for review, white-box, and black-box
-testing, and cheaper coding models in the coder pool. Every third cycle is a housekeeping batch.
+Forge intentionally uses exactly one coder. The previous three-coder tournament has been removed;
+the selected coder keeps its session across correction rounds for one iteration, then Forge resets
+that context before the next accepted slot.
 
 ## Command-line run
+
+All model flags have catalog defaults and may be overridden independently:
 
 ```bash
 python3 -m forge run \
@@ -176,112 +141,54 @@ python3 -m forge run \
   --branch main \
   --brain codex:gpt-5.6-sol:high \
   --planner codex:gpt-5.6-sol:high \
-  --coder-tdd opencode:gpt-5.6-luna:high \
-  --coder-explore opencode:grok-4.6 \
-  --coder-classic opencode:qwen-3.8-max \
+  --coder codex:gpt-5.6-luna:high \
   --reviewer codex:gpt-5.6-terra:high \
-  --tester codex:gpt-5.6-terra:high \
-  --whitebox codex:gpt-5.6-terra:high
+  --tester codex:gpt-5.6-terra:high
 ```
 
-The three omitted coder selectors use the default `codex:gpt-5.6-luna:high`.
-
-Add `--no-push` for a local-only run. Forge still commits and fast-forwards the selected branch.
-Recover a failed run from its last checkpoint without wiping surviving worktrees:
+Use `--no-push` to deliver only to the local branch. Recover an interrupted run in place:
 
 ```bash
-python3 -m forge resume --repo /path/to/product --run-id 20260820-100909-19c10671
+python3 -m forge resume --repo /path/to/product --run-id RUN_ID
 ```
 
-If the controller process fails or is interrupted after at least one batch was delivered, resume
-the same brain session and run history after fixing the cause:
+`forge recover` is a compatibility alias that reloads the same durable run artifacts. Foreground
+commands exit with status `0` after an operator pause or cancellation and `1` after `failed` or
+`stalled`; continuous runs otherwise keep executing.
 
-```bash
-python3 -m forge recover --repo /path/to/product --run-id RUN_ID
-```
-
-Runs started in the UI expose the same recovery action as **Recover same run** when their
-controller has stopped. If coding and validation finished before a review/provider failure, Forge
-recreates the candidate worktrees from their binary patches and resumes at review instead of
-spending tokens to implement the batch again.
+Selectors use `provider:model[:effort]`. The control room exposes the closed catalog, including
+Codex/OpenCode GPT models and OpenCode-only Grok, Qwen, DeepSeek, Gemini, and Kimi models. Before
+the first sprint Forge probes each unique model once. A usage-limit failure can move a role to the
+configured backup or another healthy selected model without changing the sprint contract.
 
 ## Artifacts
 
-Every run is fully inspectable under:
+Durable evidence lives under `TARGET_REPO/.forge/runs/RUN_ID/`:
 
 ```text
-TARGET_REPO/.forge/runs/RUN_ID/
-├── state.json
-├── config.json
-├── brief.md
-├── events.jsonl
-├── usage.jsonl
-├── brain/
-└── batches/
-    └── 001/
-        ├── objective.json
-        ├── plan.md
-        ├── review-bundle.json
-        ├── review.json
-        ├── black-box.json
-        ├── black-box-evidence/
-        ├── delivery.json
-        ├── candidate-metrics.json
-        └── candidates/
-            ├── tdd/
-            ├── explore/
-            └── classic/
+state.json
+config.json
+brief.md
+events.jsonl
+usage.jsonl
+product-owner/visit-001/{attempt-*,decision.json,evidence/}
+backlog/revision-001.json
+sprints/001/summary.json
+sprints/001/iterations/01/
+  plan.json
+  planner/attempt-*
+  coder/round-*.{json,patch}
+  review/round-*.json
+  tester/round-*.json
+  tester/evidence-round-*-*/
+  delivery-intent.json
+  delivery.json
+  acceptance.json
 ```
 
-Each candidate directory contains every prompt and response, raw provider events, checkbox
-progress, validation output, Git status, diffstat, a binary-safe patch, and its own `metrics.json`.
-The batch-level `candidate-metrics.json` shows completion, review score, validation results, wall
-time, warnings, and token use side by side.
-
-Forge adds `.forge/` to the target repository's local `.git/info/exclude`; it does not modify the
-product's `.gitignore`. It also locally excludes dependency/cache trees such as `node_modules`,
-virtual environments, Python caches, and TypeScript build-info files so a missing project
-`.gitignore` cannot turn generated dependencies into a huge review patch or delivery commit.
-
-Provider-reported usage is normalized to input, cached input, output, and reasoning tokens. Some
-providers or custom model endpoints may omit usage; Forge then records zero rather than inventing a
-number. Subscription-plan limits and monetary cost are provider concerns and cannot always be
-derived from tokens.
-
-## Failure behavior
-
-- A transient process crash is retried with an explicit explanation. Deterministic CLI errors
-  and agent timeouts are not immediately retried, except winner-fix, which first switches to a
-  backup from another family. A usage limit switches the role to the configured backup or a
-  healthy coder clone and resumes the same prompt on a new session; the parallel coder pool is
-  not cancelled. A stale session after a model swap is dropped and retried once.
-- An invalid brain, reviewer, tester, or planner response receives contract feedback and is resumed.
-- A coder with repeated turns that do not change plan progress is marked `stalled`; its artifacts
-  remain available and the other candidates continue.
-- If one coder hits a limit or crashes, the other candidates finish and the cycle continues when
-  at least one patch exists. Before the next cycle Forge preflights again and clones a working
-  coder model into the empty slot.
-- If the winning coder times out or hits a limit while applying review feedback, Forge switches
-  that slot to a different-family backup when one exists. If the fix still fails, the already
-  captured winner is committed instead of failing the run.
-- If all candidates produce no code, the run fails visibly instead of manufacturing progress.
-- Forge refuses to start when no usable model roster remains after preflight, when the
-  repository is dirty, or when delivery would not be a fast-forward. A failed push is reported
-  without rewriting history.
-- Pause, resume, and cancel take effect at safe phase/agent-call boundaries. They do not kill an
-  active provider process in the middle of a filesystem operation.
-- Planner commands marked `[winner-only]` are omitted from the three candidate validation passes
-  and run once after review. This is intended for live, external, destructive, or long acceptance
-  checks. Their recorded result is passed to the winner and black-box tester so neither repeats an
-  unchanged expensive timeout.
-- A failed run keeps candidate worktrees. `forge resume`, `forge recover`, and the control-room
-  recover action inspect artifacts in this order: a captured review (`review-bundle.json` plus
-  three patches and outcomes, no `delivery.json`) resumes at review even when no batch has been
-  recorded yet; a delivered batch with no further capture asks the brain for the next action; a
-  plan without a full capture keeps the plan and recodes only candidates that still lack a patch.
-  Nothing else starts a new run. After candidates are captured, the checkpoint `resume_phase` is
-  `review`. The control room labels that case **Resume review (batch N)** and warns before a new
-  run would throw away that coding work.
+Disposable snapshots and worktrees live in the user state directory, outside the target checkout.
+Forge adds only local exclusions to `.git/info/exclude`; it does not modify the product's
+`.gitignore`.
 
 ## Development
 
@@ -290,5 +197,7 @@ python3 -m pytest
 python3 -m compileall -q forge
 ```
 
-The test suite performs the complete orchestration flow with deterministic fake agents and real
-temporary Git worktrees, commits, and fast-forward delivery. It does not consume model tokens.
+The tests use deterministic fake agents and real temporary Git repositories. They cover the fixed
+sprint schedule, role gates, correction loops, evidence contracts, no-progress stalls, context
+reset, complete-tree fingerprints, and recovery across agent and delivery crash windows without
+consuming model tokens.

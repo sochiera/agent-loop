@@ -1,7 +1,10 @@
+import hashlib
 import subprocess
 from pathlib import Path
 
-from forge.gitops import GitCompetition, list_branches
+import pytest
+
+from forge.gitops import GitError, GitWorkspace, export_revision, list_branches
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -22,41 +25,46 @@ def initialized_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def test_competition_fast_forwards_selected_branch(tmp_path: Path):
+def test_export_revision_handles_empty_commit(tmp_path: Path):
+    repo = tmp_path / "empty-repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "forge@example.test")
+    git(repo, "config", "user.name", "Forge Test")
+    git(repo, "commit", "--allow-empty", "-m", "empty")
+    destination = tmp_path / "snapshot"
+
+    commit = export_revision(repo, destination)
+
+    assert commit == git(repo, "rev-parse", "HEAD")
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
+
+
+def test_export_revision_replaces_file_only_after_success(tmp_path: Path):
     repo = initialized_repo(tmp_path)
-    competition = GitCompetition(repo, "main", "run", tmp_path / "worktrees")
-    base = competition.prepare(require_remote=False)
-    candidates = competition.create_candidates()
-    (candidates["tdd"].path / "feature.txt").write_text("winner\n", encoding="utf-8")
-    captured = competition.capture(candidates["tdd"])
-    assert "feature.txt" in captured["patch"]
-    assert "feature.txt" in captured["review_patch"]
-    sha = competition.commit_and_deliver(candidates["tdd"], "winner", push=False)
-    assert git(repo, "rev-parse", "HEAD") == sha
-    assert git(repo, "rev-parse", "HEAD~1") == base
-    assert (repo / "feature.txt").read_text(encoding="utf-8") == "winner\n"
-    competition.cleanup()
-    assert not (tmp_path / "worktrees" / "tdd").exists()
+    destination = tmp_path / "snapshot"
+    destination.write_text("old\n", encoding="utf-8")
+
+    export_revision(repo, destination)
+
+    assert destination.is_dir()
+    assert (destination / "README.md").read_text(encoding="utf-8") == "base\n"
 
 
-def test_competition_restores_candidates_from_captured_binary_patches(tmp_path: Path):
+@pytest.mark.parametrize(
+    "destination_name", ["repo", "repo/inside", ".", "repo/staging/.."]
+)
+def test_export_revision_rejects_repository_overlap(
+    tmp_path: Path, destination_name: str
+):
     repo = initialized_repo(tmp_path)
-    root = tmp_path / "worktrees"
-    original = GitCompetition(repo, "main", "run", root)
-    original.prepare(require_remote=False)
-    candidates = original.create_candidates()
-    (candidates["tdd"].path / "feature.txt").write_text("restored\n", encoding="utf-8")
-    (candidates["classic"].path / "asset.bin").write_bytes(bytes(range(256)))
-    patches = {name: original.capture(candidate)["patch"] for name, candidate in candidates.items()}
-    original.cleanup()
+    destination = repo if destination_name == "repo" else tmp_path / destination_name
 
-    recovered = GitCompetition(repo, "main", "run", root)
-    recovered.prepare(require_remote=False)
-    restored = recovered.restore_candidates(patches)
+    with pytest.raises(GitError, match="must not overlap"):
+        export_revision(repo, destination)
 
-    assert (restored["tdd"].path / "feature.txt").read_text(encoding="utf-8") == "restored\n"
-    assert (restored["classic"].path / "asset.bin").read_bytes() == bytes(range(256))
-    recovered.cleanup()
+    assert (repo / "README.md").read_text(encoding="utf-8") == "base\n"
 
 
 def test_prepare_bootstraps_unborn_branch_and_excludes_brief(tmp_path: Path):
@@ -68,14 +76,14 @@ def test_prepare_bootstraps_unborn_branch_and_excludes_brief(tmp_path: Path):
     (repo / "goal.md").write_text("Build something.\n", encoding="utf-8")
     assert list_branches(repo) == ["main"]
 
-    competition = GitCompetition(
+    workspace = GitWorkspace(
         repo,
         "main",
         "run",
         tmp_path / "worktrees",
         local_excludes=("/goal.md",),
     )
-    base = competition.prepare(require_remote=False)
+    base = workspace.prepare(require_remote=False)
 
     assert git(repo, "rev-parse", "HEAD") == base
     assert git(repo, "branch", "--show-current") == "main"
@@ -83,41 +91,244 @@ def test_prepare_bootstraps_unborn_branch_and_excludes_brief(tmp_path: Path):
     assert git(repo, "log", "-1", "--pretty=%s") == "Initialize repository for Forge"
 
 
-def test_capture_excludes_generated_dependency_trees(tmp_path: Path):
+def test_workspace_capture_excludes_generated_dependency_trees(tmp_path: Path):
     repo = initialized_repo(tmp_path)
-    competition = GitCompetition(repo, "main", "run", tmp_path / "worktrees")
-    competition.prepare(require_remote=False)
-    candidate = competition.create_candidates()["tdd"]
+    workspace = GitWorkspace(repo, "main", "run", tmp_path / "worktrees")
+    base = workspace.prepare(require_remote=False)
+    candidate = workspace.create_or_reattach(base)
     (candidate.path / "node_modules/pkg").mkdir(parents=True)
     (candidate.path / "node_modules/pkg/index.js").write_text("generated\n", encoding="utf-8")
     (candidate.path / "feature.js").write_text("product\n", encoding="utf-8")
 
-    captured = competition.capture(candidate)
+    captured = workspace.capture(candidate)
 
     assert "feature.js" in captured["patch"]
     assert "node_modules" not in captured["patch"]
     assert "node_modules" not in captured["status"]
-    competition.cleanup()
+    workspace.cleanup()
 
 
-def test_reattach_and_restore_from_patches(tmp_path: Path):
+def test_workspace_delivers_clean_candidate_idempotently(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
+    base = workspace.prepare(require_remote=False)
+    candidate = workspace.create_or_reattach(base)
+    (candidate.path / "feature.txt").write_text("delivered\n", encoding="utf-8")
+
+    captured = workspace.capture(candidate)
+    assert set(captured) == {
+        "status",
+        "diffstat",
+        "patch",
+        "review_patch",
+        "review_patch_truncated",
+        "tree",
+        "fingerprint",
+    }
+    assert "feature.txt" in captured["patch"]
+    assert candidate.name == "implementation"
+    assert candidate.branch == "forge/sprint/implementation"
+
+    commit = workspace.prepare_commit(candidate, "Implement the sprint")
+    assert workspace.prepare_commit(candidate, "Must not commit twice") == commit
+    assert workspace.candidate_head(candidate) == commit
+    assert git(candidate.path, "rev-parse", "HEAD^") == base
+    assert workspace.integrate(commit, base, push=False) == commit
+    assert workspace.integrate(commit, base, push=False) == commit
+    assert workspace.target_head() == commit
+    assert (repo / "feature.txt").read_text(encoding="utf-8") == "delivered\n"
+
+    workspace.cleanup()
+    assert not candidate.path.exists()
+
+
+def test_workspace_reattaches_dirty_implementation(tmp_path: Path):
     repo = initialized_repo(tmp_path)
     root = tmp_path / "worktrees"
-    competition = GitCompetition(repo, "main", "run", root)
-    competition.prepare(require_remote=False)
-    candidates = competition.create_candidates()
-    (candidates["explore"].path / "note.txt").write_text("kept\n", encoding="utf-8")
-    captured = competition.capture(candidates["explore"])
-    patch = tmp_path / "explore.patch"
-    patch.write_text(captured["patch"], encoding="utf-8")
-    attached = GitCompetition(repo, "main", "run", root)
-    attached.prepare(require_remote=False)
-    again = attached.reattach_candidates()
-    assert (again["explore"].path / "note.txt").read_text(encoding="utf-8") == "kept\n"
-    attached.cleanup()
-    restored = GitCompetition(repo, "main", "run-2", tmp_path / "restored")
-    restored.prepare(require_remote=False)
-    trees, warnings = restored.restore_from_patches({"explore": patch})
-    assert warnings == []
-    assert (trees["explore"].path / "note.txt").read_text(encoding="utf-8") == "kept\n"
-    restored.cleanup()
+    original = GitWorkspace(repo, "main", "sprint", root)
+    base = original.prepare(require_remote=False)
+    candidate = original.create_or_reattach(base)
+    (candidate.path / "README.md").write_text("changed\n", encoding="utf-8")
+    (candidate.path / "new.txt").write_text("untracked\n", encoding="utf-8")
+
+    recovered = GitWorkspace(repo, "main", "sprint", root)
+    assert recovered.prepare(require_remote=False) == base
+    reattached = recovered.create_or_reattach(base, recover=True)
+
+    assert reattached == candidate
+    assert (reattached.path / "README.md").read_text(encoding="utf-8") == "changed\n"
+    assert (reattached.path / "new.txt").read_text(encoding="utf-8") == "untracked\n"
+    assert "README.md" in recovered.capture(reattached)["status"]
+    recovered.cleanup()
+
+
+def test_workspace_refuses_external_target_branch_drift(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
+    base = workspace.prepare(require_remote=False)
+    candidate = workspace.create_or_reattach(base)
+    (candidate.path / "feature.txt").write_text("candidate\n", encoding="utf-8")
+    commit = workspace.prepare_commit(candidate, "Candidate commit")
+
+    (repo / "external.txt").write_text("external\n", encoding="utf-8")
+    git(repo, "add", "external.txt")
+    git(repo, "commit", "-m", "External change")
+    external_head = git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(GitError, match="external drift"):
+        workspace.integrate(commit, base, push=False)
+
+    assert workspace.target_head() == external_head
+    assert not (repo / "feature.txt").exists()
+    workspace.cleanup()
+
+
+def test_workspace_recovers_committed_candidate_before_integration(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    root = tmp_path / "worktrees"
+    original = GitWorkspace(repo, "main", "sprint", root)
+    base = original.prepare(require_remote=False)
+    candidate = original.create_or_reattach(base)
+    (candidate.path / "feature.txt").write_text("recover me\n", encoding="utf-8")
+    commit = original.prepare_commit(candidate, "Prepared before crash")
+    assert original.target_head() == base
+
+    recovered = GitWorkspace(repo, "main", "sprint", root)
+    assert recovered.prepare(require_remote=False) == base
+    candidate = recovered.create_or_reattach(base, recover=True)
+
+    assert recovered.reconcile_delivery(candidate, base, push=False) == commit
+    assert recovered.target_head() == commit
+    assert (repo / "feature.txt").read_text(encoding="utf-8") == "recover me\n"
+    recovered.cleanup()
+
+
+def test_workspace_recovers_when_main_is_already_integrated(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    root = tmp_path / "worktrees"
+    original = GitWorkspace(repo, "main", "sprint", root)
+    base = original.prepare(require_remote=False)
+    candidate = original.create_or_reattach(base)
+    (candidate.path / "feature.txt").write_text("already delivered\n", encoding="utf-8")
+    commit = original.prepare_commit(candidate, "Prepared and integrated")
+    original.integrate(commit, base, push=False)
+
+    recovered = GitWorkspace(repo, "main", "sprint", root)
+    assert recovered.prepare(require_remote=False) == commit
+    candidate = recovered.create_or_reattach(base, recover=True)
+
+    assert (
+        recovered.reconcile_delivery(
+            candidate,
+            base,
+            recorded_commit=commit,
+            push=False,
+        )
+        == commit
+    )
+    assert recovered.target_head() == commit
+    recovered.cleanup()
+
+
+def test_workspace_rejects_empty_candidate_patch(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
+    base = workspace.prepare(require_remote=False)
+    candidate = workspace.create_or_reattach(base)
+
+    with pytest.raises(GitError, match="no changes"):
+        workspace.prepare_commit(candidate, "Empty sprint")
+
+    assert workspace.candidate_head(candidate) == base
+    workspace.cleanup()
+
+
+def test_workspace_fingerprint_is_stable_and_tracks_binary_patch(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
+    base = workspace.prepare(require_remote=False)
+    candidate = workspace.create_or_reattach(base)
+    asset = candidate.path / "asset.bin"
+    asset.write_bytes(b"\x00candidate-v1\xff")
+
+    first = workspace.fingerprint(candidate)
+    second = workspace.fingerprint(candidate)
+    patch = workspace.capture(candidate)["patch"]
+
+    assert first == second
+    tree = workspace.capture(candidate)["tree"]
+    assert first == hashlib.sha256(f"{base}\0{tree}".encode("ascii")).hexdigest()
+    assert len(first) == 64
+
+    asset.write_bytes(b"\x00candidate-v2\xff")
+    assert workspace.fingerprint(candidate) != first
+    workspace.cleanup()
+
+
+def test_workspace_fingerprint_covers_staged_changes_and_survives_commit(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
+    base = workspace.prepare(require_remote=False)
+    candidate = workspace.create_or_reattach(base)
+    (candidate.path / "staged.txt").write_text("first\n", encoding="utf-8")
+    git(candidate.path, "add", "staged.txt")
+
+    first = workspace.capture(candidate)
+    (candidate.path / "staged.txt").write_text("second\n", encoding="utf-8")
+    git(candidate.path, "add", "staged.txt")
+    second = workspace.capture(candidate)
+
+    assert first["fingerprint"] != second["fingerprint"]
+    assert first["tree"] != second["tree"]
+    commit = workspace.prepare_commit(
+        candidate, "Commit accepted tree", expected_tree=second["tree"]
+    )
+    after_commit = workspace.capture(candidate)
+    assert after_commit["fingerprint"] == second["fingerprint"]
+    assert after_commit["tree"] == second["tree"] == git(candidate.path, "show", "-s", "--format=%T", commit)
+    workspace.cleanup()
+
+
+def test_workspace_refuses_to_commit_a_tree_changed_after_acceptance(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
+    base = workspace.prepare(require_remote=False)
+    candidate = workspace.create_or_reattach(base)
+    (candidate.path / "accepted.txt").write_text("accepted\n", encoding="utf-8")
+    accepted_tree = workspace.capture(candidate)["tree"]
+    (candidate.path / "late.txt").write_text("late mutation\n", encoding="utf-8")
+
+    with pytest.raises(GitError, match="changed after acceptance"):
+        workspace.prepare_commit(candidate, "Must not commit", expected_tree=accepted_tree)
+
+    assert workspace.candidate_head(candidate) == base
+    workspace.cleanup()
+
+
+def test_workspace_disposable_copy_is_isolated_and_omits_local_artifacts(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
+    base = workspace.prepare(require_remote=False)
+    candidate = workspace.create_or_reattach(base)
+    (candidate.path / "README.md").write_text("candidate\n", encoding="utf-8")
+    (candidate.path / "feature.txt").write_text("working state\n", encoding="utf-8")
+    (candidate.path / "node_modules/pkg").mkdir(parents=True)
+    (candidate.path / "node_modules/pkg/index.js").write_text("dependency\n", encoding="utf-8")
+    (candidate.path / ".forge").mkdir()
+    (candidate.path / ".forge/plan.md").write_text("local plan\n", encoding="utf-8")
+
+    destination = workspace.create_disposable_copy(candidate, tmp_path / "tester-copy")
+
+    assert (destination / "README.md").read_text(encoding="utf-8") == "candidate\n"
+    assert (destination / "feature.txt").read_text(encoding="utf-8") == "working state\n"
+    assert (destination / "node_modules/pkg/index.js").read_text(encoding="utf-8") == "dependency\n"
+    assert not (destination / ".git").exists()
+    assert not (destination / ".forge").exists()
+
+    (destination / "feature.txt").write_text("tester mutation\n", encoding="utf-8")
+    assert (candidate.path / "feature.txt").read_text(encoding="utf-8") == "working state\n"
+    (candidate.path / "README.md").write_text("later candidate state\n", encoding="utf-8")
+    assert (destination / "README.md").read_text(encoding="utf-8") == "candidate\n"
+
+    workspace.cleanup()
+    assert (destination / "feature.txt").read_text(encoding="utf-8") == "tester mutation\n"
