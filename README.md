@@ -55,12 +55,16 @@ visit against the newly delivered product.
   fail on the current snapshot (RED). Forge watches the suite fail; a suite that passes immediately
   is sent back for correction. After three failed attempts the sprint continues with a recorded
   warning instead of stalling, and genuinely stuck expectations may ship as `xfail` with precise
-  repair notes visible to every later role.
+  repair notes visible to every later role. An interruption after the final attempt replays the
+  durable response and reclassifies the stored suite instead of dropping it.
 - **Coders (tournament)** — three independent agents (`tdd`, `explore`, `classic`) implement the
   same immutable plan in isolated Git worktrees from the same base commit. They never see each
   other's work. The controller-owned test suite is copied into every worktree; modifying it
-  disqualifies the candidate. Failed or limit-hit candidates stay as artifacts and the tournament
-  continues as long as one eligible candidate remains.
+  disqualifies the candidate. Failed or limit-hit candidates stay as artifacts — including the
+  patch of any dirty tree they left behind — and the tournament continues as long as one eligible
+  candidate remains; edits recovered from an interrupted candidate are preserved the same way.
+  A tournament whose every submitted candidate stayed disqualified is a deterministic dead end,
+  not a recoverable stall.
 - **Reviewer** first selects the tournament winner from the candidate patches, validation results,
   and clean-code quality, then gates winner-fix rounds. Serious correctness, completeness, security,
   regression, missing-test, and real cleanliness failures (lying names, 200-line functions, god
@@ -153,9 +157,10 @@ behavior. Closing the browser does not stop a run. Pause, resume, cancel, and sa
 available from the run detail view.
 
 External reviewer or tester blockers may be retried in place after the external condition changes.
-Deterministic stalls such as exhausted revision limits, repeated no-progress rounds, or a missing
-required story are intentionally not recoverable in place; change the product input or start a new
-run rather than repeating the same bounded phase.
+Deterministic stalls such as exhausted revision limits, repeated no-progress rounds, a missing
+required story, or a tournament where every submitted candidate stayed disqualified are
+intentionally not recoverable in place; change the product input or start a new run rather than
+repeating the same bounded phase.
 
 The three coder tactics draw their models from the configurable coder pool. With fewer than three
 pool entries, models are reused; with more, three are drawn. A single surviving eligible candidate

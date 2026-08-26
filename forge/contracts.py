@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from .sprint import (
+    CODER_CANDIDATES,
     MIN_BACKLOG_MINUTES,
     MIN_BACKLOG_STORIES,
     MIN_CLEANUP_STORIES,
@@ -259,6 +260,38 @@ CANDIDATE_SELECTION_SCHEMA: dict[str, Any] = {
     },
     "required": ["winner", "reason", "candidates", "borrow", "feedback"],
 }
+
+
+def candidate_selection_schema(submitted: tuple[str, ...]) -> dict[str, Any]:
+    """A closed selection schema limited to the candidates that were submitted.
+
+    The returned mapping for the full coder pool is the shared canonical
+    ``CANDIDATE_SELECTION_SCHEMA`` and must not be mutated.
+    """
+
+    names = tuple(dict.fromkeys(str(name) for name in submitted))
+    if names == CODER_CANDIDATES:
+        return CANDIDATE_SELECTION_SCHEMA
+    unknown = [name for name in names if name not in CODER_CANDIDATES]
+    if unknown:
+        raise ValueError(f"unknown tournament candidates: {', '.join(unknown)}")
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "winner": {"type": "string"},
+            "reason": {"type": "string"},
+            "candidates": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {name: _ASSESSMENT_SCHEMA for name in names},
+                "required": list(names),
+            },
+            "borrow": {"type": "array", "items": _BORROW_SCHEMA},
+            "feedback": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["winner", "reason", "candidates", "borrow", "feedback"],
+    }
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -789,7 +822,14 @@ def parse_candidate_selection(
     candidates = value.get("candidates")
     if not isinstance(candidates, dict):
         raise ContractError("candidates must be an object keyed by candidate name")
-    _exact_object(candidates, set(submitted), "candidate selection candidates")
+    for name in sorted(set(candidates) - set(submitted)):
+        del candidates[name]
+    missing = sorted(set(submitted) - set(candidates))
+    if missing:
+        raise ContractError(
+            "candidate selection candidates are missing assessments: "
+            + ", ".join(missing)
+        )
     for name in submitted:
         assessment = candidates[name]
         if not isinstance(assessment, dict):

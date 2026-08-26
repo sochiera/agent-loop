@@ -4,7 +4,9 @@ from pathlib import Path
 import pytest
 
 from forge.contracts import (
+    CANDIDATE_SELECTION_SCHEMA,
     ContractError,
+    candidate_selection_schema,
     parse_candidate_selection,
     parse_iteration_plan,
     parse_iteration_review,
@@ -107,6 +109,7 @@ def test_role_prompts_preserve_controller_contract_boundaries():
     assert "BACKLOG CAPACITY CONTRACT" in owner
     assert "ten-iteration sprint" in owner
     assert "numeric priority is lowest" in planner
+    assert "single tournament candidate" in planner
     assert "acceptance criterion" in planner
     assert "Only the Forge controller may commit" in implementation
     assert "Nits are deliberately absent" in implementation
@@ -257,6 +260,33 @@ def test_candidate_selection_contract_bounds_winner_and_assessments():
             submitted=submitted,
             eligible=submitted,
         )
+
+
+def test_candidate_selection_ignores_assessments_for_unsubmitted_candidates():
+    submitted = ("tdd", "explore")
+    parsed = parse_candidate_selection(
+        json.dumps(selection_contract(winner="explore")),
+        submitted=submitted,
+        eligible=submitted,
+    )
+    assert parsed["winner"] == "explore"
+    assert set(parsed["candidates"]) == {"tdd", "explore"}
+
+
+def test_candidate_selection_schema_is_built_from_the_submitted_candidates():
+    full = candidate_selection_schema(("tdd", "explore", "classic"))
+    assert full is CANDIDATE_SELECTION_SCHEMA
+
+    subset = candidate_selection_schema(("tdd", "classic"))
+    assert subset["additionalProperties"] is False
+    assert subset["required"] == ["winner", "reason", "candidates", "borrow", "feedback"]
+    candidates = subset["properties"]["candidates"]
+    assert candidates["additionalProperties"] is False
+    assert set(candidates["properties"]) == {"tdd", "classic"}
+    assert candidates["required"] == ["tdd", "classic"]
+    for assessment in candidates["properties"].values():
+        assert assessment["additionalProperties"] is False
+        assert set(assessment["required"]) == {"score", "summary", "strengths", "problems"}
 
 
 def plan(story_id: str, criterion: str, *, nits: list[str] | None = None) -> dict:

@@ -137,8 +137,9 @@ def sprint_planner_prompt(
 
 The controller owns scheduling; the Product Owner owns product priorities. Select a ready story
 whose `kind` is exactly the required type and whose numeric priority is lowest (1 is highest).
-Convert it into a bounded implementation plan that one coding agent can complete and that a reviewer
-and tester can objectively verify. Do not write code. Do not select multiple stories. Validation
+Convert it into a bounded implementation plan that a single tournament candidate can complete
+and that a reviewer and tester can objectively verify. Do not write code. Do not select multiple
+stories. Validation
 commands must be non-interactive and bounded. Every Product Owner acceptance criterion for the
 selected story must appear verbatim in at least one task's acceptance criteria. Do not narrow,
 reinterpret, or silently drop Product Owner scope. When a cleanup plan claims a quality nit, include

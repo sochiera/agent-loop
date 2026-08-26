@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from forge.agents import AgentCancelled, AgentConfigurationFailure, AgentRequest
-from forge.contracts import CANDIDATE_SELECTION_SCHEMA
 from forge.models import AgentResult, ModelSpec, ROLE_NAMES, RunConfig, RunState, Usage
 from forge.gitops import GitWorkspace
 from forge.locking import ExecutionLocked, RepositoryExecutionLock
@@ -17,6 +16,7 @@ from forge.orchestrator import (
     ForgeOrchestrator,
     IterationStalled,
     _product_owner_retry_prompt,
+    _snapshot_escape,
 )
 from forge.sprint import CODER_CANDIDATES, SPRINT_SCHEDULE
 
@@ -55,6 +55,10 @@ def result(request: AgentRequest, text: str, *, tools: int = 0) -> AgentResult:
         raw_output=text,
         tool_calls=tools,
     )
+
+
+def is_candidate_selection(request: AgentRequest) -> bool:
+    return request.role == "reviewer" and "winner" in request.schema.get("properties", {})
 
 
 def backlog() -> list[dict]:
@@ -179,7 +183,7 @@ class SprintRunner:
         if request.role in {"coder_tdd", "coder_explore", "coder_classic"}:
             return self._code(request)
         if request.role == "reviewer":
-            if request.schema is CANDIDATE_SELECTION_SCHEMA:
+            if is_candidate_selection(request):
                 return self._select(request)
             return self._review(request)
         if request.role == "tester":
@@ -355,12 +359,12 @@ def test_full_sprint_uses_fixed_schedule_and_returns_to_fresh_product_owner(tmp_
     selections = [
         request
         for request in runner.requests
-        if request.role == "reviewer" and request.schema is CANDIDATE_SELECTION_SCHEMA
+        if request.role == "reviewer" and is_candidate_selection(request)
     ]
     reviews = [
         request
         for request in runner.requests
-        if request.role == "reviewer" and request.schema is not CANDIDATE_SELECTION_SCHEMA
+        if request.role == "reviewer" and not is_candidate_selection(request)
     ]
     assert len(selections) == 10
     assert all(request.session_id is None for request in selections)
@@ -433,7 +437,7 @@ class ReviewRejectRunner(SprintRunner):
         self.review_calls = 0
 
     def run(self, request: AgentRequest) -> AgentResult:
-        if request.role == "reviewer" and request.schema is not CANDIDATE_SELECTION_SCHEMA:
+        if request.role == "reviewer" and not is_candidate_selection(request):
             self._record(request)
             self.review_calls += 1
             rejected = self.review_calls == 1
@@ -568,7 +572,7 @@ class NoProgressRunner(SprintRunner):
             self._record(request)
             self.last_story = story_from_prompt(request.prompt)
             return result(request, "No changes were necessary.")
-        if request.role == "reviewer" and request.schema is not CANDIDATE_SELECTION_SCHEMA:
+        if request.role == "reviewer" and not is_candidate_selection(request):
             self._record(request)
             text = json.dumps(
                 {
@@ -621,7 +625,7 @@ class ExternallyBlockedReviewRunner(SprintRunner):
     def run(self, request: AgentRequest) -> AgentResult:
         if (
             request.role == "reviewer"
-            and request.schema is not CANDIDATE_SELECTION_SCHEMA
+            and not is_candidate_selection(request)
             and not self.blocked_once
         ):
             self.blocked_once = True
@@ -668,7 +672,7 @@ def test_external_review_blocker_can_recover_without_consuming_round(tmp_path: P
 
 class ReviewCrashRunner(SprintRunner):
     def run(self, request: AgentRequest) -> AgentResult:
-        if request.role == "reviewer" and request.schema is not CANDIDATE_SELECTION_SCHEMA:
+        if request.role == "reviewer" and not is_candidate_selection(request):
             self._record(request)
             raise AgentConfigurationFailure("review process crashed", raw_output="crash")
         return super().run(request)
@@ -768,13 +772,294 @@ def test_tournament_continues_when_one_candidate_dies(tmp_path: Path):
     assert (orchestrator.repo / "marker-f01-explore.txt").is_file()
 
 
+class CrashingDirtyCoderRunner(SprintRunner):
+    def run(self, request: AgentRequest) -> AgentResult:
+        if request.role == "coder_classic":
+            self._record(request)
+            story = story_from_prompt(request.prompt)
+            (request.cwd / f"marker-{story.lower()}-classic.txt").write_text(
+                "dirty edit before crash\n", encoding="utf-8"
+            )
+            raise AgentConfigurationFailure("coder classic exploded", raw_output="boom")
+        return super().run(request)
+
+
+def test_failed_dirty_candidate_keeps_its_patch_before_worktrees_are_deleted(
+    tmp_path: Path,
+):
+    runner = CrashingDirtyCoderRunner(stop_after=1)
+    orchestrator = make_orchestrator(tmp_path, runner)
+
+    state = orchestrator.run()
+
+    assert state.status == "cancelled"
+    assert state.cycle == 1
+    assert state.iterations[0]["candidates"]["classic"]["status"] == "failed"
+    patch = (
+        orchestrator.store.root
+        / "sprints/001/iterations/01/candidates/classic/round-1.patch"
+    )
+    assert patch.is_file()
+    assert "marker-f01-classic.txt" in patch.read_text(encoding="utf-8")
+
+
+class InterruptedDirtyCoderRunner(SprintRunner):
+    def __init__(self):
+        super().__init__(stop_after=1)
+        self.exploded = False
+
+    def run(self, request: AgentRequest) -> AgentResult:
+        if request.role == "coder_explore" and not self.exploded:
+            self._record(request)
+            self.exploded = True
+            story = story_from_prompt(request.prompt)
+            (request.cwd / f"marker-{story.lower()}-explore.txt").write_text(
+                "recovered edits\n", encoding="utf-8"
+            )
+            raise AgentCancelled("stop mid-tournament")
+        return super().run(request)
+
+
+def test_recovered_interrupted_candidate_keeps_its_patch(tmp_path: Path):
+    first = InterruptedDirtyCoderRunner()
+    orchestrator = make_orchestrator(tmp_path, first)
+
+    state = orchestrator.run()
+    assert state.status == "cancelled"
+    assert (
+        orchestrator.state.active_iteration["candidates"]["explore"]["status"]
+        == "running"
+    )
+
+    resumed = SprintRunner(stop_after=1)
+    recovered = ForgeOrchestrator.from_existing(
+        orchestrator.repo,
+        orchestrator.run_id,
+        runner=resumed,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    ).recover()
+
+    assert recovered.status == "cancelled"
+    assert recovered.cycle == 1
+    assert recovered.iterations[0]["candidates"]["explore"]["status"] == "complete"
+    assert not any(
+        request.role == "coder_explore" for request in resumed.requests
+    )
+    patch = (
+        orchestrator.store.root
+        / "sprints/001/iterations/01/candidates/explore/round-1.patch"
+    )
+    assert patch.is_file()
+    assert "marker-f01-explore.txt" in patch.read_text(encoding="utf-8")
+
+
+class ConstrainedSelectionRunner(SprintRunner):
+    """Mimic constrained decoding that emits every candidate key regardless of deaths."""
+
+    def _select(self, request: AgentRequest) -> AgentResult:
+        base = super()._select(request)
+        payload = json.loads(base.text)
+        for name in CODER_CANDIDATES:
+            payload["candidates"].setdefault(
+                name,
+                {
+                    "score": 5,
+                    "summary": f"{name} assessed",
+                    "strengths": [],
+                    "problems": [],
+                },
+            )
+        return result(request, json.dumps(payload))
+
+
+def test_selection_survives_schema_shaped_assessments_when_a_candidate_dies(
+    tmp_path: Path,
+):
+    class ConstrainedDeadCoderRunner(ConstrainedSelectionRunner):
+        def __init__(self):
+            super().__init__(stop_after=1)
+            self.crashed = False
+
+        def run(self, request: AgentRequest) -> AgentResult:
+            if request.role == "coder_tdd" and not self.crashed:
+                self._record(request)
+                self.crashed = True
+                raise AgentConfigurationFailure("coder tdd crashed", raw_output="crash")
+            return super().run(request)
+
+    runner = ConstrainedDeadCoderRunner()
+    orchestrator = make_orchestrator(tmp_path, runner)
+
+    state = orchestrator.run()
+
+    assert state.status == "cancelled"
+    assert state.cycle == 1
+    record = state.iterations[0]
+    assert record["winner"] in {"explore", "classic"}
+    assert record["candidates"]["tdd"]["status"] == "failed"
+
+
+def test_blackbox_tests_root_must_stay_inside_the_snapshot(tmp_path: Path):
+    snapshot = tmp_path / "snapshot"
+    outside = tmp_path / "outside"
+    (snapshot / "tests" / "blackbox").mkdir(parents=True)
+    outside.mkdir()
+    (snapshot / "tests" / "blackbox" / "test_ok.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8"
+    )
+    (snapshot / "tests" / "blackbox" / "escape").symlink_to(outside)
+    (snapshot / "tests" / "linked").symlink_to(outside)
+
+    assert _snapshot_escape(snapshot, "tests/blackbox") == "tests/blackbox/escape"
+    assert _snapshot_escape(snapshot, "tests/linked") == "tests/linked"
+
+    (snapshot / "tests" / "blackbox" / "escape").unlink()
+    assert _snapshot_escape(snapshot, "tests/blackbox") is None
+
+
+class EscapingSuiteAuthor(SprintRunner):
+    def _author(self, request: AgentRequest) -> AgentResult:
+        match = re.search(r'"story_id":\s*"([FC]\d+)"', request.prompt)
+        story = match.group(1) if match else self.last_story
+        root = request.cwd / "tests" / "blackbox"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / f"test_{story.lower()}.py").write_text(
+            "from pathlib import Path\n\n\ndef test_missing_artifact():\n"
+            f"    assert Path({story.lower()!r} + '.txt').is_file()\n",
+            encoding="utf-8",
+        )
+        secret = request.cwd.parent / f"secret-{story.lower()}.md"
+        secret.write_text("outside the snapshot\n", encoding="utf-8")
+        link = root / "leak"
+        if not link.is_symlink():
+            link.symlink_to(secret)
+        return result(
+            request,
+            json.dumps(
+                {
+                    "tests_root": "tests/blackbox",
+                    "summary": f"coverage for {story} with an escaping symlink",
+                    "covered": [f"{story} is observable"],
+                    "xfails": [],
+                }
+            ),
+            tools=1,
+        )
+
+
+def test_test_author_symlink_escape_is_rejected_and_never_copied(tmp_path: Path):
+    runner = EscapingSuiteAuthor(stop_after=1)
+    orchestrator = make_orchestrator(tmp_path, runner)
+
+    state = orchestrator.run()
+
+    assert state.status == "cancelled"
+    assert state.cycle == 1
+    assert any("resolves outside the product snapshot" in item for item in state.warnings)
+    stored = orchestrator.store.root / "sprints/001/iterations/01/blackbox-tests"
+    assert not stored.exists()
+    for path in orchestrator.store.root.rglob("*"):
+        if path.is_file():
+            assert "outside the snapshot" not in path.read_text(
+                encoding="utf-8", errors="ignore"
+            )
+
+
+class LateRedAuthor(SprintRunner):
+    """Writes a passing suite twice and a RED suite on the third attempt."""
+
+    def __init__(self):
+        super().__init__(stop_after=1)
+        self.author_calls = 0
+
+    def _author(self, request: AgentRequest) -> AgentResult:
+        match = re.search(r'"story_id":\s*"([FC]\d+)"', request.prompt)
+        story = match.group(1) if match else self.last_story
+        self.last_story = story
+        self.author_calls += 1
+        root = request.cwd / "tests" / "blackbox"
+        root.mkdir(parents=True, exist_ok=True)
+        if self.author_calls < 3:
+            (root / f"test_{story.lower()}.py").write_text(
+                "def test_always_green():\n    assert True\n", encoding="utf-8"
+            )
+        else:
+            (root / f"test_{story.lower()}.py").write_text(
+                "from pathlib import Path\n\n\n"
+                "def test_missing_artifact():\n"
+                f"    assert Path({story.lower()!r} + '.txt').is_file()\n",
+                encoding="utf-8",
+            )
+        return result(
+            request,
+            json.dumps(
+                {
+                    "tests_root": "tests/blackbox",
+                    "summary": f"black-box coverage for {story}",
+                    "covered": [f"{story} is observable"],
+                    "xfails": [],
+                }
+            ),
+            tools=1,
+        )
+
+
+def test_interrupted_final_test_author_attempt_is_reclassified_not_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runner = LateRedAuthor()
+    orchestrator = make_orchestrator(tmp_path, runner)
+    original = ForgeOrchestrator._red_classification
+    classifications = {"count": 0}
+
+    def crash_on_third(self, snapshot: Path, tests_root: str):
+        classifications["count"] += 1
+        if classifications["count"] == 3:
+            raise AgentConfigurationFailure(
+                "crash while running the suite", raw_output="boom"
+            )
+        return original(self, snapshot, tests_root)
+
+    monkeypatch.setattr(ForgeOrchestrator, "_red_classification", crash_on_third)
+    with pytest.raises(AgentConfigurationFailure, match="crash while running"):
+        orchestrator.run()
+    author = orchestrator.state.active_iteration["test_author"]
+    assert author["attempts"] == 3
+    assert author["status"] == "pending"
+
+    resumed = SprintRunner(stop_after=1)
+    recovered = ForgeOrchestrator.from_existing(
+        orchestrator.repo,
+        orchestrator.run_id,
+        runner=resumed,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    ).recover()
+
+    assert recovered.status == "cancelled"
+    assert recovered.cycle == 1
+    suite = json.loads(
+        (
+            orchestrator.store.root
+            / "sprints/001/iterations/01/test-author/suite.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert suite["status"] == "red"
+    assert not [request for request in resumed.requests if request.role == "test_author"]
+    assert any(
+        "Recovered the interrupted test-author attempt 3" in item
+        for item in recovered.warnings
+    )
+
+
 class InflightEditCrashRunner(SprintRunner):
     def __init__(self):
         super().__init__(stop_after=1)
         self.review_calls = 0
 
     def run(self, request: AgentRequest) -> AgentResult:
-        if request.role == "reviewer" and request.schema is not CANDIDATE_SELECTION_SCHEMA:
+        if request.role == "reviewer" and not is_candidate_selection(request):
             self.review_calls += 1
             if self.review_calls == 1:
                 self._record(request)
@@ -1026,6 +1311,39 @@ def test_coder_tampering_with_the_blackbox_suite_is_disqualified(tmp_path: Path)
     assert record["winner"] == "tdd"
     assert record["candidates"]["explore"]["disqualified"] is True
     assert any("tampered with the black-box suite" in item for item in state.warnings)
+
+
+class AllTamperRunner(SprintRunner):
+    def run(self, request: AgentRequest) -> AgentResult:
+        if request.role in {"coder_tdd", "coder_explore", "coder_classic"}:
+            self._record(request)
+            story = story_from_prompt(request.prompt)
+            with (request.cwd / f"{story.lower()}.txt").open("a", encoding="utf-8") as handle:
+                handle.write(f"implemented {story}\n")
+            tamper = (
+                request.cwd
+                / "tests"
+                / "blackbox"
+                / f"tamper-{request.role.removeprefix('coder_')}.py"
+            )
+            tamper.write_text("def test_tamper():\n    assert True\n", encoding="utf-8")
+            return result(request, f"Implemented {story} and helped the suite.", tools=2)
+        return super().run(request)
+
+
+def test_fully_disqualified_tournament_is_a_deterministic_dead_end(tmp_path: Path):
+    runner = AllTamperRunner(stop_after=1)
+    orchestrator = make_orchestrator(tmp_path, runner)
+
+    state = orchestrator.run()
+
+    assert state.status == "stalled"
+    assert state.stalled_recoverable is False
+    candidates = state.active_iteration["candidates"]
+    assert all(candidates[name]["disqualified"] for name in CODER_CANDIDATES)
+    assert "no eligible candidate" in state.message
+    with pytest.raises(RuntimeError, match="deterministic safety limit"):
+        orchestrator.recover()
 
 
 def test_test_author_records_xfails_with_repair_notes(tmp_path: Path):
@@ -1590,3 +1908,4 @@ def test_recovery_reconstructs_partial_sprint_close_before_starting_another_slot
     assert len(recovered.completed_sprints) == 1
     assert recovered.sprint_iteration == 0
     assert recovered.needs_product_owner is True
+

@@ -37,13 +37,13 @@ from .catalog import (
     spec_with_effort,
 )
 from .contracts import (
-    CANDIDATE_SELECTION_SCHEMA,
     ITERATION_PLAN_SCHEMA,
     ITERATION_REVIEW_SCHEMA,
     ITERATION_TEST_SCHEMA,
     PRODUCT_OWNER_SCHEMA,
     TEST_AUTHOR_SCHEMA,
     ContractError,
+    candidate_selection_schema,
     parse_candidate_selection,
     parse_iteration_plan,
     parse_iteration_review,
@@ -95,6 +95,32 @@ def _product_owner_retry_prompt(error: Exception, *, inspected: bool) -> str:
         "Your product inspection remains valid, but Forge rejected the final JSON: "
         f"{error}. Return the complete corrected Product Owner JSON object only."
     )
+
+
+def _snapshot_escape(snapshot: Path, tests_root: str) -> str | None:
+    """Return the offending relative path when tests_root leaves the snapshot.
+
+    Symlinks anywhere under the suite root are followed only on paper: any
+    link that resolves outside the snapshot is reported instead of copied.
+    """
+
+    snapshot_root = snapshot.resolve()
+    root = snapshot / tests_root
+    if not root.resolve().is_relative_to(snapshot_root):
+        return tests_root
+    for item in sorted(root.rglob("*")):
+        if item.is_symlink() and not item.resolve().is_relative_to(snapshot_root):
+            return f"{tests_root}/{item.relative_to(root).as_posix()}"
+    return None
+
+
+def _reject_snapshot_escape(snapshot: Path, tests_root: str) -> None:
+    escape = _snapshot_escape(snapshot, tests_root)
+    if escape is not None:
+        raise ContractError(
+            f"tests_root {escape} resolves outside the product snapshot; "
+            "write the suite inside the snapshot without symlinks leaving it"
+        )
 
 
 class RunCancelled(RuntimeError):
@@ -955,6 +981,12 @@ class ForgeOrchestrator:
         snapshot = self.brain_dir / f"{active['id']}-test-author" / "snapshot"
         if not snapshot.exists():
             export_revision(self.repo, snapshot, str(active["base_sha"]))
+        if (
+            str(author.get("status") or "") == "pending"
+            and int(author.get("attempts") or 0) >= TEST_AUTHOR_ATTEMPTS
+            and self._recover_unclassified_suite(active, snapshot)
+        ):
+            return
         context, _empty = self._planner_context()
         prompt = test_author_prompt(
             brief=self._brief_text(),
@@ -986,6 +1018,7 @@ class ForgeOrchestrator:
                 self.store.save_state(self.state)
             try:
                 authored = parse_test_author(result.text)
+                _reject_snapshot_escape(snapshot, authored["tests_root"])
             except ContractError as exc:
                 last_gap = f"contract: {exc}"
                 prompt = (
@@ -1057,6 +1090,59 @@ class ForgeOrchestrator:
             active["phase"] = "coding"
             self._save("Coder tournament starts without a black-box suite (recorded gap).")
 
+    def _recover_unclassified_suite(self, active: dict[str, Any], snapshot: Path) -> bool:
+        """Reclassify the stored suite when the final attempt was never judged.
+
+        A crash between recording an attempt and classifying its RED state
+        leaves ``attempts`` exhausted with status ``pending``. The durable
+        response artifact is replayed instead of dropping the suite.
+        """
+
+        author = active["test_author"]
+        attempts = int(author.get("attempts") or 0)
+        stored_response = (
+            self.store.root
+            / self._iteration_rel()
+            / "test-author"
+            / f"attempt-{attempts}.response.md"
+        )
+        if not stored_response.is_file():
+            return False
+        try:
+            authored = parse_test_author(stored_response.read_text(encoding="utf-8"))
+            _reject_snapshot_escape(snapshot, authored["tests_root"])
+        except (ContractError, OSError):
+            return False
+        classification, entry = self._red_classification(
+            snapshot, authored["tests_root"]
+        )
+        self.store.write_data(
+            f"{self._iteration_rel()}/test-author/red-attempt-{attempts}.json",
+            {
+                "tests_root": authored["tests_root"],
+                "classification": classification,
+                "command": entry.get("command"),
+                "return_code": entry.get("return_code"),
+                "output_tail": str(entry.get("output") or "")[-6000:],
+                "recovered": True,
+            },
+        )
+        if classification == "red":
+            status = "red"
+            gap = ""
+        else:
+            status = "warned"
+            gap = (
+                "the interrupted final test-author attempt was reclassified "
+                f"after recovery as {classification}"
+            )
+        self._warning(
+            f"Recovered the interrupted test-author attempt {attempts}; "
+            f"the stored suite is accepted ({status})."
+        )
+        self._accept_authored_tests(active, snapshot, authored, status=status, gap=gap)
+        return True
+
     def _accept_authored_tests(
         self,
         active: dict[str, Any],
@@ -1067,6 +1153,7 @@ class ForgeOrchestrator:
         gap: str = "",
     ) -> None:
         author = active["test_author"]
+        _reject_snapshot_escape(snapshot, authored["tests_root"])
         stored = self._stored_tests_dir()
         if stored.exists():
             shutil.rmtree(stored)
@@ -1145,6 +1232,10 @@ class ForgeOrchestrator:
                     record.get("start_fingerprint") or ""
                 ):
                     with self._state_lock:
+                        self.store.write_text(
+                            f"{self._iteration_rel()}/candidates/{name}/round-1.patch",
+                            capture["patch"],
+                        )
                         self._complete_candidate(
                             active, name, capture, summary=record.get("summary") or ""
                         )
@@ -1230,11 +1321,26 @@ class ForgeOrchestrator:
                 f"{self._iteration_rel()}/candidates/{name}/failure.log",
                 exc.raw_output or str(exc),
             )
+            self._persist_candidate_patch(name)
             with self._state_lock:
                 record["status"] = "failed"
                 record["failure"] = str(exc)
                 self._warning(f"coder {name} left the tournament: {exc}")
                 self.store.save_state(self.state)
+
+    def _persist_candidate_patch(self, name: str) -> None:
+        """Best-effort capture of a dead candidate's dirty tree before cleanup."""
+
+        try:
+            capture = self._workspace.capture(self._candidate(name))
+        except Exception:
+            return
+        if not str(capture.get("patch") or ""):
+            return
+        self.store.write_text(
+            f"{self._iteration_rel()}/candidates/{name}/round-1.patch",
+            capture["patch"],
+        )
 
     def _complete_candidate(
         self,
@@ -1291,11 +1397,21 @@ class ForgeOrchestrator:
         candidates = active["candidates"]
         eligible = self._eligible_candidates()
         if not eligible:
+            resettable = any(
+                candidates[name].get("status") == "failed" for name in CODER_CANDIDATES
+            )
             with self._state_lock:
-                self._reset_failed_candidates()
+                if resettable:
+                    self._reset_failed_candidates()
+            detail = (
+                "; failed candidates were reset for another attempt"
+                if resettable
+                else "; every submitted candidate stayed disqualified or incomplete, "
+                "so recovery cannot progress"
+            )
             raise IterationStalled(
-                f"tournament produced no eligible candidate for {active['id']}",
-                recoverable=True,
+                f"tournament produced no eligible candidate for {active['id']}{detail}",
+                recoverable=resettable,
             )
         self._run_candidate_validations(eligible)
         submitted = tuple(
@@ -1338,7 +1454,7 @@ class ForgeOrchestrator:
                 cwd=self.worktree_root,
                 session_id=session,
                 access="read",
-                schema=CANDIDATE_SELECTION_SCHEMA,
+                schema=candidate_selection_schema(submitted),
                 relative=f"{self._iteration_rel()}/selection/attempt-{attempt}",
                 invocation=attempt,
             )
