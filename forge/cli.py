@@ -25,6 +25,11 @@ def _parser() -> argparse.ArgumentParser:
             metavar="PROVIDER:MODEL[:EFFORT]",
         )
     run.add_argument(
+        "--shuffle-coders",
+        action="store_true",
+        help="redraw the three coder models randomly before each sprint",
+    )
+    run.add_argument(
         "--backup",
         default=None,
         metavar="PROVIDER:MODEL[:EFFORT]",
@@ -90,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         push=not args.no_push,
         agent_timeout_seconds=args.agent_timeout,
         backup=ModelSpec.parse(args.backup) if args.backup else None,
+        shuffle_coders=args.shuffle_coders,
     )
     orchestrator = ForgeOrchestrator(config, on_event=on_event)
     state = orchestrator.run()

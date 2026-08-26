@@ -17,17 +17,24 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .artifacts import atomic_write
-from .catalog import catalog_payload, DEFAULTS
+from .catalog import assign_coder_models, catalog_payload, DEFAULTS
 from .gitops import list_branches, repository_summary
 from .locking import ExecutionLocked
-from .models import ModelSpec, ROLE_NAMES, RunConfig
+from .models import (
+    CODER_ROLES,
+    ModelSpec,
+    ROLE_NAMES,
+    RunConfig,
+    STAFF_ROLES,
+)
 from .orchestrator import ForgeOrchestrator
 
 
 STATIC = Path(__file__).with_name("static")
 MAX_BROWSE_ENTRIES = 1000
 MAX_PREVIEW_BYTES = 2_000_000
-PREFERENCE_ROLES = ROLE_NAMES
+MAX_CODER_PREFERENCES = 12
+PREFERENCE_ROLES = STAFF_ROLES
 RECOVERABLE_STATUSES = frozenset({"failed", "cancelled", "running", "paused"})
 
 
@@ -94,14 +101,18 @@ def sanitize_preferences(payload: dict[str, Any]) -> dict[str, Any]:
             value = str(models_raw.get(role) or "").strip()
             if value:
                 models[role] = value
-    # Import the first old pool entry when loading pre-sprint UI preferences.
-    if "coder" not in models and isinstance(payload.get("coder_models"), list):
-        legacy_coder = next(
-            (str(item).strip() for item in payload["coder_models"] if str(item).strip()),
-            "",
-        )
-        if legacy_coder:
-            models["coder"] = legacy_coder
+    coder_models: list[str] = []
+    if isinstance(payload.get("coder_models"), list):
+        for item in payload["coder_models"]:
+            value = str(item).strip()
+            if value:
+                coder_models.append(value)
+    coder_models = coder_models[:MAX_CODER_PREFERENCES]
+    # Import the old pool entry (or single coder) when no pool was stored.
+    if not coder_models:
+        legacy_sources = [str(models_raw.get("coder") or "").strip()] if isinstance(models_raw, dict) else []
+        legacy_sources += [str(models_raw.get(role) or "").strip() for role in CODER_ROLES] if isinstance(models_raw, dict) else []
+        coder_models = [item for item in legacy_sources if item][:1]
     backup = str(payload.get("backup") or "").strip()
     return {
         "repo": str(payload.get("repo") or ""),
@@ -110,6 +121,7 @@ def sanitize_preferences(payload: dict[str, Any]) -> dict[str, Any]:
         "brief": str(payload.get("brief") or payload.get("brief_text") or ""),
         "push": payload.get("push") is not False,
         "models": models,
+        "coder_models": coder_models,
         "shared_staff_model": payload.get("shared_staff_model") is True,
         "backup": backup,
     }
@@ -127,6 +139,11 @@ def preferences_from_config(config: RunConfig) -> dict[str, Any]:
             for role in PREFERENCE_ROLES
             if role in config.models
         },
+        "coder_models": [
+            config.models[role].display()
+            for role in CODER_ROLES
+            if role in config.models
+        ],
         "shared_staff_model": False,
         "backup": config.backup.display() if config.backup is not None else "",
     }
@@ -210,19 +227,40 @@ def restart_payload(active_runs: int, confirm: bool) -> dict[str, Any]:
 
 
 def models_from_payload(payload: dict[str, Any]) -> dict[str, ModelSpec]:
+    import random
+
     raw_models = payload.get("models")
     if not isinstance(raw_models, dict):
         raise ValueError("models must be an object")
+    models: dict[str, ModelSpec] = {}
+    for role in STAFF_ROLES:
+        value = str(raw_models.get(role) or "").strip()
+        models[role] = ModelSpec.parse(value or DEFAULTS[role])
+    explicit_coders = [
+        role for role in CODER_ROLES if str(raw_models.get(role) or "").strip()
+    ]
+    if explicit_coders:
+        for role in CODER_ROLES:
+            value = str(raw_models.get(role) or "").strip()
+            models[role] = ModelSpec.parse(value or DEFAULTS[role])
+        return models
+    pool: list[ModelSpec] = []
     raw_pool = payload.get("coder_models")
-    legacy_coder = ""
     if isinstance(raw_pool, list):
-        legacy_coder = next((str(item).strip() for item in raw_pool if str(item).strip()), "")
-    models = {
-        role: ModelSpec.parse(
-            str(raw_models.get(role) or (legacy_coder if role == "coder" else "") or DEFAULTS[role])
+        for item in raw_pool:
+            value = str(item).strip()
+            if value:
+                pool.append(ModelSpec.parse(value))
+    if len(pool) > MAX_CODER_PREFERENCES:
+        raise ValueError(
+            f"the coder pool accepts at most {MAX_CODER_PREFERENCES} models"
         )
-        for role in ROLE_NAMES
-    }
+    if pool:
+        seed = ",".join(spec.display() for spec in pool)
+        models.update(assign_coder_models(models, pool, rng=random.Random(seed)))
+        return models
+    for role in CODER_ROLES:
+        models[role] = ModelSpec.parse(DEFAULTS[role])
     return models
 
 

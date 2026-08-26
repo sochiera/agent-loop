@@ -18,6 +18,8 @@ SPRINT_SCHEDULE: tuple[str, ...] = (
     "cleanup",
 )
 
+CODER_CANDIDATES: tuple[str, ...] = ("tdd", "explore", "classic")
+
 MIN_BACKLOG_STORIES = 12
 MIN_FEATURE_STORIES = SPRINT_SCHEDULE.count("feature")
 MIN_CLEANUP_STORIES = SPRINT_SCHEDULE.count("cleanup")

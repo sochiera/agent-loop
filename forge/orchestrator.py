@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import os
 import queue
+import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -23,39 +27,59 @@ from .agents import (
     AgentRunner,
     AgentTimeout,
     AgentUsageLimit,
-    is_usage_limit,
 )
 from .artifacts import ArtifactStore, utc_now
-from .catalog import ROLE_TIMEOUTS, model_family, model_identity, spec_with_effort
+from .catalog import (
+    ROLE_TIMEOUTS,
+    assign_coder_models,
+    model_family,
+    model_identity,
+    spec_with_effort,
+)
 from .contracts import (
+    CANDIDATE_SELECTION_SCHEMA,
     ITERATION_PLAN_SCHEMA,
     ITERATION_REVIEW_SCHEMA,
     ITERATION_TEST_SCHEMA,
     PRODUCT_OWNER_SCHEMA,
+    TEST_AUTHOR_SCHEMA,
     ContractError,
+    parse_candidate_selection,
     parse_iteration_plan,
     parse_iteration_review,
     parse_iteration_test,
     parse_product_owner,
+    parse_test_author,
 )
 from .display import optional_virtual_display
 from .gitops import CandidateWorktree, GitError, GitWorkspace, export_revision
 from .locking import RepositoryExecutionLock
-from .models import AgentResult, ModelSpec, ROLE_NAMES, RunConfig, RunState
+from .models import CODER_ROLES, AgentResult, ModelSpec, ROLE_NAMES, RunConfig, RunState
 from .prompts import (
+    candidate_selection_prompt,
     implementation_prompt,
     iteration_reviewer_prompt,
     product_owner_prompt,
     sprint_planner_prompt,
+    test_author_prompt,
     unified_tester_prompt,
 )
-from .sprint import SPRINT_SCHEDULE, assert_sprint_cursor, compact_iteration, ready_stories, slot_kind
-from .validation import run_commands
+from .sprint import (
+    CODER_CANDIDATES,
+    SPRINT_SCHEDULE,
+    assert_sprint_cursor,
+    compact_iteration,
+    ready_stories,
+    slot_kind,
+)
+from .validation import classify_red_exit_code, run_commands
 
 
 PROBE_PROMPT = "Reply with the single word ready."
 EVENT_QUEUE_LIMIT = 256
 EVENT_SHUTDOWN_TIMEOUT_SECONDS = 1.0
+SCHEMA_VERSION = 3
+TEST_AUTHOR_ATTEMPTS = 3
 _EVENT_STOP = object()
 _NO_CALLBACK_CONTEXT = object()
 
@@ -355,7 +379,7 @@ class ForgeOrchestrator:
         self._shutdown_event_dispatcher()
 
     def run(self) -> RunState:
-        if self.state.schema_version != 2:
+        if self.state.schema_version != SCHEMA_VERSION:
             raise RuntimeError("legacy Forge runs are read-only and cannot enter sprint mode")
         execution_lock, generation = self._acquire_execution(recover=False)
         try:
@@ -379,7 +403,7 @@ class ForgeOrchestrator:
         return self._recover_execution(execution_lock, generation)
 
     def _validate_recoverable_state(self) -> None:
-        if self.state.schema_version != 2:
+        if self.state.schema_version != SCHEMA_VERSION:
             raise RuntimeError("legacy Forge runs cannot be recovered by the sprint orchestrator")
         if self.state.status not in {"failed", "paused", "cancelled", "running", "stalled"}:
             raise RuntimeError(
@@ -518,6 +542,8 @@ class ForgeOrchestrator:
 
     def _preflight(self) -> None:
         self._phase("preflight", "Checking providers and target repository.")
+        if importlib.util.find_spec("pytest") is None:
+            raise ValueError("pytest must be importable by the Forge interpreter for the RED gate")
         if self.check_binaries:
             for role in ROLE_NAMES:
                 model = self.config.models[role]
@@ -625,12 +651,32 @@ class ForgeOrchestrator:
                     self.state.brain_session_id = None
                     self.state.product_owner_inspected = False
                     self.state.active_iteration = {}
+                    self._shuffle_coder_pool()
                     self._save(
                         f"Product Owner prepared {decision['capacity']['stories']} stories "
                         f"({decision['capacity']['estimated_minutes']} estimated minutes)."
                     )
                 return
         raise RuntimeError("Product Owner failed its backlog contract three times")
+
+    def _shuffle_coder_pool(self) -> None:
+        """Redraw the three coder models from the original pool for a new sprint."""
+
+        if not self.config.shuffle_coders:
+            return
+        pool = []
+        for role in CODER_ROLES:
+            raw = self.state.original_models.get(role)
+            if raw:
+                pool.append(ModelSpec(**raw))
+        if not pool:
+            return
+        self.config.models = assign_coder_models(self.config.models, pool)
+        self._persist_models()
+        draw = ", ".join(
+            f"{role}={self.config.models[role].display()}" for role in CODER_ROLES
+        )
+        self._warning(f"shuffled coder pool for sprint {self.state.sprint_number}: {draw}")
 
     def _close_sprint(self) -> None:
         with self._state_lock:
@@ -687,10 +733,16 @@ class ForgeOrchestrator:
             phase = str(self.state.active_iteration.get("phase") or "planning")
             if phase == "planning":
                 self._plan_iteration()
+            elif phase == "test-authoring":
+                self._author_tests()
             elif phase == "coding":
-                self._code_iteration()
+                self._code_tournament()
+            elif phase == "selection":
+                self._select_winner()
             elif phase == "review":
                 self._review_iteration()
+            elif phase == "fixing":
+                self._fix_iteration()
             elif phase == "testing":
                 self._test_iteration()
             elif phase == "delivery":
@@ -720,6 +772,35 @@ class ForgeOrchestrator:
                 "story_id": "",
                 "plan": {},
                 "planner_session": None,
+                "test_author": {
+                    "session": None,
+                    "attempts": 0,
+                    "status": "pending",
+                    "tests_root": "",
+                    "digest": "",
+                    "summary": "",
+                    "covered": [],
+                    "xfails": [],
+                    "gaps": [],
+                },
+                "candidates": {
+                    name: {
+                        "session": None,
+                        "status": "pending",
+                        "failure": "",
+                        "start_fingerprint": "",
+                        "fingerprint": "",
+                        "tree": "",
+                        "summary": "",
+                        "disqualified": False,
+                        "disqualify_reason": "",
+                        "validation": [],
+                    }
+                    for name in CODER_CANDIDATES
+                },
+                "selection": {},
+                "selection_session": None,
+                "winner": "",
                 "coder_session": None,
                 "reviewer_session": None,
                 "tester_session": None,
@@ -809,7 +890,7 @@ class ForgeOrchestrator:
             with self._state_lock:
                 active["story_id"] = plan["story_id"]
                 active["plan"] = plan
-                active["phase"] = "coding"
+                active["phase"] = "test-authoring"
                 for story in self.state.backlog:
                     if story.get("id") == plan["story_id"]:
                         story["status"] = "selected"
@@ -818,16 +899,531 @@ class ForgeOrchestrator:
             return
         raise RuntimeError("planner failed its iteration contract three times")
 
-    def _candidate(self) -> CandidateWorktree:
+    # Black-box test authoring (RED) --------------------------------
+
+    @staticmethod
+    def _tests_digest(root: Path) -> str:
+        """Hash the relative paths, modes, and bytes of a test suite tree."""
+
+        digest = hashlib.sha256()
+        if not root.is_dir():
+            return ""
+        for path in sorted(item for item in root.rglob("*") if item.is_file()):
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(oct(path.stat().st_mode & 0o777).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _install_blackbox_tests(stored: Path, destination: Path) -> None:
+        if destination.exists() or destination.is_symlink():
+            if destination.is_dir() and not destination.is_symlink():
+                shutil.rmtree(destination)
+            else:
+                destination.unlink()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(stored, destination)
+
+    def _stored_tests_dir(self) -> Path:
+        return self.store.root / self._iteration_rel() / "blackbox-tests"
+
+    def _red_classification(
+        self, snapshot: Path, tests_root: str
+    ) -> tuple[str, dict[str, Any]]:
+        root = snapshot / tests_root
+        if not root.is_dir() or not any(root.rglob("test_*.py")):
+            return "missing", {"command": "", "return_code": -1, "output": "no test files"}
+        command = f"{shlex.quote(sys.executable)} -m pytest -q {shlex.quote(tests_root)}"
+        entry = run_commands((command,), snapshot)[0]
+        return classify_red_exit_code(int(entry["return_code"])), entry
+
+    def _author_tests(self) -> None:
+        active = self.state.active_iteration
+        author = active["test_author"]
+        if str(author.get("status") or "") in {"red", "warned"}:
+            with self._state_lock:
+                active["phase"] = "coding"
+                self._save("Black-box suite is durable; starting the coder tournament.")
+            return
+        self._phase(
+            "test-authoring",
+            f"Test author is writing black-box tests for {active['story_id']}.",
+        )
+        snapshot = self.brain_dir / f"{active['id']}-test-author" / "snapshot"
+        if not snapshot.exists():
+            export_revision(self.repo, snapshot, str(active["base_sha"]))
+        context, _empty = self._planner_context()
+        prompt = test_author_prompt(
+            brief=self._brief_text(),
+            plan=dict(active["plan"]),
+            repository_context=context,
+            environment_context=self._environment_context(),
+        )
+        session = author.get("session")
+        last_authored: dict[str, Any] | None = None
+        last_gap = "no parseable test author response"
+        start_attempt = int(author.get("attempts") or 0) + 1
+        for attempt in range(start_attempt, TEST_AUTHOR_ATTEMPTS + 1):
+            result = self._invoke(
+                role="test_author",
+                model=self.config.models["test_author"],
+                prompt=prompt,
+                cwd=snapshot,
+                session_id=session,
+                access="test",
+                schema=TEST_AUTHOR_SCHEMA,
+                extra_writable_dirs=(snapshot,),
+                relative=f"{self._iteration_rel()}/test-author/attempt-{attempt}",
+                invocation=attempt,
+            )
+            session = result.session_id or session
+            with self._state_lock:
+                author["session"] = session
+                author["attempts"] = attempt
+                self.store.save_state(self.state)
+            try:
+                authored = parse_test_author(result.text)
+            except ContractError as exc:
+                last_gap = f"contract: {exc}"
+                prompt = (
+                    f"Forge rejected the test author JSON: {exc}. "
+                    "Return the complete corrected JSON only."
+                )
+                continue
+            last_authored = authored
+            classification, entry = self._red_classification(
+                snapshot, authored["tests_root"]
+            )
+            self.store.write_data(
+                f"{self._iteration_rel()}/test-author/red-attempt-{attempt}.json",
+                {
+                    "tests_root": authored["tests_root"],
+                    "classification": classification,
+                    "command": entry.get("command"),
+                    "return_code": entry.get("return_code"),
+                    "output_tail": str(entry.get("output") or "")[-6000:],
+                },
+            )
+            if classification == "red":
+                self._accept_authored_tests(active, snapshot, authored, status="red")
+                return
+            if classification == "passing":
+                last_gap = "the suite already passes on the current snapshot (no RED)"
+                prompt = (
+                    "Forge watched your suite pass on the current product snapshot. "
+                    "Black-box tests for new planned behavior must fail first (RED). "
+                    "Strengthen the tests so they fail now, mark only genuinely stuck "
+                    "expectations as xfail with repair notes, then return the JSON again."
+                )
+            elif classification == "missing":
+                last_gap = f"no pytest files found under {authored['tests_root']}"
+                prompt = (
+                    f"Forge found no test files under {authored['tests_root']}. "
+                    "Write pytest test_*.py files there and return the JSON again."
+                )
+            else:
+                last_gap = (
+                    f"the suite errored during collection/execution "
+                    f"(exit {entry.get('return_code')}): "
+                    f"{str(entry.get('output') or '')[-500:]}"
+                )
+                prompt = (
+                    "Forge could not run your suite to a clean RED state. The pytest run "
+                    f"errored: {str(entry.get('output') or '')[-1000:]}\n"
+                    "Fix collection errors and return the JSON again."
+                )
+        if last_authored is not None and (
+            snapshot / last_authored["tests_root"]
+        ).is_dir():
+            self._warning(
+                "test author could not produce a valid RED suite in "
+                f"{TEST_AUTHOR_ATTEMPTS} attempts; proceeding with the last suite and a "
+                f"recorded gap: {last_gap}"
+            )
+            self._accept_authored_tests(
+                active, snapshot, last_authored, status="warned", gap=last_gap
+            )
+            return
+        self._warning(
+            "test author produced no usable black-box suite; the tournament proceeds "
+            f"without one. Recorded gap: {last_gap}"
+        )
+        with self._state_lock:
+            author["status"] = "warned"
+            author["gaps"].append(last_gap)
+            active["phase"] = "coding"
+            self._save("Coder tournament starts without a black-box suite (recorded gap).")
+
+    def _accept_authored_tests(
+        self,
+        active: dict[str, Any],
+        snapshot: Path,
+        authored: dict[str, Any],
+        *,
+        status: str,
+        gap: str = "",
+    ) -> None:
+        author = active["test_author"]
+        stored = self._stored_tests_dir()
+        if stored.exists():
+            shutil.rmtree(stored)
+        shutil.copytree(snapshot / authored["tests_root"], stored)
+        self.store.write_data(
+            f"{self._iteration_rel()}/test-author/suite.json",
+            {
+                "tests_root": authored["tests_root"],
+                "summary": authored["summary"],
+                "covered": authored["covered"],
+                "xfails": authored["xfails"],
+                "status": status,
+                "gap": gap,
+            },
+        )
+        with self._state_lock:
+            author["status"] = status
+            author["tests_root"] = authored["tests_root"]
+            author["digest"] = self._tests_digest(stored)
+            author["summary"] = authored["summary"]
+            author["covered"] = authored["covered"]
+            author["xfails"] = authored["xfails"]
+            if gap:
+                author["gaps"].append(gap)
+            active["phase"] = "coding"
+            self._save(
+                f"Black-box suite accepted ({status}) at {authored['tests_root']}; "
+                "starting the coder tournament."
+            )
+
+    def _candidate(self, name: str) -> CandidateWorktree:
         assert self._workspace is not None
         return self._workspace.create_or_reattach(
-            str(self.state.active_iteration["base_sha"]), recover=True
+            name, str(self.state.active_iteration["base_sha"]), recover=True
         )
 
-    def _code_iteration(self) -> None:
+    def _winner_candidate(self) -> CandidateWorktree:
+        return self._candidate(str(self.state.active_iteration["winner"]))
+
+    # Tournament ----------------------------------------------------
+
+    def _code_tournament(self) -> None:
         assert self._workspace is not None
         active = self.state.active_iteration
-        candidate = self._candidate()
+        candidates = active["candidates"]
+        base_sha = str(active["base_sha"])
+        author = active["test_author"]
+        tests_root = str(author.get("tests_root") or "")
+        stored_tests = self._stored_tests_dir()
+
+        pending = [
+            name
+            for name in CODER_CANDIDATES
+            if candidates[name].get("status") in {"pending", "running"}
+        ]
+        if not pending:
+            with self._state_lock:
+                active["phase"] = "selection"
+                self._save("All tournament candidates are resolved; selecting a winner.")
+            return
+
+        self._phase(
+            "coding",
+            f"Tournament: {len(pending)} coder(s) implement {active['story_id']} "
+            "in isolated worktrees.",
+        )
+
+        attached: dict[str, CandidateWorktree] = {}
+        for name in list(pending):
+            record = candidates[name]
+            candidate = self._candidate(name)
+            attached[name] = candidate
+            if record.get("status") == "running":
+                capture = self._workspace.capture(candidate)
+                if str(capture["fingerprint"]) != str(
+                    record.get("start_fingerprint") or ""
+                ):
+                    with self._state_lock:
+                        self._complete_candidate(
+                            active, name, capture, summary=record.get("summary") or ""
+                        )
+                        self._save(
+                            f"Recovered edits left by interrupted coder {name}; "
+                            "the candidate is complete."
+                        )
+                    pending.remove(name)
+                    continue
+            if tests_root and stored_tests.is_dir():
+                self._install_blackbox_tests(stored_tests, candidate.path / tests_root)
+            capture = self._workspace.capture(candidate)
+            with self._state_lock:
+                record["status"] = "running"
+                record["start_fingerprint"] = str(capture["fingerprint"])
+                self.store.save_state(self.state)
+
+        def work(name: str) -> None:
+            record = candidates[name]
+            candidate = attached[name]
+            prompt = implementation_prompt(
+                plan=dict(active["plan"]),
+                blocking_findings=[],
+                tester_feedback=[],
+                tactic=name,
+                tests_root=tests_root,
+                xfails=list(author.get("xfails") or []),
+            )
+            result = self._invoke(
+                role=f"coder_{name}",
+                model=self.config.models[f"coder_{name}"],
+                prompt=prompt,
+                cwd=candidate.path,
+                session_id=record.get("session"),
+                access="write",
+                candidate=name,
+                relative=f"{self._iteration_rel()}/candidates/{name}/round-1",
+                invocation=1,
+                failover_on_timeout=True,
+            )
+            capture = self._workspace.capture(candidate)
+            self.store.write_text(
+                f"{self._iteration_rel()}/candidates/{name}/round-1.patch",
+                capture["patch"],
+            )
+            with self._state_lock:
+                record["session"] = result.session_id or record.get("session")
+                record["summary"] = result.text.strip()
+                self._complete_candidate(active, name, capture, summary=record["summary"])
+
+        if pending:
+            with ThreadPoolExecutor(max_workers=len(pending)) as pool:
+                futures = {}
+                for name in pending:
+                    futures[pool.submit(self._guarded_candidate, work, name)] = name
+                for future in as_completed(futures):
+                    future.result()
+        with self._state_lock:
+            active["phase"] = "selection"
+            complete = [
+                name
+                for name in CODER_CANDIDATES
+                if candidates[name].get("status") == "complete"
+            ]
+            self._save(
+                f"Tournament finished with {len(complete)} complete candidate(s); "
+                "selecting a winner."
+            )
+
+    def _guarded_candidate(
+        self, work: Callable[[str], None], name: str
+    ) -> None:
+        """A failed or limit-hit candidate stays as an artifact; it never kills peers."""
+
+        active = self.state.active_iteration
+        record = active["candidates"][name]
+        try:
+            work(name)
+        except (RunCancelled, RunInterrupted):
+            raise
+        except AgentFailure as exc:
+            self.store.write_text(
+                f"{self._iteration_rel()}/candidates/{name}/failure.log",
+                exc.raw_output or str(exc),
+            )
+            with self._state_lock:
+                record["status"] = "failed"
+                record["failure"] = str(exc)
+                self._warning(f"coder {name} left the tournament: {exc}")
+                self.store.save_state(self.state)
+
+    def _complete_candidate(
+        self,
+        active: dict[str, Any],
+        name: str,
+        capture: dict[str, Any],
+        *,
+        summary: str,
+    ) -> None:
+        record = active["candidates"][name]
+        record["status"] = "complete"
+        record["fingerprint"] = str(capture["fingerprint"])
+        record["tree"] = str(capture["tree"])
+        record["summary"] = summary
+        tests_root = str(active["test_author"].get("tests_root") or "")
+        if tests_root:
+            candidate_root = self._workspace_candidate_root(name)
+            actual = self._tests_digest(candidate_root / tests_root)
+            expected = str(active["test_author"].get("digest") or "")
+            if expected and actual != expected:
+                record["disqualified"] = True
+                record["disqualify_reason"] = (
+                    f"controller-owned black-box suite at {tests_root} was modified"
+                )
+                self._warning(
+                    f"coder {name} disqualified: tampered with the black-box suite "
+                    f"at {tests_root}"
+                )
+
+    def _workspace_candidate_root(self, name: str) -> Path:
+        return self.worktree_root / name
+
+    def _eligible_candidates(self) -> tuple[str, ...]:
+        candidates = self.state.active_iteration["candidates"]
+        return tuple(
+            name
+            for name in CODER_CANDIDATES
+            if candidates[name].get("status") == "complete"
+            and not candidates[name].get("disqualified")
+        )
+
+    def _reset_failed_candidates(self) -> None:
+        candidates = self.state.active_iteration["candidates"]
+        for name in CODER_CANDIDATES:
+            if candidates[name].get("status") == "failed":
+                candidates[name]["status"] = "pending"
+                candidates[name]["session"] = None
+
+    # Selection -----------------------------------------------------
+
+    def _select_winner(self) -> None:
+        assert self._workspace is not None
+        active = self.state.active_iteration
+        candidates = active["candidates"]
+        eligible = self._eligible_candidates()
+        if not eligible:
+            with self._state_lock:
+                self._reset_failed_candidates()
+            raise IterationStalled(
+                f"tournament produced no eligible candidate for {active['id']}",
+                recoverable=True,
+            )
+        self._run_candidate_validations(eligible)
+        submitted = tuple(
+            name
+            for name in CODER_CANDIDATES
+            if candidates[name].get("status") == "complete"
+        )
+        if len(eligible) == 1:
+            winner = eligible[0]
+            with self._state_lock:
+                active["winner"] = winner
+                active["selection"] = {
+                    "winner": winner,
+                    "reason": "only eligible candidate",
+                    "candidates": {},
+                    "borrow": [],
+                    "feedback": [],
+                }
+                active["coder_session"] = candidates[winner].get("session")
+                active["phase"] = "review"
+                self._save(f"{winner} is the only eligible candidate; reviewing it.")
+            return
+        self._phase(
+            "selection",
+            f"Reviewer is comparing {len(eligible)} eligible candidates for "
+            f"{active['story_id']}.",
+        )
+        prompt = candidate_selection_prompt(
+            plan=dict(active["plan"]),
+            candidates=[self._candidate_dossier(name) for name in submitted],
+            eligible=eligible,
+            tests_root=str(active["test_author"].get("tests_root") or ""),
+        )
+        session = active.get("selection_session")
+        for attempt in range(1, 4):
+            result = self._invoke(
+                role="reviewer",
+                model=self.config.models["reviewer"],
+                prompt=prompt,
+                cwd=self.worktree_root,
+                session_id=session,
+                access="read",
+                schema=CANDIDATE_SELECTION_SCHEMA,
+                relative=f"{self._iteration_rel()}/selection/attempt-{attempt}",
+                invocation=attempt,
+            )
+            session = result.session_id or session
+            with self._state_lock:
+                active["selection_session"] = session
+                self.store.save_state(self.state)
+            try:
+                selection = parse_candidate_selection(
+                    result.text, submitted=submitted, eligible=eligible
+                )
+            except ContractError as exc:
+                prompt = (
+                    f"Forge rejected the selection JSON: {exc}. "
+                    "Return the complete corrected JSON only."
+                )
+                continue
+            self.store.write_data(
+                f"{self._iteration_rel()}/selection/selection.json", selection
+            )
+            winner = str(selection["winner"])
+            with self._state_lock:
+                active["selection"] = selection
+                active["winner"] = winner
+                active["coder_session"] = candidates[winner].get("session")
+                active["reviewer_session"] = session
+                active["phase"] = "review"
+                self._save(
+                    f"Reviewer selected {winner} as the winner: {selection['reason']}"
+                )
+            return
+        raise RuntimeError("reviewer failed its selection contract three times")
+
+    def _candidate_dossier(self, name: str) -> dict[str, Any]:
+        active = self.state.active_iteration
+        record = active["candidates"][name]
+        dossier: dict[str, Any] = {
+            "name": name,
+            "status": record.get("status"),
+            "disqualified": bool(record.get("disqualified")),
+            "summary": record.get("summary") or "",
+            "validation": self._compact_validation(record.get("validation") or []),
+        }
+        if record.get("disqualify_reason"):
+            dossier["disqualify_reason"] = record["disqualify_reason"]
+        if record.get("status") == "complete":
+            candidate = self._candidate(name)
+            capture = self._workspace.capture(candidate)
+            dossier["diffstat"] = capture["diffstat"]
+            dossier["patch"] = capture["review_patch"]
+        return dossier
+
+    def _run_candidate_validations(self, eligible: tuple[str, ...]) -> None:
+        active = self.state.active_iteration
+        plan = active["plan"]
+        commands = [str(item) for item in plan["validation_commands"]]
+        tests_root = str(active["test_author"].get("tests_root") or "")
+        if tests_root:
+            commands.append(
+                f"{shlex.quote(sys.executable)} -m pytest -q {shlex.quote(tests_root)}"
+            )
+
+        def validate(name: str) -> None:
+            candidate = self._candidate(name)
+            copy = self._validation_copy(candidate, f"select-{name}")
+            try:
+                results = run_commands(tuple(commands), copy)
+            finally:
+                shutil.rmtree(copy, ignore_errors=True)
+            with self._state_lock:
+                active["candidates"][name]["validation"] = results
+                self.store.save_state(self.state)
+
+        with ThreadPoolExecutor(max_workers=len(eligible)) as pool:
+            futures = [pool.submit(validate, name) for name in eligible]
+            for future in as_completed(futures):
+                future.result()
+
+    # Winner-fix rounds ----------------------------------------------
+
+    def _fix_iteration(self) -> None:
+        assert self._workspace is not None
+        active = self.state.active_iteration
+        winner = str(active["winner"])
+        candidate = self._winner_candidate()
         current_capture = self._workspace.capture(candidate)
         current_fingerprint = str(current_capture["fingerprint"])
         if active.get("coder_inflight"):
@@ -847,26 +1443,39 @@ class ForgeOrchestrator:
                 f"coder exceeded {self.config.max_revision_rounds} rounds for {active['id']}"
             )
 
-        self._phase("coding", f"Coder is implementing {active['story_id']}.")
+        self._phase("coding", f"Winner {winner} is fixing {active['story_id']}.")
         with self._state_lock:
             active["coder_round"] = int(active.get("coder_round") or 0) + 1
             active["coder_inflight"] = True
             active["coder_start_fingerprint"] = current_fingerprint
             self.store.save_state(self.state)
             coder_round = int(active["coder_round"])
+        selection = active.get("selection") or {}
+        borrow = [
+            item for item in selection.get("borrow") or [] if item.get("from") != winner
+        ]
+        borrow += [
+            {"from": "reviewer", "what": item}
+            for item in selection.get("feedback") or []
+        ]
         prompt = implementation_prompt(
             plan=dict(active["plan"]),
             blocking_findings=list(active.get("review_findings") or []),
             tester_feedback=list(active.get("test_findings") or []),
             previous_summary=str(active.get("implementation_summary") or ""),
+            tactic=winner,
+            tests_root=str(active["test_author"].get("tests_root") or ""),
+            xfails=list(active["test_author"].get("xfails") or []),
+            borrow=borrow,
         )
         result = self._invoke(
-            role="coder",
-            model=self.config.models["coder"],
+            role=f"coder_{winner}",
+            model=self.config.models[f"coder_{winner}"],
             prompt=prompt,
             cwd=candidate.path,
             session_id=active.get("coder_session"),
             access="write",
+            candidate=winner,
             relative=f"{self._iteration_rel()}/coder/round-{coder_round}",
             invocation=coder_round,
             failover_on_timeout=True,
@@ -886,12 +1495,30 @@ class ForgeOrchestrator:
                 "diffstat": capture["diffstat"],
             },
         )
+        tests_root = str(active["test_author"].get("tests_root") or "")
+        if tests_root:
+            expected = str(active["test_author"].get("digest") or "")
+            if expected and self._tests_digest(candidate.path / tests_root) != expected:
+                self._warning(
+                    f"coder {winner} modified the controller-owned suite at {tests_root}; "
+                    "restoring it"
+                )
+                self._install_blackbox_tests(
+                    self._stored_tests_dir(), candidate.path / tests_root
+                )
+                capture = self._workspace.capture(candidate)
+                fingerprint = str(capture["fingerprint"])
         with self._state_lock:
             active["coder_session"] = result.session_id or active.get("coder_session")
             active["implementation_summary"] = result.text.strip()
             active["coder_inflight"] = False
             if fingerprint == current_fingerprint:
                 active["unchanged_rounds"] = int(active.get("unchanged_rounds") or 0) + 1
+                if result.tool_calls == 0:
+                    raise IterationStalled(
+                        f"coder {winner} made no tool calls and no workspace progress "
+                        f"in round {coder_round}"
+                    )
             else:
                 active["unchanged_rounds"] = 0
             if int(active["unchanged_rounds"]) >= self.config.stalled_turns:
@@ -905,7 +1532,7 @@ class ForgeOrchestrator:
             active["tested_fingerprint"] = ""
             active["tested_tree"] = ""
             active["phase"] = "review"
-            self._save(f"Coder round {coder_round} is ready for review.")
+            self._save(f"Winner fix round {coder_round} is ready for review.")
 
     def _validation_copy(self, candidate: CandidateWorktree, name: str) -> Path:
         assert self._workspace is not None
@@ -921,7 +1548,7 @@ class ForgeOrchestrator:
             raise IterationStalled(
                 f"reviewer exceeded {self.config.max_revision_rounds} rounds for {active['id']}"
             )
-        candidate = self._candidate()
+        candidate = self._winner_candidate()
         capture = self._workspace.capture(candidate)
         fingerprint = str(capture["fingerprint"])
         tree = str(capture["tree"])
@@ -994,7 +1621,7 @@ class ForgeOrchestrator:
                 if review["verdict"] == "reject":
                     active["review_findings"] = review["blocking_findings"]
                     active["test_findings"] = []
-                    active["phase"] = "coding"
+                    active["phase"] = "fixing"
                     self._save(
                         f"Reviewer rejected round {active['coder_round']} with "
                         f"{len(review['blocking_findings'])} blocker(s)."
@@ -1015,7 +1642,7 @@ class ForgeOrchestrator:
             raise IterationStalled(
                 f"tester exceeded {self.config.max_revision_rounds} rounds for {active['id']}"
             )
-        candidate = self._candidate()
+        candidate = self._winner_candidate()
         capture = self._workspace.capture(candidate)
         fingerprint = str(capture["fingerprint"])
         tree = str(capture["tree"])
@@ -1116,7 +1743,7 @@ class ForgeOrchestrator:
                             active["review_findings"] = []
                             active["reviewed_fingerprint"] = ""
                             active["reviewed_tree"] = ""
-                            active["phase"] = "coding"
+                            active["phase"] = "fixing"
                             self._save(
                                 f"Tester rejected the implementation with "
                                 f"{len(report['blocking_findings'])} blocker(s); returning to coder."
@@ -1137,7 +1764,7 @@ class ForgeOrchestrator:
     def _deliver_iteration(self) -> None:
         assert self._workspace is not None
         active = self.state.active_iteration
-        candidate = self._candidate()
+        candidate = self._winner_candidate()
         capture = self._workspace.capture(candidate)
         fingerprint = str(capture["fingerprint"])
         tree = str(capture["tree"])
@@ -1199,6 +1826,14 @@ class ForgeOrchestrator:
             "story_id": story_id,
             "objective": active["plan"]["objective"],
             "commit": commit,
+            "winner": str(active.get("winner") or ""),
+            "candidates": {
+                name: {
+                    "status": active["candidates"][name].get("status"),
+                    "disqualified": bool(active["candidates"][name].get("disqualified")),
+                }
+                for name in CODER_CANDIDATES
+            },
             "review_summary": active["review"].get("summary", ""),
             "test_summary": active["test"].get("summary", ""),
             "nits": list(active.get("nits") or []),

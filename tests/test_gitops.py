@@ -1,4 +1,5 @@
 import hashlib
+import os
 import subprocess
 from pathlib import Path
 
@@ -95,7 +96,7 @@ def test_workspace_capture_excludes_generated_dependency_trees(tmp_path: Path):
     repo = initialized_repo(tmp_path)
     workspace = GitWorkspace(repo, "main", "run", tmp_path / "worktrees")
     base = workspace.prepare(require_remote=False)
-    candidate = workspace.create_or_reattach(base)
+    candidate = workspace.create_or_reattach("tdd", base)
     (candidate.path / "node_modules/pkg").mkdir(parents=True)
     (candidate.path / "node_modules/pkg/index.js").write_text("generated\n", encoding="utf-8")
     (candidate.path / "feature.js").write_text("product\n", encoding="utf-8")
@@ -112,7 +113,7 @@ def test_workspace_delivers_clean_candidate_idempotently(tmp_path: Path):
     repo = initialized_repo(tmp_path)
     workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
     base = workspace.prepare(require_remote=False)
-    candidate = workspace.create_or_reattach(base)
+    candidate = workspace.create_or_reattach("tdd", base)
     (candidate.path / "feature.txt").write_text("delivered\n", encoding="utf-8")
 
     captured = workspace.capture(candidate)
@@ -122,12 +123,13 @@ def test_workspace_delivers_clean_candidate_idempotently(tmp_path: Path):
         "patch",
         "review_patch",
         "review_patch_truncated",
+        "modes",
         "tree",
         "fingerprint",
     }
     assert "feature.txt" in captured["patch"]
-    assert candidate.name == "implementation"
-    assert candidate.branch == "forge/sprint/implementation"
+    assert candidate.name == "tdd"
+    assert candidate.branch == "forge/sprint/tdd"
 
     commit = workspace.prepare_commit(candidate, "Implement the sprint")
     assert workspace.prepare_commit(candidate, "Must not commit twice") == commit
@@ -147,13 +149,13 @@ def test_workspace_reattaches_dirty_implementation(tmp_path: Path):
     root = tmp_path / "worktrees"
     original = GitWorkspace(repo, "main", "sprint", root)
     base = original.prepare(require_remote=False)
-    candidate = original.create_or_reattach(base)
+    candidate = original.create_or_reattach("tdd", base)
     (candidate.path / "README.md").write_text("changed\n", encoding="utf-8")
     (candidate.path / "new.txt").write_text("untracked\n", encoding="utf-8")
 
     recovered = GitWorkspace(repo, "main", "sprint", root)
     assert recovered.prepare(require_remote=False) == base
-    reattached = recovered.create_or_reattach(base, recover=True)
+    reattached = recovered.create_or_reattach("tdd", base, recover=True)
 
     assert reattached == candidate
     assert (reattached.path / "README.md").read_text(encoding="utf-8") == "changed\n"
@@ -166,7 +168,7 @@ def test_workspace_refuses_external_target_branch_drift(tmp_path: Path):
     repo = initialized_repo(tmp_path)
     workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
     base = workspace.prepare(require_remote=False)
-    candidate = workspace.create_or_reattach(base)
+    candidate = workspace.create_or_reattach("tdd", base)
     (candidate.path / "feature.txt").write_text("candidate\n", encoding="utf-8")
     commit = workspace.prepare_commit(candidate, "Candidate commit")
 
@@ -188,14 +190,14 @@ def test_workspace_recovers_committed_candidate_before_integration(tmp_path: Pat
     root = tmp_path / "worktrees"
     original = GitWorkspace(repo, "main", "sprint", root)
     base = original.prepare(require_remote=False)
-    candidate = original.create_or_reattach(base)
+    candidate = original.create_or_reattach("tdd", base)
     (candidate.path / "feature.txt").write_text("recover me\n", encoding="utf-8")
     commit = original.prepare_commit(candidate, "Prepared before crash")
     assert original.target_head() == base
 
     recovered = GitWorkspace(repo, "main", "sprint", root)
     assert recovered.prepare(require_remote=False) == base
-    candidate = recovered.create_or_reattach(base, recover=True)
+    candidate = recovered.create_or_reattach("tdd", base, recover=True)
 
     assert recovered.reconcile_delivery(candidate, base, push=False) == commit
     assert recovered.target_head() == commit
@@ -208,14 +210,14 @@ def test_workspace_recovers_when_main_is_already_integrated(tmp_path: Path):
     root = tmp_path / "worktrees"
     original = GitWorkspace(repo, "main", "sprint", root)
     base = original.prepare(require_remote=False)
-    candidate = original.create_or_reattach(base)
+    candidate = original.create_or_reattach("tdd", base)
     (candidate.path / "feature.txt").write_text("already delivered\n", encoding="utf-8")
     commit = original.prepare_commit(candidate, "Prepared and integrated")
     original.integrate(commit, base, push=False)
 
     recovered = GitWorkspace(repo, "main", "sprint", root)
     assert recovered.prepare(require_remote=False) == commit
-    candidate = recovered.create_or_reattach(base, recover=True)
+    candidate = recovered.create_or_reattach("tdd", base, recover=True)
 
     assert (
         recovered.reconcile_delivery(
@@ -234,7 +236,7 @@ def test_workspace_rejects_empty_candidate_patch(tmp_path: Path):
     repo = initialized_repo(tmp_path)
     workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
     base = workspace.prepare(require_remote=False)
-    candidate = workspace.create_or_reattach(base)
+    candidate = workspace.create_or_reattach("tdd", base)
 
     with pytest.raises(GitError, match="no changes"):
         workspace.prepare_commit(candidate, "Empty sprint")
@@ -247,7 +249,7 @@ def test_workspace_fingerprint_is_stable_and_tracks_binary_patch(tmp_path: Path)
     repo = initialized_repo(tmp_path)
     workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
     base = workspace.prepare(require_remote=False)
-    candidate = workspace.create_or_reattach(base)
+    candidate = workspace.create_or_reattach("tdd", base)
     asset = candidate.path / "asset.bin"
     asset.write_bytes(b"\x00candidate-v1\xff")
 
@@ -269,7 +271,7 @@ def test_workspace_fingerprint_covers_staged_changes_and_survives_commit(tmp_pat
     repo = initialized_repo(tmp_path)
     workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
     base = workspace.prepare(require_remote=False)
-    candidate = workspace.create_or_reattach(base)
+    candidate = workspace.create_or_reattach("tdd", base)
     (candidate.path / "staged.txt").write_text("first\n", encoding="utf-8")
     git(candidate.path, "add", "staged.txt")
 
@@ -293,7 +295,7 @@ def test_workspace_refuses_to_commit_a_tree_changed_after_acceptance(tmp_path: P
     repo = initialized_repo(tmp_path)
     workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
     base = workspace.prepare(require_remote=False)
-    candidate = workspace.create_or_reattach(base)
+    candidate = workspace.create_or_reattach("tdd", base)
     (candidate.path / "accepted.txt").write_text("accepted\n", encoding="utf-8")
     accepted_tree = workspace.capture(candidate)["tree"]
     (candidate.path / "late.txt").write_text("late mutation\n", encoding="utf-8")
@@ -309,7 +311,7 @@ def test_workspace_disposable_copy_is_isolated_and_omits_local_artifacts(tmp_pat
     repo = initialized_repo(tmp_path)
     workspace = GitWorkspace(repo, "main", "sprint", tmp_path / "worktrees")
     base = workspace.prepare(require_remote=False)
-    candidate = workspace.create_or_reattach(base)
+    candidate = workspace.create_or_reattach("tdd", base)
     (candidate.path / "README.md").write_text("candidate\n", encoding="utf-8")
     (candidate.path / "feature.txt").write_text("working state\n", encoding="utf-8")
     (candidate.path / "node_modules/pkg").mkdir(parents=True)
@@ -332,3 +334,106 @@ def test_workspace_disposable_copy_is_isolated_and_omits_local_artifacts(tmp_pat
 
     workspace.cleanup()
     assert (destination / "feature.txt").read_text(encoding="utf-8") == "tester mutation\n"
+
+
+def test_workspace_creates_three_isolated_candidates_from_one_base(tmp_path: Path):
+    from forge.sprint import CODER_CANDIDATES
+
+    repo = initialized_repo(tmp_path)
+    workspace = GitWorkspace(repo, "main", "run", tmp_path / "worktrees")
+    base = workspace.prepare(require_remote=False)
+
+    candidates = {
+        name: workspace.create_or_reattach(name, base) for name in CODER_CANDIDATES
+    }
+
+    assert {name: item.name for name, item in candidates.items()} == {
+        name: name for name in CODER_CANDIDATES
+    }
+    assert len({item.branch for item in candidates.values()}) == 3
+    assert len({item.path for item in candidates.values()}) == 3
+    for item in candidates.values():
+        assert git(item.path, "rev-parse", "HEAD") == base
+
+    (candidates["tdd"].path / "tdd.txt").write_text("only in tdd\n", encoding="utf-8")
+    assert workspace.capture(candidates["tdd"])["fingerprint"] != workspace.capture(
+        candidates["explore"]
+    )["fingerprint"]
+    assert "tdd.txt" not in workspace.capture(candidates["explore"])["patch"]
+    assert "tdd.txt" not in workspace.capture(candidates["classic"])["patch"]
+    assert not (candidates["explore"].path / "tdd.txt").exists()
+    workspace.cleanup()
+
+
+def test_workspace_reattaches_each_candidate_independently(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    root = tmp_path / "worktrees"
+    original = GitWorkspace(repo, "main", "run", root)
+    base = original.prepare(require_remote=False)
+    for name in ("tdd", "explore", "classic"):
+        candidate = original.create_or_reattach(name, base)
+        (candidate.path / f"{name}.txt").write_text(f"{name} work\n", encoding="utf-8")
+
+    recovered = GitWorkspace(repo, "main", "run", root)
+    assert recovered.prepare(require_remote=False) == base
+    for name in ("explore", "tdd", "classic"):
+        candidate = recovered.create_or_reattach(name, base, recover=True)
+        assert (candidate.path / f"{name}.txt").read_text(encoding="utf-8") == f"{name} work\n"
+        assert f"{name}.txt" in recovered.capture(candidate)["patch"]
+    recovered.cleanup()
+
+
+def test_capture_preserves_executable_mode_bits(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    workspace = GitWorkspace(repo, "main", "run", tmp_path / "worktrees")
+    base = workspace.prepare(require_remote=False)
+    candidate = workspace.create_or_reattach("tdd", base)
+    script = candidate.path / "run.sh"
+    script.write_text("#!/usr/bin/env bash\necho ran\n", encoding="utf-8")
+
+    before = workspace.capture(candidate)
+    assert before["modes"]["run.sh"] == "100644"
+
+    script.chmod(0o755)
+    after = workspace.capture(candidate)
+
+    assert after["modes"]["run.sh"] == "100755"
+    assert after["fingerprint"] != before["fingerprint"]
+    assert "100755" in after["patch"]
+    workspace.cleanup()
+
+
+def test_disposable_copy_and_delivery_preserve_executable_mode(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    workspace = GitWorkspace(repo, "main", "run", tmp_path / "worktrees")
+    base = workspace.prepare(require_remote=False)
+    candidate = workspace.create_or_reattach("tdd", base)
+    script = candidate.path / "run.sh"
+    script.write_text("#!/usr/bin/env bash\necho ran\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    copy = workspace.create_disposable_copy(candidate, tmp_path / "tester-copy")
+    assert os.access(copy / "run.sh", os.X_OK)
+
+    tree = workspace.capture(candidate)["tree"]
+    commit = workspace.prepare_commit(candidate, "Executable delivery", expected_tree=tree)
+    workspace.integrate(commit, base, push=False)
+
+    delivered_mode = git(repo, "ls-tree", "HEAD", "run.sh").split()[0]
+    assert delivered_mode == "100755"
+    assert os.access(repo / "run.sh", os.X_OK)
+    workspace.cleanup()
+
+
+def test_export_revision_preserves_executable_mode(tmp_path: Path):
+    repo = initialized_repo(tmp_path)
+    git(repo, "commit", "--allow-empty", "-m", "still plain")
+    (repo / "setup.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    os.chmod(repo / "setup.sh", 0o755)
+    git(repo, "add", "setup.sh")
+    git(repo, "commit", "-m", "add executable script")
+    destination = tmp_path / "snapshot"
+
+    export_revision(repo, destination)
+
+    assert os.access(destination / "setup.sh", os.X_OK)

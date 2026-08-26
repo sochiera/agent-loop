@@ -193,6 +193,73 @@ ITERATION_TEST_SCHEMA: dict[str, Any] = {
     ],
 }
 
+_XFAIL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "nodeid": {"type": "string"},
+        "reason": {"type": "string"},
+        "repair_notes": {"type": "string"},
+    },
+    "required": ["nodeid", "reason", "repair_notes"],
+}
+
+TEST_AUTHOR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "tests_root": {"type": "string"},
+        "summary": {"type": "string"},
+        "covered": {"type": "array", "items": {"type": "string"}},
+        "xfails": {"type": "array", "items": _XFAIL_SCHEMA},
+    },
+    "required": ["tests_root", "summary", "covered", "xfails"],
+}
+
+_ASSESSMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "score": {"type": "number"},
+        "summary": {"type": "string"},
+        "strengths": {"type": "array", "items": {"type": "string"}},
+        "problems": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["score", "summary", "strengths", "problems"],
+}
+
+_BORROW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "from": {"type": "string"},
+        "what": {"type": "string"},
+    },
+    "required": ["from", "what"],
+}
+
+CANDIDATE_SELECTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "winner": {"type": "string"},
+        "reason": {"type": "string"},
+        "candidates": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "tdd": _ASSESSMENT_SCHEMA,
+                "explore": _ASSESSMENT_SCHEMA,
+                "classic": _ASSESSMENT_SCHEMA,
+            },
+            "required": [],
+        },
+        "borrow": {"type": "array", "items": _BORROW_SCHEMA},
+        "feedback": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["winner", "reason", "candidates", "borrow", "feedback"],
+}
+
 
 def _extract_json(text: str) -> dict[str, Any]:
     stripped = text.strip()
@@ -650,4 +717,121 @@ def parse_iteration_test(
     if verdict == "blocked" and not blocker:
         raise ContractError("tester blocked requires a blocker")
     value.update(task_results=results, blocking_findings=findings, nits=nits, blocker=blocker)
+    return value
+
+
+def parse_test_author(text: str) -> dict[str, Any]:
+    value = _extract_json(text)
+    _exact_object(
+        value, {"tests_root", "summary", "covered", "xfails"}, "test author response"
+    )
+    tests_root = _required_text(value, "tests_root", "test author response")
+    if tests_root.startswith("/") or ".." in tests_root.split("/"):
+        raise ContractError("tests_root must be a relative path inside the product")
+    if not tests_root.startswith("tests/") or tests_root.endswith("/"):
+        raise ContractError("tests_root must be a directory path starting with tests/")
+    if any(character.isspace() for character in tests_root):
+        raise ContractError("tests_root must not contain whitespace")
+    value["tests_root"] = tests_root
+    value["summary"] = _required_text(value, "summary", "test author response")
+    value["covered"] = _string_list(
+        value.get("covered"), "covered", nonempty=True
+    )
+    raw_xfails = value.get("xfails")
+    if not isinstance(raw_xfails, list):
+        raise ContractError("xfails must be an array")
+    xfails: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(raw_xfails, start=1):
+        if not isinstance(raw, dict):
+            raise ContractError(f"xfail {index} must be an object")
+        _exact_object(raw, {"nodeid", "reason", "repair_notes"}, f"xfail {index}")
+        nodeid = _required_text(raw, "nodeid", f"xfail {index}")
+        if nodeid in seen:
+            raise ContractError(f"duplicate xfail nodeid: {nodeid}")
+        seen.add(nodeid)
+        xfails.append(
+            {
+                "nodeid": nodeid,
+                "reason": _required_text(raw, "reason", f"xfail {nodeid}"),
+                "repair_notes": _required_text(
+                    raw, "repair_notes", f"xfail {nodeid}"
+                ),
+            }
+        )
+    value["xfails"] = xfails
+    return value
+
+
+def parse_candidate_selection(
+    text: str,
+    *,
+    submitted: tuple[str, ...],
+    eligible: tuple[str, ...],
+) -> dict[str, Any]:
+    value = _extract_json(text)
+    _exact_object(
+        value,
+        {"winner", "reason", "candidates", "borrow", "feedback"},
+        "candidate selection",
+    )
+    winner = value.get("winner")
+    if winner not in submitted:
+        raise ContractError(
+            f"selected winner is not a submitted candidate: {winner}"
+        )
+    if winner not in eligible:
+        raise ContractError(
+            f"selected winner is not an eligible candidate: {winner}"
+        )
+    value["winner"] = str(winner)
+    value["reason"] = _required_text(value, "reason", "candidate selection")
+    candidates = value.get("candidates")
+    if not isinstance(candidates, dict):
+        raise ContractError("candidates must be an object keyed by candidate name")
+    _exact_object(candidates, set(submitted), "candidate selection candidates")
+    for name in submitted:
+        assessment = candidates[name]
+        if not isinstance(assessment, dict):
+            raise ContractError(f"candidate {name} assessment must be an object")
+        _exact_object(
+            assessment,
+            {"score", "summary", "strengths", "problems"},
+            f"candidate {name} assessment",
+        )
+        score = assessment.get("score")
+        if (
+            not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or not 0 <= score <= 100
+        ):
+            raise ContractError(f"candidate {name} score must be a number 0..100")
+        assessment["summary"] = _required_text(
+            assessment, "summary", f"candidate {name} assessment"
+        )
+        assessment["strengths"] = _string_list(
+            assessment.get("strengths"), f"candidate {name} strengths"
+        )
+        assessment["problems"] = _string_list(
+            assessment.get("problems"), f"candidate {name} problems"
+        )
+    raw_borrow = value.get("borrow")
+    if not isinstance(raw_borrow, list):
+        raise ContractError("borrow must be an array")
+    borrow: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_borrow, start=1):
+        if not isinstance(raw, dict):
+            raise ContractError(f"borrow {index} must be an object")
+        _exact_object(raw, {"from", "what"}, f"borrow {index}")
+        source = raw.get("from")
+        if source not in submitted:
+            raise ContractError(f"borrow {index} references unknown candidate: {source}")
+        borrow.append(
+            {
+                "from": str(source),
+                "what": _required_text(raw, "what", f"borrow {index}"),
+            }
+        )
+    value["borrow"] = borrow
+    value["feedback"] = _string_list(value.get("feedback"), "feedback")
     return value

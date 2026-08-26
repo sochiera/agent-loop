@@ -14,6 +14,30 @@ from .sprint import (
 )
 
 
+CLEAN_CODE_RULES = """CLEAN CODE (Uncle Bob) — mandatory:
+- Names say what the code does; no lying or vague names.
+- Functions stay short and do one thing; no 200-line walls, no god objects.
+- Keep SOLID boundaries; no cleverness that a maintainer must decode.
+- No dead code and no comments that merely narrate the code.
+"""
+
+
+CODER_TACTICS = {
+    "tdd": (
+        "Work test-first: before each behavior change, add or extend a focused failing test "
+        "next to the code, watch it fail, then implement until it passes."
+    ),
+    "explore": (
+        "Explore the existing code and product behavior first, prototype the smallest working "
+        "path, then harden it into a clean implementation."
+    ),
+    "classic": (
+        "Implement the plan directly with steady, conventional engineering; add focused tests "
+        "after each task is in place."
+    ),
+}
+
+
 PRODUCT_OWNER_SYSTEM = """You are the Product Owner for a continuous Forge sprint.
 
 Judge the product, not its implementation. Use your tools extensively. Launch the public product,
@@ -153,14 +177,76 @@ Return exactly:
 """
 
 
+def test_author_prompt(
+    *,
+    brief: str,
+    plan: dict[str, Any],
+    repository_context: str,
+    environment_context: str,
+) -> str:
+    return f"""You are the black-box test author for one sprint iteration.
+
+Write pytest integration tests that treat the product as a black box: exercise its public
+CLI/API/HTTP/process behavior, never its internals. Tests describe *what should happen*, not how
+the implementation achieves it. Do not mock the system under test unless unavoidable. Cover the
+plan's `public_checks` and every Product Owner acceptance criterion of the selected story.
+
+The tests MUST fail on the current product snapshot (RED): the planned behavior does not exist
+yet. The controller runs `python3 -m pytest` on your suite and rejects tests that already pass,
+fail to collect, or error for unrelated reasons. If a small part of the expectation cannot be
+made to fail cleanly yet, mark it `xfail` with precise repair notes instead of weakening it.
+Write the suite under a single `tests/...` directory inside the product snapshot. You may run
+pytest yourself to check collection and RED status before answering.
+
+IMMUTABLE PLAN
+{json.dumps(plan, indent=2, sort_keys=True)}
+
+ORIGINAL BRIEF
+{brief.strip()}
+
+MECHANICAL REPOSITORY SNAPSHOT
+{repository_context}
+
+TOOLCHAIN
+{environment_context}
+
+Return exactly:
+{{
+  "tests_root": "tests/blackbox",
+  "summary": "what the suite proves",
+  "covered": ["acceptance criterion or public check covered by the suite"],
+  "xfails": [{{"nodeid": "tests/blackbox/test_x.py::test_y", "reason": "why it cannot fail cleanly yet", "repair_notes": "exact repair steps for later roles"}}]
+}}
+"""
+
+
 def implementation_prompt(
     *,
     plan: dict[str, Any],
     blocking_findings: list[dict[str, Any]],
     tester_feedback: list[dict[str, Any]],
     previous_summary: str = "",
+    tactic: str = "classic",
+    tests_root: str = "",
+    xfails: list[dict[str, Any]] | None = None,
+    borrow: list[dict[str, Any]] | None = None,
 ) -> str:
-    return f"""You are the implementation agent for one sprint iteration.
+    tactic_line = CODER_TACTICS.get(tactic, CODER_TACTICS["classic"])
+    blackbox = ""
+    if tests_root:
+        blackbox = f"""BLACK-BOX SUITE
+A controller-owned pytest suite is installed at `{tests_root}`. It is the objective definition of
+done: implement until it passes. Never modify, rename, delete, or add files under `{tests_root}`;
+tampering disqualifies your candidate. You may add your own focused tests outside that directory.
+KNOWN XFAILS (repair notes apply)
+{json.dumps(xfails or [], indent=2, sort_keys=True)}
+"""
+    borrow_text = ""
+    if borrow:
+        borrow_text = f"""REVIEWER BORROW GUIDANCE (ideas worth adopting from other candidates; guidance only)
+{json.dumps(borrow, indent=2, sort_keys=True)}
+"""
+    return f"""You are the {tactic} implementation agent for one sprint iteration.
 
 Implement every task in the immutable plan in the current worktree. Use tools, edit the product,
 run focused checks when execution tools are available, and leave the worktree ready for review. The
@@ -170,6 +256,11 @@ scope. Tester failures are mandatory regressions to repair. Preserve good existi
 Only the Forge controller may commit, push, switch branches, alter Git refs, or touch another
 worktree. Leave all changes uncommitted in this worktree.
 
+TACTIC
+{tactic_line}
+
+{CLEAN_CODE_RULES}
+{blackbox}{borrow_text}
 PLAN
 {json.dumps(plan, indent=2, sort_keys=True)}
 
@@ -187,6 +278,45 @@ decides whether the tasks are complete.
 """
 
 
+def candidate_selection_prompt(
+    *,
+    plan: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    eligible: tuple[str, ...],
+    tests_root: str,
+) -> str:
+    return f"""You are the tournament reviewer. Three independent coders implemented the same
+immutable plan in isolated worktrees without seeing each other's work. Choose exactly one winner.
+
+Judge each candidate on correctness against the plan, black-box suite and validation evidence,
+and clean-code quality. {CLEAN_CODE_RULES}
+Prefer the candidate you would maintain for a year, not the one with the most lines. Disqualified
+candidates tampered with the controller-owned test suite and can never win. Never edit files,
+commit, push, switch branches, or alter Git refs.
+
+IMMUTABLE PLAN
+{json.dumps(plan, indent=2, sort_keys=True)}
+
+BLACK-BOX SUITE LOCATION
+{tests_root or "none"}
+
+ELIGIBLE CANDIDATES
+{json.dumps(list(eligible))}
+
+TOURNAMENT CANDIDATES
+{json.dumps(candidates, indent=2, sort_keys=True)}
+
+Return exactly:
+{{"winner":"tdd|explore|classic","reason":"...",
+"candidates":{{"<name>":{{"score":0,"summary":"...","strengths":["..."],"problems":["..."]}}}},
+"borrow":[{{"from":"<candidate>","what":"idea the winner should adopt"}}],
+"feedback":["guidance for the winner's first fix round"]}}
+
+The `candidates` object must assess every submitted candidate exactly once. `winner` must be an
+eligible candidate. `borrow` is prompt guidance only; nothing is applied automatically.
+"""
+
+
 def iteration_reviewer_prompt(
     *,
     plan: dict[str, Any],
@@ -194,12 +324,16 @@ def iteration_reviewer_prompt(
     validation: list[dict[str, Any]],
     previous_findings: list[dict[str, Any]],
 ) -> str:
-    return f"""You are a pragmatic reviewer and release gate for one implementation.
+    return f"""You are a pragmatic reviewer and release gate for the winning implementation.
 
 Inspect the worktree and verify the immutable plan. Be strict about serious correctness,
 completeness, security, regression, and missing-test problems. Do not be hostile or block delivery
 for taste, naming preferences, tiny polish, or speculative improvements. Put those in `nits`; nits
 are non-blocking and will be considered during a cleanup iteration. Never edit the product.
+
+{CLEAN_CODE_RULES}
+You MAY block on real cleanliness failures that will rot the codebase: lying names, 200-line
+functions, god objects, dead code. Taste and style preferences still go to `nits`.
 
 Accept only when every task meets its acceptance criteria and there are no serious blockers. Reject
 with concrete evidence and a bounded suggested fix. Use `blocked` only when review itself cannot be

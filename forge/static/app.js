@@ -1,20 +1,23 @@
-const roles = ["brain", "planner", "reviewer", "tester"];
+const roles = ["brain", "planner", "test_author", "reviewer", "tester"];
 const roleMeta = {
   brain: ["Product Owner", "Inspects the product and owns the backlog"],
   planner: ["Planner", "Turns one prioritized story into bounded tasks"],
-  reviewer: ["Reviewer", "Pragmatic serious-defect gate"],
+  test_author: ["Test author", "Writes the failing black-box suite before coding"],
+  reviewer: ["Reviewer", "Picks the tournament winner and gates fixes"],
   tester: ["Unified tester", "White-box and public-behavior acceptance"],
 };
 const defaults = {
   brain: "codex:gpt-5.6-sol:high",
   planner: "codex:gpt-5.6-sol:high",
+  test_author: "opencode:deepseek-v4-flash-0731:high",
   reviewer: "codex:gpt-5.6-terra:high",
   tester: "codex:gpt-5.6-terra:high",
 };
 const defaultCoder = "codex:gpt-5.6-luna:high";
-const defaultCoderPool = [defaultCoder];
-const phases = ["preflight", "product-owner", "planning", "coding", "review", "testing", "delivery", "finalizing"];
-const phaseLabels = ["Preflight", "Product owner", "Plan", "Code", "Review", "Test", "Deliver", "Finalize"];
+const defaultCoderPool = [defaultCoder, defaultCoder, defaultCoder];
+const maxCoderModels = 12;
+const phases = ["preflight", "product-owner", "planning", "test-authoring", "coding", "selection", "review", "testing", "delivery", "finalizing"];
+const phaseLabels = ["Preflight", "Product owner", "Plan", "Tests (RED)", "Code ×3", "Select", "Review", "Test", "Deliver", "Finalize"];
 const storageKey = "forge-control-room-v5";
 const providerLabels = {codex: "Codex", opencode: "OpenCode"};
 const familyLabels = {gpt: "GPT", grok: "Grok", qwen: "Qwen", deepseek: "DeepSeek", gemini: "Gemini", kimi: "Kimi", glm: "GLM"};
@@ -160,36 +163,55 @@ function coderSelectors() {
 }
 
 function relabelCoderCards() {
-  coderCards().forEach(card => {
-    card.querySelector(".model-label").textContent = "Coder";
+  const cards = coderCards();
+  cards.forEach((card, index) => {
+    card.querySelector(".model-label").textContent = `Coder ${index + 1}`;
+    const remove = card.querySelector(".model-remove");
+    if (remove) remove.disabled = cards.length <= 1;
   });
+  const add = document.querySelector("#add-coder");
+  if (add) add.disabled = cards.length >= maxCoderModels;
 }
 
 function addCoderCard(value = defaultCoder) {
-  if (coderCards().length) return;
+  if (coderCards().length >= maxCoderModels) return;
   const template = document.querySelector("#model-template");
   const fragment = template.content.cloneNode(true);
   const card = fragment.querySelector(".model-card");
   card.dataset.role = "coder";
-  fragment.querySelector(".model-help").textContent = "Implements one immutable iteration plan";
+  fragment.querySelector(".model-help").textContent = "Drawn into TDD / explore / classic";
+  const remove = fragment.querySelector(".model-remove");
+  remove.classList.remove("hidden");
+  remove.addEventListener("click", event => {
+    event.preventDefault();
+    removeCoderCard(card);
+  });
   applySelector(card, value);
   document.querySelector("#coder-models").appendChild(fragment);
   relabelCoderCards();
 }
 
+function removeCoderCard(card) {
+  if (coderCards().length <= 1) return;
+  card.remove();
+  relabelCoderCards();
+  saveForm();
+}
+
 function replaceCoderPool(values) {
   document.querySelector("#coder-models").innerHTML = "";
   const pool = values.length ? values : defaultCoderPool;
-  addCoderCard(pool[0]);
+  pool.slice(0, maxCoderModels).forEach(value => addCoderCard(value));
 }
 
 function savedCoderPool(value) {
-  if (value.models?.coder) return [value.models.coder];
   if (Array.isArray(value.coder_models) && value.coder_models.length) return value.coder_models;
   const previous = ["coder_tdd", "coder_explore", "coder_classic"]
     .map(role => value.models?.[role])
     .filter(Boolean);
-  return previous.length ? [previous[0]] : defaultCoderPool;
+  if (previous.length) return previous;
+  if (value.models?.coder) return [value.models.coder];
+  return defaultCoderPool;
 }
 
 function staffIdentity(value) {
@@ -302,7 +324,6 @@ function collectForm() {
   const models = shared
     ? staffSelectorsFromShared()
     : Object.fromEntries(roles.map(role => [role, selectorFromCard(roleCard(role))]));
-  models.coder = coderSelectors()[0] || defaultCoder;
   return {
     repo: document.querySelector("#repo").value,
     branch: document.querySelector("#branch").value,
@@ -311,6 +332,7 @@ function collectForm() {
     brief: document.querySelector("#brief").value,
     push: document.querySelector("#push").checked,
     models,
+    coder_models: coderSelectors(),
     shared_staff_model: shared,
     backup: shared && backupOn ? selectorFromCard(document.querySelector("#staff-backup .model-card")) : "",
   };
@@ -535,9 +557,15 @@ function eventRows(run) {
 
 function coderDraw(run) {
   const models = run.config?.models || {};
-  const spec = models.coder;
-  const text = spec ? `${spec.provider}:${spec.model}${spec.effort ? `:${spec.effort}` : ""}` : "—";
-  return `<h3>Implementation model</h3><ul class="coder-draw"><li><strong>Coder</strong> ${escapeHtml(text)}</li></ul>`;
+  const labels = {coder_tdd: "TDD", coder_explore: "Explore", coder_classic: "Classic"};
+  const rows = Object.entries(labels).map(([role, label]) => {
+    const spec = models[role];
+    const text = spec
+      ? `${spec.provider}:${spec.model}${spec.effort ? `:${spec.effort}` : ""}`
+      : "—";
+    return `<li><strong>${escapeHtml(label)}</strong> ${escapeHtml(text)}</li>`;
+  }).join("");
+  return `<h3>Coder draw</h3><ul class="coder-draw">${rows}</ul>`;
 }
 
 function eventsBox() {
@@ -745,6 +773,10 @@ document.querySelector("#enable-backup").addEventListener("change", () => {
   syncStaffMode();
   saveForm();
 });
+document.querySelector("#add-coder").addEventListener("click", () => {
+  addCoderCard();
+  saveForm();
+});
 document.querySelector("#restart").addEventListener("click", () => restartForge(false));
 document.querySelector("#restart-yes").addEventListener("click", () => restartForge(true));
 document.querySelector("#restart-no").addEventListener("click", () => showRestartConfirm(false));
@@ -773,6 +805,7 @@ document.querySelector("#run-form").addEventListener("submit", async event => {
     brief_text: document.querySelector("#brief").value.trim(),
     push: document.querySelector("#push").checked,
     models: form.models,
+    coder_models: form.coder_models,
     shared_staff_model: form.shared_staff_model,
     backup: form.backup,
   };

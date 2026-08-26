@@ -7,14 +7,30 @@ from pathlib import Path
 from typing import Any
 
 
-ROLE_NAMES = ("brain", "planner", "coder", "reviewer", "tester")
+ROLE_NAMES = (
+    "brain",
+    "planner",
+    "test_author",
+    "coder_tdd",
+    "coder_explore",
+    "coder_classic",
+    "reviewer",
+    "tester",
+)
+
+CODER_ROLES = ("coder_tdd", "coder_explore", "coder_classic")
+
+STAFF_ROLES = ("brain", "planner", "test_author", "reviewer", "tester")
 
 LEGACY_CODER_ROLES = ("coder_tdd", "coder_explore", "coder_classic")
 
 DEFAULT_MODEL_SELECTORS = {
     "brain": "codex:gpt-5.6-sol:high",
     "planner": "codex:gpt-5.6-sol:high",
-    "coder": "codex:gpt-5.6-luna:high",
+    "test_author": "opencode:deepseek-v4-flash-0731:high",
+    "coder_tdd": "codex:gpt-5.6-luna:high",
+    "coder_explore": "codex:gpt-5.6-luna:high",
+    "coder_classic": "codex:gpt-5.6-luna:high",
     "reviewer": "codex:gpt-5.6-terra:high",
     "tester": "codex:gpt-5.6-terra:high",
 }
@@ -62,6 +78,7 @@ class RunConfig:
     stalled_turns: int = 3
     backup: ModelSpec | None = None
     max_revision_rounds: int = 8
+    shuffle_coders: bool = False
 
     def validate(self) -> None:
         from .catalog import validate_spec
@@ -100,13 +117,16 @@ class RunConfig:
         raw_models = {
             key: ModelSpec(**spec) for key, spec in value["models"].items()
         }
-        if "coder" not in raw_models:
-            for legacy in LEGACY_CODER_ROLES:
-                if legacy in raw_models:
-                    raw_models["coder"] = raw_models[legacy]
-                    break
-        if "coder" not in raw_models:
-            raw_models["coder"] = ModelSpec.parse(DEFAULT_MODEL_SELECTORS["coder"])
+        if not any(role in raw_models for role in CODER_ROLES):
+            legacy = raw_models.get("coder")
+            if legacy is None:
+                legacy = ModelSpec.parse(DEFAULT_MODEL_SELECTORS["coder_tdd"])
+            for role in CODER_ROLES:
+                raw_models[role] = legacy
+        if "test_author" not in raw_models:
+            raw_models["test_author"] = ModelSpec.parse(
+                DEFAULT_MODEL_SELECTORS["test_author"]
+            )
         models = {
             role: raw_models[role]
             for role in ROLE_NAMES
@@ -123,6 +143,7 @@ class RunConfig:
             stalled_turns=int(value.get("stalled_turns", 3)),
             backup=ModelSpec(**backup) if isinstance(backup, dict) else None,
             max_revision_rounds=int(value.get("max_revision_rounds", 8)),
+            shuffle_coders=bool(value.get("shuffle_coders", False)),
         )
 
 
@@ -174,7 +195,7 @@ class RunState:
     last_red_flags: list[str] = field(default_factory=list)
     original_models: dict[str, dict[str, Any]] = field(default_factory=dict)
     disabled_models: list[str] = field(default_factory=list)
-    schema_version: int = 2
+    schema_version: int = 3
     sprint_number: int = 0
     sprint_iteration: int = 0
     sprint_started_at: str = ""

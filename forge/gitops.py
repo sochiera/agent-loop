@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .sprint import CODER_CANDIDATES
+
 
 class GitError(RuntimeError):
     pass
@@ -145,6 +147,7 @@ def _capture_workspace_candidate(
             "diff", "--no-ext-diff", "--unified=3", base_sha, tree
         )
         diffstat = snapshot_git("diff", "--stat", base_sha, tree)
+        modes = _index_modes(snapshot_git("ls-files", "-s"))
     finally:
         index_path.unlink(missing_ok=True)
         Path(f"{index_path}.lock").unlink(missing_ok=True)
@@ -165,13 +168,28 @@ def _capture_workspace_candidate(
         "patch": patch,
         "review_patch": review_patch,
         "review_patch_truncated": review_patch_truncated,
+        "modes": modes,
         "tree": tree,
         "fingerprint": digest.hexdigest(),
     }
 
 
+def _index_modes(ls_files_output: str) -> dict[str, str]:
+    """Map every indexed path to its Git mode so executable bits stay visible."""
+
+    modes: dict[str, str] = {}
+    for line in ls_files_output.splitlines():
+        if "\t" not in line:
+            continue
+        metadata, path = line.split("\t", 1)
+        parts = metadata.split()
+        if len(parts) >= 1:
+            modes[path] = parts[0]
+    return modes
+
+
 class GitWorkspace:
-    """A recoverable single-candidate workspace with strict fast-forward delivery."""
+    """A recoverable tournament workspace with strict fast-forward delivery."""
 
     def __init__(
         self,
@@ -188,12 +206,12 @@ class GitWorkspace:
         self.worktree_root = worktree_root.resolve()
         self.local_excludes = local_excludes
         self.base_sha = ""
-        self._candidate: CandidateWorktree | None = None
-        self._candidate_base_sha = ""
+        self._candidates: dict[str, CandidateWorktree] = {}
+        self._candidate_bases: dict[str, str] = {}
 
-    @property
-    def implementation_branch(self) -> str:
-        return f"forge/{self.run_id}/implementation"
+    def candidate_branch(self, name: str) -> str:
+        self._require_candidate_name(name)
+        return f"forge/{self.run_id}/{name}"
 
     def prepare(self, require_remote: bool) -> str:
         self.base_sha = _prepare_repository(
@@ -206,25 +224,26 @@ class GitWorkspace:
         return self.base_sha
 
     def create_or_reattach(
-        self, base_sha: str, recover: bool = False
+        self, name: str, base_sha: str, recover: bool = False
     ) -> CandidateWorktree:
         self._require_prepared()
+        self._require_candidate_name(name)
         base_sha = self._resolve_commit(base_sha, "candidate base")
-        branch = self.implementation_branch
+        branch = self.candidate_branch(name)
         _run(self.repo, "check-ref-format", "--branch", branch)
-        path = self.worktree_root / "implementation"
-        candidate = CandidateWorktree("implementation", path, branch)
+        path = self.worktree_root / name
+        candidate = CandidateWorktree(name, path, branch)
         path_exists = path.exists() or path.is_symlink()
         branch_exists = self._branch_exists(branch)
 
         if path_exists:
             if not recover:
-                raise GitError(f"implementation worktree already exists: {path}")
+                raise GitError(f"{name} worktree already exists: {path}")
             head = self._inspect_candidate(candidate)
         elif branch_exists:
             if not recover:
-                raise GitError(f"implementation branch already exists: {branch}")
-            head = self._resolve_commit(f"refs/heads/{branch}", "implementation branch")
+                raise GitError(f"{name} branch already exists: {branch}")
+            head = self._resolve_commit(f"refs/heads/{branch}", f"{name} branch")
             self._validate_candidate_position(head, base_sha)
             _run(self.repo, "worktree", "prune", check=False)
             _run(self.repo, "worktree", "add", str(path), branch)
@@ -239,8 +258,8 @@ class GitWorkspace:
             head = self._inspect_candidate(candidate)
 
         self._validate_candidate_position(head, base_sha)
-        self._candidate = candidate
-        self._candidate_base_sha = base_sha
+        self._candidates[name] = candidate
+        self._candidate_bases[name] = base_sha
         return candidate
 
     def capture(self, candidate: CandidateWorktree) -> dict[str, Any]:
@@ -357,20 +376,25 @@ class GitWorkspace:
         return destination
 
     def cleanup(self) -> None:
-        if self._candidate is not None:
-            candidate = self._candidate
+        for name in CODER_CANDIDATES:
             _run(
                 self.repo,
                 "worktree",
                 "remove",
                 "--force",
-                str(candidate.path),
+                str(self.worktree_root / name),
                 check=False,
             )
-            _run(self.repo, "worktree", "prune", check=False)
-            _run(self.repo, "branch", "-D", candidate.branch, check=False)
-            self._candidate = None
-            self._candidate_base_sha = ""
+            _run(
+                self.repo,
+                "branch",
+                "-D",
+                self.candidate_branch(name),
+                check=False,
+            )
+        _run(self.repo, "worktree", "prune", check=False)
+        self._candidates.clear()
+        self._candidate_bases.clear()
         try:
             self.worktree_root.rmdir()
         except OSError:
@@ -379,6 +403,13 @@ class GitWorkspace:
     def _require_prepared(self) -> None:
         if not self.base_sha:
             raise GitError("workspace must be prepared first")
+
+    @staticmethod
+    def _require_candidate_name(name: str) -> None:
+        if name not in CODER_CANDIDATES:
+            raise GitError(
+                f"candidate name must be one of {', '.join(CODER_CANDIDATES)}: {name}"
+            )
 
     def _resolve_commit(self, value: str, label: str) -> str:
         if not value.strip():
@@ -407,18 +438,19 @@ class GitWorkspace:
         )
 
     def _inspect_candidate(self, candidate: CandidateWorktree) -> str:
+        self._require_candidate_name(candidate.name)
         expected = CandidateWorktree(
-            "implementation",
-            self.worktree_root / "implementation",
-            self.implementation_branch,
+            candidate.name,
+            self.worktree_root / candidate.name,
+            self.candidate_branch(candidate.name),
         )
         if candidate != expected:
             raise GitError("candidate does not belong to this implementation workspace")
         if not candidate.path.is_dir():
-            raise GitError(f"implementation worktree is missing: {candidate.path}")
+            raise GitError(f"{candidate.name} worktree is missing: {candidate.path}")
         top = Path(_run(candidate.path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
         if top != candidate.path.resolve():
-            raise GitError(f"invalid implementation worktree: {candidate.path}")
+            raise GitError(f"invalid {candidate.name} worktree: {candidate.path}")
         candidate_common = Path(
             _run(candidate.path, "rev-parse", "--git-common-dir").stdout.strip()
         )
@@ -432,21 +464,22 @@ class GitWorkspace:
         current = _run(candidate.path, "branch", "--show-current").stdout.strip()
         if current != candidate.branch:
             raise GitError(
-                f"implementation worktree is on {current or 'detached HEAD'}, "
+                f"{candidate.name} worktree is on {current or 'detached HEAD'}, "
                 f"expected {candidate.branch}"
             )
         head = _run(candidate.path, "rev-parse", "HEAD").stdout.strip()
         branch_head = self._resolve_commit(
-            f"refs/heads/{candidate.branch}", "implementation branch"
+            f"refs/heads/{candidate.branch}", f"{candidate.name} branch"
         )
         if branch_head != head:
             raise GitError("implementation branch and worktree HEAD do not match")
         return head
 
     def _candidate_base(self, candidate: CandidateWorktree) -> str:
-        if self._candidate != candidate or not self._candidate_base_sha:
+        base = self._candidate_bases.get(candidate.name, "")
+        if not base:
             raise GitError("candidate has not been attached to this workspace")
-        return self._candidate_base_sha
+        return base
 
     def _validate_candidate_position(self, head: str, base_sha: str) -> None:
         if head != base_sha:
@@ -464,7 +497,7 @@ class GitWorkspace:
     ) -> None:
         self._validate_delivery_commit(commit, base_sha)
         if self._inspect_candidate(candidate) != commit:
-            raise GitError("implementation worktree is not at the prepared commit")
+            raise GitError(f"{candidate.name} worktree is not at the prepared commit")
         if _run(candidate.path, "status", "--porcelain").stdout.strip():
             raise GitError("implementation changed after its commit was prepared")
         if _run(candidate.path, "write-tree").stdout.strip() != self._tree(commit):

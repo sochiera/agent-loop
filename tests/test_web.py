@@ -10,7 +10,7 @@ import pytest
 
 from pathlib import Path
 
-from forge.models import ROLE_NAMES, RunState
+from forge.models import CODER_ROLES, ROLE_NAMES, STAFF_ROLES, RunState
 from forge.web import (
     ForgeHandler,
     LiveRun,
@@ -110,11 +110,11 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         html = urllib.request.urlopen(base + "/", timeout=2).read().decode()
         assert "Forge Control Room" in html
         assert "model-provider" in html
-        assert "Coder model" in html
+        assert "Coder model pool" in html
         assert 'id="shared-staff"' in html
         assert 'id="enable-backup"' in html
-        assert 'id="add-coder"' not in html
-        assert "model-remove" not in html
+        assert 'id="add-coder"' in html
+        assert "model-remove" in html
         assert 'id="restart"' in html
         assert 'id="browse-repo"' in html
         assert 'id="browse-brief"' in html
@@ -149,10 +149,13 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         )
         assert by_key["glm-5.3"]["family"] == "glm"
         assert by_key["glm-5.3"]["ids"]["opencode"] == "zai-coding-plan/glm-5.3"
-        assert catalog["defaults"]["coder"] == "codex:gpt-5.6-luna:high"
+        assert catalog["defaults"]["coder_tdd"] == "codex:gpt-5.6-luna:high"
+        assert catalog["defaults"]["coder_explore"] == "codex:gpt-5.6-luna:high"
+        assert catalog["defaults"]["coder_classic"] == "codex:gpt-5.6-luna:high"
+        assert catalog["defaults"]["test_author"] == "opencode:deepseek-v4-flash-0731:high"
         assert "model-effort" in html
         assert 'class="model-effort" required' not in html
-        assert "Implementation model" in urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
+        assert "Coder draw" in urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
         assert "opencode" in catalog["providers"]
         assert "claude" not in catalog["providers"]
         listing = json.loads(
@@ -191,7 +194,7 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         )
         assert saved_prefs["models"]["brain"] == "opencode:grok-4.6:high"
         loaded_prefs = json.loads(urllib.request.urlopen(base + "/api/preferences", timeout=2).read())
-        assert loaded_prefs["models"]["coder"] == "opencode:kimi-k3:high"
+        assert loaded_prefs["coder_models"] == ["opencode:kimi-k3:high"]
         health = json.loads(urllib.request.urlopen(base + "/api/health", timeout=2).read())
         assert health == {"ok": True, "active_runs": 0}
         restart = json.loads(
@@ -212,7 +215,7 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         thread.join()
 
 
-def test_post_runs_uses_single_coder_model(tmp_path, monkeypatch):
+def test_post_runs_draws_the_coder_pool(tmp_path, monkeypatch):
     repo = tmp_path / "empty-repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
@@ -245,13 +248,14 @@ def test_post_runs_uses_single_coder_model(tmp_path, monkeypatch):
         "brief_path": str(repo / "goal.md"),
         "push": False,
         "models": {
-            role: "codex:gpt-5.6-sol:high" for role in ROLE_NAMES if role != "coder"
+            role: "codex:gpt-5.6-sol:high" for role in STAFF_ROLES
         },
         "coder_models": ["opencode:grok-4.6"],
     }
     created = registry.start(payload)
     models = created["config"]["models"]
-    assert models["coder"]["model"] == "xai/grok-4.6"
+    for role in CODER_ROLES:
+        assert models[role]["model"] == "xai/grok-4.6"
     assert models["brain"]["model"] == "gpt-5.6-sol"
     listed = registry.list()
     assert listed[0]["run_id"] == "pool-run"
@@ -273,11 +277,11 @@ def test_post_runs_uses_single_coder_model(tmp_path, monkeypatch):
             method="POST",
         )
         posted = json.loads(urllib.request.urlopen(request, timeout=2).read())
-        assert posted["config"]["models"]["coder"]["model"] == "xai/grok-4.6"
+        assert posted["config"]["models"]["coder_tdd"]["model"] == "xai/grok-4.6"
         bad = urllib.request.Request(
             base + "/api/runs",
             data=json.dumps(
-                {**payload, "models": {**payload["models"], "coder": "invalid"}}
+                {**payload, "models": {**payload["models"], "brain": "invalid"}}
             ).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -353,8 +357,8 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
         "push": False,
         "models": {
             "brain": "opencode:grok-4.6:high",
-            "coder": "opencode:kimi-k3:high",
         },
+        "coder_models": ["opencode:kimi-k3:high", "codex:gpt-5.6-luna:high"],
         "shared_staff_model": False,
         "backup": "",
     }
@@ -393,6 +397,7 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
         "brief": "",
         "push": True,
         "models": {},
+        "coder_models": [],
         "shared_staff_model": False,
         "backup": "",
     }
@@ -405,7 +410,7 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
         }
     )
     assert saved["models"]["brain"] == "opencode:grok-4.6:high"
-    assert registry.load_preferences()["models"]["coder"] == "opencode:kimi-k3:high"
+    assert registry.load_preferences()["coder_models"] == ["opencode:kimi-k3:high"]
 
     registry.start(
         {
@@ -413,7 +418,7 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
             "brief_path": str(repo / "goal.md"),
             "push": False,
             "models": {
-                role: "codex:gpt-5.6-sol:high" for role in ROLE_NAMES if role != "coder"
+                role: "codex:gpt-5.6-sol:high" for role in STAFF_ROLES
             },
             "coder_models": ["opencode:grok-4.6"],
         }
@@ -421,7 +426,7 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
     (tmp_path / "ui-preferences.json").unlink()
     fallback = registry.load_preferences()
     assert fallback["models"]["brain"] == "codex:gpt-5.6-sol:high"
-    assert fallback["models"]["coder"] == "opencode:xai/grok-4.6"
+    assert fallback["coder_models"] == ["opencode:xai/grok-4.6"] * 3
 
 
 def test_concurrent_recover_live_launches_exactly_one_thread(tmp_path):

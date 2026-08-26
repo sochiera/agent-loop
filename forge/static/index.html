@@ -90,9 +90,10 @@
         <div id="models" class="model-grid"></div>
 
         <div class="model-head">
-          <div><span class="eyebrow">Implementation</span><h2>Coder model</h2></div>
+          <div><span class="eyebrow">Competitors</span><h2>Coder model pool</h2></div>
+          <button type="button" id="add-coder" class="button ghost">Add model</button>
         </div>
-        <p class="coder-pool-help">One coder owns each implementation and its correction rounds until review and unified testing accept it.</p>
+        <p class="coder-pool-help">TDD, exploratory, and classic each draw one model from this pool. Add more or fewer than three; leftovers are unused, shortages are reused.</p>
         <div id="coder-models" class="model-grid"></div>
 
         <div class="submit-row">
@@ -138,6 +139,7 @@
     <label class="model-card">
       <span class="model-label"></span>
       <small class="model-help"></small>
+      <button type="button" class="model-remove hidden" aria-label="Remove coder model">Remove</button>
       <div class="model-picks">
         <select class="model-provider" required></select>
         <select class="model-name" required></select>
