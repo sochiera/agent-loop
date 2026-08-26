@@ -368,6 +368,38 @@ def test_full_sprint_uses_fixed_schedule_and_returns_to_fresh_product_owner(tmp_
     assert all(request.session_id == "reviewer-session" for request in reviews)
 
 
+def test_shuffle_coders_redraws_the_pool_at_each_sprint(tmp_path: Path):
+    runner = SprintRunner(stop_after=1)
+    repo, brief = repo_and_brief(tmp_path)
+    pool = [
+        "codex:gpt-5.6-sol:low",
+        "codex:gpt-5.6-terra:low",
+        "codex:gpt-5.6-luna:low",
+    ]
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:low") for role in ROLE_NAMES}
+    for role, selector in zip(CODER_CANDIDATES, pool):
+        models[f"coder_{role}"] = ModelSpec.parse(selector)
+    orchestrator = ForgeOrchestrator(
+        RunConfig(
+            str(repo), str(brief), "main", models, push=False, shuffle_coders=True
+        ),
+        run_id="sprint-run",
+        runner=runner,
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+
+    state = orchestrator.run()
+
+    assert state.status == "cancelled"
+    drawn = sorted(
+        orchestrator.config.models[f"coder_{name}"].display()
+        for name in CODER_CANDIDATES
+    )
+    assert drawn == sorted(pool)
+    assert any("shuffled coder pool" in item for item in state.warnings)
+
+
 class ProductOwnerCorrectionRunner(SprintRunner):
     def __init__(self):
         super().__init__(stop_after=0)

@@ -23,7 +23,6 @@ from .locking import ExecutionLocked
 from .models import (
     CODER_ROLES,
     ModelSpec,
-    ROLE_NAMES,
     RunConfig,
     STAFF_ROLES,
 )

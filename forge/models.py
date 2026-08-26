@@ -22,8 +22,6 @@ CODER_ROLES = ("coder_tdd", "coder_explore", "coder_classic")
 
 STAFF_ROLES = ("brain", "planner", "test_author", "reviewer", "tester")
 
-LEGACY_CODER_ROLES = ("coder_tdd", "coder_explore", "coder_classic")
-
 DEFAULT_MODEL_SELECTORS = {
     "brain": "codex:gpt-5.6-sol:high",
     "planner": "codex:gpt-5.6-sol:high",
