@@ -120,6 +120,9 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert 'id="browse-brief"' in html
         assert 'id="fs-explorer"' in html
         script = urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
+        stylesheet = urllib.request.urlopen(base + "/style.css", timeout=2).read().decode()
+        assert ".detail-panel { grid-column: 1; }" in stylesheet
+        assert ".detail-panel { grid-column: 1 / -1; }" not in stylesheet
         assert "/api/catalog" in script
         assert 'data-action="recover" ${!run.recoverable ? "disabled" : ""}' in script
         assert "/api/browse" in script
