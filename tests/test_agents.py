@@ -166,7 +166,7 @@ def test_runner_cancel_stops_live_process(tmp_path: Path):
     runner._command = lambda request: ["sleep", "30"]
     request = AgentRequest(
         "planner",
-        ModelSpec.parse("opencode:grok-4.6"),
+        ModelSpec.parse("opencode:glm-5.3-flash"),
         "x",
         tmp_path,
     )
@@ -201,7 +201,7 @@ def test_runner_cancel_during_command_build_prevents_process_start(tmp_path: Pat
     runner._command = blocked_command
     request = AgentRequest(
         "planner",
-        ModelSpec.parse("opencode:grok-4.6"),
+        ModelSpec.parse("opencode:glm-5.3-flash"),
         "x",
         tmp_path,
     )

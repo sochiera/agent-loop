@@ -25,7 +25,7 @@ STAFF_ROLES = ("brain", "planner", "test_author", "reviewer", "tester")
 DEFAULT_MODEL_SELECTORS = {
     "brain": "codex:gpt-5.6-sol:high",
     "planner": "codex:gpt-5.6-sol:high",
-    "test_author": "opencode:deepseek-v4-flash-0731:high",
+    "test_author": "codex:gpt-5.6-luna:high",
     "coder_tdd": "codex:gpt-5.6-luna:high",
     "coder_explore": "codex:gpt-5.6-luna:high",
     "coder_classic": "codex:gpt-5.6-luna:high",
@@ -42,7 +42,7 @@ class ModelSpec:
 
     @classmethod
     def parse(cls, value: str) -> "ModelSpec":
-        from .catalog import resolve_identity
+        from .catalog import parse_identity
 
         parts = value.strip().split(":", 2)
         if not parts or not parts[0]:
@@ -50,7 +50,7 @@ class ModelSpec:
                 "model must use provider:model[:effort], where provider is "
                 "codex or opencode"
             )
-        provider, model = resolve_identity(
+        provider, model = parse_identity(
             parts[0], parts[1] if len(parts) > 1 else ""
         )
         return cls(
@@ -76,10 +76,12 @@ class RunConfig:
     stalled_turns: int = 3
     backup: ModelSpec | None = None
     max_revision_rounds: int = 8
-    shuffle_coders: bool = False
+    shuffle_coders: bool = True
+    policy_path: str = ""
 
     def validate(self) -> None:
         from .catalog import validate_spec
+        from .policy import load_policy, policy_allows
 
         repo = Path(self.repo).expanduser().resolve()
         brief = Path(self.brief).expanduser().resolve()
@@ -90,10 +92,21 @@ class RunConfig:
         missing = sorted(set(ROLE_NAMES) - set(self.models))
         if missing:
             raise ValueError(f"missing model selections: {', '.join(missing)}")
-        for spec in self.models.values():
+        snapshot = load_policy(self.policy_path or None)
+        for role, spec in self.models.items():
             validate_spec(spec)
+            if not policy_allows(spec, snapshot):
+                raise ValueError(
+                    f"{role} model {spec.display()} is not allowed by the active "
+                    f"model policy (promotion_state={snapshot.state})"
+                )
         if self.backup is not None:
             validate_spec(self.backup)
+            if not policy_allows(self.backup, snapshot):
+                raise ValueError(
+                    f"backup model {self.backup.display()} is not allowed by the "
+                    f"active model policy (promotion_state={snapshot.state})"
+                )
         if not self.branch.strip():
             raise ValueError("branch cannot be empty")
         if self.agent_timeout_seconds < 1:
@@ -141,7 +154,8 @@ class RunConfig:
             stalled_turns=int(value.get("stalled_turns", 3)),
             backup=ModelSpec(**backup) if isinstance(backup, dict) else None,
             max_revision_rounds=int(value.get("max_revision_rounds", 8)),
-            shuffle_coders=bool(value.get("shuffle_coders", False)),
+            shuffle_coders=bool(value.get("shuffle_coders", True)),
+            policy_path=str(value.get("policy_path") or ""),
         )
 
 
@@ -193,6 +207,8 @@ class RunState:
     last_red_flags: list[str] = field(default_factory=list)
     original_models: dict[str, dict[str, Any]] = field(default_factory=dict)
     disabled_models: list[str] = field(default_factory=list)
+    policy_snapshot: dict[str, Any] = field(default_factory=dict)
+    model_migrations: list[dict[str, Any]] = field(default_factory=list)
     schema_version: int = 3
     sprint_number: int = 0
     sprint_iteration: int = 0

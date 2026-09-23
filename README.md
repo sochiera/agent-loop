@@ -129,13 +129,49 @@ be resumed by this controller; start a new run instead.
 - Linux or macOS, Git, and Python 3.12 or newer with `pytest` importable (Forge runs the black-box
   RED gate and candidate validation with its own interpreter).
 - At least one authenticated supported agent CLI:
-  - `codex` for GPT-family catalog models;
-  - `opencode` for GPT, Grok, Qwen, DeepSeek, Gemini, Kimi, and GLM catalog models.
+  - `codex` for the native Codex GPT-5.6 Sol, Terra, and Luna models;
+  - `opencode` for the OpenCode Go GLM 5.3 Flash, DeepSeek V4.1 Flash, and MiMo V2.6 Flash models.
 - A clean target Git repository. Forge can initialize an unborn selected branch. Push-enabled runs
   also require an `origin` remote.
 
 Forge uses existing CLI authentication, has no runtime Python dependencies, and does not require
 API keys in its configuration.
+
+## Model policy
+
+Forge routes every role through a fail-closed model policy. The active catalog is exactly:
+
+- `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna`;
+- `opencode:opencode-go/glm-5.3-flash`, `opencode:opencode-go/deepseek-v4.1-flash`,
+  `opencode:opencode-go/mimo-v2.6-flash`.
+
+Grok, Kimi, Qwen, OpenRouter, the stale Alibaba/Z.AI providers, and local models are never part of
+active routing. Luna is native Codex only and never runs through OpenCode. Legacy identities still
+*parse* so old run state and old UI preferences stay readable, but they are rejected for a new run
+and are never selected as a fallback.
+
+The policy reads its promotion state from `/home/jan/.hermes/state/model-policy.json` (or the path in
+`--policy-path` / `FORGE_MODEL_POLICY_PATH`). `promotion_state=active` enables DeepSeek V4.1 Flash and
+disables MiMo; `inactive` does the opposite. A missing, invalid, or unknown state fails closed to the
+native GPT models plus GLM Flash, and never guesses DeepSeek or MiMo.
+
+New runs draw their roster with weighted selection:
+
+- brain and planner: Sol 45 / Terra 55;
+- coder tactics: Luna 45 / GLM 15 / current cheap coder 40, preferring distinct families;
+- test author and tester: Luna 35 / GLM 35 / current cheap coder 30;
+- reviewer: Terra 55 / Sol 45.
+
+When the winning coder is from the OpenAI family, the review gate switches to an independent OpenCode
+Go family (GLM or the current cheap coder) if one is healthy, and records a diversity exception when
+none is. Failover after a quota or provider failure draws only from the active policy, prefers another
+family, and never returns to a disabled or promotion-inactive model. Explicit CLI/UI role overrides
+remain available but every override must pass the same active-policy gate.
+
+Saved runs written under an older policy recover only after an explicit migration
+(`forge resume --migrate-models`, or `migrate_models: true` in the UI recovery payload); Forge never
+silently runs a banned model. The selected roster and the promotion snapshot are persisted in the run
+config and state without secrets.
 
 ## Run the control room
 
@@ -151,8 +187,8 @@ python3 -m venv .venv
 .venv/bin/forge ui
 ```
 
-The UI listens on `127.0.0.1:8787` by default. It configures the repository, branch, brief, one
-model per staff role, a coder pool for the tournament, an optional failover model, and push
+The UI listens on `127.0.0.1:8787` by default. It configures the repository, branch, brief, the
+policy-selected roster, a coder pool for the tournament, an optional failover model, and push
 behavior. Closing the browser does not stop a run. Pause, resume, cancel, and same-run recovery are
 available from the run detail view.
 
@@ -162,13 +198,16 @@ required story, or a tournament where every submitted candidate stayed disqualif
 intentionally not recoverable in place; change the product input or start a new run rather than
 repeating the same bounded phase.
 
-The three coder tactics draw their models from the configurable coder pool. With fewer than three
-pool entries, models are reused; with more, three are drawn. A single surviving eligible candidate
-still completes an iteration — the tournament degrades, it never silently becomes the design.
+The three coder tactics draw their models from the configurable coder pool, weighted by role and
+preferring distinct families. With fewer than three distinct pool entries, models are reused; with
+more, three are drawn. Weighted coder reshuffling is enabled by default and redraws the pool before
+each sprint (`--no-shuffle-coders` disables it). A single surviving eligible candidate still
+completes an iteration — the tournament degrades, it never silently becomes the design.
 
 ## Command-line run
 
-All model flags have catalog defaults and may be overridden independently:
+Unspecified role flags are drawn from the active model policy; explicit flags override the draw but
+must pass the same policy gate:
 
 ```bash
 python3 -m forge run \
@@ -176,17 +215,16 @@ python3 -m forge run \
   --brief /path/to/brief.md \
   --branch main \
   --brain codex:gpt-5.6-sol:high \
-  --planner codex:gpt-5.6-sol:high \
-  --test-author opencode:deepseek-v4-flash-0731:high \
+  --planner codex:gpt-5.6-terra:high \
+  --test-author codex:gpt-5.6-luna:high \
   --coder-tdd codex:gpt-5.6-luna:high \
-  --coder-explore codex:gpt-5.6-luna:high \
-  --coder-classic codex:gpt-5.6-luna:high \
+  --coder-explore opencode:opencode-go/glm-5.3-flash:high \
+  --coder-classic opencode:opencode-go/deepseek-v4.1-flash:high \
   --reviewer codex:gpt-5.6-terra:high \
-  --tester codex:gpt-5.6-terra:high
+  --tester codex:gpt-5.6-luna:high
 ```
 
-Add `--shuffle-coders` to redraw the three coder models from the configured pool before each
-sprint.
+Add `--no-shuffle-coders` to keep the initial coder draw for every sprint.
 
 Use `--no-push` to deliver only to the local branch. Recover an interrupted run in place:
 
@@ -198,10 +236,16 @@ python3 -m forge resume --repo /path/to/product --run-id RUN_ID
 commands exit with status `0` after an operator pause or cancellation and `1` after `failed` or
 `stalled`; continuous runs otherwise keep executing.
 
-Selectors use `provider:model[:effort]`. The control room exposes the closed catalog, including
-Codex/OpenCode GPT models and OpenCode-only Grok, Qwen, DeepSeek, Gemini, Kimi, and GLM models. Before
-the first sprint Forge probes each unique model once. A usage-limit failure can move a role to the
-configured backup or another healthy selected model without changing the sprint contract.
+Selectors use `provider:model[:effort]`. The control room exposes only the closed active catalog
+(Codex GPT-5.6 Sol/Terra/Luna and OpenCode Go GLM/DeepSeek/MiMo Flash). Before the first sprint Forge
+probes each unique model once. A usage-limit failure moves a role to another healthy active model
+(never a disabled or promotion-inactive one) without changing the sprint contract.
+
+Recover an off-policy run by explicitly migrating it first:
+
+```bash
+python3 -m forge resume --repo /path/to/product --run-id RUN_ID --migrate-models
+```
 
 ## Artifacts
 

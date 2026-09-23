@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from forge.agents import AgentCancelled, AgentConfigurationFailure, AgentRequest
+from forge.catalog import model_family, model_identity
 from forge.models import AgentResult, ModelSpec, ROLE_NAMES, RunConfig, RunState, Usage
 from forge.gitops import GitWorkspace
 from forge.locking import ExecutionLocked, RepositoryExecutionLock
@@ -18,6 +19,7 @@ from forge.orchestrator import (
     _product_owner_retry_prompt,
     _snapshot_escape,
 )
+from forge.policy import load_policy
 from forge.sprint import CODER_CANDIDATES, SPRINT_SCHEDULE
 
 
@@ -369,7 +371,10 @@ def test_full_sprint_uses_fixed_schedule_and_returns_to_fresh_product_owner(tmp_
     assert len(selections) == 10
     assert all(request.session_id is None for request in selections)
     assert len(reviews) == 10
-    assert all(request.session_id == "reviewer-session" for request in reviews)
+    # A diversity switch to an independent reviewer drops the stale session once;
+    # every later review reuses the reviewer session normally.
+    assert all(request.session_id in (None, "reviewer-session") for request in reviews)
+    assert sum(1 for request in reviews if request.session_id == "reviewer-session") >= 9
 
 
 def test_shuffle_coders_redraws_the_pool_at_each_sprint(tmp_path: Path):
@@ -402,6 +407,58 @@ def test_shuffle_coders_redraws_the_pool_at_each_sprint(tmp_path: Path):
     )
     assert drawn == sorted(pool)
     assert any("shuffled coder pool" in item for item in state.warnings)
+
+
+def test_reviewer_switches_to_an_independent_family_after_an_openai_winner(tmp_path: Path):
+    runner = SprintRunner(stop_after=1)
+    orchestrator = make_orchestrator(tmp_path, runner)
+
+    state = orchestrator.run()
+
+    assert state.status == "cancelled"
+    assert model_family(orchestrator.config.models["reviewer"]) != "gpt"
+    assert any("reviewer switched" in item for item in state.warnings)
+
+
+def test_replacement_prefers_an_independent_active_family(tmp_path: Path):
+    orchestrator = make_orchestrator(tmp_path, SprintRunner(stop_after=0))
+    current = ModelSpec.parse("codex:gpt-5.6-luna:high")
+
+    replacement = orchestrator._replacement_for("coder_tdd", current)
+    assert replacement is not None
+    assert model_family(replacement) != "gpt"
+
+    orchestrator.state.disabled_models = [model_identity(replacement)]
+    fallback = orchestrator._replacement_for("coder_tdd", current)
+    assert fallback is None or model_identity(fallback) != model_identity(replacement)
+
+
+def test_replacement_respects_the_promotion_state(tmp_path: Path):
+    orchestrator = make_orchestrator(tmp_path, SprintRunner(stop_after=0))
+    policy_file = tmp_path / "inactive-policy.json"
+    policy_file.write_text('{"promotion_state": "inactive"}', encoding="utf-8")
+    orchestrator.policy = load_policy(str(policy_file))
+
+    replacement = orchestrator._replacement_for(
+        "coder_tdd", ModelSpec.parse("opencode:deepseek-v4.1-flash:high")
+    )
+    assert replacement is not None
+    assert orchestrator.policy.allows(replacement)
+
+
+def test_new_run_persists_the_roster_and_policy_snapshot(tmp_path: Path):
+    runner = SprintRunner(stop_after=1)
+    orchestrator = make_orchestrator(tmp_path, runner)
+
+    orchestrator.run()
+
+    snapshot = orchestrator.state.policy_snapshot
+    assert snapshot["promotion_state"] in {"active", "inactive", "unknown"}
+    assert snapshot["allowed_models"]
+    blob = json.dumps(snapshot).lower()
+    assert "token" not in blob and "secret" not in blob and "api_key" not in blob
+    config = json.loads((orchestrator.store.root / "config.json").read_text())
+    assert set(config["models"]) == set(ROLE_NAMES)
 
 
 class ProductOwnerCorrectionRunner(SprintRunner):
@@ -1563,7 +1620,7 @@ def test_recovery_reloads_config_without_restoring_old_repository_path(tmp_path:
     orchestrator = make_orchestrator(tmp_path, SprintRunner(stop_after=0))
     orchestrator.state.status = "failed"
     persisted = RunConfig.from_dict(orchestrator.state.config)
-    persisted.models["brain"] = ModelSpec.parse("opencode:grok-4.6:high")
+    persisted.models["brain"] = ModelSpec.parse("opencode:glm-5.3-flash:high")
     orchestrator.state.config = persisted.to_dict()
     orchestrator.store.save_state(orchestrator.state)
 
@@ -1571,9 +1628,38 @@ def test_recovery_reloads_config_without_restoring_old_repository_path(tmp_path:
         recover=True, reload_state=True
     )
     try:
-        assert orchestrator.config.models["brain"].model == "xai/grok-4.6"
+        assert orchestrator.config.models["brain"].model == "opencode-go/glm-5.3-flash"
         assert orchestrator.config.repo == str(orchestrator.repo)
         assert orchestrator.state.config == orchestrator.config.to_dict()
+    finally:
+        orchestrator._release_execution(execution_lock, generation)
+
+
+def test_off_policy_recovery_is_gated_until_explicit_migration(tmp_path: Path):
+    orchestrator = make_orchestrator(tmp_path, SprintRunner(stop_after=0))
+    orchestrator.state.status = "failed"
+    persisted = RunConfig.from_dict(orchestrator.state.config)
+    persisted.models["brain"] = ModelSpec.parse("opencode:grok-4.6:high")
+    orchestrator.state.config = persisted.to_dict()
+    orchestrator.store.save_state(orchestrator.state)
+
+    with pytest.raises(RuntimeError, match="off-policy"):
+        orchestrator._acquire_execution(recover=True, reload_state=True)
+
+    migrated = orchestrator.migrate_models()
+    assert "brain" in migrated
+    assert orchestrator.config.models["brain"].display() in {
+        "codex:gpt-5.6-sol:high",
+        "codex:gpt-5.6-terra:high",
+    }
+    assert orchestrator.state.model_migrations
+    execution_lock, generation = orchestrator._acquire_execution(
+        recover=True, reload_state=True
+    )
+    try:
+        assert orchestrator.config.models["brain"] != ModelSpec.parse(
+            "opencode:grok-4.6:high"
+        )
     finally:
         orchestrator._release_execution(execution_lock, generation)
 

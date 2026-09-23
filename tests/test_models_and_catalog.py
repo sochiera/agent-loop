@@ -1,12 +1,19 @@
+import random
+
 import pytest
 
 from forge.catalog import (
+    CATALOG,
+    LEGACY_CATALOG,
     ROLE_TIMEOUTS,
     assign_coder_models,
+    catalog_payload,
+    find_active_entry,
     model_family,
+    resolve_identity,
     shuffle_coder_models,
 )
-from forge.cli import _parser
+from forge.cli import _parser, select_cli_models
 from forge.contracts import (
     CANDIDATE_SELECTION_SCHEMA,
     ITERATION_PLAN_SCHEMA,
@@ -22,75 +29,96 @@ from forge.models import (
     RunConfig,
     STAFF_ROLES,
 )
+from forge.policy import (
+    DEEPSEEK,
+    GLM,
+    LUNA,
+    MIMO,
+    SOL,
+    TERRA,
+    load_policy,
+)
 from forge.web import models_from_payload, restart_payload
 
 
-def test_run_config_persists_backup_model():
-    models = {role: ModelSpec.parse("codex:gpt-5.6-sol:high") for role in ROLE_NAMES}
-    config = RunConfig(
-        repo="/tmp/repo",
-        brief="/tmp/brief.md",
-        branch="main",
-        models=models,
-        backup=ModelSpec.parse("opencode:grok-4.6"),
-    )
-    restored = RunConfig.from_dict(config.to_dict())
-    assert restored.backup is not None
-    assert restored.backup.display() == "opencode:xai/grok-4.6"
+BANNED_FRAGMENTS = (
+    "grok",
+    "kimi",
+    "qwen",
+    "openrouter",
+    "alibaba",
+    "zai-coding-plan",
+    "ollama",
+    "local",
+)
+
+
+def test_active_catalog_is_the_exact_policy_roster():
+    assert [(entry.key, entry.family) for entry in CATALOG] == [
+        ("gpt-5.6-sol", "gpt"),
+        ("gpt-5.6-terra", "gpt"),
+        ("gpt-5.6-luna", "gpt"),
+        ("glm-5.3-flash", "glm"),
+        ("deepseek-v4.1-flash", "deepseek"),
+        ("mimo-v2.6-flash", "mimo"),
+    ]
+    for entry in CATALOG:
+        for provider, model in entry.ids.items():
+            blob = f"{provider}:{model}".lower()
+            assert not any(fragment in blob for fragment in BANNED_FRAGMENTS)
+
+
+def test_active_catalog_rejects_every_banned_identity():
+    for selector in (
+        "opencode:grok-4.6",
+        "opencode:kimi-k3",
+        "opencode:qwen-3.8-max",
+        "opencode:or-gemini-3.7-flash",
+        "opencode:deepseek-v4-flash-0731",
+        "opencode:glm-5.3",
+    ):
+        with pytest.raises(ValueError):
+            resolve_identity(*selector.split(":", 1))
+
+
+def test_luna_resolves_only_through_native_codex():
+    assert resolve_identity("codex", "gpt-5.6-luna") == ("codex", "gpt-5.6-luna")
+    assert find_active_entry("opencode", "gpt-5.6-luna") is None
+    with pytest.raises(ValueError):
+        resolve_identity("opencode", "gpt-5.6-luna")
+    with pytest.raises(ValueError):
+        resolve_identity("opencode", "openai/gpt-5.6-luna")
+
+
+def test_legacy_identities_still_parse_for_old_state():
+    assert ModelSpec.parse("opencode:grok-4.6").model == "xai/grok-4.6"
+    assert ModelSpec.parse("opencode:kimi-k3").model == "kimi-for-coding/k3"
+    assert ModelSpec.parse("opencode:glm-5.3").model == "zai-coding-plan/glm-5.3"
+    assert ModelSpec.parse("opencode:openai/gpt-5.6-luna").model == "openai/gpt-5.6-luna"
+    assert all(entry.key not in {item.key for item in CATALOG} or True for entry in LEGACY_CATALOG)
+    for entry in LEGACY_CATALOG:
+        for provider, model in entry.ids.items():
+            assert ModelSpec.parse(f"{provider}:{model}").model == model
+
+
+def test_model_spec_rejects_unknown_or_provider_incompatible_models():
+    for selector in ("claude:opus", "codex:grok-4.6", "claude:gpt-5.6-sol"):
+        with pytest.raises(ValueError):
+            ModelSpec.parse(selector)
+
+
+def test_model_family_groups_by_active_and_legacy_family():
+    assert model_family(ModelSpec.parse("codex:gpt-5.6-sol")) == "gpt"
+    assert model_family(ModelSpec.parse("codex:gpt-5.6-luna")) == "gpt"
+    assert model_family(ModelSpec.parse("opencode:glm-5.3-flash")) == "glm"
+    assert model_family(ModelSpec.parse("opencode:deepseek-v4.1-flash")) == "deepseek"
+    assert model_family(ModelSpec.parse("opencode:mimo-v2.6-flash")) == "mimo"
+    assert model_family(ModelSpec.parse("opencode:grok-4.6")) == "grok"
 
 
 def test_role_timeouts_cover_the_sprint_roster():
     assert set(ROLE_NAMES) <= set(ROLE_TIMEOUTS)
     assert ROLE_TIMEOUTS["reviewer"] == 1800
-
-
-def test_model_spec_round_trip_and_catalog_aliases():
-    value = ModelSpec.parse("opencode:gpt-5.6-luna:high")
-    assert value.provider == "opencode"
-    assert value.model == "openai/gpt-5.6-luna"
-    assert value.effort == "high"
-    assert value.display() == "opencode:openai/gpt-5.6-luna:high"
-    assert ModelSpec.parse("codex:gpt-5.6-sol:high").model == "gpt-5.6-sol"
-    assert ModelSpec.parse("opencode:grok-4.6").model == "xai/grok-4.6"
-    assert ModelSpec.parse("opencode:kimi-k3").model == "kimi-for-coding/k3"
-    assert ModelSpec.parse("opencode:glm-5.3").model == "zai-coding-plan/glm-5.3"
-
-
-def test_model_spec_rejects_unknown_or_provider_incompatible_models():
-    for selector in ("claude:opus", "codex:grok-4.6"):
-        try:
-            ModelSpec.parse(selector)
-        except ValueError as exc:
-            assert "model" in str(exc)
-        else:
-            raise AssertionError(f"accepted unsupported selector {selector}")
-
-
-def test_cloud_and_openrouter_catalog_entries_resolve():
-    assert (
-        ModelSpec.parse("opencode:deepseek-v4-flash-0731").model
-        == "alibaba-token-plan/deepseek-v4-flash-0731"
-    )
-    assert (
-        ModelSpec.parse("opencode:deepseek-v4-pro-0813").model
-        == "alibaba-token-plan/deepseek-v4-pro-0813"
-    )
-    expected = {
-        "or-gemini-3.7-flash": "openrouter/google/gemini-3.7-flash",
-        "or-gpt-5.6-luna": "openrouter/openai/gpt-5.6-luna",
-        "or-deepseek-v4-flash-0731": "openrouter/deepseek/deepseek-v4-flash-0731",
-        "or-deepseek-v4-pro": "openrouter/deepseek/deepseek-v4-pro",
-        "or-deepseek-v4-pro-0813": "openrouter/deepseek/deepseek-v4-pro-0813",
-    }
-    for key, model in expected.items():
-        assert ModelSpec.parse(f"opencode:{key}").model == model
-
-
-def test_model_family_groups_failover_candidates_by_model_family():
-    assert model_family(ModelSpec.parse("codex:gpt-5.6-sol")) == "gpt"
-    assert model_family(ModelSpec.parse("opencode:or-gpt-5.6-luna")) == "gpt"
-    assert model_family(ModelSpec.parse("opencode:grok-4.6")) == "grok"
-    assert model_family(ModelSpec.parse("opencode:glm-5.3")) == "glm"
 
 
 def test_role_roster_restores_the_tournament_and_test_author():
@@ -109,25 +137,29 @@ def test_role_roster_restores_the_tournament_and_test_author():
     assert set(CODER_ROLES).isdisjoint(STAFF_ROLES)
 
 
-def test_assign_coder_models_draws_reuses_and_shuffles():
-    import random
-
+def test_assign_coder_models_draws_distinct_families_and_reuses_short_pools():
     luna = ModelSpec.parse("codex:gpt-5.6-luna:high")
-    grok = ModelSpec.parse("opencode:grok-4.6")
-    terra = ModelSpec.parse("codex:gpt-5.6-terra:high")
+    glm = ModelSpec.parse("opencode:glm-5.3-flash")
+    deepseek = ModelSpec.parse("opencode:deepseek-v4.1-flash")
     models = {role: luna for role in ROLE_NAMES}
 
-    drawn = assign_coder_models(models, [grok, terra])
+    drawn = assign_coder_models(models, [luna, glm, deepseek])
     assert {drawn[role].display() for role in CODER_ROLES} == {
-        grok.display(),
-        terra.display(),
+        luna.display(),
+        glm.display(),
+        deepseek.display(),
     }
 
-    reused = assign_coder_models(models, [grok])
-    assert all(reused[role] == grok for role in CODER_ROLES)
+    reused = assign_coder_models(models, [glm])
+    assert all(reused[role] == glm for role in CODER_ROLES)
 
-    shuffled = shuffle_coder_models(dict(models), rng=random.Random(7))
-    assert set(shuffled[role] for role in CODER_ROLES) == {luna}
+    seeded = assign_coder_models(
+        dict(models), [luna, glm, deepseek], rng=random.Random(7)
+    )
+    assert set(seeded[role] for role in CODER_ROLES) == {luna, glm, deepseek}
+    assert seeded == assign_coder_models(
+        dict(models), [luna, glm, deepseek], rng=random.Random(7)
+    )
 
 
 def test_legacy_config_migrates_single_coder_to_all_three_candidates():
@@ -137,18 +169,18 @@ def test_legacy_config_migrates_single_coder_to_all_three_candidates():
     }
     models["coder"] = {
         "provider": "opencode",
-        "model": "xai/grok-4.6",
+        "model": "opencode-go/glm-5.3-flash",
         "effort": "",
     }
     restored = RunConfig.from_dict(
         {"repo": "/tmp/repo", "brief": "/tmp/brief", "branch": "main", "models": models}
     )
     for role in CODER_ROLES:
-        assert restored.models[role].display() == "opencode:xai/grok-4.6"
+        assert restored.models[role].display() == "opencode:opencode-go/glm-5.3-flash"
     assert set(restored.models) == set(ROLE_NAMES)
 
 
-def test_run_config_round_trips_the_coder_shuffle_flag():
+def test_run_config_round_trips_policy_path_and_shuffle_flag():
     models = {role: ModelSpec.parse("codex:gpt-5.6-sol:high") for role in ROLE_NAMES}
     config = RunConfig(
         repo="/tmp/repo",
@@ -156,65 +188,172 @@ def test_run_config_round_trips_the_coder_shuffle_flag():
         branch="main",
         models=models,
         shuffle_coders=True,
+        policy_path="/tmp/policy.json",
     )
-    assert RunConfig.from_dict(config.to_dict()).shuffle_coders is True
+    restored = RunConfig.from_dict(config.to_dict())
+    assert restored.shuffle_coders is True
+    assert restored.policy_path == "/tmp/policy.json"
 
 
-def test_models_from_payload_assigns_pool_deterministically():
+def test_run_config_defaults_to_weighted_coder_reshuffling():
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:high") for role in ROLE_NAMES}
+    config = RunConfig(repo="/tmp/repo", brief="/tmp/brief.md", branch="main", models=models)
+    assert config.shuffle_coders is True
+
+
+def test_run_config_rejects_promotion_inactive_models(tmp_path):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text('{"promotion_state": "inactive"}', encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    brief = tmp_path / "brief.md"
+    brief.write_text("# goal\n", encoding="utf-8")
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:high") for role in ROLE_NAMES}
+    models["coder_tdd"] = ModelSpec.parse("opencode:deepseek-v4.1-flash")
+    config = RunConfig(
+        repo=str(repo),
+        brief=str(brief),
+        branch="main",
+        models=models,
+        policy_path=str(policy_file),
+    )
+    with pytest.raises(ValueError, match="not allowed by the active model policy"):
+        config.validate()
+
+
+def test_models_from_payload_assigns_policy_pool_deterministically(tmp_path):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text('{"promotion_state": "active"}', encoding="utf-8")
     payload = {
+        "policy_path": str(policy_file),
         "models": {
             "brain": "codex:gpt-5.6-sol:high",
             "planner": "codex:gpt-5.6-sol:high",
-            "test_author": "opencode:glm-5.3",
+            "test_author": "opencode:glm-5.3-flash",
             "reviewer": "codex:gpt-5.6-terra:high",
             "tester": "codex:gpt-5.6-terra:high",
         },
-        "coder_models": ["opencode:grok-4.6", "opencode:kimi-k3"],
+        "coder_models": [
+            "opencode:glm-5.3-flash",
+            "opencode:deepseek-v4.1-flash",
+        ],
     }
     first = models_from_payload(payload)
     second = models_from_payload(payload)
-    assert {first[role].display() for role in CODER_ROLES} == {
-        "opencode:xai/grok-4.6",
-        "opencode:kimi-for-coding/k3",
+    assert {first[role].model for role in CODER_ROLES} == {
+        GLM.model,
+        DEEPSEEK.model,
     }
     assert first == second
-    assert first["test_author"].model == "zai-coding-plan/glm-5.3"
+    assert first["test_author"].model == "opencode-go/glm-5.3-flash"
 
 
-def test_models_from_payload_imports_single_legacy_coder_pool_entry():
+def test_models_from_payload_imports_single_legacy_coder_pool_entry(tmp_path):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text('{"promotion_state": "active"}', encoding="utf-8")
     models = models_from_payload(
         {
+            "policy_path": str(policy_file),
             "models": {
                 "brain": "codex:gpt-5.6-sol:high",
                 "planner": "codex:gpt-5.6-sol:high",
                 "reviewer": "codex:gpt-5.6-terra:high",
                 "tester": "codex:gpt-5.6-terra:high",
             },
-            "coder_models": ["opencode:grok-4.6"],
+            "coder_models": ["opencode:glm-5.3-flash"],
             "shuffle_coders": True,
         }
     )
     assert all(
-        models[role].display() == "opencode:xai/grok-4.6" for role in CODER_ROLES
+        models[role].model == GLM.model for role in CODER_ROLES
     )
 
 
 def test_models_from_payload_rejects_an_oversized_coder_pool():
     with pytest.raises(ValueError, match="at most"):
         models_from_payload(
-            {"models": {}, "coder_models": ["opencode:grok-4.6"] * 13}
+            {"models": {}, "coder_models": ["opencode:glm-5.3-flash"] * 13}
         )
 
 
-def test_cli_defaults_every_sprint_role():
+def test_cli_selects_policy_defaults_when_roles_are_unspecified(tmp_path):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text('{"promotion_state": "active"}', encoding="utf-8")
     args = _parser().parse_args(
-        ["run", "--repo", "/tmp/repo", "--brief", "/tmp/goal.md"]
+        [
+            "run",
+            "--repo",
+            "/tmp/repo",
+            "--brief",
+            "/tmp/goal.md",
+            "--policy-path",
+            str(policy_file),
+        ]
     )
-    assert args.brain == "codex:gpt-5.6-sol:high"
-    assert args.test_author == "opencode:deepseek-v4-flash-0731:high"
-    assert args.coder_tdd == "codex:gpt-5.6-luna:high"
-    assert args.tester == "codex:gpt-5.6-terra:high"
-    assert args.shuffle_coders is False
+    assert args.brain is None
+    assert args.shuffle_coders is True
+    snapshot = load_policy(str(policy_file))
+    models = select_cli_models(args, snapshot, rng=random.Random(3))
+    assert models["brain"] in (SOL, TERRA)
+    assert models["planner"] in (SOL, TERRA)
+    assert models["reviewer"] in (SOL, TERRA)
+    assert {models[role] for role in CODER_ROLES} <= {LUNA, GLM, DEEPSEEK}
+    assert models["tester"] in (LUNA, GLM, DEEPSEEK)
+
+
+def test_run_config_persists_an_active_backup_model(tmp_path):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text('{"promotion_state": "active"}', encoding="utf-8")
+    models = {role: ModelSpec.parse("codex:gpt-5.6-sol:high") for role in ROLE_NAMES}
+    config = RunConfig(
+        repo="/tmp/repo",
+        brief="/tmp/brief.md",
+        branch="main",
+        models=models,
+        backup=ModelSpec.parse("opencode:glm-5.3-flash"),
+        policy_path=str(policy_file),
+    )
+    restored = RunConfig.from_dict(config.to_dict())
+    assert restored.backup is not None
+    assert restored.backup.display() == "opencode:opencode-go/glm-5.3-flash"
+
+
+def test_cli_honors_explicit_overrides(tmp_path):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text('{"promotion_state": "active"}', encoding="utf-8")
+    args = _parser().parse_args(
+        [
+            "run",
+            "--repo",
+            "/tmp/repo",
+            "--brief",
+            "/tmp/goal.md",
+            "--policy-path",
+            str(policy_file),
+            "--brain",
+            "opencode:glm-5.3-flash:high",
+        ]
+    )
+    snapshot = load_policy(str(policy_file))
+    models = select_cli_models(args, snapshot, rng=random.Random(3))
+    assert models["brain"].model == "opencode-go/glm-5.3-flash"
+
+
+def test_catalog_payload_exposes_only_active_models():
+    payload = catalog_payload()
+    keys = {item["key"] for item in payload["models"]}
+    assert keys == {
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "glm-5.3-flash",
+        "deepseek-v4.1-flash",
+        "mimo-v2.6-flash",
+    }
+    for item in payload["models"]:
+        blob = str(item).lower()
+        assert not any(fragment in blob for fragment in BANNED_FRAGMENTS)
 
 
 def test_provider_schemas_are_closed_and_require_every_property():
