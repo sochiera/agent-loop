@@ -14,6 +14,7 @@ from typing import Any
 
 from .artifacts import atomic_write
 from .models import AgentResult, ModelSpec, Usage
+from .policy import PromotionSnapshot, load_policy
 from .validation import _signal_session
 
 
@@ -202,12 +203,39 @@ def _opencode_parse(events: list[dict[str, Any]]) -> tuple[str, Usage, int]:
 
 
 class AgentRunner:
-    """Invoke Codex, Claude Code, or OpenCode without a shell."""
+    """Invoke Codex, Claude Code, or OpenCode without a shell.
 
-    def __init__(self) -> None:
+    The runner is the final execution boundary. It refuses any model the active
+    policy does not allow, so a direct ``AgentRunner`` call cannot bypass the
+    catalog and promotion gate even when ``RunConfig``/CLI/UI validation is
+    skipped. Pass an explicit ``policy`` for hermetic tests; otherwise the
+    current policy is loaded fail-closed on every call.
+    """
+
+    def __init__(
+        self,
+        *,
+        policy: PromotionSnapshot | None = None,
+        policy_path: str | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._processes: list[subprocess.Popen[str]] = []
         self._cancelled = threading.Event()
+        self._policy = policy
+        self._policy_path = policy_path
+
+    def _current_policy(self) -> PromotionSnapshot:
+        if self._policy is not None:
+            return self._policy
+        return load_policy(self._policy_path)
+
+    def _ensure_policy(self, request: AgentRequest) -> None:
+        snapshot = self._current_policy()
+        if not snapshot.allows(request.model):
+            raise AgentConfigurationFailure(
+                f"{request.role} model {request.model.display()} is not allowed by "
+                f"the active model policy (promotion_state={snapshot.state})"
+            )
 
     def cancel(self) -> None:
         with self._lock:
@@ -240,6 +268,7 @@ class AgentRunner:
             raise AgentCancelled(f"{request.role} cancelled")
         if request.access not in {"none", "read", "inspect", "write", "test"}:
             raise ValueError(f"unsupported agent access profile: {request.access}")
+        self._ensure_policy(request)
         request.cwd.mkdir(parents=True, exist_ok=True)
         command = self._command(request)
         environment = os.environ.copy()
@@ -316,6 +345,7 @@ class AgentRunner:
         )
 
     def _command(self, request: AgentRequest) -> list[str]:
+        self._ensure_policy(request)
         if request.model.provider == "codex":
             return self._codex_command(request)
         if request.model.provider == "opencode":

@@ -260,6 +260,12 @@ def load_policy(path: str | Path | None = None) -> PromotionSnapshot:
 
 
 def snapshot_from_dict(data: Mapping[str, Any]) -> PromotionSnapshot:
+    """Rebuild a snapshot for audit/display only.
+
+    Never use this to authorize execution: persisted snapshots can be stale, so
+    recovery, failover and migration must reload the current policy instead.
+    """
+
     state = str(data.get("promotion_state") or PROMOTION_UNKNOWN)
     if state not in {PROMOTION_ACTIVE, PROMOTION_INACTIVE}:
         state = PROMOTION_UNKNOWN

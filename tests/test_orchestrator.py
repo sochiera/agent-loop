@@ -1664,6 +1664,111 @@ def test_off_policy_recovery_is_gated_until_explicit_migration(tmp_path: Path):
         orchestrator._release_execution(execution_lock, generation)
 
 
+def policy_run_config(tmp_path: Path, policy_file: Path, **changes) -> RunConfig:
+    repo, brief = repo_and_brief(tmp_path)
+    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:high") for role in ROLE_NAMES}
+    models.update(changes.pop("models", {}))
+    return RunConfig(
+        repo=str(repo),
+        brief=str(brief),
+        branch="main",
+        models=models,
+        push=False,
+        policy_path=str(policy_file),
+        **changes,
+    )
+
+
+def policy_run_orchestrator(tmp_path: Path, config: RunConfig) -> ForgeOrchestrator:
+    return ForgeOrchestrator(
+        config,
+        run_id="policy-run",
+        runner=SprintRunner(stop_after=0),
+        state_home=tmp_path / "state",
+        check_binaries=False,
+    )
+
+
+def test_recovery_authorizes_from_current_policy_not_the_persisted_snapshot(tmp_path: Path):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text('{"promotion_state": "active"}', encoding="utf-8")
+    config = policy_run_config(
+        tmp_path,
+        policy_file,
+        models={"coder_tdd": ModelSpec.parse("opencode:deepseek-v4.1-flash:high")},
+    )
+    orchestrator = policy_run_orchestrator(tmp_path, config)
+    assert orchestrator.state.policy_snapshot["promotion_state"] == "active"
+    orchestrator.state.status = "failed"
+    orchestrator.store.save_state(orchestrator.state)
+
+    # Central state flips after the run was created. The persisted audit
+    # snapshot still says active, but it must not authorize DeepSeek.
+    policy_file.write_text('{"promotion_state": "inactive"}', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="off-policy"):
+        orchestrator._acquire_execution(recover=True, reload_state=True)
+
+    changed = orchestrator.migrate_models()
+    assert "coder_tdd" in changed
+    assert orchestrator.policy.state == "inactive"
+    assert orchestrator.config.models["coder_tdd"].model != "opencode-go/deepseek-v4.1-flash"
+    assert orchestrator.policy.allows(orchestrator.config.models["coder_tdd"])
+
+
+@pytest.mark.parametrize("corruption", ["missing", "invalid"])
+def test_recovery_blocks_promotion_models_when_current_state_is_unusable(
+    tmp_path: Path, corruption: str
+):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text('{"promotion_state": "inactive"}', encoding="utf-8")
+    config = policy_run_config(
+        tmp_path,
+        policy_file,
+        models={"coder_tdd": ModelSpec.parse("opencode:mimo-v2.6-flash:high")},
+    )
+    orchestrator = policy_run_orchestrator(tmp_path, config)
+    orchestrator.state.status = "failed"
+    orchestrator.store.save_state(orchestrator.state)
+    if corruption == "missing":
+        policy_file.unlink()
+    else:
+        policy_file.write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="off-policy"):
+        orchestrator._acquire_execution(recover=True, reload_state=True)
+
+    changed = orchestrator.migrate_models()
+    assert "coder_tdd" in changed
+    assert orchestrator.config.models["coder_tdd"].model in {
+        "gpt-5.6-luna",
+        "opencode-go/glm-5.3-flash",
+    }
+
+
+def test_failover_reloads_current_policy_and_never_returns_a_stale_promotion_model(
+    tmp_path: Path,
+):
+    from forge.policy import DEEPSEEK, PROMOTION_ACTIVE, PromotionSnapshot
+
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text('{"promotion_state": "active"}', encoding="utf-8")
+    config = policy_run_config(tmp_path, policy_file)
+    orchestrator = policy_run_orchestrator(tmp_path, config)
+    orchestrator.policy = PromotionSnapshot(state=PROMOTION_ACTIVE, cheap_coder=DEEPSEEK)
+    policy_file.write_text('{"promotion_state": "inactive"}', encoding="utf-8")
+
+    replacement = orchestrator._replacement_for(
+        "coder_tdd", ModelSpec.parse("opencode:glm-5.3-flash:high")
+    )
+
+    assert replacement is not None
+    assert orchestrator.policy.state == "inactive"
+    assert not orchestrator.policy.allows(DEEPSEEK)
+    assert replacement.model != "opencode-go/deepseek-v4.1-flash"
+    assert orchestrator.policy.allows(replacement)
+
+
 def test_from_existing_uses_repository_containing_copied_run(tmp_path: Path):
     orchestrator = make_orchestrator(tmp_path, SprintRunner(stop_after=0))
     orchestrator.state.status = "failed"

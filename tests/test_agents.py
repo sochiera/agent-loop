@@ -3,8 +3,11 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from forge.agents import (
     AgentCancelled,
+    AgentConfigurationFailure,
     AgentRequest,
     AgentRunner,
     AgentUsageLimit,
@@ -76,7 +79,7 @@ def test_brain_commands_are_restricted(tmp_path: Path):
     assert "plugins" in codex
     request = AgentRequest(
         "brain",
-        ModelSpec.parse("opencode:gpt-5.6-sol"),
+        ModelSpec.parse("opencode:glm-5.3-flash"),
         "x",
         tmp_path,
         access="none",
@@ -127,7 +130,7 @@ def test_codex_coder_uses_lean_cached_tool_surface(tmp_path: Path):
 def test_opencode_writer_denies_git_delivery_and_external_paths(tmp_path: Path):
     request = AgentRequest(
         "coder",
-        ModelSpec.parse("opencode:gpt-5.6-luna:high"),
+        ModelSpec.parse("opencode:glm-5.3-flash:high"),
         "implement",
         tmp_path,
         access="write",
@@ -146,7 +149,7 @@ def test_opencode_writer_denies_git_delivery_and_external_paths(tmp_path: Path):
 def test_opencode_tester_can_execute_inside_disposable_copy(tmp_path: Path):
     request = AgentRequest(
         "tester",
-        ModelSpec.parse("opencode:gpt-5.6-terra:high"),
+        ModelSpec.parse("opencode:glm-5.3-flash:high"),
         "exercise public behavior",
         tmp_path,
         access="test",
@@ -237,3 +240,60 @@ def test_kimi_billing_cycle_limit_is_usage_limit():
     )
     assert is_usage_limit(message)
     assert failure_type_for(message) is AgentUsageLimit
+
+
+def test_runner_rejects_off_policy_models_at_the_command_boundary(tmp_path, monkeypatch):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text('{"promotion_state": "inactive"}', encoding="utf-8")
+    monkeypatch.setenv("FORGE_MODEL_POLICY_PATH", str(policy_file))
+    runner = AgentRunner()
+
+    for selector in (
+        "opencode:deepseek-v4.1-flash",
+        "opencode:grok-4.6",
+        "opencode:kimi-k3",
+    ):
+        request = AgentRequest(
+            "coder_tdd", ModelSpec.parse(selector), "x", tmp_path
+        )
+        with pytest.raises(AgentConfigurationFailure):
+            runner._command(request)
+        with pytest.raises(AgentConfigurationFailure):
+            runner.run(request)
+
+    allowed = AgentRequest(
+        "coder_tdd", ModelSpec.parse("opencode:mimo-v2.6-flash"), "x", tmp_path
+    )
+    assert runner._command(allowed)[0] == "opencode"
+
+
+def test_runner_fails_closed_when_the_policy_is_missing(tmp_path):
+    runner = AgentRunner()
+    for selector in (
+        "opencode:deepseek-v4.1-flash",
+        "opencode:mimo-v2.6-flash",
+        "opencode:grok-4.6",
+    ):
+        request = AgentRequest(
+            "coder_tdd", ModelSpec.parse(selector), "x", tmp_path
+        )
+        with pytest.raises(AgentConfigurationFailure):
+            runner._command(request)
+
+
+def test_runner_accepts_an_injected_policy_for_hermetic_tests(tmp_path):
+    from forge.policy import (
+        PROMOTION_ACTIVE,
+        PromotionSnapshot,
+        cheap_coder_for,
+    )
+
+    runner = AgentRunner(
+        policy=PromotionSnapshot(
+            state=PROMOTION_ACTIVE, cheap_coder=cheap_coder_for(PROMOTION_ACTIVE)
+        )
+    )
+    request = AgentRequest(
+        "coder_tdd", ModelSpec.parse("opencode:deepseek-v4.1-flash"), "x", tmp_path
+    )
+    assert runner._command(request)[0] == "opencode"

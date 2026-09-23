@@ -56,7 +56,7 @@ from .display import optional_virtual_display
 from .gitops import CandidateWorktree, GitError, GitWorkspace, export_revision
 from .locking import RepositoryExecutionLock
 from .models import CODER_ROLES, AgentResult, ModelSpec, ROLE_NAMES, RunConfig, RunState
-from .policy import load_policy, policy_allows, snapshot_from_dict
+from .policy import load_policy, policy_allows
 from .prompts import (
     candidate_selection_prompt,
     implementation_prompt,
@@ -160,7 +160,7 @@ class ForgeOrchestrator:
         self.repo = Path(config.repo).expanduser().resolve()
         self.brief_path = Path(config.brief).expanduser().resolve()
         self.run_id = run_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
-        self.runner = runner or AgentRunner()
+        self.runner = runner or AgentRunner(policy_path=config.policy_path or None)
         self.store = ArtifactStore(self.repo, self.run_id)
         self.on_event = on_event
         default_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
@@ -176,12 +176,9 @@ class ForgeOrchestrator:
             self.config.repo = str(self.repo)
             self.state.config = self.config.to_dict()
             self.brief_path = Path(self.config.brief).expanduser().resolve()
-            persisted = dict(self.state.policy_snapshot or {})
-            self.policy = (
-                snapshot_from_dict(persisted)
-                if persisted
-                else load_policy(self.config.policy_path or None)
-            )
+            # The persisted snapshot is audit evidence only; execution is always
+            # authorized by the freshly loaded central policy.
+            self.policy = load_policy(self.config.policy_path or None)
         else:
             self.state = RunState(
                 run_id=self.run_id,
@@ -438,6 +435,11 @@ class ForgeOrchestrator:
         )
         return self._recover_execution(execution_lock, generation)
 
+    def _refresh_policy(self) -> None:
+        """Reload the current central policy; persisted snapshots never authorize."""
+
+        self.policy = load_policy(self.config.policy_path or None)
+
     def _validate_recoverable_state(self) -> None:
         if self.state.schema_version != SCHEMA_VERSION:
             raise RuntimeError("legacy Forge runs cannot be recovered by the sprint orchestrator")
@@ -445,6 +447,7 @@ class ForgeOrchestrator:
             raise RuntimeError(
                 f"run {self.run_id} is {self.state.status}; it is not recoverable"
             )
+        self._refresh_policy()
         off_policy = [
             role
             for role in ROLE_NAMES
@@ -470,6 +473,7 @@ class ForgeOrchestrator:
         on-policy is returned unchanged, so this is safe to call defensively.
         """
 
+        self._refresh_policy()
         off_policy = [
             role
             for role in ROLE_NAMES
@@ -764,6 +768,7 @@ class ForgeOrchestrator:
 
         if not self.config.shuffle_coders:
             return
+        self._refresh_policy()
         pool: list[ModelSpec] = []
         seen: set[str] = set()
         for role in CODER_ROLES:
@@ -1589,6 +1594,7 @@ class ForgeOrchestrator:
         winner_spec = self.config.models.get(f"coder_{winner_name}")
         if winner_spec is None:
             return
+        self._refresh_policy()
         winner_family = model_family(winner_spec)
         reviewer = self.config.models["reviewer"]
         reviewer_family = model_family(reviewer)
@@ -2310,6 +2316,7 @@ class ForgeOrchestrator:
         self._save(f"Model preflight passed with {len(failures)} replacement(s).")
 
     def _replacement_for(self, role: str, current: ModelSpec) -> ModelSpec | None:
+        self._refresh_policy()
         disabled = set(self.state.disabled_models)
         options: list[ModelSpec] = []
         if self.config.backup is not None:
