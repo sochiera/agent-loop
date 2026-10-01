@@ -23,14 +23,14 @@ CODER_ROLES = ("coder_tdd", "coder_explore", "coder_classic")
 STAFF_ROLES = ("brain", "planner", "test_author", "reviewer", "tester")
 
 DEFAULT_MODEL_SELECTORS = {
-    "brain": "codex:gpt-5.6-sol:high",
-    "planner": "codex:gpt-5.6-sol:high",
-    "test_author": "codex:gpt-5.6-luna:high",
-    "coder_tdd": "codex:gpt-5.6-luna:high",
-    "coder_explore": "codex:gpt-5.6-luna:high",
-    "coder_classic": "codex:gpt-5.6-luna:high",
-    "reviewer": "codex:gpt-5.6-terra:high",
-    "tester": "codex:gpt-5.6-terra:high",
+    "brain": "codex:gpt-6-sol:medium",
+    "planner": "codex:gpt-6-sol:medium",
+    "test_author": "codex:gpt-6-luna:xhigh",
+    "coder_tdd": "codex:gpt-6-luna:xhigh",
+    "coder_explore": "codex:gpt-6-luna:xhigh",
+    "coder_classic": "codex:gpt-6-luna:xhigh",
+    "reviewer": "codex:gpt-6-sol:medium",
+    "tester": "codex:gpt-6-luna:xhigh",
 }
 
 
@@ -48,7 +48,7 @@ class ModelSpec:
         if not parts or not parts[0]:
             raise ValueError(
                 "model must use provider:model[:effort], where provider is "
-                "codex or opencode"
+                "codex, claude, or opencode"
             )
         provider, model = parse_identity(
             parts[0], parts[1] if len(parts) > 1 else ""

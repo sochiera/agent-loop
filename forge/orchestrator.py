@@ -35,7 +35,6 @@ from .catalog import (
     assign_coder_models,
     model_family,
     model_identity,
-    spec_with_effort,
 )
 from .contracts import (
     ITERATION_PLAN_SCHEMA,
@@ -2338,7 +2337,8 @@ class ForgeOrchestrator:
         different = [
             item for item in healthy if model_family(item) != model_family(current)
         ]
-        return spec_with_effort((different or healthy)[0], current.effort)
+        # Each roster model runs at its own pinned effort, never the failed one's.
+        return self.policy.pin((different or healthy)[0])
 
     def _apply_replacement(self, exhausted: ModelSpec, replacement: ModelSpec) -> None:
         with self._roster_lock:
@@ -2348,7 +2348,7 @@ class ForgeOrchestrator:
             for role in ROLE_NAMES:
                 spec = self.config.models[role]
                 if model_identity(spec) == identity:
-                    self.config.models[role] = spec_with_effort(replacement, spec.effort)
+                    self.config.models[role] = self.policy.pin(replacement)
             self._persist_models()
 
     def _invoke(

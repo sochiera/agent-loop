@@ -30,12 +30,10 @@ from forge.models import (
     STAFF_ROLES,
 )
 from forge.policy import (
-    DEEPSEEK,
     GLM,
     LUNA,
-    MIMO,
+    OPUS,
     SOL,
-    TERRA,
     load_policy,
 )
 from forge.web import models_from_payload, restart_payload
@@ -55,12 +53,13 @@ BANNED_FRAGMENTS = (
 
 def test_active_catalog_is_the_exact_policy_roster():
     assert [(entry.key, entry.family) for entry in CATALOG] == [
-        ("gpt-5.6-sol", "gpt"),
-        ("gpt-5.6-terra", "gpt"),
-        ("gpt-5.6-luna", "gpt"),
+        ("gpt-6-sol", "gpt"),
+        ("gpt-6-luna", "gpt"),
+        ("claude-opus-5-5", "claude"),
         ("glm-5.3-flash", "glm"),
-        ("deepseek-v4.1-flash", "deepseek"),
-        ("mimo-v2.6-flash", "mimo"),
+    ]
+    assert [entry.efforts for entry in CATALOG] == [
+        ("medium",), ("xhigh",), ("medium",), ("xhigh",)
     ]
     for entry in CATALOG:
         for provider, model in entry.ids.items():
@@ -76,18 +75,46 @@ def test_active_catalog_rejects_every_banned_identity():
         "opencode:or-gemini-3.7-flash",
         "opencode:deepseek-v4-flash-0731",
         "opencode:glm-5.3",
+        "codex:gpt-5.6-sol",
+        "codex:gpt-5.6-terra",
+        "codex:gpt-5.6-luna",
+        "opencode:deepseek-v4.1-flash",
+        "opencode:mimo-v2.6-flash",
+        "claude:opus",
+        "opencode:gpt-6-sol",
     ):
         with pytest.raises(ValueError):
             resolve_identity(*selector.split(":", 1))
 
 
+def test_retired_roster_still_parses_for_old_state():
+    for selector in (
+        "codex:gpt-5.6-sol",
+        "codex:gpt-5.6-terra",
+        "codex:gpt-5.6-luna",
+        "opencode:deepseek-v4.1-flash",
+        "opencode:mimo-v2.6-flash",
+    ):
+        assert ModelSpec.parse(selector).provider == selector.split(":")[0]
+
+
 def test_luna_resolves_only_through_native_codex():
-    assert resolve_identity("codex", "gpt-5.6-luna") == ("codex", "gpt-5.6-luna")
-    assert find_active_entry("opencode", "gpt-5.6-luna") is None
+    assert resolve_identity("codex", "gpt-6-luna") == ("codex", "gpt-6-luna")
+    assert find_active_entry("opencode", "gpt-6-luna") is None
     with pytest.raises(ValueError):
-        resolve_identity("opencode", "gpt-5.6-luna")
+        resolve_identity("opencode", "gpt-6-luna")
     with pytest.raises(ValueError):
-        resolve_identity("opencode", "openai/gpt-5.6-luna")
+        resolve_identity("claude", "gpt-6-luna")
+
+
+def test_opus_resolves_only_through_claude_code_by_explicit_slug():
+    assert resolve_identity("claude", "claude-opus-5-5") == ("claude", "claude-opus-5-5")
+    assert ModelSpec.parse("claude:claude-opus-5-5:medium") == OPUS
+    for model in ("opus", "claude-opus-5", "claude-opus-4-8"):
+        with pytest.raises(ValueError):
+            resolve_identity("claude", model)
+    with pytest.raises(ValueError):
+        resolve_identity("opencode", "claude-opus-5-5")
 
 
 def test_legacy_identities_still_parse_for_old_state():
@@ -102,14 +129,16 @@ def test_legacy_identities_still_parse_for_old_state():
 
 
 def test_model_spec_rejects_unknown_or_provider_incompatible_models():
-    for selector in ("claude:opus", "codex:grok-4.6", "claude:gpt-5.6-sol"):
+    for selector in ("claude:opus", "codex:grok-4.6", "claude:gpt-5.6-sol", "gemini:x"):
         with pytest.raises(ValueError):
             ModelSpec.parse(selector)
 
 
 def test_model_family_groups_by_active_and_legacy_family():
+    assert model_family(ModelSpec.parse("codex:gpt-6-sol")) == "gpt"
+    assert model_family(ModelSpec.parse("codex:gpt-6-luna")) == "gpt"
+    assert model_family(ModelSpec.parse("claude:claude-opus-5-5")) == "claude"
     assert model_family(ModelSpec.parse("codex:gpt-5.6-sol")) == "gpt"
-    assert model_family(ModelSpec.parse("codex:gpt-5.6-luna")) == "gpt"
     assert model_family(ModelSpec.parse("opencode:glm-5.3-flash")) == "glm"
     assert model_family(ModelSpec.parse("opencode:deepseek-v4.1-flash")) == "deepseek"
     assert model_family(ModelSpec.parse("opencode:mimo-v2.6-flash")) == "mimo"
@@ -138,27 +167,27 @@ def test_role_roster_restores_the_tournament_and_test_author():
 
 
 def test_assign_coder_models_draws_distinct_families_and_reuses_short_pools():
-    luna = ModelSpec.parse("codex:gpt-5.6-luna:high")
+    luna = ModelSpec.parse("codex:gpt-6-luna:xhigh")
     glm = ModelSpec.parse("opencode:glm-5.3-flash")
-    deepseek = ModelSpec.parse("opencode:deepseek-v4.1-flash")
+    opus = ModelSpec.parse("claude:claude-opus-5-5")
     models = {role: luna for role in ROLE_NAMES}
 
-    drawn = assign_coder_models(models, [luna, glm, deepseek])
+    drawn = assign_coder_models(models, [luna, glm, opus])
     assert {drawn[role].display() for role in CODER_ROLES} == {
         luna.display(),
         glm.display(),
-        deepseek.display(),
+        opus.display(),
     }
 
     reused = assign_coder_models(models, [glm])
     assert all(reused[role] == glm for role in CODER_ROLES)
 
     seeded = assign_coder_models(
-        dict(models), [luna, glm, deepseek], rng=random.Random(7)
+        dict(models), [luna, glm, opus], rng=random.Random(7)
     )
-    assert set(seeded[role] for role in CODER_ROLES) == {luna, glm, deepseek}
+    assert set(seeded[role] for role in CODER_ROLES) == {luna, glm, opus}
     assert seeded == assign_coder_models(
-        dict(models), [luna, glm, deepseek], rng=random.Random(7)
+        dict(models), [luna, glm, opus], rng=random.Random(7)
     )
 
 
@@ -181,7 +210,7 @@ def test_legacy_config_migrates_single_coder_to_all_three_candidates():
 
 
 def test_run_config_round_trips_policy_path_and_shuffle_flag():
-    models = {role: ModelSpec.parse("codex:gpt-5.6-sol:high") for role in ROLE_NAMES}
+    models = {role: ModelSpec.parse("codex:gpt-6-sol:medium") for role in ROLE_NAMES}
     config = RunConfig(
         repo="/tmp/repo",
         brief="/tmp/brief.md",
@@ -196,21 +225,32 @@ def test_run_config_round_trips_policy_path_and_shuffle_flag():
 
 
 def test_run_config_defaults_to_weighted_coder_reshuffling():
-    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:high") for role in ROLE_NAMES}
+    models = {role: ModelSpec.parse("codex:gpt-6-luna:xhigh") for role in ROLE_NAMES}
     config = RunConfig(repo="/tmp/repo", brief="/tmp/brief.md", branch="main", models=models)
     assert config.shuffle_coders is True
 
 
-def test_run_config_rejects_promotion_inactive_models(tmp_path):
+@pytest.mark.parametrize(
+    "retired",
+    [
+        "codex:gpt-5.6-sol:high",
+        "codex:gpt-5.6-terra:high",
+        "codex:gpt-5.6-luna:high",
+        "opencode:deepseek-v4.1-flash",
+        "opencode:mimo-v2.6-flash",
+        "codex:gpt-6-sol:high",
+    ],
+)
+def test_run_config_rejects_the_retired_roster(tmp_path, retired):
     policy_file = tmp_path / "policy.json"
-    policy_file.write_text('{"promotion_state": "inactive"}', encoding="utf-8")
+    policy_file.write_text('{"promotion_state": "active"}', encoding="utf-8")
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".git").mkdir()
     brief = tmp_path / "brief.md"
     brief.write_text("# goal\n", encoding="utf-8")
-    models = {role: ModelSpec.parse("codex:gpt-5.6-luna:high") for role in ROLE_NAMES}
-    models["coder_tdd"] = ModelSpec.parse("opencode:deepseek-v4.1-flash")
+    models = {role: ModelSpec.parse("codex:gpt-6-luna:xhigh") for role in ROLE_NAMES}
+    models["coder_tdd"] = ModelSpec.parse(retired)
     config = RunConfig(
         repo=str(repo),
         brief=str(brief),
@@ -218,7 +258,7 @@ def test_run_config_rejects_promotion_inactive_models(tmp_path):
         models=models,
         policy_path=str(policy_file),
     )
-    with pytest.raises(ValueError, match="not allowed by the active model policy"):
+    with pytest.raises(ValueError, match="unsupported model|not allowed"):
         config.validate()
 
 
@@ -228,22 +268,22 @@ def test_models_from_payload_assigns_policy_pool_deterministically(tmp_path):
     payload = {
         "policy_path": str(policy_file),
         "models": {
-            "brain": "codex:gpt-5.6-sol:high",
-            "planner": "codex:gpt-5.6-sol:high",
+            "brain": "codex:gpt-6-sol:medium",
+            "planner": "codex:gpt-6-sol:medium",
             "test_author": "opencode:glm-5.3-flash",
-            "reviewer": "codex:gpt-5.6-terra:high",
-            "tester": "codex:gpt-5.6-terra:high",
+            "reviewer": "codex:gpt-6-sol:medium",
+            "tester": "codex:gpt-6-sol:medium",
         },
         "coder_models": [
             "opencode:glm-5.3-flash",
-            "opencode:deepseek-v4.1-flash",
+            "claude:claude-opus-5-5",
         ],
     }
     first = models_from_payload(payload)
     second = models_from_payload(payload)
     assert {first[role].model for role in CODER_ROLES} == {
         GLM.model,
-        DEEPSEEK.model,
+        OPUS.model,
     }
     assert first == second
     assert first["test_author"].model == "opencode-go/glm-5.3-flash"
@@ -256,10 +296,10 @@ def test_models_from_payload_imports_single_legacy_coder_pool_entry(tmp_path):
         {
             "policy_path": str(policy_file),
             "models": {
-                "brain": "codex:gpt-5.6-sol:high",
-                "planner": "codex:gpt-5.6-sol:high",
-                "reviewer": "codex:gpt-5.6-terra:high",
-                "tester": "codex:gpt-5.6-terra:high",
+                "brain": "codex:gpt-6-sol:medium",
+                "planner": "codex:gpt-6-sol:medium",
+                "reviewer": "codex:gpt-6-sol:medium",
+                "tester": "codex:gpt-6-sol:medium",
             },
             "coder_models": ["opencode:glm-5.3-flash"],
             "shuffle_coders": True,
@@ -295,17 +335,17 @@ def test_cli_selects_policy_defaults_when_roles_are_unspecified(tmp_path):
     assert args.shuffle_coders is True
     snapshot = load_policy(str(policy_file))
     models = select_cli_models(args, snapshot, rng=random.Random(3))
-    assert models["brain"] in (SOL, TERRA)
-    assert models["planner"] in (SOL, TERRA)
-    assert models["reviewer"] in (SOL, TERRA)
-    assert {models[role] for role in CODER_ROLES} <= {LUNA, GLM, DEEPSEEK}
-    assert models["tester"] in (LUNA, GLM, DEEPSEEK)
+    assert models["brain"] in (SOL, GLM)
+    assert models["planner"] in (SOL, GLM)
+    assert models["reviewer"] in (SOL, GLM)
+    assert {models[role] for role in CODER_ROLES} == {LUNA, GLM, OPUS}
+    assert models["tester"] in (LUNA, GLM, OPUS)
 
 
 def test_run_config_persists_an_active_backup_model(tmp_path):
     policy_file = tmp_path / "policy.json"
     policy_file.write_text('{"promotion_state": "active"}', encoding="utf-8")
-    models = {role: ModelSpec.parse("codex:gpt-5.6-sol:high") for role in ROLE_NAMES}
+    models = {role: ModelSpec.parse("codex:gpt-6-sol:medium") for role in ROLE_NAMES}
     config = RunConfig(
         repo="/tmp/repo",
         brief="/tmp/brief.md",
@@ -332,25 +372,19 @@ def test_cli_honors_explicit_overrides(tmp_path):
             "--policy-path",
             str(policy_file),
             "--brain",
-            "opencode:glm-5.3-flash:high",
+            "opencode:glm-5.3-flash",
         ]
     )
     snapshot = load_policy(str(policy_file))
     models = select_cli_models(args, snapshot, rng=random.Random(3))
-    assert models["brain"].model == "opencode-go/glm-5.3-flash"
+    assert models["brain"] == GLM
 
 
 def test_catalog_payload_exposes_only_active_models():
     payload = catalog_payload()
     keys = {item["key"] for item in payload["models"]}
-    assert keys == {
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "glm-5.3-flash",
-        "deepseek-v4.1-flash",
-        "mimo-v2.6-flash",
-    }
+    assert keys == {"gpt-6-sol", "gpt-6-luna", "claude-opus-5-5", "glm-5.3-flash"}
+    assert payload["providers"] == ["codex", "claude", "opencode"]
     for item in payload["models"]:
         blob = str(item).lower()
         assert not any(fragment in blob for fragment in BANNED_FRAGMENTS)

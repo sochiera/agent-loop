@@ -8,6 +8,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -177,6 +178,35 @@ def _codex_parse(events: list[dict[str, Any]]) -> tuple[str, Usage, int]:
     return text, usage, tool_calls
 
 
+def _walk(value: Any):
+    yield value
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk(child)
+
+
+def _claude_parse(events: list[dict[str, Any]]) -> tuple[str, Usage, int]:
+    text = ""
+    usage = Usage()
+    tool_ids: set[str] = set()
+    for event in events:
+        if event.get("type") == "result":
+            structured = event.get("structured_output")
+            if isinstance(structured, dict):
+                text = json.dumps(structured)
+            elif isinstance(event.get("result"), str):
+                text = event["result"]
+            if isinstance(event.get("usage"), dict):
+                usage = _normalized_usage(event["usage"], cost=event.get("total_cost_usd"))
+        for item in _walk(event):
+            if isinstance(item, dict) and item.get("type") == "tool_use":
+                tool_ids.add(str(item.get("id") or id(item)))
+    return text, usage, len(tool_ids)
+
+
 def _opencode_parse(events: list[dict[str, Any]]) -> tuple[str, Usage, int]:
     texts: list[str] = []
     usage = Usage()
@@ -236,6 +266,7 @@ class AgentRunner:
                 f"{request.role} model {request.model.display()} is not allowed by "
                 f"the active model policy (promotion_state={snapshot.state})"
             )
+        request.model = snapshot.pin(request.model)
 
     def cancel(self) -> None:
         with self._lock:
@@ -324,6 +355,7 @@ class AgentRunner:
         events = _json_lines(raw)
         parser = {
             "codex": _codex_parse,
+            "claude": _claude_parse,
             "opencode": _opencode_parse,
         }[request.model.provider]
         text, usage, tool_calls = parser(events)
@@ -348,6 +380,8 @@ class AgentRunner:
         self._ensure_policy(request)
         if request.model.provider == "codex":
             return self._codex_command(request)
+        if request.model.provider == "claude":
+            return self._claude_command(request)
         if request.model.provider == "opencode":
             return self._opencode_command(request)
         raise ValueError(f"unsupported provider: {request.model.provider}")
@@ -420,6 +454,50 @@ class AgentRunner:
             command += [request.session_id, "-"]
         else:
             command += ["-"]
+        return command
+
+    def _claude_command(self, request: AgentRequest) -> list[str]:
+        command = [
+            "claude",
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            # Tools are pre-approved below; anything else is denied, never asked.
+            "--permission-mode",
+            "dontAsk",
+        ]
+        if request.session_id:
+            command += ["--resume", request.session_id]
+        else:
+            command += ["--session-id", str(uuid.uuid4())]
+        if request.model.model:
+            command += ["--model", request.model.model]
+        if request.model.effort:
+            command += ["--effort", request.model.effort]
+        if request.role != "tester":
+            # Same lean surface as Codex: no user plugins, skills, hooks or MCP.
+            command += [
+                "--safe-mode",
+                "--disable-slash-commands",
+                "--strict-mcp-config",
+                "--mcp-config",
+                '{"mcpServers":{}}',
+            ]
+        tools = {
+            "none": "",
+            "read": "Read,Glob,Grep",
+            "inspect": "Read,Glob,Grep,Bash,WebFetch",
+            "write": "Read,Edit,Write,Glob,Grep,Bash",
+            "test": "Read,Edit,Write,Glob,Grep,Bash,WebFetch",
+        }[request.access]
+        command += ["--tools", tools]
+        if tools:
+            command += ["--allowedTools", tools]
+        for path in request.extra_writable_dirs:
+            command += ["--add-dir", str(path)]
+        if request.schema is not None:
+            command += ["--json-schema", json.dumps(request.schema, separators=(",", ":"))]
         return command
 
     def _opencode_command(self, request: AgentRequest) -> list[str]:
