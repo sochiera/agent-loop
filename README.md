@@ -129,8 +129,9 @@ be resumed by this controller; start a new run instead.
 - Linux or macOS, Git, and Python 3.12 or newer with `pytest` importable (Forge runs the black-box
   RED gate and candidate validation with its own interpreter).
 - At least one authenticated supported agent CLI:
-  - `codex` for the native Codex GPT-5.6 Sol, Terra, and Luna models;
-  - `opencode` for the OpenCode Go GLM 5.3 Flash, DeepSeek V4.1 Flash, and MiMo V2.6 Flash models.
+  - `codex` for the native Codex GPT-6 Sol and Luna models;
+  - `claude` (Claude Code) for Claude Opus 5.5;
+  - `opencode` for the OpenCode Go GLM 5.3 Flash model.
 - A clean target Git repository. Forge can initialize an unborn selected branch. Push-enabled runs
   also require an `origin` remote.
 
@@ -139,34 +140,40 @@ API keys in its configuration.
 
 ## Model policy
 
-Forge routes every role through a fail-closed model policy. The active catalog is exactly:
+Forge routes every role through a closed model policy that mirrors
+`~/.hermes/scripts/model_policy.py`. The active catalog is exactly four models, each pinned to one
+harness and one reasoning effort:
 
-- `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna`;
-- `opencode:opencode-go/glm-5.3-flash`, `opencode:opencode-go/deepseek-v4.1-flash`,
-  `opencode:opencode-go/mimo-v2.6-flash`.
+| Selector | Central policy id | Harness | Effort |
+| --- | --- | --- | --- |
+| `codex:gpt-6-sol:medium` | `openai-codex/gpt-6-sol` | native Codex | medium |
+| `codex:gpt-6-luna:xhigh` | `openai-codex/gpt-6-luna` | native Codex | xhigh |
+| `claude:claude-opus-5-5:medium` | `claude-code/claude-opus-5-5` | Claude Code | medium |
+| `opencode:opencode-go/glm-5.3-flash:xhigh` | `opencode-go/glm-5.3-flash` | OpenCode Go | xhigh |
 
-Grok, Kimi, Qwen, OpenRouter, the stale Alibaba/Z.AI providers, and local models are never part of
-active routing. Luna is native Codex only and never runs through OpenCode. Legacy identities still
-*parse* so old run state and old UI preferences stay readable, but they are rejected for a new run
-and are never selected as a fallback.
+A selector without an effort is pinned to the policy effort; any other effort is rejected. Opus is
+addressed by its explicit `claude-opus-5-5` slug, never the `opus` alias. The retired roster
+(GPT-5.6 Sol/Terra/Luna, DeepSeek, MiMo) and Grok, Kimi, Qwen, OpenRouter, the stale Alibaba/Z.AI
+providers, and local models are never part of active routing. Legacy identities still *parse* so old
+run state and old UI preferences stay readable, but they are rejected for a new run, for recovery,
+and at the agent runner, and are never selected as a fallback.
 
-The policy reads its promotion state from `/home/jan/.hermes/state/model-policy.json` (or the path in
-`--policy-path` / `FORGE_MODEL_POLICY_PATH`). `promotion_state=active` enables DeepSeek V4.1 Flash and
-disables MiMo; `inactive` does the opposite. A missing, invalid, or unknown state fails closed to the
-native GPT models plus GLM Flash, and never guesses DeepSeek or MiMo.
+The promotion state in `/home/jan/.hermes/state/model-policy.json` (or the path in `--policy-path` /
+`FORGE_MODEL_POLICY_PATH`) is still recorded in the run snapshot, but it no longer changes which
+models are eligible.
 
-New runs draw their roster with weighted selection:
+New runs draw their roster with the central policy weights:
 
-- brain and planner: Sol 45 / Terra 55;
-- coder tactics: Luna 45 / GLM 15 / current cheap coder 40, preferring distinct families;
-- test author and tester: Luna 35 / GLM 35 / current cheap coder 30;
-- reviewer: Terra 55 / Sol 45.
+- brain and planner: Sol 50 / GLM 50;
+- coder tactics: Opus 25 / Luna 50 / GLM 25, preferring distinct models;
+- test author and tester: Opus 20 / Luna 55 / GLM 25;
+- reviewer: Sol 50 / GLM 50.
 
-When the winning coder is from the OpenAI family, the review gate switches to an independent OpenCode
-Go family (GLM or the current cheap coder) if one is healthy, and records a diversity exception when
-none is. Failover after a quota or provider failure draws only from the active policy, prefers another
-family, and never returns to a disabled or promotion-inactive model. Explicit CLI/UI role overrides
-remain available but every override must pass the same active-policy gate.
+The review gate switches to a reviewer from a different family than the winning coder (GLM for a GPT
+winner, Sol for a GLM winner) if one is healthy, and records a diversity exception when none is.
+Failover after a quota or provider failure draws only from the four policy models at their pinned
+effort, prefers another family, and never returns to a disabled model. Explicit CLI/UI role overrides
+remain available but every override must pass the same policy gate.
 
 Saved runs written under an older policy recover only after an explicit migration
 (`forge resume --migrate-models`, or `migrate_models: true` in the UI recovery payload); Forge never
@@ -214,14 +221,14 @@ python3 -m forge run \
   --repo /path/to/product \
   --brief /path/to/brief.md \
   --branch main \
-  --brain codex:gpt-5.6-sol:high \
-  --planner codex:gpt-5.6-terra:high \
-  --test-author codex:gpt-5.6-luna:high \
-  --coder-tdd codex:gpt-5.6-luna:high \
-  --coder-explore opencode:opencode-go/glm-5.3-flash:high \
-  --coder-classic opencode:opencode-go/deepseek-v4.1-flash:high \
-  --reviewer codex:gpt-5.6-terra:high \
-  --tester codex:gpt-5.6-luna:high
+  --brain codex:gpt-6-sol:medium \
+  --planner codex:gpt-6-sol:medium \
+  --test-author codex:gpt-6-luna:xhigh \
+  --coder-tdd codex:gpt-6-luna:xhigh \
+  --coder-explore opencode:opencode-go/glm-5.3-flash:xhigh \
+  --coder-classic claude:claude-opus-5-5:medium \
+  --reviewer opencode:opencode-go/glm-5.3-flash:xhigh \
+  --tester codex:gpt-6-luna:xhigh
 ```
 
 Add `--no-shuffle-coders` to keep the initial coder draw for every sprint.
@@ -237,9 +244,9 @@ commands exit with status `0` after an operator pause or cancellation and `1` af
 `stalled`; continuous runs otherwise keep executing.
 
 Selectors use `provider:model[:effort]`. The control room exposes only the closed active catalog
-(Codex GPT-5.6 Sol/Terra/Luna and OpenCode Go GLM/DeepSeek/MiMo Flash). Before the first sprint Forge
+(Codex GPT-6 Sol/Luna, Claude Code Opus 5.5, and OpenCode Go GLM 5.3 Flash). Before the first sprint Forge
 probes each unique model once. A usage-limit failure moves a role to another healthy active model
-(never a disabled or promotion-inactive one) without changing the sprint contract.
+(never a disabled or retired one) without changing the sprint contract.
 
 Recover an off-policy run by explicitly migrating it first:
 

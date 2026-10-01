@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-PROVIDERS = ("codex", "opencode")
+PROVIDERS = ("codex", "claude", "opencode")
 
 
 @dataclass(frozen=True)
@@ -27,29 +27,34 @@ class CatalogEntry:
         return self.ids[provider]
 
 
-# The active Forge catalog. Luna is native Codex only; every OpenCode Go model
-# uses its exact ``opencode-go/...`` identifier.
+# The active Forge catalog mirrors ~/.hermes/scripts/model_policy.py. Each model
+# runs on exactly one harness at exactly one reasoning effort: GPT-6 through
+# native Codex, Opus 5.5 through Claude Code by its explicit slug (never the
+# ``opus`` alias), and GLM Flash through OpenCode Go.
 CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
-        key="gpt-5.6-sol",
-        label="GPT-5.6 Sol",
+        key="gpt-6-sol",
+        label="GPT-6 Sol",
         family="gpt",
         providers=("codex",),
-        ids={"codex": "gpt-5.6-sol"},
+        ids={"codex": "gpt-6-sol"},
+        efforts=("medium",),
     ),
     CatalogEntry(
-        key="gpt-5.6-terra",
-        label="GPT-5.6 Terra",
+        key="gpt-6-luna",
+        label="GPT-6 Luna",
         family="gpt",
         providers=("codex",),
-        ids={"codex": "gpt-5.6-terra"},
+        ids={"codex": "gpt-6-luna"},
+        efforts=("xhigh",),
     ),
     CatalogEntry(
-        key="gpt-5.6-luna",
-        label="GPT-5.6 Luna",
-        family="gpt",
-        providers=("codex",),
-        ids={"codex": "gpt-5.6-luna"},
+        key="claude-opus-5-5",
+        label="Claude Opus 5.5",
+        family="claude",
+        providers=("claude",),
+        ids={"claude": "claude-opus-5-5"},
+        efforts=("medium",),
     ),
     CatalogEntry(
         key="glm-5.3-flash",
@@ -57,7 +62,13 @@ CATALOG: tuple[CatalogEntry, ...] = (
         family="glm",
         providers=("opencode",),
         ids={"opencode": "opencode-go/glm-5.3-flash"},
+        efforts=("xhigh",),
     ),
+)
+
+# Parse-only history. These identities load old artifacts and preferences but
+# are never part of the active catalog and never become a fallback.
+LEGACY_CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="deepseek-v4.1-flash",
         label="DeepSeek V4.1 Flash",
@@ -72,11 +83,6 @@ CATALOG: tuple[CatalogEntry, ...] = (
         providers=("opencode",),
         ids={"opencode": "opencode-go/mimo-v2.6-flash"},
     ),
-)
-
-# Parse-only history. These identities load old artifacts and preferences but
-# are never part of the active catalog and never become a fallback.
-LEGACY_CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="gpt-5.6-sol",
         label="GPT-5.6 Sol",
@@ -194,14 +200,14 @@ LEGACY_CATALOG: tuple[CatalogEntry, ...] = (
 # Representative, fail-closed defaults. Real new runs draw their roster from
 # ``forge.policy``; these keep CLI/UI selectors valid when no policy is present.
 DEFAULTS = {
-    "brain": "codex:gpt-5.6-sol:high",
-    "planner": "codex:gpt-5.6-sol:high",
-    "test_author": "codex:gpt-5.6-luna:high",
-    "coder_tdd": "codex:gpt-5.6-luna:high",
-    "coder_explore": "codex:gpt-5.6-luna:high",
-    "coder_classic": "codex:gpt-5.6-luna:high",
-    "reviewer": "codex:gpt-5.6-terra:high",
-    "tester": "codex:gpt-5.6-terra:high",
+    "brain": "codex:gpt-6-sol:medium",
+    "planner": "codex:gpt-6-sol:medium",
+    "test_author": "codex:gpt-6-luna:xhigh",
+    "coder_tdd": "codex:gpt-6-luna:xhigh",
+    "coder_explore": "codex:gpt-6-luna:xhigh",
+    "coder_classic": "codex:gpt-6-luna:xhigh",
+    "reviewer": "codex:gpt-6-sol:medium",
+    "tester": "codex:gpt-6-luna:xhigh",
 }
 
 ROLE_TIMEOUTS = {
@@ -246,14 +252,15 @@ def resolve_identity(provider: str, model: str) -> tuple[str, str]:
 
     if provider not in PROVIDERS:
         raise ValueError(
-            "model must use provider:model[:effort], where provider is codex or opencode"
+            "model must use provider:model[:effort], where provider is codex, "
+            "claude, or opencode"
         )
     entry = find_active_entry(provider, model)
     if entry is None:
         raise ValueError(
             f"unsupported model {provider}:{model or '(empty)'}; "
             "choose an active policy model "
-            "(Codex GPT-5.6 Sol/Terra/Luna or OpenCode Go GLM/DeepSeek/MiMo Flash)"
+            "(Codex GPT-6 Sol/Luna, Claude Code Opus 5.5, or OpenCode Go GLM Flash)"
         )
     return provider, entry.id_for(provider)
 
@@ -263,7 +270,8 @@ def parse_identity(provider: str, model: str) -> tuple[str, str]:
 
     if provider not in PROVIDERS:
         raise ValueError(
-            "model must use provider:model[:effort], where provider is codex or opencode"
+            "model must use provider:model[:effort], where provider is codex, "
+            "claude, or opencode"
         )
     entry = find_entry(provider, model)
     if entry is None:
