@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 
+from .access import GATE_ENV, gate_from_env
 from .models import DEFAULT_MODEL_SELECTORS, ModelSpec, ROLE_NAMES, RunConfig
 from .orchestrator import ForgeOrchestrator
 from .policy import PromotionSnapshot, load_policy
@@ -74,6 +76,15 @@ def _parser() -> argparse.ArgumentParser:
     ui.add_argument("--host", default="127.0.0.1")
     ui.add_argument("--port", type=int, default=8787)
     ui.add_argument("--no-browser", action="store_true")
+    ui.add_argument(
+        "--access-gate-file",
+        default="",
+        metavar="PATH",
+        help=(
+            "require this 0600 file's contents as the WWW entrance secret "
+            f"(defaults to the {GATE_ENV} environment variable)"
+        ),
+    )
     return parser
 
 
@@ -96,7 +107,15 @@ def select_cli_models(
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "ui":
-        serve(args.host, args.port, open_browser=not args.no_browser)
+        env: dict[str, str] | None = None
+        if args.access_gate_file:
+            env = dict(os.environ)
+            env[GATE_ENV] = args.access_gate_file
+        try:
+            gate = gate_from_env(env)
+        except Exception as exc:
+            raise SystemExit(f"forge ui: access gate misconfigured: {exc}")
+        serve(args.host, args.port, open_browser=not args.no_browser, gate=gate)
         return 0
     on_event = lambda event: print(json.dumps(event, sort_keys=True), flush=True)
     if args.command in {"resume", "recover"}:

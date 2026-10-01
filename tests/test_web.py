@@ -10,6 +10,7 @@ import pytest
 
 from pathlib import Path
 
+from forge.access import AccessGate, GateMisconfigured, gate_from_env, read_expected_value
 from forge.models import CODER_ROLES, ROLE_NAMES, STAFF_ROLES, RunState
 from forge.web import (
     ForgeHandler,
@@ -570,3 +571,108 @@ def test_restore_session_exposes_dead_running_run_as_recoverable(
     assert launched["recoverable"] is False
     release.set()
     registry._runs["dead-running"].thread.join(timeout=1)
+
+
+def _gated_server(registry: RunRegistry, gate, tmp_path: Path):
+    handler = type(
+        "GatedForgeHandler",
+        (ForgeHandler,),
+        {
+            "registry": registry,
+            "gate": gate,
+            "request_restart": staticmethod(
+                lambda confirm: restart_payload(registry.active_count(), confirm)
+            ),
+        },
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    return server, thread
+
+
+def test_access_gate_requires_the_entrance_secret(tmp_path: Path):
+    registry = RunRegistry(state_home=tmp_path)
+    gate = AccessGate(b"gate-secret")
+    server, thread = _gated_server(registry, gate, tmp_path)
+    base = f"http://127.0.0.1:{server.server_port}"
+    requester = urllib.request.build_opener(urllib.request.HTTPErrorProcessor())
+
+    def fetch(path: str, headers: dict[str, str] | None = None):
+        request = urllib.request.Request(base + path, headers=headers or {})
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode()
+
+    try:
+        status, _ = fetch("/api/health")
+        assert status == 403
+        status, body = fetch("/", headers={"X-Forge-Access": "wrong"})
+        assert status == 403
+        status, _ = fetch("/api/health", headers={"X-Forge-Access": "gate-secret"})
+        assert status == 200
+        status, _ = fetch("/", headers={"X-Forge-Access": "gate-secret"})
+        assert status == 200
+        status, body = fetch(
+            "/api/preference",
+            headers={"X-Forge-Access": "gate-secret"},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_access_gate_post_is_rejected_before_auth(tmp_path: Path):
+    registry = RunRegistry(state_home=tmp_path)
+    gate = AccessGate(b"gate-secret")
+    server, thread = _gated_server(registry, gate, tmp_path)
+    base = f"http://127.0.0.1:{server.server_port}"
+    request = urllib.request.Request(
+        base + "/api/preferences",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        try:
+            urllib.request.urlopen(request, timeout=2)
+            raise AssertionError("expected 403")
+        except urllib.error.HTTPError as error:
+            assert error.code == 403
+        assert registry.load_preferences()["repo"] == ""
+        assert registry._preferences_path().exists() is False
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_access_gate_helper_rejects_bad_config(tmp_path: Path):
+    with pytest.raises(GateMisconfigured):
+        read_expected_value("")
+    with pytest.raises(GateMisconfigured):
+        read_expected_value("relative/path")
+    with pytest.raises(GateMisconfigured):
+        read_expected_value(str(tmp_path / "missing"))
+    loose = tmp_path / "loose"
+    loose.write_bytes(b"secret")
+    loose.chmod(0o644)
+    with pytest.raises(GateMisconfigured):
+        read_expected_value(str(loose))
+    empty = tmp_path / "empty"
+    empty.write_bytes(b"   \n")
+    empty.chmod(0o600)
+    with pytest.raises(GateMisconfigured):
+        read_expected_value(str(empty))
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"  gate-secret  \n")
+    secret.chmod(0o600)
+    gate = gate_from_env({"FORGE_UI_PASSWORD_FILE": str(secret)})
+    assert gate is not None
+    assert gate.allows("gate-secret")
+    assert not gate.allows("gate-secretx")
+    assert not gate.allows("")
+    assert gate is None or AccessGate(b"gate-secret").allows("gate-secret")
