@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .artifacts import atomic_write
+from .access import AccessGate
 from .catalog import assign_coder_models, catalog_payload, DEFAULTS
 from .gitops import list_branches, repository_summary
 from .locking import ExecutionLocked
@@ -559,8 +560,20 @@ class RunRegistry:
 class ForgeHandler(BaseHTTPRequestHandler):
     registry: RunRegistry
     request_restart: Callable[[bool], dict[str, Any]] | None = None
+    gate: AccessGate | None = None
+
+    def _gate_allowed(self) -> bool:
+        gate = type(self).gate
+        if gate is None:
+            return True
+        return gate.allows(self.headers.get("X-Forge-Access"))
+
+    def _reject_gate(self, detail: str, status: HTTPStatus) -> None:
+        self._json({"error": detail}, status)
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._gate_allowed():
+            return self._reject_gate("access gate: not authorized", HTTPStatus.FORBIDDEN)
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/health":
             return self._json({"ok": True, "active_runs": self.registry.active_count()})
@@ -612,6 +625,8 @@ class ForgeHandler(BaseHTTPRequestHandler):
         return self._static(parsed.path)
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._gate_allowed():
+            return self._reject_gate("access gate: not authorized", HTTPStatus.FORBIDDEN)
         try:
             payload = self._body()
             if self.path == "/api/restart":
@@ -678,7 +693,13 @@ class ForgeHandler(BaseHTTPRequestHandler):
         return
 
 
-def serve(host: str = "127.0.0.1", port: int = 8787, *, open_browser: bool = True) -> None:
+def serve(
+    host: str = "127.0.0.1",
+    port: int = 8787,
+    *,
+    open_browser: bool = True,
+    gate: AccessGate | None = None,
+) -> None:
     registry = RunRegistry()
     registry.restore_session()
     ctl: dict[str, Any] = {"server": None, "pending": False}
@@ -696,7 +717,11 @@ def serve(host: str = "127.0.0.1", port: int = 8787, *, open_browser: bool = Tru
     handler = type(
         "BoundForgeHandler",
         (ForgeHandler,),
-        {"registry": registry, "request_restart": staticmethod(request_restart)},
+        {
+            "registry": registry,
+            "request_restart": staticmethod(request_restart),
+            "gate": gate,
+        },
     )
     server = ThreadingHTTPServer((host, port), handler)
     ctl["server"] = server
