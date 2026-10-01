@@ -85,7 +85,96 @@ def _parser() -> argparse.ArgumentParser:
             f"(defaults to the {GATE_ENV} environment variable)"
         ),
     )
+
+    for command, is_resume in (("swarm-run", False), ("swarm-resume", True)):
+        swarm_parser = sub.add_parser(
+            command,
+            help=(
+                "resume a swarm run from its durable state"
+                if is_resume
+                else "run the cheap-model swarm in the foreground"
+            ),
+        )
+        if is_resume:
+            swarm_parser.add_argument("--repo", required=True, help="target Git repository")
+            swarm_parser.add_argument("--run-id", required=True, help="existing Forge run id")
+        else:
+            swarm_parser.add_argument("--repo", required=True, help="target Git repository")
+            swarm_parser.add_argument("--brief", required=True, help="(product) brief in Markdown")
+            swarm_parser.add_argument("--branch", default="main", help="local swarm branch")
+            swarm_parser.add_argument(
+                "--planner",
+                default=None,
+                metavar="PROVIDER:MODEL[:EFFORT]",
+                help=f"strong model for the swarm planner (default: {DEFAULT_MODEL_SELECTORS['planner']})",
+            )
+            swarm_parser.add_argument(
+                "--reviewer",
+                default=None,
+                metavar="PROVIDER:MODEL[:EFFORT]",
+                help="strong model choosing the better version (default: codex:gpt-6-sol:medium)",
+            )
+            swarm_parser.add_argument(
+                "--pool",
+                default="",
+                metavar="SELECTOR[,SELECTOR...]",
+                help="override the six-slot cheap pool (defaults to the central policy pool)",
+            )
+            swarm_parser.add_argument("--teams", type=int, default=3, help="parallel team count (cap 6 worktrees)")
+            swarm_parser.add_argument(
+                "--ready-threshold",
+                type=float,
+                default=0.7,
+                help="top-priority done fraction that re-arms the planner",
+            )
+            swarm_parser.add_argument("--seed", type=int, default=None, help="deterministic RNG seed")
+            swarm_parser.add_argument(
+                "--policy-path",
+                default="",
+                metavar="PATH",
+                help="model policy JSON path (defaults to Jan's state file)",
+            )
+            swarm_parser.add_argument("--no-push", action="store_true", help="deliver locally only")
+            swarm_parser.add_argument("--agent-timeout", type=int, default=3600, metavar="SECONDS")
     return parser
+
+
+def swarm_controller(args: argparse.Namespace) -> "SwarmController":
+    """Build the cheap-model swarm controller from CLI flags."""
+    from forge.swarm import SwarmController
+
+    snapshot = load_policy(args.policy_path or None)
+    if args.command == "swarm-resume":
+        repo = Path(args.repo).expanduser().resolve()
+        config_path = repo / ".forge" / "runs" / args.run_id / "config.json"
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        config = RunConfig.from_dict(raw)
+        config.repo = str(repo)
+        return SwarmController(config, run_id=args.run_id, on_event=None, resume=True)
+    roster = select_cli_models(args, snapshot)
+    if args.planner:
+        roster["planner"] = ModelSpec.parse(args.planner)
+    if args.reviewer:
+        roster["reviewer"] = ModelSpec.parse(args.reviewer)
+    pool = list(CHEAP_CODER_POOL)
+    if args.pool:
+        pool = [ModelSpec.parse(value.strip()) for value in args.pool.split(",") if value.strip()]
+    config = RunConfig(
+        repo=str(Path(args.repo).expanduser().resolve()),
+        brief=str(Path(args.brief).expanduser().resolve()),
+        branch=args.branch,
+        models=roster,
+        push=not args.no_push,
+        agent_timeout_seconds=args.agent_timeout,
+        shuffle_coders=False,
+        policy_path=args.policy_path,
+        coder_pool=pool,
+    )
+    from forge.swarm import DEFAULT_SWARM_TEAMS
+
+    teams = min(getattr(args, "teams", DEFAULT_SWARM_TEAMS), DEFAULT_SWARM_TEAMS)
+    rng = random.Random(args.seed) if args.seed is not None else random.Random()
+    return SwarmController(config, on_event=None, rng=rng, teams=teams)
 
 
 def select_cli_models(
@@ -118,6 +207,20 @@ def main(argv: list[str] | None = None) -> int:
         serve(args.host, args.port, open_browser=not args.no_browser, gate=gate)
         return 0
     on_event = lambda event: print(json.dumps(event, sort_keys=True), flush=True)
+    if args.command in {"swarm-run", "swarm-resume"}:
+        if args.command == "swarm-resume" and not (
+            Path(args.repo).expanduser().resolve()
+            / ".forge"
+            / "runs"
+            / args.run_id
+            / "config.json"
+        ).is_file():
+            raise SystemExit(f"Forge run config does not exist for the swarm: {args.run_id}")
+        controller = swarm_controller(args)
+        controller.run()
+        summary = controller.summary()
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0 if summary["status"] in {"completed", "cancelled"} else 1
     if args.command in {"resume", "recover"}:
         repo = Path(args.repo).expanduser().resolve()
         config_path = repo / ".forge" / "runs" / args.run_id / "config.json"

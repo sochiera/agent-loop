@@ -65,8 +65,9 @@ TEST_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((OPUS, 20), (LUNA, 55), (GLM,
 _PINNED_EFFORTS = {model_identity(spec): spec.effort for spec in ALLOWED_MODELS}
 _WORKER_ROLES = frozenset({*CODER_ROLES, "test_author", "tester"})
 _CODER_ONLY = frozenset(model_identity(spec) for spec in CODER_ONLY_MODELS)
-# Roles that may run a coder-only model; "probe" is the preflight health check.
-_CODER_ONLY_ROLES = frozenset({*CODER_ROLES, "probe"})
+# Roles that may run a coder-only model: the tournament coders, the preflight
+# health check, and the swarm's cheap reviewers (part of the pure cheap pool).
+_CODER_ONLY_ROLES = frozenset({*CODER_ROLES, "probe", "swarm_reviewer"})
 
 
 def _weighted_pick(

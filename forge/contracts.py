@@ -875,3 +875,190 @@ def parse_candidate_selection(
     value["borrow"] = borrow
     value["feedback"] = _string_list(value.get("feedback"), "feedback")
     return value
+
+
+def parse_swarm_backlog(text: str, *, minimum_tasks: int) -> dict[str, Any]:
+    """Parse a swarm planner backlog: distinct parallel tasks over separate areas."""
+
+    value = _extract_json(text)
+    _exact_object(value, {"summary", "tasks"}, "swarm backlog")
+    value["summary"] = _required_text(value, "summary", "swarm backlog")
+    tasks: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    raw = value.get("tasks")
+    if not isinstance(raw, list):
+        raise ContractError("swarm backlog tasks must be an array")
+    for index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise ContractError(f"swarm task {index} must be an object")
+        keys = {"id", "title", "area", "description", "acceptance_criteria",
+                "validation_commands", "priority"}
+        missing = keys - set(item)
+        extra = set(item) - keys
+        if missing:
+            raise ContractError(
+                f"swarm task {index} is missing keys: {', '.join(sorted(missing))}"
+            )
+        if extra:
+            item = {key: item[key] for key in sorted(keys)}
+        task_id = str(item["id"]).strip()
+        if not task_id:
+            raise ContractError(f"swarm task {index} has an empty id")
+        if task_id in seen:
+            raise ContractError(f"swarm task id is not unique: {task_id}")
+        seen.add(task_id)
+        title = _required_text(item, "title", f"swarm task {task_id}")
+        area = _required_text(item, "area", f"swarm task {task_id}")
+        description = _required_text(item, "description", f"swarm task {task_id}")
+        criteria = item.get("acceptance_criteria")
+        if not isinstance(criteria, list) or not any(
+            str(entry).strip() for entry in criteria
+        ):
+            raise ContractError(
+                f"swarm task {task_id} needs at least one acceptance criterion"
+            )
+        commands = item.get("validation_commands") or []
+        if not isinstance(commands, list) or not all(
+            isinstance(entry, str) and entry.strip() for entry in commands
+        ):
+            raise ContractError(
+                f"swarm task {task_id} validation_commands must be an array of strings"
+            )
+        priority = item.get("priority")
+        if (
+            not isinstance(priority, int)
+            or isinstance(priority, bool)
+            or not 1 <= priority <= 99
+        ):
+            raise ContractError(f"swarm task {task_id} priority must be an integer 1..99")
+        tasks.append(
+            {
+                "id": task_id,
+                "title": title,
+                "area": area,
+                "description": description,
+                "acceptance_criteria": [str(entry) for entry in criteria],
+                "validation_commands": list(commands),
+                "priority": priority,
+            }
+        )
+    if len(tasks) < minimum_tasks:
+        raise ContractError(
+            f"swarm backlog needs at least {minimum_tasks} distinct tasks, got {len(tasks)}"
+        )
+    value["tasks"] = tasks
+    return value
+
+
+def parse_swarm_replan(text: str, *, unfinished: tuple[str, ...]) -> dict[str, Any]:
+    """Parse a threshold-triggered replan: new tasks plus reprioritized pending ids."""
+
+    value = _extract_json(text)
+    _exact_object(value, {"summary", "new_tasks", "priorities"}, "swarm replan")
+    value["summary"] = _required_text(value, "summary", "swarm replan")
+    raw_new = value.get("new_tasks")
+    if not isinstance(raw_new, list) or not raw_new:
+        raise ContractError("swarm replan must add at least one new task")
+    new_tasks: list[dict[str, Any]] = []
+    seen: set[str] = set(unfinished)
+    for item in raw_new:
+        if not isinstance(item, dict):
+            raise ContractError("each swarm replan new task must be an object")
+        single = parse_swarm_backlog(json.dumps({"summary": "x", "tasks": [item]}),
+                                     minimum_tasks=1)
+        task = single["tasks"][0]
+        if task["id"] in seen:
+            raise ContractError(f"swarm replan task id is not unique: {task['id']}")
+        seen.add(task["id"])
+        new_tasks.append(task)
+    value["new_tasks"] = new_tasks
+    raw_priorities = value.get("priorities")
+    if not isinstance(raw_priorities, dict):
+        raise ContractError("swarm replan priorities must be an object of task ids")
+    priorities: dict[str, int] = {}
+    for key, entry in raw_priorities.items():
+        if (
+            not isinstance(entry, int)
+            or isinstance(entry, bool)
+            or not 1 <= entry <= 99
+        ):
+            raise ContractError(f"swarm replan priority for {key} must be 1..99")
+        priorities[str(key)] = entry
+    value["priorities"] = priorities
+    missing = [task_id for task_id in unfinished if task_id not in priorities]
+    if missing:
+        raise ContractError(
+            "swarm replan priorities must cover every unfinished task; missing: "
+            + ", ".join(missing)
+        )
+    return value
+
+
+def parse_swarm_review(text: str) -> dict[str, Any]:
+    """Parse a cheap swarm reviewer verdict for one candidate version."""
+
+    value = _extract_json(text)
+    _exact_object(value, {"verdict", "summary", "blocking"}, "swarm review")
+    verdict = value.get("verdict")
+    if verdict not in {"approve", "fix"}:
+        raise ContractError(f"swarm review verdict must be approve or fix, got: {verdict}")
+    value["verdict"] = str(verdict)
+    value["summary"] = _required_text(value, "summary", "swarm review")
+    blocking: list[dict[str, Any]] = []
+    raw = value.get("blocking") or []
+    if not isinstance(raw, list):
+        raise ContractError("swarm review blocking must be an array")
+    for index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise ContractError(f"swarm blocking finding {index} must be an object")
+        _exact_object(item, {"problem", "detail"}, f"swarm blocking finding {index}")
+        blocking.append(
+            {
+                "problem": _required_text(item, "problem", f"swarm blocking {index}"),
+                "detail": _required_text(item, "detail", f"swarm blocking {index}"),
+            }
+        )
+    if verdict == "fix" and not blocking:
+        raise ContractError("a fix verdict needs at least one blocking finding")
+    if verdict == "approve" and blocking:
+        raise ContractError("an approve verdict must not keep blocking findings")
+    value["blocking"] = blocking
+    return value
+
+
+def parse_swarm_selection(
+    text: str, *, submitted: tuple[str, ...]
+) -> dict[str, Any]:
+    """Parse the strong reviewer's choice of the better cheap candidate."""
+
+    value = _extract_json(text)
+    _exact_object(value, {"winner", "reason", "candidates", "feedback"}, "swarm selection")
+    winner = value.get("winner")
+    if not isinstance(winner, str) or winner not in submitted:
+        raise ContractError(
+            f"swarm selection winner must be one of the submitted versions: {winner!r}"
+        )
+    value["winner"] = winner
+    value["reason"] = _required_text(value, "reason", "swarm selection")
+    value["feedback"] = _string_list(value.get("feedback"), "swarm selection feedback")
+    candidates = value.get("candidates")
+    if not isinstance(candidates, dict):
+        raise ContractError("swarm selection candidates must be an object")
+    for name in sorted(set(candidates) - set(submitted)):
+        del candidates[name]
+    for name in submitted:
+        assessment = candidates.get(name)
+        if not isinstance(assessment, dict):
+            raise ContractError(f"swarm selection is missing assessment for {name}")
+        _exact_object(assessment, {"score", "summary"}, f"swarm selection {name}")
+        score = assessment.get("score")
+        if (
+            not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or not 0 <= score <= 100
+        ):
+            raise ContractError(f"swarm selection score for {name} must be 0..100")
+        assessment["summary"] = _required_text(
+            assessment, "summary", f"swarm selection {name}"
+        )
+    return value
