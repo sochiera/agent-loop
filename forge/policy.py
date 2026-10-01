@@ -1,11 +1,15 @@
 """Jan's model routing policy for Forge runs.
 
-The roster mirrors ~/.hermes/scripts/model_policy.py and is closed: exactly
-four models, each pinned to one harness and one reasoning effort. The legacy
-GPT-5.6 Sol/Terra/Luna, DeepSeek, and MiMo roster is retired and never
-selected. The promotion state is still read for audit display, but it no
-longer changes which models are eligible. Every decision here is deterministic
-for a given RNG, so tests can seed it without touching Jan's home directory.
+The smart roster mirrors ~/.hermes/scripts/model_policy.py and is closed:
+four models, each pinned to one harness and one reasoning effort. Forge adds a
+cheap coder pool of six slots (DeepSeek, MiMo and GLM Flash through OpenCode Go
+plus three slots of native Codex Luna); the tournament coders draw three slots
+from it without replacement. DeepSeek and MiMo are coder-only and never staff a
+planner, reviewer, or any other role. The legacy GPT-5.6 Sol/Terra/Luna roster
+is retired and never selected. The promotion state is still read for audit
+display, but it no longer changes which models are eligible. Every decision
+here is deterministic for a given RNG, so tests can seed it without touching
+Jan's home directory.
 """
 
 from __future__ import annotations
@@ -31,8 +35,17 @@ SOL = ModelSpec("codex", "gpt-6-sol", "medium")
 LUNA = ModelSpec("codex", "gpt-6-luna", "xhigh")
 OPUS = ModelSpec("claude", "claude-opus-5-5", "medium")
 GLM = ModelSpec("opencode", "opencode-go/glm-5.3-flash", "xhigh")
+DEEPSEEK = ModelSpec("opencode", "opencode-go/deepseek-v4.1-flash", "xhigh")
+MIMO = ModelSpec("opencode", "opencode-go/mimo-v2.6-flash", "xhigh")
 
-ALLOWED_MODELS: tuple[ModelSpec, ...] = (SOL, LUNA, OPUS, GLM)
+ALLOWED_MODELS: tuple[ModelSpec, ...] = (SOL, LUNA, OPUS, GLM, DEEPSEEK, MIMO)
+
+# Forge-only cheap models: allowed for the tournament coders, nowhere else.
+CODER_ONLY_MODELS: tuple[ModelSpec, ...] = (DEEPSEEK, MIMO)
+
+# The cheap coder pool is a list of slots; Luna's large limits earn it three.
+# Each sprint draws len(CODER_ROLES) slots without replacement.
+CHEAP_CODER_POOL: tuple[ModelSpec, ...] = (DEEPSEEK, MIMO, GLM, LUNA, LUNA, LUNA)
 
 # Exact identifiers used by the central Hermes policy.
 POLICY_IDS = {
@@ -40,16 +53,20 @@ POLICY_IDS = {
     model_identity(LUNA): "openai-codex/gpt-6-luna",
     model_identity(OPUS): "claude-code/claude-opus-5-5",
     model_identity(GLM): "opencode-go/glm-5.3-flash",
+    model_identity(DEEPSEEK): "opencode-go/deepseek-v4.1-flash",
+    model_identity(MIMO): "opencode-go/mimo-v2.6-flash",
 }
 
 # Weighted pools, copied from the central policy's role weights.
 STRONG_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((SOL, 50), (GLM, 50))
 REVIEW_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((SOL, 50), (GLM, 50))
-CODER_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((OPUS, 25), (LUNA, 50), (GLM, 25))
 TEST_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((OPUS, 20), (LUNA, 55), (GLM, 25))
 
 _PINNED_EFFORTS = {model_identity(spec): spec.effort for spec in ALLOWED_MODELS}
 _WORKER_ROLES = frozenset({*CODER_ROLES, "test_author", "tester"})
+_CODER_ONLY = frozenset(model_identity(spec) for spec in CODER_ONLY_MODELS)
+# Roles that may run a coder-only model; "probe" is the preflight health check.
+_CODER_ONLY_ROLES = frozenset({*CODER_ROLES, "probe"})
 
 
 def _weighted_pick(
@@ -87,11 +104,18 @@ class PromotionSnapshot:
     def allowed_models(self) -> tuple[ModelSpec, ...]:
         return ALLOWED_MODELS
 
-    def allows(self, spec: ModelSpec) -> bool:
-        """Allow only a roster model at its pinned effort (empty means pinned)."""
+    def allows(self, spec: ModelSpec, role: str | None = None) -> bool:
+        """Allow only a roster model at its pinned effort (empty means pinned).
 
-        pinned = _PINNED_EFFORTS.get(model_identity(spec))
-        return pinned is not None and spec.effort in {"", pinned}
+        With a role, coder-only models are refused outside the coder roles;
+        ``None`` checks catalog membership alone.
+        """
+
+        identity = model_identity(spec)
+        pinned = _PINNED_EFFORTS.get(identity)
+        if pinned is None or spec.effort not in {"", pinned}:
+            return False
+        return role is None or identity not in _CODER_ONLY or role in _CODER_ONLY_ROLES
 
     def identity_allowed(self, identity: str) -> bool:
         return identity in _PINNED_EFFORTS
@@ -106,8 +130,16 @@ class PromotionSnapshot:
 
     # Weighted pools --------------------------------------------------
 
+    def coder_pool(self) -> tuple[ModelSpec, ...]:
+        return CHEAP_CODER_POOL
+
     def coder_options(self) -> list[tuple[ModelSpec, int]]:
-        return list(CODER_WEIGHTS)
+        """The cheap pool as weighted options: one weight per slot."""
+
+        weights: dict[ModelSpec, int] = {}
+        for spec in CHEAP_CODER_POOL:
+            weights[spec] = weights.get(spec, 0) + 1
+        return list(weights.items())
 
     def test_options(self) -> list[tuple[ModelSpec, int]]:
         return list(TEST_WEIGHTS)
@@ -133,21 +165,7 @@ class PromotionSnapshot:
         return _weighted_pick(self.role_options(role), rng)
 
     def select_coder_roster(self, rng: Any) -> dict[str, ModelSpec]:
-        options = self.coder_options()
-        needed = len(CODER_ROLES)
-        chosen: list[ModelSpec] = []
-        pool = list(options)
-        while pool and len(chosen) < needed:
-            pick = _weighted_pick(pool, rng)
-            chosen.append(pick)
-            pool = [
-                (spec, weight)
-                for spec, weight in pool
-                if model_identity(spec) != model_identity(pick)
-            ]
-        while len(chosen) < needed:
-            chosen.append(_weighted_pick(options, rng))
-        rng.shuffle(chosen)
+        chosen = rng.sample(list(CHEAP_CODER_POOL), len(CODER_ROLES))
         return dict(zip(CODER_ROLES, chosen))
 
     def select_new_run_models(
@@ -214,6 +232,8 @@ class PromotionSnapshot:
             "policy_ids": [
                 POLICY_IDS[model_identity(spec)] for spec in self.allowed_models()
             ],
+            "coder_only_models": [spec.display() for spec in CODER_ONLY_MODELS],
+            "coder_pool": [spec.display() for spec in self.coder_pool()],
         }
 
 
@@ -263,5 +283,7 @@ def snapshot_from_dict(data: Mapping[str, Any]) -> PromotionSnapshot:
     )
 
 
-def policy_allows(spec: ModelSpec, snapshot: PromotionSnapshot) -> bool:
-    return snapshot.allows(spec)
+def policy_allows(
+    spec: ModelSpec, snapshot: PromotionSnapshot, role: str | None = None
+) -> bool:
+    return snapshot.allows(spec, role)

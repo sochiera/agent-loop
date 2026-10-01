@@ -451,7 +451,7 @@ class ForgeOrchestrator:
             role
             for role in ROLE_NAMES
             if role in self.config.models
-            and not policy_allows(self.config.models[role], self.policy)
+            and not policy_allows(self.config.models[role], self.policy, role)
         ]
         if off_policy:
             raise RuntimeError(
@@ -477,7 +477,7 @@ class ForgeOrchestrator:
             role
             for role in ROLE_NAMES
             if role in self.config.models
-            and not policy_allows(self.config.models[role], self.policy)
+            and not policy_allows(self.config.models[role], self.policy, role)
         ]
         if not off_policy:
             return {}
@@ -763,30 +763,34 @@ class ForgeOrchestrator:
         raise RuntimeError("Product Owner failed its backlog contract three times")
 
     def _shuffle_coder_pool(self) -> None:
-        """Redraw the three coder models from the weighted policy pool each sprint."""
+        """Redraw the three coder models from the run's slot pool each sprint."""
 
         if not self.config.shuffle_coders:
             return
         self._refresh_policy()
-        pool: list[ModelSpec] = []
-        seen: set[str] = set()
-        for role in CODER_ROLES:
-            raw = self.state.original_models.get(role)
-            if raw:
-                spec = ModelSpec(**raw)
-                if model_identity(spec) not in seen:
-                    pool.append(spec)
-                    seen.add(model_identity(spec))
+        disabled = set(self.state.disabled_models)
+        pool = [
+            spec
+            for spec in self.config.coder_pool
+            if model_identity(spec) not in disabled
+            and policy_allows(spec, self.policy, CODER_ROLES[0])
+        ]
+        if not pool and not self.config.coder_pool:
+            # Runs from before the slot pool reshuffle their original coders.
+            seen: set[str] = set()
+            for role in CODER_ROLES:
+                raw = self.state.original_models.get(role)
+                if raw:
+                    spec = ModelSpec(**raw)
+                    if model_identity(spec) not in seen:
+                        pool.append(spec)
+                        seen.add(model_identity(spec))
         if not pool:
-            pool = [spec for spec, _ in self.policy.coder_options()]
-        weights = {
-            model_identity(spec): weight for spec, weight in self.policy.coder_options()
-        }
+            pool = list(self.policy.coder_pool())
         self.config.models = assign_coder_models(
             self.config.models,
             pool,
             rng=random.Random(f"{self.run_id}:{self.state.sprint_number}"),
-            weights=weights,
         )
         self._persist_models()
         draw = ", ".join(
@@ -2328,7 +2332,7 @@ class ForgeOrchestrator:
             identity = model_identity(spec)
             if identity == current_identity or identity in disabled or identity in seen:
                 continue
-            if not policy_allows(spec, self.policy):
+            if not policy_allows(spec, self.policy, role):
                 continue
             seen.add(identity)
             healthy.append(spec)
@@ -2347,8 +2351,17 @@ class ForgeOrchestrator:
                 self.state.disabled_models.append(identity)
             for role in ROLE_NAMES:
                 spec = self.config.models[role]
-                if model_identity(spec) == identity:
-                    self.config.models[role] = self.policy.pin(replacement)
+                if model_identity(spec) != identity:
+                    continue
+                # A coder-only replacement cannot staff the other roles sharing
+                # the exhausted model; those get their own role-safe pick.
+                substitute = (
+                    replacement
+                    if policy_allows(replacement, self.policy, role)
+                    else self._replacement_for(role, spec)
+                )
+                if substitute is not None:
+                    self.config.models[role] = self.policy.pin(substitute)
             self._persist_models()
 
     def _invoke(

@@ -19,7 +19,7 @@ from forge.orchestrator import (
     _product_owner_retry_prompt,
     _snapshot_escape,
 )
-from forge.policy import load_policy
+from forge.policy import CHEAP_CODER_POOL, DEEPSEEK, GLM, LUNA, MIMO, load_policy
 from forge.sprint import CODER_CANDIDATES, SPRINT_SCHEDULE
 
 
@@ -407,6 +407,76 @@ def test_shuffle_coders_redraws_the_pool_at_each_sprint(tmp_path: Path):
     )
     assert drawn == sorted(pool)
     assert any("shuffled coder pool" in item for item in state.warnings)
+
+
+def test_shuffle_coders_redraws_three_slots_from_the_cheap_pool(tmp_path: Path):
+    runner = SprintRunner(stop_after=1)
+    orchestrator = make_orchestrator(
+        tmp_path, runner, coder_pool=list(CHEAP_CODER_POOL)
+    )
+
+    state = orchestrator.run()
+
+    assert state.status == "cancelled"
+    drawn = [orchestrator.config.models[f"coder_{name}"] for name in CODER_CANDIDATES]
+    for spec in set(drawn):
+        assert drawn.count(spec) <= CHEAP_CODER_POOL.count(spec)
+    assert any("shuffled coder pool" in item for item in state.warnings)
+    for role in ("brain", "planner", "reviewer", "tester", "test_author"):
+        assert orchestrator.config.models[role] not in (DEEPSEEK, MIMO)
+
+
+def test_shuffle_coders_covers_the_pool_and_skips_disabled_models(tmp_path: Path):
+    orchestrator = make_orchestrator(
+        tmp_path, SprintRunner(stop_after=0), coder_pool=list(CHEAP_CODER_POOL)
+    )
+    seen = set()
+    luna_counts = set()
+    for sprint in range(1, 40):
+        orchestrator.state.sprint_number = sprint
+        orchestrator._shuffle_coder_pool()
+        drawn = [orchestrator.config.models[f"coder_{name}"] for name in CODER_CANDIDATES]
+        seen.update(drawn)
+        luna_counts.add(drawn.count(LUNA))
+    assert seen == {DEEPSEEK, MIMO, GLM, LUNA}
+    assert max(luna_counts) >= 2
+
+    orchestrator.state.disabled_models = [model_identity(LUNA)]
+    for sprint in range(40, 60):
+        orchestrator.state.sprint_number = sprint
+        orchestrator._shuffle_coder_pool()
+        drawn = {orchestrator.config.models[f"coder_{name}"] for name in CODER_CANDIDATES}
+        assert drawn == {DEEPSEEK, MIMO, GLM}
+
+
+def test_coder_only_replacement_never_staffs_a_shared_role(tmp_path: Path):
+    orchestrator = make_orchestrator(tmp_path, SprintRunner(stop_after=0))
+    for role in ("coder_tdd", "tester", "reviewer"):
+        orchestrator.config.models[role] = GLM
+
+    orchestrator._apply_replacement(GLM, DEEPSEEK)
+
+    assert orchestrator.config.models["coder_tdd"] == DEEPSEEK
+    for role in ("tester", "reviewer"):
+        replaced = orchestrator.config.models[role]
+        assert replaced not in (GLM, DEEPSEEK, MIMO)
+        assert orchestrator.policy.allows(replaced, role)
+
+
+def test_coder_only_model_on_a_staff_role_needs_migration(tmp_path: Path):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text('{"promotion_state": "active"}', encoding="utf-8")
+    orchestrator = policy_run_orchestrator(
+        tmp_path, policy_run_config(tmp_path, policy_file)
+    )
+    persist_retired_model(orchestrator, "reviewer", "opencode:mimo-v2.6-flash:xhigh")
+
+    with pytest.raises(RuntimeError, match="off-policy"):
+        orchestrator._acquire_execution(recover=True, reload_state=True)
+
+    changed = orchestrator.migrate_models()
+    assert list(changed) == ["reviewer"]
+    assert orchestrator.config.models["reviewer"] not in (DEEPSEEK, MIMO)
 
 
 def test_reviewer_switches_to_an_independent_family_after_an_openai_winner(tmp_path: Path):
