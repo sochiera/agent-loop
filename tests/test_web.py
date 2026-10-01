@@ -140,22 +140,30 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert summary["brief_text"] == "# Build it\n"
         catalog = json.loads(urllib.request.urlopen(base + "/api/catalog", timeout=2).read())
         by_key = {item["key"]: item for item in catalog["models"]}
-        assert "gpt-5.6-sol" in by_key
-        assert by_key["deepseek-v4-flash-0731"]["family"] == "deepseek"
-        assert by_key["deepseek-v4-pro-0813"]["family"] == "deepseek"
-        assert by_key["or-deepseek-v4-flash-0731"]["ids"]["opencode"] == (
-            "openrouter/deepseek/deepseek-v4-flash-0731"
+        assert set(by_key) == {
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "glm-5.3-flash",
+            "deepseek-v4.1-flash",
+            "mimo-v2.6-flash",
+        }
+        assert by_key["gpt-5.6-sol"]["providers"] == ["codex"]
+        assert by_key["gpt-5.6-luna"]["providers"] == ["codex"]
+        assert by_key["glm-5.3-flash"]["family"] == "glm"
+        assert by_key["glm-5.3-flash"]["ids"]["opencode"] == "opencode-go/glm-5.3-flash"
+        assert by_key["deepseek-v4.1-flash"]["ids"]["opencode"] == (
+            "opencode-go/deepseek-v4.1-flash"
         )
-        assert "or-deepseek-v3.2" not in by_key
-        assert by_key["or-gemini-3.7-flash"]["ids"]["opencode"] == (
-            "openrouter/google/gemini-3.7-flash"
-        )
-        assert by_key["glm-5.3"]["family"] == "glm"
-        assert by_key["glm-5.3"]["ids"]["opencode"] == "zai-coding-plan/glm-5.3"
+        assert by_key["mimo-v2.6-flash"]["family"] == "mimo"
+        assert "grok-4.6" not in by_key
+        assert "kimi-k3" not in by_key
         assert catalog["defaults"]["coder_tdd"] == "codex:gpt-5.6-luna:high"
         assert catalog["defaults"]["coder_explore"] == "codex:gpt-5.6-luna:high"
         assert catalog["defaults"]["coder_classic"] == "codex:gpt-5.6-luna:high"
-        assert catalog["defaults"]["test_author"] == "opencode:deepseek-v4-flash-0731:high"
+        assert catalog["defaults"]["test_author"] == "codex:gpt-5.6-luna:high"
+        assert catalog["defaults"]["reviewer"] == "codex:gpt-5.6-terra:high"
+        assert catalog["policy"]["promotion_state"] == "unknown"
         assert "model-effort" in html
         assert 'class="model-effort" required' not in html
         assert "Coder draw" in urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
@@ -253,12 +261,12 @@ def test_post_runs_draws_the_coder_pool(tmp_path, monkeypatch):
         "models": {
             role: "codex:gpt-5.6-sol:high" for role in STAFF_ROLES
         },
-        "coder_models": ["opencode:grok-4.6"],
+        "coder_models": ["opencode:glm-5.3-flash"],
     }
     created = registry.start(payload)
     models = created["config"]["models"]
     for role in CODER_ROLES:
-        assert models[role]["model"] == "xai/grok-4.6"
+        assert models[role]["model"] == "opencode-go/glm-5.3-flash"
     assert models["brain"]["model"] == "gpt-5.6-sol"
     listed = registry.list()
     assert listed[0]["run_id"] == "pool-run"
@@ -280,7 +288,9 @@ def test_post_runs_draws_the_coder_pool(tmp_path, monkeypatch):
             method="POST",
         )
         posted = json.loads(urllib.request.urlopen(request, timeout=2).read())
-        assert posted["config"]["models"]["coder_tdd"]["model"] == "xai/grok-4.6"
+        assert posted["config"]["models"]["coder_tdd"]["model"] == (
+            "opencode-go/glm-5.3-flash"
+        )
         bad = urllib.request.Request(
             base + "/api/runs",
             data=json.dumps(
@@ -423,13 +433,13 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
             "models": {
                 role: "codex:gpt-5.6-sol:high" for role in STAFF_ROLES
             },
-            "coder_models": ["opencode:grok-4.6"],
+            "coder_models": ["opencode:glm-5.3-flash"],
         }
     )
     (tmp_path / "ui-preferences.json").unlink()
     fallback = registry.load_preferences()
     assert fallback["models"]["brain"] == "codex:gpt-5.6-sol:high"
-    assert fallback["coder_models"] == ["opencode:xai/grok-4.6"] * 3
+    assert fallback["coder_models"] == ["opencode:opencode-go/glm-5.3-flash"] * 3
 
 
 def test_concurrent_recover_live_launches_exactly_one_thread(tmp_path):

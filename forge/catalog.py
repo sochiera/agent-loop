@@ -1,9 +1,15 @@
-"""Closed catalog of models Forge may run."""
+"""Closed catalog of models Forge may run.
+
+Only the exact identities in :data:`CATALOG` are active. Everything else is
+retained solely so old run state, old UI preferences, and old CLI selectors can
+still be *parsed*; off-policy identities are rejected for a new run and are
+never selected as a fallback.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 PROVIDERS = ("codex", "opencode")
 
@@ -21,7 +27,56 @@ class CatalogEntry:
         return self.ids[provider]
 
 
+# The active Forge catalog. Luna is native Codex only; every OpenCode Go model
+# uses its exact ``opencode-go/...`` identifier.
 CATALOG: tuple[CatalogEntry, ...] = (
+    CatalogEntry(
+        key="gpt-5.6-sol",
+        label="GPT-5.6 Sol",
+        family="gpt",
+        providers=("codex",),
+        ids={"codex": "gpt-5.6-sol"},
+    ),
+    CatalogEntry(
+        key="gpt-5.6-terra",
+        label="GPT-5.6 Terra",
+        family="gpt",
+        providers=("codex",),
+        ids={"codex": "gpt-5.6-terra"},
+    ),
+    CatalogEntry(
+        key="gpt-5.6-luna",
+        label="GPT-5.6 Luna",
+        family="gpt",
+        providers=("codex",),
+        ids={"codex": "gpt-5.6-luna"},
+    ),
+    CatalogEntry(
+        key="glm-5.3-flash",
+        label="GLM 5.3 Flash",
+        family="glm",
+        providers=("opencode",),
+        ids={"opencode": "opencode-go/glm-5.3-flash"},
+    ),
+    CatalogEntry(
+        key="deepseek-v4.1-flash",
+        label="DeepSeek V4.1 Flash",
+        family="deepseek",
+        providers=("opencode",),
+        ids={"opencode": "opencode-go/deepseek-v4.1-flash"},
+    ),
+    CatalogEntry(
+        key="mimo-v2.6-flash",
+        label="MiMo V2.6 Flash",
+        family="mimo",
+        providers=("opencode",),
+        ids={"opencode": "opencode-go/mimo-v2.6-flash"},
+    ),
+)
+
+# Parse-only history. These identities load old artifacts and preferences but
+# are never part of the active catalog and never become a fallback.
+LEGACY_CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="gpt-5.6-sol",
         label="GPT-5.6 Sol",
@@ -136,10 +191,12 @@ CATALOG: tuple[CatalogEntry, ...] = (
     ),
 )
 
+# Representative, fail-closed defaults. Real new runs draw their roster from
+# ``forge.policy``; these keep CLI/UI selectors valid when no policy is present.
 DEFAULTS = {
     "brain": "codex:gpt-5.6-sol:high",
     "planner": "codex:gpt-5.6-sol:high",
-    "test_author": "opencode:deepseek-v4-flash-0731:high",
+    "test_author": "codex:gpt-5.6-luna:high",
     "coder_tdd": "codex:gpt-5.6-luna:high",
     "coder_explore": "codex:gpt-5.6-luna:high",
     "coder_classic": "codex:gpt-5.6-luna:high",
@@ -160,19 +217,50 @@ ROLE_TIMEOUTS = {
 }
 
 
-def find_entry(provider: str, model: str) -> CatalogEntry | None:
+def _match(
+    entries: Sequence[CatalogEntry], provider: str, model: str
+) -> CatalogEntry | None:
     needle = model.strip()
     if not needle:
         return None
-    for entry in CATALOG:
+    for entry in entries:
         if needle in {entry.key, *entry.ids.values()}:
-            if provider in entry.providers:
-                return entry
-            return None
+            return entry if provider in entry.providers else None
     return None
 
 
+def find_active_entry(provider: str, model: str) -> CatalogEntry | None:
+    return _match(CATALOG, provider, model)
+
+
+def find_legacy_entry(provider: str, model: str) -> CatalogEntry | None:
+    return _match(LEGACY_CATALOG, provider, model)
+
+
+def find_entry(provider: str, model: str) -> CatalogEntry | None:
+    return find_active_entry(provider, model) or find_legacy_entry(provider, model)
+
+
 def resolve_identity(provider: str, model: str) -> tuple[str, str]:
+    """Resolve an *active* identity, rejecting legacy/off-policy selectors."""
+
+    if provider not in PROVIDERS:
+        raise ValueError(
+            "model must use provider:model[:effort], where provider is codex or opencode"
+        )
+    entry = find_active_entry(provider, model)
+    if entry is None:
+        raise ValueError(
+            f"unsupported model {provider}:{model or '(empty)'}; "
+            "choose an active policy model "
+            "(Codex GPT-5.6 Sol/Terra/Luna or OpenCode Go GLM/DeepSeek/MiMo Flash)"
+        )
+    return provider, entry.id_for(provider)
+
+
+def parse_identity(provider: str, model: str) -> tuple[str, str]:
+    """Resolve an active or legacy identity so old state can still be read."""
+
     if provider not in PROVIDERS:
         raise ValueError(
             "model must use provider:model[:effort], where provider is codex or opencode"
@@ -181,7 +269,7 @@ def resolve_identity(provider: str, model: str) -> tuple[str, str]:
     if entry is None:
         raise ValueError(
             f"unsupported model {provider}:{model or '(empty)'}; "
-            "choose a catalog model (GPT family, Grok 4.6, Qwen, DeepSeek, Gemini, Kimi, GLM)"
+            "choose a catalog model"
         )
     return provider, entry.id_for(provider)
 
@@ -205,27 +293,67 @@ def spec_with_effort(spec: Any, effort: str = "") -> Any:
     return ModelSpec(spec.provider, spec.model, effort or spec.effort)
 
 
+def _weighted_sample_without_replacement(
+    options: Sequence[tuple[Any, int]], needed: int, picker: Any
+) -> list[Any]:
+    pool = [(spec, max(1, int(weight))) for spec, weight in options]
+    chosen: list[Any] = []
+    while pool and len(chosen) < needed:
+        specs = [spec for spec, _ in pool]
+        weights = [weight for _, weight in pool]
+        pick = picker.choices(specs, weights=weights, k=1)[0]
+        chosen.append(pick)
+        pool = [
+            (spec, weight)
+            for spec, weight in pool
+            if model_identity(spec) != model_identity(pick)
+        ]
+    return chosen
+
+
 def assign_coder_models(
     models: dict[str, Any],
     pool: list[Any] | None = None,
     *,
     rng: Any = None,
+    weights: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
+    """Draw the three coder roles from a pool, weighted and family-diverse.
+
+    The pool is de-duplicated by identity so distinct families are preferred;
+    when it is too small the remaining roles reuse the available models.
+    """
+
     import random
 
     from .models import CODER_ROLES
 
     source = list(pool) if pool is not None else [models[role] for role in CODER_ROLES]
-    if not source:
+    unique: list[Any] = []
+    seen: set[str] = set()
+    for spec in source:
+        identity = model_identity(spec)
+        if identity not in seen:
+            unique.append(spec)
+            seen.add(identity)
+    if not unique:
         raise ValueError("at least one coder model is required")
     picker = rng or random.Random()
+    weight_map = weights or {}
+    options = [
+        (spec, int(weight_map.get(model_identity(spec), 1))) for spec in unique
+    ]
     needed = len(CODER_ROLES)
-    if len(source) >= needed:
-        chosen = picker.sample(source, needed)
+    if len(options) >= needed:
+        chosen = _weighted_sample_without_replacement(options, needed, picker)
     else:
-        chosen = list(source)
+        chosen = list(unique)
         while len(chosen) < needed:
-            chosen.append(picker.choice(source))
+            chosen.append(picker.choices(
+                [spec for spec, _ in options],
+                weights=[weight for _, weight in options],
+                k=1,
+            )[0])
         picker.shuffle(chosen)
     updated = dict(models)
     for role, spec in zip(CODER_ROLES, chosen):
@@ -234,13 +362,13 @@ def assign_coder_models(
 
 
 def shuffle_coder_models(
-    models: dict[str, Any], *, rng: Any = None
+    models: dict[str, Any], *, rng: Any = None, weights: Mapping[str, int] | None = None
 ) -> dict[str, Any]:
-    return assign_coder_models(models, rng=rng)
+    return assign_coder_models(models, rng=rng, weights=weights)
 
 
-def catalog_payload() -> dict[str, Any]:
-    return {
+def catalog_payload(policy_snapshot: Any = None) -> dict[str, Any]:
+    payload = {
         "providers": list(PROVIDERS),
         "defaults": dict(DEFAULTS),
         "models": [
@@ -255,3 +383,7 @@ def catalog_payload() -> dict[str, Any]:
             for entry in CATALOG
         ],
     }
+    if policy_snapshot is not None:
+        payload["policy"] = policy_snapshot.to_dict()
+        payload["defaults"] = policy_snapshot.representative_defaults()
+    return payload

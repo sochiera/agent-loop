@@ -9,7 +9,7 @@ const roleMeta = {
 const defaults = {
   brain: "codex:gpt-5.6-sol:high",
   planner: "codex:gpt-5.6-sol:high",
-  test_author: "opencode:deepseek-v4-flash-0731:high",
+  test_author: "codex:gpt-5.6-luna:high",
   reviewer: "codex:gpt-5.6-terra:high",
   tester: "codex:gpt-5.6-terra:high",
 };
@@ -20,27 +20,17 @@ const phases = ["preflight", "product-owner", "planning", "test-authoring", "cod
 const phaseLabels = ["Preflight", "Product owner", "Plan", "Tests (RED)", "Code ×3", "Select", "Review", "Test", "Deliver", "Finalize"];
 const storageKey = "forge-control-room-v5";
 const providerLabels = {codex: "Codex", opencode: "OpenCode"};
-const familyLabels = {gpt: "GPT", grok: "Grok", qwen: "Qwen", deepseek: "DeepSeek", gemini: "Gemini", kimi: "Kimi", glm: "GLM"};
+const familyLabels = {gpt: "GPT", glm: "GLM", deepseek: "DeepSeek", mimo: "MiMo"};
 const effortLabels = {"": "Default", low: "Low", medium: "Medium", high: "High"};
 const fallbackCatalog = {
   providers: ["codex", "opencode"],
   models: [
-    {key: "gpt-5.6-sol", label: "GPT-5.6 Sol", family: "gpt", providers: ["codex", "opencode"], ids: {codex: "gpt-5.6-sol", opencode: "openai/gpt-5.6-sol"}, efforts: ["", "low", "medium", "high"]},
-    {key: "gpt-5.6-terra", label: "GPT-5.6 Terra", family: "gpt", providers: ["codex", "opencode"], ids: {codex: "gpt-5.6-terra", opencode: "openai/gpt-5.6-terra"}, efforts: ["", "low", "medium", "high"]},
-    {key: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "gpt", providers: ["codex", "opencode"], ids: {codex: "gpt-5.6-luna", opencode: "openai/gpt-5.6-luna"}, efforts: ["", "low", "medium", "high"]},
-    {key: "gpt-5.5", label: "GPT-5.5", family: "gpt", providers: ["opencode"], ids: {opencode: "openai/gpt-5.5"}, efforts: ["", "low", "medium", "high"]},
-    {key: "gpt-5.4", label: "GPT-5.4", family: "gpt", providers: ["opencode"], ids: {opencode: "openai/gpt-5.4"}, efforts: ["", "low", "medium", "high"]},
-    {key: "grok-4.6", label: "Grok 4.6", family: "grok", providers: ["opencode"], ids: {opencode: "xai/grok-4.6"}, efforts: ["", "low", "medium", "high"]},
-    {key: "qwen-3.8-max", label: "Qwen 3.8 Max", family: "qwen", providers: ["opencode"], ids: {opencode: "alibaba-token-plan/qwen3.8-max"}, efforts: ["", "low", "medium", "high"]},
-    {key: "deepseek-v4-flash-0731", label: "DeepSeek Flash 0731", family: "deepseek", providers: ["opencode"], ids: {opencode: "alibaba-token-plan/deepseek-v4-flash-0731"}, efforts: ["", "low", "medium", "high"]},
-    {key: "deepseek-v4-pro-0813", label: "DeepSeek Pro 0813", family: "deepseek", providers: ["opencode"], ids: {opencode: "alibaba-token-plan/deepseek-v4-pro-0813"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-gemini-3.7-flash", label: "Gemini 3.7 Flash OR", family: "gemini", providers: ["opencode"], ids: {opencode: "openrouter/google/gemini-3.7-flash"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-gpt-5.6-luna", label: "GPT-5.6 Luna OR", family: "gpt", providers: ["opencode"], ids: {opencode: "openrouter/openai/gpt-5.6-luna"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-deepseek-v4-flash-0731", label: "DeepSeek Flash 0731 OR", family: "deepseek", providers: ["opencode"], ids: {opencode: "openrouter/deepseek/deepseek-v4-flash-0731"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-deepseek-v4-pro", label: "DeepSeek V4 Pro OR", family: "deepseek", providers: ["opencode"], ids: {opencode: "openrouter/deepseek/deepseek-v4-pro"}, efforts: ["", "low", "medium", "high"]},
-    {key: "or-deepseek-v4-pro-0813", label: "DeepSeek V4 Pro 0813 OR", family: "deepseek", providers: ["opencode"], ids: {opencode: "openrouter/deepseek/deepseek-v4-pro-0813"}, efforts: ["", "low", "medium", "high"]},
-    {key: "kimi-k3", label: "Kimi K3", family: "kimi", providers: ["opencode"], ids: {opencode: "kimi-for-coding/k3"}, efforts: ["", "low", "medium", "high"]},
-    {key: "glm-5.3", label: "GLM 5.3", family: "glm", providers: ["opencode"], ids: {opencode: "zai-coding-plan/glm-5.3"}, efforts: ["", "low", "medium", "high"]},
+    {key: "gpt-5.6-sol", label: "GPT-5.6 Sol", family: "gpt", providers: ["codex"], ids: {codex: "gpt-5.6-sol"}, efforts: ["", "low", "medium", "high"]},
+    {key: "gpt-5.6-terra", label: "GPT-5.6 Terra", family: "gpt", providers: ["codex"], ids: {codex: "gpt-5.6-terra"}, efforts: ["", "low", "medium", "high"]},
+    {key: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "gpt", providers: ["codex"], ids: {codex: "gpt-5.6-luna"}, efforts: ["", "low", "medium", "high"]},
+    {key: "glm-5.3-flash", label: "GLM 5.3 Flash", family: "glm", providers: ["opencode"], ids: {opencode: "opencode-go/glm-5.3-flash"}, efforts: ["", "low", "medium", "high"]},
+    {key: "deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash", family: "deepseek", providers: ["opencode"], ids: {opencode: "opencode-go/deepseek-v4.1-flash"}, efforts: ["", "low", "medium", "high"]},
+    {key: "mimo-v2.6-flash", label: "MiMo V2.6 Flash", family: "mimo", providers: ["opencode"], ids: {opencode: "opencode-go/mimo-v2.6-flash"}, efforts: ["", "low", "medium", "high"]},
   ],
 };
 let catalog = fallbackCatalog;
@@ -263,7 +253,7 @@ function applySharedFromModels(models, backup) {
   const backupCard = document.querySelector("#staff-backup .model-card");
   const hasBackup = Boolean(backup);
   document.querySelector("#enable-backup").checked = hasBackup;
-  if (backupCard) applySelector(backupCard, backup || "opencode:grok-4.6");
+  if (backupCard) applySelector(backupCard, backup || "opencode:opencode-go/glm-5.3-flash");
 }
 
 function buildModelFields() {
@@ -302,7 +292,7 @@ function buildModelFields() {
   backupCard.dataset.role = "backup";
   backupFragment.querySelector(".model-label").textContent = "Backup";
   backupFragment.querySelector(".model-help").textContent = "Different provider or model for usage-limit failover";
-  applySelector(backupCard, "opencode:grok-4.6");
+  applySelector(backupCard, "opencode:opencode-go/glm-5.3-flash");
   backupBox.appendChild(backupFragment);
   replaceCoderPool(defaultCoderPool);
   syncStaffMode();

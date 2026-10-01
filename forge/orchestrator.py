@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import queue
+import random
 import shlex
 import shutil
 import subprocess
@@ -55,6 +56,7 @@ from .display import optional_virtual_display
 from .gitops import CandidateWorktree, GitError, GitWorkspace, export_revision
 from .locking import RepositoryExecutionLock
 from .models import CODER_ROLES, AgentResult, ModelSpec, ROLE_NAMES, RunConfig, RunState
+from .policy import load_policy, policy_allows
 from .prompts import (
     candidate_selection_prompt,
     implementation_prompt,
@@ -154,10 +156,11 @@ class ForgeOrchestrator:
         if not resume:
             config.validate()
         self.config = config
+        self.policy = load_policy(config.policy_path or None)
         self.repo = Path(config.repo).expanduser().resolve()
         self.brief_path = Path(config.brief).expanduser().resolve()
         self.run_id = run_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
-        self.runner = runner or AgentRunner()
+        self.runner = runner or AgentRunner(policy_path=config.policy_path or None)
         self.store = ArtifactStore(self.repo, self.run_id)
         self.on_event = on_event
         default_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
@@ -173,6 +176,9 @@ class ForgeOrchestrator:
             self.config.repo = str(self.repo)
             self.state.config = self.config.to_dict()
             self.brief_path = Path(self.config.brief).expanduser().resolve()
+            # The persisted snapshot is audit evidence only; execution is always
+            # authorized by the freshly loaded central policy.
+            self.policy = load_policy(self.config.policy_path or None)
         else:
             self.state = RunState(
                 run_id=self.run_id,
@@ -181,6 +187,7 @@ class ForgeOrchestrator:
                 created_at=now,
                 updated_at=now,
                 config=config.to_dict(),
+                policy_snapshot=self.policy.to_dict(),
                 original_models={
                     role: {
                         "provider": spec.provider,
@@ -428,6 +435,11 @@ class ForgeOrchestrator:
         )
         return self._recover_execution(execution_lock, generation)
 
+    def _refresh_policy(self) -> None:
+        """Reload the current central policy; persisted snapshots never authorize."""
+
+        self.policy = load_policy(self.config.policy_path or None)
+
     def _validate_recoverable_state(self) -> None:
         if self.state.schema_version != SCHEMA_VERSION:
             raise RuntimeError("legacy Forge runs cannot be recovered by the sprint orchestrator")
@@ -435,11 +447,77 @@ class ForgeOrchestrator:
             raise RuntimeError(
                 f"run {self.run_id} is {self.state.status}; it is not recoverable"
             )
+        self._refresh_policy()
+        off_policy = [
+            role
+            for role in ROLE_NAMES
+            if role in self.config.models
+            and not policy_allows(self.config.models[role], self.policy)
+        ]
+        if off_policy:
+            raise RuntimeError(
+                f"run {self.run_id} still uses off-policy models for "
+                f"{', '.join(off_policy)}; explicitly migrate it to the active "
+                "model policy before recovery (forge resume --migrate-models)"
+            )
         if self.state.status == "stalled" and not self.state.stalled_recoverable:
             raise RuntimeError(
                 "this run stalled at a deterministic safety limit; start a new run "
                 "or change its durable product input instead of retrying the same phase"
             )
+
+    def migrate_models(self) -> dict[str, str]:
+        """Explicitly replace off-policy models with policy-selected ones.
+
+        Returns a mapping of the roles that changed. A run that is already
+        on-policy is returned unchanged, so this is safe to call defensively.
+        """
+
+        self._refresh_policy()
+        off_policy = [
+            role
+            for role in ROLE_NAMES
+            if role in self.config.models
+            and not policy_allows(self.config.models[role], self.policy)
+        ]
+        if not off_policy:
+            return {}
+        coder_off = [role for role in off_policy if role in CODER_ROLES]
+        replacements: dict[str, ModelSpec] = {}
+        if coder_off:
+            roster = self.policy.select_coder_roster(
+                random.Random(f"{self.run_id}:migrate-coders")
+            )
+            for role in coder_off:
+                replacements[role] = roster[role]
+        for role in off_policy:
+            if role in coder_off:
+                continue
+            replacements[role] = self.policy.select_role(
+                role, random.Random(f"{self.run_id}:migrate:{role}")
+            )
+        changed: dict[str, str] = {}
+        with self._state_lock:
+            for role, spec in replacements.items():
+                previous = self.config.models[role]
+                self.config.models[role] = spec
+                changed[role] = f"{previous.display()} -> {spec.display()}"
+            self.state.original_models = {
+                role: {
+                    "provider": spec.provider,
+                    "model": spec.model,
+                    "effort": spec.effort,
+                }
+                for role, spec in self.config.models.items()
+                if role in CODER_ROLES
+            }
+            self.state.model_migrations.append(
+                {"at": utc_now(), "changed": dict(changed)}
+            )
+            self.state.policy_snapshot = self.policy.to_dict()
+        self._persist_models()
+        self._warning(f"migrated off-policy models to the active policy: {changed}")
+        return changed
 
     def _recover_execution(
         self, execution_lock: RepositoryExecutionLock, generation: int
@@ -686,18 +764,31 @@ class ForgeOrchestrator:
         raise RuntimeError("Product Owner failed its backlog contract three times")
 
     def _shuffle_coder_pool(self) -> None:
-        """Redraw the three coder models from the original pool for a new sprint."""
+        """Redraw the three coder models from the weighted policy pool each sprint."""
 
         if not self.config.shuffle_coders:
             return
-        pool = []
+        self._refresh_policy()
+        pool: list[ModelSpec] = []
+        seen: set[str] = set()
         for role in CODER_ROLES:
             raw = self.state.original_models.get(role)
             if raw:
-                pool.append(ModelSpec(**raw))
+                spec = ModelSpec(**raw)
+                if model_identity(spec) not in seen:
+                    pool.append(spec)
+                    seen.add(model_identity(spec))
         if not pool:
-            return
-        self.config.models = assign_coder_models(self.config.models, pool)
+            pool = [spec for spec, _ in self.policy.coder_options()]
+        weights = {
+            model_identity(spec): weight for spec, weight in self.policy.coder_options()
+        }
+        self.config.models = assign_coder_models(
+            self.config.models,
+            pool,
+            rng=random.Random(f"{self.run_id}:{self.state.sprint_number}"),
+            weights=weights,
+        )
         self._persist_models()
         draw = ", ".join(
             f"{role}={self.config.models[role].display()}" for role in CODER_ROLES
@@ -827,6 +918,7 @@ class ForgeOrchestrator:
                 "selection": {},
                 "selection_session": None,
                 "winner": "",
+                "reviewer_diversity": {},
                 "coder_session": None,
                 "reviewer_session": None,
                 "tester_session": None,
@@ -1431,6 +1523,7 @@ class ForgeOrchestrator:
                     "feedback": [],
                 }
                 active["coder_session"] = candidates[winner].get("session")
+                self._apply_reviewer_diversity(winner)
                 active["phase"] = "review"
                 self._save(f"{winner} is the only eligible candidate; reviewing it.")
             return
@@ -1481,12 +1574,66 @@ class ForgeOrchestrator:
                 active["winner"] = winner
                 active["coder_session"] = candidates[winner].get("session")
                 active["reviewer_session"] = session
+                self._apply_reviewer_diversity(winner)
                 active["phase"] = "review"
                 self._save(
                     f"Reviewer selected {winner} as the winner: {selection['reason']}"
                 )
             return
         raise RuntimeError("reviewer failed its selection contract three times")
+
+    def _apply_reviewer_diversity(self, winner_name: str) -> None:
+        """Keep the review gate in an independent family when one exists.
+
+        Called while holding ``_state_lock``. The candidate-selection reviewer
+        may already share the winning coder's family; if an active independent
+        family is healthy, switch to it and drop the now-stale provider session.
+        """
+
+        active = self.state.active_iteration
+        winner_spec = self.config.models.get(f"coder_{winner_name}")
+        if winner_spec is None:
+            return
+        self._refresh_policy()
+        winner_family = model_family(winner_spec)
+        reviewer = self.config.models["reviewer"]
+        reviewer_family = model_family(reviewer)
+        if reviewer_family != winner_family:
+            active["reviewer_diversity"] = {
+                "winner_family": winner_family,
+                "reviewer_family": reviewer_family,
+                "exception": "",
+            }
+            return
+        replacement, note = self.policy.independent_reviewer(
+            winner_family,
+            disabled=list(self.state.disabled_models),
+            rng=random.Random(f"{self.run_id}:{active.get('id')}:reviewer"),
+        )
+        if replacement is None:
+            active["reviewer_diversity"] = {
+                "winner_family": winner_family,
+                "reviewer_family": reviewer_family,
+                "exception": note or "no independent active family is healthy",
+            }
+            self._warning(
+                "reviewer diversity exception for "
+                f"{active.get('id')}: {active['reviewer_diversity']['exception']}"
+            )
+            return
+        self.config.models["reviewer"] = replacement
+        active["reviewer_session"] = None
+        active["reviewer_diversity"] = {
+            "winner_family": winner_family,
+            "reviewer_family": model_family(replacement),
+            "exception": "",
+        }
+        self._persist_models()
+        self._warning(
+            f"reviewer switched to {replacement.display()} for an independent "
+            f"{model_family(replacement)} review of the {winner_family} winner "
+            f"{winner_name}"
+        )
 
     def _candidate_dossier(self, name: str) -> dict[str, Any]:
         active = self.state.active_iteration
@@ -2169,23 +2316,28 @@ class ForgeOrchestrator:
         self._save(f"Model preflight passed with {len(failures)} replacement(s).")
 
     def _replacement_for(self, role: str, current: ModelSpec) -> ModelSpec | None:
+        self._refresh_policy()
         disabled = set(self.state.disabled_models)
-        candidates: list[ModelSpec] = []
+        options: list[ModelSpec] = []
         if self.config.backup is not None:
-            candidates.append(self.config.backup)
-        for other in ROLE_NAMES:
-            spec = self.config.models[other]
-            if model_identity(spec) != model_identity(current):
-                candidates.append(spec)
-        healthy = [
-            item
-            for item in candidates
-            if model_identity(item) not in disabled
-            and model_identity(item) != model_identity(current)
-        ]
+            options.append(self.config.backup)
+        options.extend(self.policy.failover_options(role))
+        current_identity = model_identity(current)
+        healthy: list[ModelSpec] = []
+        seen: set[str] = set()
+        for spec in options:
+            identity = model_identity(spec)
+            if identity == current_identity or identity in disabled or identity in seen:
+                continue
+            if not policy_allows(spec, self.policy):
+                continue
+            seen.add(identity)
+            healthy.append(spec)
         if not healthy:
             return None
-        different = [item for item in healthy if model_family(item) != model_family(current)]
+        different = [
+            item for item in healthy if model_family(item) != model_family(current)
+        ]
         return spec_with_effort((different or healthy)[0], current.effort)
 
     def _apply_replacement(self, exhausted: ModelSpec, replacement: ModelSpec) -> None:
@@ -2339,6 +2491,7 @@ class ForgeOrchestrator:
     def _persist_models(self) -> None:
         with self._state_lock:
             self.state.config = self.config.to_dict()
+            self.state.policy_snapshot = self.policy.to_dict()
             self.store.write_data("config.json", self.config.to_dict())
             self.store.save_state(self.state)
 

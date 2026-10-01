@@ -23,10 +23,12 @@ from .locking import ExecutionLocked
 from .models import (
     CODER_ROLES,
     ModelSpec,
+    ROLE_NAMES,
     RunConfig,
     STAFF_ROLES,
 )
 from .orchestrator import ForgeOrchestrator
+from .policy import PromotionSnapshot, load_policy
 
 
 STATIC = Path(__file__).with_name("static")
@@ -225,42 +227,59 @@ def restart_payload(active_runs: int, confirm: bool) -> dict[str, Any]:
     return {"restarting": True, "active_runs": active_runs}
 
 
-def models_from_payload(payload: dict[str, Any]) -> dict[str, ModelSpec]:
+def models_from_payload(
+    payload: dict[str, Any],
+    *,
+    policy_snapshot: PromotionSnapshot | None = None,
+) -> dict[str, ModelSpec]:
     import random
 
+    snapshot = policy_snapshot or load_policy(str(payload.get("policy_path") or "") or None)
     raw_models = payload.get("models")
     if not isinstance(raw_models, dict):
         raise ValueError("models must be an object")
-    models: dict[str, ModelSpec] = {}
+    overrides: dict[str, ModelSpec] = {}
     for role in STAFF_ROLES:
         value = str(raw_models.get(role) or "").strip()
-        models[role] = ModelSpec.parse(value or DEFAULTS[role])
+        if value:
+            overrides[role] = ModelSpec.parse(value)
     explicit_coders = [
         role for role in CODER_ROLES if str(raw_models.get(role) or "").strip()
     ]
     if explicit_coders:
         for role in CODER_ROLES:
             value = str(raw_models.get(role) or "").strip()
-            models[role] = ModelSpec.parse(value or DEFAULTS[role])
-        return models
-    pool: list[ModelSpec] = []
-    raw_pool = payload.get("coder_models")
-    if isinstance(raw_pool, list):
-        for item in raw_pool:
-            value = str(item).strip()
             if value:
-                pool.append(ModelSpec.parse(value))
-    if len(pool) > MAX_CODER_PREFERENCES:
-        raise ValueError(
-            f"the coder pool accepts at most {MAX_CODER_PREFERENCES} models"
-        )
-    if pool:
-        seed = ",".join(spec.display() for spec in pool)
-        models.update(assign_coder_models(models, pool, rng=random.Random(seed)))
-        return models
-    for role in CODER_ROLES:
-        models[role] = ModelSpec.parse(DEFAULTS[role])
-    return models
+                overrides[role] = ModelSpec.parse(value)
+    else:
+        pool: list[ModelSpec] = []
+        raw_pool = payload.get("coder_models")
+        if isinstance(raw_pool, list):
+            for item in raw_pool:
+                value = str(item).strip()
+                if value:
+                    pool.append(ModelSpec.parse(value))
+        if len(pool) > MAX_CODER_PREFERENCES:
+            raise ValueError(
+                f"the coder pool accepts at most {MAX_CODER_PREFERENCES} models"
+            )
+        if pool:
+            seed = ",".join(spec.display() for spec in pool)
+            weights = {
+                f"{spec.provider}:{spec.model}": weight
+                for spec, weight in snapshot.coder_options()
+            }
+            overrides.update(
+                assign_coder_models(
+                    {role: ModelSpec.parse(DEFAULTS[role]) for role in CODER_ROLES},
+                    pool,
+                    rng=random.Random(seed),
+                    weights=weights,
+                )
+            )
+    rng = random.Random(json.dumps(payload, sort_keys=True, default=str))
+    models = snapshot.select_new_run_models(rng, overrides)
+    return {role: models[role] for role in ROLE_NAMES}
 
 
 @dataclass
@@ -300,6 +319,7 @@ class RunRegistry:
             push=bool(payload.get("push", True)),
             agent_timeout_seconds=int(payload.get("agent_timeout_seconds", 3600)),
             backup=ModelSpec.parse(backup_raw) if backup_raw else None,
+            policy_path=str(payload.get("policy_path") or ""),
         )
         orchestrator = ForgeOrchestrator(config, state_home=self.state_home)
         live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())
@@ -470,6 +490,8 @@ class RunRegistry:
         repo = Path(str(payload["repo"])).expanduser().resolve()
         run_id = str(payload["run_id"])
         orchestrator = ForgeOrchestrator.from_existing(repo, run_id, state_home=self.state_home)
+        if payload.get("migrate_models"):
+            orchestrator.migrate_models()
         live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())
         with self._lock:
             existing = self._runs.get(run_id)
@@ -551,7 +573,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
             except KeyError:
                 return self._json({"error": "run not found"}, HTTPStatus.NOT_FOUND)
         if parsed.path == "/api/catalog":
-            return self._json(catalog_payload())
+            return self._json(catalog_payload(load_policy()))
         if parsed.path == "/api/preferences":
             return self._json(self.registry.load_preferences())
         if parsed.path == "/api/browse":
