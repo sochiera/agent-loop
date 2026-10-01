@@ -14,13 +14,7 @@ const defaults = {
   tester: "codex:gpt-6-luna:xhigh",
 };
 const defaultCoder = "codex:gpt-6-luna:xhigh";
-// The cheap coder pool: six slots, three drawn per sprint without replacement.
-const defaultCoderPool = [
-  "opencode:opencode-go/deepseek-v4.1-flash:xhigh",
-  "opencode:opencode-go/mimo-v2.6-flash:xhigh",
-  "opencode:opencode-go/glm-5.3-flash:xhigh",
-  defaultCoder, defaultCoder, defaultCoder,
-];
+const defaultCoderPool = [defaultCoder, defaultCoder, defaultCoder];
 const maxCoderModels = 12;
 const phases = ["preflight", "product-owner", "planning", "test-authoring", "coding", "selection", "review", "testing", "delivery", "finalizing"];
 const phaseLabels = ["Preflight", "Product owner", "Plan", "Tests (RED)", "Code ×3", "Select", "Review", "Test", "Deliver", "Finalize"];
@@ -89,13 +83,10 @@ function providerOptions(selectedProvider) {
   ).join("");
 }
 
-function isCoderCard(card) {
-  return card?.dataset.role === "coder";
-}
-
-// Coder-only models (DeepSeek, MiMo) are offered to coder cards alone.
-function cardModels(card) {
-  return isCoderCard(card) ? catalog.models : catalog.models.filter(entry => !entry.coder_only);
+// Swarm-only models (DeepSeek, MiMo) live in the swarm's cheap pool alone, so
+// no tournament card offers them.
+function cardModels(_card) {
+  return catalog.models.filter(entry => !entry.coder_only);
 }
 
 function modelOptions(provider, selectedKey, card) {

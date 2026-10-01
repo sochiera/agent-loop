@@ -8,7 +8,8 @@ import pytest
 
 from forge.agents import AgentFailure, AgentRequest
 from forge.models import AgentResult, ModelSpec, ROLE_NAMES, RunConfig, Usage
-from forge.policy import CHEAP_CODER_POOL, SOL
+from forge.policy import CHEAP_CODER_POOL, SOL, load_policy
+from forge.prompts import CODER_TACTICS
 from forge.swarm import SWARM_AGENTS_CAP, SwarmController, SwarmGitError
 
 
@@ -84,7 +85,7 @@ def cohort_backlog_json() -> str:
 
 
 def make_controller(repo: Path, brief: Path, runner: SwarmRunner, tmp_path: Path, **kw: object) -> SwarmController:
-    config = transfer(repo, brief, coder_pool=list(CHEAP_CODER_POOL))
+    config = transfer(repo, brief, cheap_pool=list(CHEAP_CODER_POOL))
     options = {"teams": 3, "min_backlog": 15, "rng": None}
     options.update(kw)
     return SwarmController(
@@ -111,6 +112,11 @@ class SwarmRunner:
         self._fail_coders = fail_coders
 
     def run(self, request: AgentRequest) -> AgentResult:
+        # The real runner enforces the role gate; the fake must too.
+        assert load_policy(None).allows(request.model, request.role), (
+            request.role,
+            request.model.display(),
+        )
         with self._lock:
             self.requests.append(request)
             self._active += 1
@@ -129,7 +135,7 @@ class SwarmRunner:
     def _dispatch(self, request: AgentRequest) -> AgentResult:
         if request.role == "planner":
             return self._plan(request)
-        if request.role.startswith("coder_"):
+        if request.role == "swarm_coder":
             return self._code(request)
         if request.role == "swarm_reviewer":
             return self._review(request)
@@ -166,7 +172,7 @@ class SwarmRunner:
         if self._fail_coders:
             raise AgentFailure("cheap coder died", raw_output="boom")
         task_id = re.search(r'"id":\s*"(SW[^"]*)"', request.prompt).group(1)
-        mode = request.role.removeprefix("coder_")
+        mode = next(name for name, text in CODER_TACTICS.items() if text in request.prompt)
         (request.cwd / f"{task_id.lower().replace('-', '_')}.txt" if False else request.cwd / f"{task_id.lower()}.txt").write_text(
             f"implemented {task_id} via {mode}\n", encoding="utf-8"
         )
@@ -228,7 +234,7 @@ def test_swarm_full_flow_pool_and_cap(tmp_path: Path) -> None:
     coding_requests = [
         request
         for request in runner.requests
-        if request.role.startswith("coder_") or request.role == "swarm_reviewer"
+        if request.role in {"swarm_coder", "swarm_reviewer"}
     ]
     assert coding_requests
     for request in coding_requests:
@@ -293,7 +299,7 @@ def test_swarm_pair_failure_is_cheap_and_task_drops(tmp_path: Path) -> None:
     assert state.status == "completed"
     assert all(task.status == "dropped" for task in state.tasks)
     assert box.state.warnings
-    coding = [request for request in runner.requests if request.role.startswith("coder_")]
+    coding = [request for request in runner.requests if request.role == "swarm_coder"]
     assert coding and all(request.model.display() in POOL_IDENTITIES for request in coding)
 
 
@@ -304,3 +310,23 @@ def test_swarm_backlog_contract_minimum(tmp_path: Path) -> None:
     state = box.run()
     assert state.status == "failed"
     assert "at least 15" in state.message
+
+
+def test_swarm_cli_builds_a_controller_on_the_cheap_pool(tmp_path):
+    from forge.cli import _parser, swarm_controller
+
+    repo, brief = repo_and_brief(tmp_path)
+    args = _parser().parse_args(
+        [
+            "swarm-run",
+            "--repo", str(repo),
+            "--brief", str(brief),
+            "--policy-path", str(tmp_path / "absent.json"),
+            "--teams", "9",
+            "--seed", "1",
+        ]
+    )
+    controller = swarm_controller(args)
+    assert controller.config.cheap_pool == list(CHEAP_CODER_POOL)
+    assert controller.strong_reviewer == SOL
+    assert controller.teams_limit == 3

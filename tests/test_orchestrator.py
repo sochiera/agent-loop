@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 import threading
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ from forge.orchestrator import (
     _product_owner_retry_prompt,
     _snapshot_escape,
 )
-from forge.policy import CHEAP_CODER_POOL, DEEPSEEK, GLM, LUNA, MIMO, load_policy
+from forge.policy import CHEAP_CODER_POOL, DEEPSEEK, GLM, LUNA, MIMO, OPUS, load_policy
 from forge.sprint import CODER_CANDIDATES, SPRINT_SCHEDULE
 
 
@@ -409,55 +410,40 @@ def test_shuffle_coders_redraws_the_pool_at_each_sprint(tmp_path: Path):
     assert any("shuffled coder pool" in item for item in state.warnings)
 
 
-def test_shuffle_coders_redraws_three_slots_from_the_cheap_pool(tmp_path: Path):
-    runner = SprintRunner(stop_after=1)
+def test_tournament_ignores_the_cheap_pool_and_skips_swarm_only_coders(tmp_path: Path):
+    # The cheap pool belongs to the swarm: a tournament run never draws from it,
+    # even when its config carries one, and swarm-only originals are skipped.
     orchestrator = make_orchestrator(
-        tmp_path, runner, coder_pool=list(CHEAP_CODER_POOL)
+        tmp_path, SprintRunner(stop_after=0), cheap_pool=list(CHEAP_CODER_POOL)
     )
-
-    state = orchestrator.run()
-
-    assert state.status == "cancelled"
-    drawn = [orchestrator.config.models[f"coder_{name}"] for name in CODER_CANDIDATES]
-    for spec in set(drawn):
-        assert drawn.count(spec) <= CHEAP_CODER_POOL.count(spec)
-    assert any("shuffled coder pool" in item for item in state.warnings)
-    for role in ("brain", "planner", "reviewer", "tester", "test_author"):
-        assert orchestrator.config.models[role] not in (DEEPSEEK, MIMO)
-
-
-def test_shuffle_coders_covers_the_pool_and_skips_disabled_models(tmp_path: Path):
-    orchestrator = make_orchestrator(
-        tmp_path, SprintRunner(stop_after=0), coder_pool=list(CHEAP_CODER_POOL)
-    )
-    seen = set()
-    luna_counts = set()
-    for sprint in range(1, 40):
-        orchestrator.state.sprint_number = sprint
-        orchestrator._shuffle_coder_pool()
-        drawn = [orchestrator.config.models[f"coder_{name}"] for name in CODER_CANDIDATES]
-        seen.update(drawn)
-        luna_counts.add(drawn.count(LUNA))
-    assert seen == {DEEPSEEK, MIMO, GLM, LUNA}
-    assert max(luna_counts) >= 2
-
-    orchestrator.state.disabled_models = [model_identity(LUNA)]
-    for sprint in range(40, 60):
+    orchestrator.state.original_models = {
+        "coder_tdd": asdict(DEEPSEEK),
+        "coder_explore": asdict(MIMO),
+        "coder_classic": asdict(LUNA),
+    }
+    for sprint in range(1, 30):
         orchestrator.state.sprint_number = sprint
         orchestrator._shuffle_coder_pool()
         drawn = {orchestrator.config.models[f"coder_{name}"] for name in CODER_CANDIDATES}
-        assert drawn == {DEEPSEEK, MIMO, GLM}
+        assert drawn == {LUNA}
+
+    orchestrator.state.disabled_models = [model_identity(LUNA)]
+    seen = set()
+    for sprint in range(30, 60):
+        orchestrator.state.sprint_number = sprint
+        orchestrator._shuffle_coder_pool()
+        seen.update(orchestrator.config.models[f"coder_{name}"] for name in CODER_CANDIDATES)
+    assert seen == {OPUS, GLM}
 
 
-def test_coder_only_replacement_never_staffs_a_shared_role(tmp_path: Path):
+def test_swarm_only_replacement_never_staffs_a_tournament_role(tmp_path: Path):
     orchestrator = make_orchestrator(tmp_path, SprintRunner(stop_after=0))
     for role in ("coder_tdd", "tester", "reviewer"):
         orchestrator.config.models[role] = GLM
 
     orchestrator._apply_replacement(GLM, DEEPSEEK)
 
-    assert orchestrator.config.models["coder_tdd"] == DEEPSEEK
-    for role in ("tester", "reviewer"):
+    for role in ("coder_tdd", "tester", "reviewer"):
         replaced = orchestrator.config.models[role]
         assert replaced not in (GLM, DEEPSEEK, MIMO)
         assert orchestrator.policy.allows(replaced, role)

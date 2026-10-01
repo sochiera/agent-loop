@@ -22,7 +22,7 @@ class CatalogEntry:
     providers: tuple[str, ...]
     ids: dict[str, str]
     efforts: tuple[str, ...] = ("", "low", "medium", "high")
-    # Coder-only models staff the tournament coders and nothing else.
+    # Coder-only models staff the swarm's cheap roles and nothing else.
     coder_only: bool = False
 
     def id_for(self, provider: str) -> str:
@@ -33,7 +33,7 @@ class CatalogEntry:
 # runs on exactly one harness at exactly one reasoning effort: GPT-6 through
 # native Codex, Opus 5.5 through Claude Code by its explicit slug (never the
 # ``opus`` alias), and GLM Flash through OpenCode Go. DeepSeek and MiMo Flash are
-# Forge's cheap OpenCode Go coders: active only for the tournament coder roles.
+# Forge's cheap OpenCode Go models: active only in the swarm's cheap pool.
 CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="gpt-6-sol",

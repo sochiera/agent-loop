@@ -57,7 +57,7 @@ from .contracts import (
 )
 from .locking import RepositoryExecutionLock
 from .models import ModelSpec, RunConfig
-from .policy import GLM, OPUS, SOL
+from .policy import GLM, OPUS, SOL, SWARM_CODER_ROLE, SWARM_REVIEWER_ROLE
 from .prompts import (
     swarm_backlog_prompt,
     swarm_coder_prompt,
@@ -337,9 +337,9 @@ class SwarmController:
 
         self.planner = self._staff_model("planner", allowed={SOL, OPUS, GLM})
         self.strong_reviewer = self._staff_model("reviewer", allowed={SOL, OPUS})
-        if len(config.coder_pool) < 4:
+        if len(config.cheap_pool) < 4:
             raise ValueError(
-                "the swarm consumes the six-slot cheap pool; RunConfig.coder_pool must "
+                "the swarm consumes the six-slot cheap pool; RunConfig.cheap_pool must "
                 "hold at least four slots (two coder slots plus two reviewer slots)"
             )
         if resume:
@@ -722,7 +722,7 @@ class SwarmController:
             slots = self.rng.sample(
                 [
                     ModelSpec(spec.provider, spec.model, spec.effort)
-                    for spec in self.config.coder_pool
+                    for spec in self.config.cheap_pool
                 ],
                 4,
             )
@@ -830,7 +830,7 @@ class SwarmController:
         task = self._task_of(team)
         previous = team.versions.get(mode, {}).get("summary", "") if mode in team.versions else ""
         return {
-            "role": f"coder_{mode}",
+            "role": SWARM_CODER_ROLE,
             "spec": ModelSpec(**team.coder(mode)["spec"]),
             "prompt": swarm_coder_prompt(
                 task={
@@ -855,7 +855,7 @@ class SwarmController:
         task = self._task_of(team)
         data = team.versions.get(mode, {})
         return {
-            "role": "swarm_reviewer",
+            "role": SWARM_REVIEWER_ROLE,
             "spec": ModelSpec(**team.reviewer_for(mode)["spec"]),
             "prompt": swarm_reviewer_prompt(
                 task={
@@ -1056,9 +1056,9 @@ class SwarmController:
                     mode=job.get("mode", ""),
                 )
                 continue
-            if job["role"].startswith("coder_"):
+            if job["role"] == SWARM_CODER_ROLE:
                 self._apply_code(team, job["mode"], outcome)
-            elif job["role"] == "swarm_reviewer":
+            elif job["role"] == SWARM_REVIEWER_ROLE:
                 if team.phase == "winner-fix":
                     self._apply_winner_review(team, outcome)
                 else:

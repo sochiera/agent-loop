@@ -9,9 +9,9 @@ import random
 from pathlib import Path
 
 from .access import GATE_ENV, gate_from_env
-from .models import CODER_ROLES, DEFAULT_MODEL_SELECTORS, ModelSpec, ROLE_NAMES, RunConfig
+from .models import DEFAULT_MODEL_SELECTORS, ModelSpec, ROLE_NAMES, RunConfig
 from .orchestrator import ForgeOrchestrator
-from .policy import PromotionSnapshot, load_policy
+from .policy import SOL, PromotionSnapshot, load_policy
 from .web import serve
 
 
@@ -151,12 +151,16 @@ def swarm_controller(args: argparse.Namespace) -> "SwarmController":
         config = RunConfig.from_dict(raw)
         config.repo = str(repo)
         return SwarmController(config, run_id=args.run_id, on_event=None, resume=True)
-    roster = select_cli_models(args, snapshot)
+    rng = random.Random(args.seed) if args.seed is not None else random.Random()
+    # The planner draws from the strong pool; the strong reviewer defaults to
+    # Sol because the swarm's final reviewer must be Sol or Opus.
+    overrides = {
+        "reviewer": ModelSpec.parse(args.reviewer) if args.reviewer else SOL,
+    }
     if args.planner:
-        roster["planner"] = ModelSpec.parse(args.planner)
-    if args.reviewer:
-        roster["reviewer"] = ModelSpec.parse(args.reviewer)
-    pool = list(CHEAP_CODER_POOL)
+        overrides["planner"] = ModelSpec.parse(args.planner)
+    roster = snapshot.select_new_run_models(rng, overrides)
+    pool = list(snapshot.cheap_pool())
     if args.pool:
         pool = [ModelSpec.parse(value.strip()) for value in args.pool.split(",") if value.strip()]
     config = RunConfig(
@@ -168,12 +172,11 @@ def swarm_controller(args: argparse.Namespace) -> "SwarmController":
         agent_timeout_seconds=args.agent_timeout,
         shuffle_coders=False,
         policy_path=args.policy_path,
-        coder_pool=pool,
+        cheap_pool=pool,
     )
     from forge.swarm import DEFAULT_SWARM_TEAMS
 
     teams = min(getattr(args, "teams", DEFAULT_SWARM_TEAMS), DEFAULT_SWARM_TEAMS)
-    rng = random.Random(args.seed) if args.seed is not None else random.Random()
     return SwarmController(config, on_event=None, rng=rng, teams=teams)
 
 
@@ -263,12 +266,6 @@ def main(argv: list[str] | None = None) -> int:
         backup=ModelSpec.parse(args.backup) if args.backup else None,
         shuffle_coders=args.shuffle_coders,
         policy_path=args.policy_path,
-        # Explicit coder flags pin the run; otherwise redraw from the cheap pool.
-        coder_pool=(
-            []
-            if any(getattr(args, role) for role in CODER_ROLES)
-            else list(snapshot.coder_pool())
-        ),
     )
     orchestrator = ForgeOrchestrator(config, on_event=on_event)
     state = orchestrator.run()
