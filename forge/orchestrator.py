@@ -81,6 +81,21 @@ EVENT_QUEUE_LIMIT = 256
 EVENT_SHUTDOWN_TIMEOUT_SECONDS = 1.0
 SCHEMA_VERSION = 3
 TEST_AUTHOR_ATTEMPTS = 3
+
+# Durable iteration phases in drive order; forge.diagram renders the README
+# Sprint loop diagram from this tuple, so keep it aligned with the dispatch in
+# `_run_iteration`.
+ITERATION_PHASES: tuple[str, ...] = (
+    "planning",
+    "test-authoring",
+    "coding",
+    "selection",
+    "review",
+    "fixing",
+    "testing",
+    "delivery",
+    "finalizing",
+)
 _EVENT_STOP = object()
 _NO_CALLBACK_CONTEXT = object()
 
@@ -847,26 +862,22 @@ class ForgeOrchestrator:
         while self.state.active_iteration:
             self._checkpoint()
             phase = str(self.state.active_iteration.get("phase") or "planning")
-            if phase == "planning":
-                self._plan_iteration()
-            elif phase == "test-authoring":
-                self._author_tests()
-            elif phase == "coding":
-                self._code_tournament()
-            elif phase == "selection":
-                self._select_winner()
-            elif phase == "review":
-                self._review_iteration()
-            elif phase == "fixing":
-                self._fix_iteration()
-            elif phase == "testing":
-                self._test_iteration()
-            elif phase == "delivery":
-                self._deliver_iteration()
-            elif phase == "finalizing":
-                self._finalize_iteration()
-            else:
+            handlers = {
+                "planning": self._plan_iteration,
+                "test-authoring": self._author_tests,
+                "coding": self._code_tournament,
+                "selection": self._select_winner,
+                "review": self._review_iteration,
+                "fixing": self._fix_iteration,
+                "testing": self._test_iteration,
+                "delivery": self._deliver_iteration,
+                "finalizing": self._finalize_iteration,
+            }
+            assert tuple(handlers) == ITERATION_PHASES, "iteration dispatch drift"
+            handler = handlers.get(phase)
+            if handler is None:
                 raise RuntimeError(f"unknown iteration phase: {phase}")
+            handler()
 
     def _start_iteration(self) -> None:
         assert self._workspace is not None
