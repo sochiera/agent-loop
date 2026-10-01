@@ -778,30 +778,38 @@ class ForgeOrchestrator:
         raise RuntimeError("Product Owner failed its backlog contract three times")
 
     def _shuffle_coder_pool(self) -> None:
-        """Redraw the three coder models from the run's slot pool each sprint."""
+        """Reshuffle the run's original coders each sprint.
+
+        The cheap pool belongs to the swarm alone; the tournament never draws
+        from it, so off-policy (including swarm-only) and disabled coders are
+        skipped and the smart worker roster is the fallback.
+        """
 
         if not self.config.shuffle_coders:
             return
         self._refresh_policy()
         disabled = set(self.state.disabled_models)
-        pool = [
-            spec
-            for spec in self.config.coder_pool
-            if model_identity(spec) not in disabled
-            and policy_allows(spec, self.policy, CODER_ROLES[0])
-        ]
-        if not pool and not self.config.coder_pool:
-            # Runs from before the slot pool reshuffle their original coders.
-            seen: set[str] = set()
-            for role in CODER_ROLES:
-                raw = self.state.original_models.get(role)
-                if raw:
-                    spec = ModelSpec(**raw)
-                    if model_identity(spec) not in seen:
-                        pool.append(spec)
-                        seen.add(model_identity(spec))
+        pool: list[ModelSpec] = []
+        seen: set[str] = set()
+        for role in CODER_ROLES:
+            raw = self.state.original_models.get(role)
+            if not raw:
+                continue
+            spec = ModelSpec(**raw)
+            identity = model_identity(spec)
+            if (
+                identity in seen
+                or identity in disabled
+                or not policy_allows(spec, self.policy, role)
+            ):
+                continue
+            pool.append(spec)
+            seen.add(identity)
         if not pool:
-            pool = list(self.policy.coder_pool())
+            options = [spec for spec, _ in self.policy.coder_options()]
+            pool = [
+                spec for spec in options if model_identity(spec) not in disabled
+            ] or options
         self.config.models = assign_coder_models(
             self.config.models,
             pool,

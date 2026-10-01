@@ -78,13 +78,13 @@ class RunConfig:
     max_revision_rounds: int = 8
     shuffle_coders: bool = True
     policy_path: str = ""
-    # Slots the coder roles are redrawn from each sprint; empty keeps the
-    # pre-pool behaviour of reshuffling the run's original coders.
-    coder_pool: list[ModelSpec] = field(default_factory=list)
+    # The swarm's cheap pool: each slot may staff a swarm coder or cheap
+    # reviewer. The sprint tournament ignores it.
+    cheap_pool: list[ModelSpec] = field(default_factory=list)
 
     def validate(self) -> None:
         from .catalog import validate_spec
-        from .policy import load_policy, policy_allows
+        from .policy import SWARM_CODER_ROLE, load_policy, policy_allows
 
         repo = Path(self.repo).expanduser().resolve()
         brief = Path(self.brief).expanduser().resolve()
@@ -110,11 +110,11 @@ class RunConfig:
                     f"backup model {self.backup.display()} is not allowed by the "
                     f"active model policy (promotion_state={snapshot.state})"
                 )
-        for spec in self.coder_pool:
+        for spec in self.cheap_pool:
             validate_spec(spec)
-            if not policy_allows(spec, snapshot, CODER_ROLES[0]):
+            if not policy_allows(spec, snapshot, SWARM_CODER_ROLE):
                 raise ValueError(
-                    f"coder pool model {spec.display()} is not allowed by the "
+                    f"cheap pool model {spec.display()} is not allowed by the "
                     f"active model policy (promotion_state={snapshot.state})"
                 )
         if not self.branch.strip():
@@ -130,7 +130,7 @@ class RunConfig:
         data = asdict(self)
         data["models"] = {key: asdict(value) for key, value in self.models.items()}
         data["backup"] = asdict(self.backup) if self.backup is not None else None
-        data["coder_pool"] = [asdict(spec) for spec in self.coder_pool]
+        data["cheap_pool"] = [asdict(spec) for spec in self.cheap_pool]
         return data
 
     @classmethod
@@ -167,9 +167,9 @@ class RunConfig:
             max_revision_rounds=int(value.get("max_revision_rounds", 8)),
             shuffle_coders=bool(value.get("shuffle_coders", True)),
             policy_path=str(value.get("policy_path") or ""),
-            coder_pool=[
+            cheap_pool=[
                 ModelSpec(**spec)
-                for spec in value.get("coder_pool") or []
+                for spec in value.get("cheap_pool") or []
                 if isinstance(spec, dict)
             ],
         )

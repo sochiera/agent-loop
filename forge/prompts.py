@@ -413,3 +413,147 @@ Return exactly:
 "blocking_findings":[{{"id":"TEST-001","summary":"...","evidence":"...","suggested_fix":"...","task_ids":["TASK-001"]}}],
 "nits":[],"blocker":""}}
 """
+
+
+def swarm_backlog_prompt(
+    *,
+    brief: str,
+    minimum_tasks: int,
+    repository_context: str,
+    environment_context: str,
+    existing_tasks: list[dict[str, Any]] | None = None,
+) -> str:
+    existing = ""
+    if existing_tasks:
+        existing = f"""
+ALREADY PLANNED OR IN FLIGHT
+{json.dumps(existing_tasks, indent=2, sort_keys=True)}
+"""
+    return f"""You are the swarm planner. The controller is about to launch parallel pairs of cheap
+coders and reviews your plan. Return JSON only.
+
+Lay out at least {minimum_tasks} tasks from different product areas that can be implemented
+mostly in parallel: keep their files disjoint, keep every task self-contained, and make the
+acceptance criteria objectively verifiable. Validation commands must be non-interactive and
+bounded. Do not write code. Never modify files, commit, push, switch branches, or alter Git refs.
+{existing}
+ORIGINAL BRIEF
+{brief.strip()}
+
+MECHANICAL REPOSITORY SNAPSHOT
+{repository_context}
+
+TOOLCHAIN
+{environment_context}
+
+Return exactly:
+{{
+  "summary":"one paragraph describing the planned areas",
+  "tasks":[{{
+    "id":"SW-001","title":"...","area":"one distinct product area",
+    "description":"what must change and why",
+    "acceptance_criteria":["objectively checkable criterion"],
+    "validation_commands":["bounded non-interactive command"],
+    "priority":1
+  }}]
+}}
+"""
+
+
+def swarm_replan_prompt(*, tasks: list[dict[str, Any]]) -> str:
+    """Planner replan prompt: add tasks and reprioritize every unfinished task."""
+    return f"""The swarm crossed the readiness threshold. As the swarm planner you now add fresh
+tasks and reprioritize every unfinished task. Return JSON only.
+
+Keep ids stable for tasks that already exist: unfinished listed tasks keep their ids, and your
+new tasks take fresh unique ids. Do not drop or reword unfinished tasks. Every new task must come
+from a different area than the unfinished tasks. Do not write code. Never modify files, commit,
+push, switch branches, or alter Git refs.
+
+CURRENT BACKLOG (unfinished tasks; keep alive every id below)
+{json.dumps(tasks, indent=2, sort_keys=True)}
+
+Return exactly:
+{{
+  "summary":"what changed in the plan",
+  "new_tasks":[{{"id":"SW-900","title":"...","area":"...","description":"...","acceptance_criteria":["..."],"validation_commands":["..."],"priority":1}}],
+  "priorities":{{"SW-002":1,"SW-005":2}}
+}}
+"""
+
+
+def swarm_coder_prompt(
+    *,
+    task: dict[str, Any],
+    mode: str,
+    blocking_findings: list[dict[str, Any]],
+    previous_summary: str = "",
+) -> str:
+    return implementation_prompt(
+        plan={
+            "objective": task["title"],
+            "tasks": [
+                {
+                    "id": task["id"],
+                    "title": task["title"],
+                    "description": task["description"],
+                    "acceptance_criteria": task["acceptance_criteria"],
+                }
+            ],
+            "validation_commands": task.get("validation_commands", []),
+        },
+        blocking_findings=blocking_findings,
+        tester_feedback=[],
+        previous_summary=previous_summary,
+        tactic=mode,
+    )
+
+
+def swarm_reviewer_prompt(
+    *,
+    task: dict[str, Any],
+    validation: list[dict[str, Any]],
+) -> str:
+    return f"""You are a cheap swarm reviewer for one candidate implementation of one task.
+
+Inspect the current worktree and the candidate summary. Judge correctness against the task
+description and acceptance criteria, and flag anything that would break other work in the
+repository. Do not demand taste rewrites; report only what a maintainer must fix. Do not edit
+files, commit, push, switch branches, or alter Git refs.
+
+TASK
+{json.dumps(task, indent=2, sort_keys=True)}
+
+MECHANICAL VALIDATION RESULTS (empty means no command ran)
+{json.dumps(validation, indent=2, sort_keys=True)}
+
+Return exactly:
+{{"verdict":"approve|fix","summary":"...",
+"blocking":[{{"problem":"short name","detail":"what and how to fix"}}]}}
+"""
+
+
+def swarm_selection_prompt(
+    *,
+    task: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    submitted: tuple[str, ...],
+) -> str:
+    return f"""You are the strong swarm reviewer. Two cheap coders implemented the same task
+independently in isolated worktrees, and each version passed its own cheap reviewer. Choose the
+better version. Do not edit files, commit, push, switch branches, or alter Git refs.
+
+TASK
+{json.dumps(task, indent=2, sort_keys=True)}
+
+SUBMITTED VERSIONS
+{json.dumps(list(submitted))}
+
+CANDIDATES
+{json.dumps(candidates, indent=2, sort_keys=True)}
+
+Return exactly:
+{{"winner":"<candidate name>","reason":"why this version wins",
+"candidates":{{"<candidate name>":{{"score":0,"summary":"assessment"}}}},
+"feedback":["fixes the winner has to address before merge"]}}
+"""

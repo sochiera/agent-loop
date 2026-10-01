@@ -181,15 +181,16 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
             "opencode-go/deepseek-v4.1-flash",
             "opencode-go/mimo-v2.6-flash",
         ]
-        assert catalog["policy"]["coder_pool"] == [
+        assert catalog["policy"]["cheap_pool"] == [
             "opencode:opencode-go/deepseek-v4.1-flash:xhigh",
             "opencode:opencode-go/mimo-v2.6-flash:xhigh",
             "opencode:opencode-go/glm-5.3-flash:xhigh",
             *["codex:gpt-6-luna:xhigh"] * 3,
         ]
-        assert "opencode:opencode-go/deepseek-v4.1-flash:xhigh" in script
-        assert "opencode:opencode-go/mimo-v2.6-flash:xhigh" in script
-        assert "entry.coder_only" in script
+        # The cheap pool is the swarm's; the tournament UI never offers it.
+        assert "opencode:opencode-go/deepseek-v4.1-flash:xhigh" not in script
+        assert "opencode:opencode-go/mimo-v2.6-flash:xhigh" not in script
+        assert "!entry.coder_only" in script
         assert catalog["defaults"]["coder_tdd"] == "codex:gpt-6-luna:xhigh"
         assert catalog["defaults"]["coder_explore"] == "codex:gpt-6-luna:xhigh"
         assert catalog["defaults"]["coder_classic"] == "codex:gpt-6-luna:xhigh"
@@ -471,8 +472,8 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
     (tmp_path / "ui-preferences.json").unlink()
     fallback = registry.load_preferences()
     assert fallback["models"]["brain"] == "codex:gpt-6-sol:medium"
-    # The run remembers its slot pool, so the fallback restores the pool itself.
-    assert fallback["coder_models"] == ["opencode:opencode-go/glm-5.3-flash:xhigh"]
+    # Tournament runs keep no cheap pool; the fallback restores the drawn coders.
+    assert fallback["coder_models"] == ["opencode:opencode-go/glm-5.3-flash:xhigh"] * 3
 
 
 def test_concurrent_recover_live_launches_exactly_one_thread(tmp_path):

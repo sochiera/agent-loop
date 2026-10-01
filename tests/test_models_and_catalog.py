@@ -38,7 +38,7 @@ from forge.policy import (
     SOL,
     load_policy,
 )
-from forge.web import models_from_payload, restart_payload, run_coder_pool
+from forge.web import models_from_payload, restart_payload
 
 
 BANNED_FRAGMENTS = (
@@ -359,13 +359,13 @@ def _valid_run_paths(tmp_path):
 
 
 @pytest.mark.parametrize("cheap", [DEEPSEEK, MIMO])
-def test_run_config_admits_cheap_coders_but_not_as_staff_or_backup(tmp_path, cheap):
+def test_run_config_keeps_swarm_only_models_in_the_cheap_pool(tmp_path, cheap):
     paths = _valid_run_paths(tmp_path)
     models = {role: SOL for role in ROLE_NAMES}
     for role in CODER_ROLES:
-        models[role] = cheap
-    RunConfig(branch="main", models=dict(models), coder_pool=[cheap, LUNA], **paths).validate()
-    for role in ("brain", "planner", "test_author", "reviewer", "tester"):
+        models[role] = LUNA
+    RunConfig(branch="main", models=dict(models), cheap_pool=[cheap, LUNA], **paths).validate()
+    for role in ROLE_NAMES:
         staffed = dict(models)
         staffed[role] = cheap
         with pytest.raises(ValueError, match="not allowed"):
@@ -374,35 +374,35 @@ def test_run_config_admits_cheap_coders_but_not_as_staff_or_backup(tmp_path, che
         RunConfig(branch="main", models=dict(models), backup=cheap, **paths).validate()
 
 
-def test_run_config_round_trips_and_validates_the_coder_pool(tmp_path):
+def test_run_config_round_trips_and_validates_the_cheap_pool(tmp_path):
     paths = _valid_run_paths(tmp_path)
     models = {role: SOL for role in ROLE_NAMES}
+    for role in CODER_ROLES:
+        models[role] = LUNA
     pool = [DEEPSEEK, MIMO, GLM, LUNA, LUNA, LUNA]
-    config = RunConfig(branch="main", models=models, coder_pool=pool, **paths)
-    assert RunConfig.from_dict(config.to_dict()).coder_pool == pool
-    assert RunConfig.from_dict({**config.to_dict(), "coder_pool": None}).coder_pool == []
+    config = RunConfig(branch="main", models=models, cheap_pool=pool, **paths)
+    config.validate()
+    assert RunConfig.from_dict(config.to_dict()).cheap_pool == pool
+    assert RunConfig.from_dict({**config.to_dict(), "cheap_pool": None}).cheap_pool == []
     bad = RunConfig(
         branch="main",
         models=models,
-        coder_pool=[ModelSpec("codex", "gpt-6-luna", "medium")],
+        cheap_pool=[ModelSpec("codex", "gpt-6-luna", "medium")],
         **paths,
     )
-    with pytest.raises(ValueError, match="coder pool model"):
+    with pytest.raises(ValueError, match="cheap pool model"):
         bad.validate()
 
 
-def test_run_coder_pool_defaults_to_the_cheap_slots_and_keeps_explicit_choices(tmp_path):
+def test_ui_coder_pool_never_defaults_to_the_cheap_pool(tmp_path):
     policy_path = _valid_run_paths(tmp_path)["policy_path"]
-    default = run_coder_pool({"policy_path": policy_path, "models": {}})
-    assert default == [DEEPSEEK, MIMO, GLM, LUNA, LUNA, LUNA]
-    chosen = run_coder_pool(
+    for _ in range(20):
+        models = models_from_payload({"policy_path": policy_path, "models": {}})
+        assert not {models[role] for role in CODER_ROLES} & {DEEPSEEK, MIMO}
+    chosen = models_from_payload(
         {"models": {}, "coder_models": ["claude:claude-opus-5-5:medium", "codex:gpt-6-luna:xhigh"]}
     )
-    assert chosen == [OPUS, LUNA]
-    pinned = run_coder_pool(
-        {"models": {"coder_tdd": "codex:gpt-6-luna:xhigh"}, "coder_models": ["opencode:glm-5.3-flash"]}
-    )
-    assert pinned == []
+    assert {chosen[role] for role in CODER_ROLES} <= {OPUS, LUNA}
 
 
 def test_models_from_payload_rejects_an_oversized_coder_pool():
@@ -433,7 +433,7 @@ def test_cli_selects_policy_defaults_when_roles_are_unspecified(tmp_path):
     assert models["brain"] in (SOL, GLM)
     assert models["planner"] in (SOL, GLM)
     assert models["reviewer"] in (SOL, GLM)
-    assert {models[role] for role in CODER_ROLES} <= {DEEPSEEK, MIMO, GLM, LUNA}
+    assert {models[role] for role in CODER_ROLES} <= {OPUS, GLM, LUNA}
     assert models["tester"] in (LUNA, GLM, OPUS)
 
 

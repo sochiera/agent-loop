@@ -262,7 +262,13 @@ def test_runner_rejects_off_policy_models_at_the_command_boundary(
     monkeypatch.setenv("FORGE_MODEL_POLICY_PATH", str(policy_file))
     runner = AgentRunner()
 
-    for selector in (*RETIRED_SELECTORS, "codex:gpt-6-sol:high"):
+    # Swarm-only models are refused for the tournament coders as well.
+    for selector in (
+        *RETIRED_SELECTORS,
+        "codex:gpt-6-sol:high",
+        "opencode:deepseek-v4.1-flash:xhigh",
+        "opencode:mimo-v2.6-flash:xhigh",
+    ):
         request = AgentRequest(
             "coder_tdd", ModelSpec.parse(selector), "x", tmp_path
         )
@@ -276,8 +282,6 @@ def test_runner_rejects_off_policy_models_at_the_command_boundary(
         ("codex:gpt-6-luna:xhigh", "codex"),
         ("claude:claude-opus-5-5:medium", "claude"),
         ("opencode:glm-5.3-flash:xhigh", "opencode"),
-        ("opencode:deepseek-v4.1-flash:xhigh", "opencode"),
-        ("opencode:mimo-v2.6-flash:xhigh", "opencode"),
     ):
         allowed = AgentRequest("coder_tdd", ModelSpec.parse(selector), "x", tmp_path)
         assert runner._command(allowed)[0] == binary
@@ -286,15 +290,18 @@ def test_runner_rejects_off_policy_models_at_the_command_boundary(
 @pytest.mark.parametrize(
     "selector", ["opencode:deepseek-v4.1-flash", "opencode:mimo-v2.6-flash:xhigh"]
 )
-def test_runner_keeps_coder_only_models_out_of_staff_roles(tmp_path, selector):
+def test_runner_keeps_swarm_only_models_in_the_swarm_roles(tmp_path, selector):
     from forge.policy import PROMOTION_ACTIVE, PromotionSnapshot
 
     runner = AgentRunner(policy=PromotionSnapshot(state=PROMOTION_ACTIVE))
-    for role in ("brain", "planner", "test_author", "reviewer", "tester"):
+    for role in (
+        "brain", "planner", "test_author", "reviewer", "tester",
+        "coder_tdd", "coder_explore", "coder_classic",
+    ):
         request = AgentRequest(role, ModelSpec.parse(selector), "x", tmp_path)
         with pytest.raises(AgentConfigurationFailure):
             runner._command(request)
-    for role in ("coder_tdd", "coder_explore", "coder_classic", "probe"):
+    for role in ("swarm_coder", "swarm_reviewer", "probe"):
         request = AgentRequest(role, ModelSpec.parse(selector), "x", tmp_path)
         command = runner._command(request)
         assert command[0] == "opencode"
