@@ -6,16 +6,26 @@ sochiera.pl), the process can enforce Jan's access gate itself. The gate is
 off by default: a plain local install keeps its historical anonymous surface.
 The expected value is supplied by the operator's local secret file, never via
 command-line options, and the match is constant-time rather than literal.
+
+Two entrance channels present the secret. The original one is the literal
+``X-Forge-Access`` request header, meant for server-side clients. The second
+is RFC 7617 Basic authentication, whose password part is what a stock browser
+collects with its native prompt when the server answers 401/WWW-Authenticate.
+Both channels accept the exact file value only; nothing else changes the
+status of the request.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hmac
 import os
 import stat
 from pathlib import Path
 
 GATE_ENV = "FORGE_UI_PASSWORD_FILE"
+REALM = "Forge Control Room"
 
 
 class GateMisconfigured(RuntimeError):
@@ -54,6 +64,30 @@ class AccessGate:
             return False
         offered = value.strip().encode("utf-8")
         return hmac.compare_digest(offered, self._expected)
+
+    def allows_basic_auth(self, header: str | None) -> bool:
+        """Verify the RFC 7617 Basic credentials against the secret file.
+
+        The username is ignored; the password must equal the whole secret
+        file value, so the browser prompt takes exactly the same secret as
+        the X-Forge-Access header. Parsing is non-fatal: malformed input
+        simply fails the check instead of raising.
+        """
+
+        if not header:
+            return False
+        scheme, _, remainder = header.partition(" ")
+        if scheme.strip().lower() != "basic":
+            return False
+        try:
+            decoded = base64.b64decode(remainder.strip(), validate=True)
+        except (binascii.Error, ValueError):
+            return False
+        _, separator, password = decoded.partition(b":")
+        if not separator:
+            return False
+        offered = password.strip()
+        return bool(offered) and hmac.compare_digest(offered, self._expected)
 
 
 def gate_from_env(environ: dict[str, str] | None = None) -> AccessGate | None:

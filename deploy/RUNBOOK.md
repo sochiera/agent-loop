@@ -19,9 +19,23 @@ chmod 600 /home/jan/.config/sochiera/forge-gate-secret
 FORGE_UI_PASSWORD_FILE=/home/jan/.config/sochiera/forge-gate-secret \
   python3 -m forge ui --no-browser
 # lub: python3 -m forge ui --no-browser --access-gate-file /home/jan/.config/sochiera/forge-gate-secret
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/api/health          # -> 403
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/api/health          # -> 401 (challenge Basic Auth)
 curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Forge-Access: <sekret>' http://127.0.0.1:8787/api/health  # -> 200
 ```
+
+## 1a. Wejście z przeglądarki (bez wtyczki)
+
+Serwer na każde odrzucone żądanie odpowiada 401 z nagłówkiem
+`WWW-Authenticate: Basic realm="Forge Control Room", charset="UTF-8"`, więc
+zwykła przeglądarka sama pokazuje natywne okno logowania. W polu użytkownika
+wpisz cokolwiek (np. `jan`), w polu hasła — sekret z pliku 0600. Po zalogowaniu
+przeglądarka dokleja `Authorization: Basic …` do HTML, statyki i każdego
+ żądania UI do `/api/…`, więc app.js nie musi (i nie dokleja) żadnych
+nagłówków. Kanał `X-Forge-Access` pozostał nietknięty (curl/skrypty).
+
+Panel działa też pod prefiksem `/forge/`, bo statyka i wywołania API w UI są
+względne (`style.css`, `app.js`, `api/…`), a proxy nginx zdejmuje prefiks
+(`proxy_pass http://127.0.0.1:8791/`), więc backend widzi korzeń.
 
 ## 2. Laptop: tunel do VPS
 
@@ -59,7 +73,8 @@ sudo nginx -t && sudo systemctl reload nginx
 ## 4. Weryfikacja po wdrożeniu (tylko po ship-it)
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' https://sochiera.pl/forge/            # -> 403 bez sekretu
+curl -s -o /dev/null -w '%{http_code}\n' https://sochiera.pl/forge/            # -> 401 bez sekretu (challenge)
+curl -s -o /dev/null -w '%{http_code}\n' -u 'jan:<sekret>' https://sochiera.pl/forge/    # -> 200 (Basic)
 curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Forge-Access: <sekret>' https://sochiera.pl/forge/  # -> 200
 curl -s -o /dev/null -w '%{http_code}\n' https://sochiera.pl/                  # -> 200 (strona główna nietknięta)
 curl -s -o /dev/null -w '%{http_code}\n' https://sochiera.pl/malowanie-po-numerach/  # -> 200

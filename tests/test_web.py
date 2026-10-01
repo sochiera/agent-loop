@@ -1,3 +1,4 @@
+import base64
 import json
 import subprocess
 import threading
@@ -630,9 +631,9 @@ def test_access_gate_requires_the_entrance_secret(tmp_path: Path):
 
     try:
         status, _ = fetch("/api/health")
-        assert status == 403
+        assert status == 401
         status, body = fetch("/", headers={"X-Forge-Access": "wrong"})
-        assert status == 403
+        assert status == 401
         status, _ = fetch("/api/health", headers={"X-Forge-Access": "gate-secret"})
         assert status == 200
         status, _ = fetch("/", headers={"X-Forge-Access": "gate-secret"})
@@ -641,6 +642,118 @@ def test_access_gate_requires_the_entrance_secret(tmp_path: Path):
             "/api/preference",
             headers={"X-Forge-Access": "gate-secret"},
         )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_access_gate_accepts_browser_basic_credentials(tmp_path: Path):
+    registry = RunRegistry(state_home=tmp_path)
+    gate = AccessGate(b"gate-secret")
+    server, thread = _gated_server(registry, gate, tmp_path)
+    base = f"http://127.0.0.1:{server.server_port}"
+
+    authorized = "Basic " + base64.b64encode(b"jan:gate-secret").decode()
+
+    def request(path: str, auth: str | None = None, method: str = "GET", data=None):
+        headers = {"Content-Type": "application/json"}
+        if auth:
+            headers["Authorization"] = auth
+        return urllib.request.Request(
+            base + path, data=data, headers=headers, method=method
+        )
+
+    def open_request(request):
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                return response.status, response.read().decode(), response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode(), error.headers
+
+    try:
+        status, body, headers = open_request(request("/api/health"))
+        assert status == 401
+        assert headers["WWW-Authenticate"] == (
+            'Basic realm="Forge Control Room", charset="UTF-8"'
+        )
+        assert "access gate: not authorized" in body
+        status, _, _ = open_request(request("/api/health", "Basic !!!not-b64!!!"))
+        assert status == 401
+        wrong = "Basic " + base64.b64encode(b"jan:wrong-password").decode()
+        status, _, _ = open_request(request("/api/health", wrong))
+        assert status == 401
+        status, body, _ = open_request(request("/", authorized))
+        assert status == 200
+        assert "Forge Control Room" in body
+        status, health, _ = open_request(request("/api/health", authorized))
+        assert status == 200
+        assert json.loads(health)["ok"] is True
+        saved, saved_body, _ = open_request(
+            request(
+                "/api/preferences",
+                authorized,
+                method="POST",
+                data=json.dumps({"push": False}).encode(),
+            )
+        )
+        assert saved == 200
+        assert saved_body is not None
+        assert json.loads(saved_body)["push"] is False
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_access_gate_still_backs_the_header_channel():
+    gate = AccessGate(b"gate-secret")
+    assert gate.allows("gate-secret") is True
+    assert gate.allows("wrong") is False
+    assert gate.allows("") is False
+
+    encoded = base64.b64encode(b"whatever-user:gate-secret").decode()
+    assert gate.allows_basic_auth(f"Basic {encoded}") is True
+    assert gate.allows_basic_auth(f"basic {encoded}") is True
+    assert gate.allows_basic_auth(f"Basic {base64.b64encode(b'u:nope').decode()}") is False
+    assert gate.allows_basic_auth(f"Bearer {encoded}") is False
+    assert gate.allows_basic_auth("") is False
+    assert gate.allows_basic_auth(None) is False
+    assert gate.allows_basic_auth("Basic !!!broken") is False
+    assert gate.allows_basic_auth("Basic") is False
+
+
+def test_relative_ui_paths_keep_working_behind_a_prefix_proxy(tmp_path: Path):
+    """The /forge/ proxy strips its prefix, so UI targets must not be root-absolute."""
+
+    registry = RunRegistry(state_home=tmp_path)
+    gate = AccessGate(b"gate-secret")
+    server, thread = _gated_server(registry, gate, tmp_path)
+    base = f"http://127.0.0.1:{server.server_port}"
+    authorized = "Basic " + base64.b64encode(b"jan:gate-secret").decode()
+
+    def fetch(path: str, headers: dict[str, str] | None = None):
+        request = urllib.request.Request(base + path, headers=headers or {})
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode()
+
+    try:
+        status, html = fetch("/", headers={"X-Forge-Access": "gate-secret"})
+        assert status == 200
+        assert 'href="/style.css"' not in html
+        assert 'src="/app.js"' not in html
+        assert 'href="style.css"' in html
+        assert 'src="app.js"' in html
+
+        status, script = fetch("/app.js", headers={"X-Forge-Access": "gate-secret"})
+        assert status == 200
+        assert 'fetch("/api' not in script and "fetch(`/api" not in script
+        assert 'path.startsWith("/") ? path.slice(1) : path' in script
+        status, health = fetch("/api/health", headers={"X-Forge-Access": "gate-secret"})
+        assert json.loads(health)["ok"] is True
     finally:
         server.shutdown()
         server.server_close()
@@ -661,9 +774,9 @@ def test_access_gate_post_is_rejected_before_auth(tmp_path: Path):
     try:
         try:
             urllib.request.urlopen(request, timeout=2)
-            raise AssertionError("expected 403")
+            raise AssertionError("expected an unauthorized response")
         except urllib.error.HTTPError as error:
-            assert error.code == 403
+            assert error.code == 401
         assert registry.load_preferences()["repo"] == ""
         assert registry._preferences_path().exists() is False
     finally:
