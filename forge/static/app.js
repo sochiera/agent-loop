@@ -53,7 +53,10 @@ function formatTokens(value) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {headers: {"Content-Type": "application/json"}, ...options});
+  // Relative request targets keep working when the room is proxied under a
+  // subpath (the /forge/ entrance) and when it is served directly from /.
+  const target = path.startsWith("/") ? path.slice(1) : path;
+  const response = await fetch(target, {headers: {"Content-Type": "application/json"}, ...options});
   const value = await response.json();
   if (!response.ok) throw new Error(value.error || response.statusText);
   return value;

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .artifacts import atomic_write
-from .access import AccessGate
+from .access import REALM, AccessGate
 from .catalog import assign_coder_models, catalog_payload, DEFAULTS
 from .gitops import list_branches, repository_summary
 from .locking import ExecutionLocked
@@ -566,14 +566,27 @@ class ForgeHandler(BaseHTTPRequestHandler):
         gate = type(self).gate
         if gate is None:
             return True
-        return gate.allows(self.headers.get("X-Forge-Access"))
+        return gate.allows(self.headers.get("X-Forge-Access")) or gate.allows_basic_auth(
+            self.headers.get("Authorization")
+        )
 
-    def _reject_gate(self, detail: str, status: HTTPStatus) -> None:
-        self._json({"error": detail}, status)
+    def _challenge_gate(self) -> None:
+        """Ask the browser for RFC 7617 credentials with a native prompt."""
+
+        body = json.dumps({"error": "access gate: not authorized"}).encode()
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("Content-Type", "application/json")
+        self.send_header(
+            "WWW-Authenticate", f'Basic realm="{REALM}", charset="UTF-8"'
+        )
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
         if not self._gate_allowed():
-            return self._reject_gate("access gate: not authorized", HTTPStatus.FORBIDDEN)
+            return self._challenge_gate()
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/health":
             return self._json({"ok": True, "active_runs": self.registry.active_count()})
@@ -626,7 +639,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._gate_allowed():
-            return self._reject_gate("access gate: not authorized", HTTPStatus.FORBIDDEN)
+            return self._challenge_gate()
         try:
             payload = self._body()
             if self.path == "/api/restart":
