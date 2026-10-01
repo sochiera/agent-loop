@@ -7,30 +7,28 @@ const roleMeta = {
   tester: ["Unified tester", "White-box and public-behavior acceptance"],
 };
 const defaults = {
-  brain: "codex:gpt-5.6-sol:high",
-  planner: "codex:gpt-5.6-sol:high",
-  test_author: "codex:gpt-5.6-luna:high",
-  reviewer: "codex:gpt-5.6-terra:high",
-  tester: "codex:gpt-5.6-terra:high",
+  brain: "codex:gpt-6-sol:medium",
+  planner: "codex:gpt-6-sol:medium",
+  test_author: "codex:gpt-6-luna:xhigh",
+  reviewer: "codex:gpt-6-sol:medium",
+  tester: "codex:gpt-6-luna:xhigh",
 };
-const defaultCoder = "codex:gpt-5.6-luna:high";
+const defaultCoder = "codex:gpt-6-luna:xhigh";
 const defaultCoderPool = [defaultCoder, defaultCoder, defaultCoder];
 const maxCoderModels = 12;
 const phases = ["preflight", "product-owner", "planning", "test-authoring", "coding", "selection", "review", "testing", "delivery", "finalizing"];
 const phaseLabels = ["Preflight", "Product owner", "Plan", "Tests (RED)", "Code ×3", "Select", "Review", "Test", "Deliver", "Finalize"];
 const storageKey = "forge-control-room-v5";
-const providerLabels = {codex: "Codex", opencode: "OpenCode"};
-const familyLabels = {gpt: "GPT", glm: "GLM", deepseek: "DeepSeek", mimo: "MiMo"};
-const effortLabels = {"": "Default", low: "Low", medium: "Medium", high: "High"};
+const providerLabels = {codex: "Codex", claude: "Claude Code", opencode: "OpenCode"};
+const familyLabels = {gpt: "GPT", claude: "Claude", glm: "GLM"};
+const effortLabels = {"": "Default", low: "Low", medium: "Medium", high: "High", xhigh: "XHigh"};
 const fallbackCatalog = {
-  providers: ["codex", "opencode"],
+  providers: ["codex", "claude", "opencode"],
   models: [
-    {key: "gpt-5.6-sol", label: "GPT-5.6 Sol", family: "gpt", providers: ["codex"], ids: {codex: "gpt-5.6-sol"}, efforts: ["", "low", "medium", "high"]},
-    {key: "gpt-5.6-terra", label: "GPT-5.6 Terra", family: "gpt", providers: ["codex"], ids: {codex: "gpt-5.6-terra"}, efforts: ["", "low", "medium", "high"]},
-    {key: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "gpt", providers: ["codex"], ids: {codex: "gpt-5.6-luna"}, efforts: ["", "low", "medium", "high"]},
-    {key: "glm-5.3-flash", label: "GLM 5.3 Flash", family: "glm", providers: ["opencode"], ids: {opencode: "opencode-go/glm-5.3-flash"}, efforts: ["", "low", "medium", "high"]},
-    {key: "deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash", family: "deepseek", providers: ["opencode"], ids: {opencode: "opencode-go/deepseek-v4.1-flash"}, efforts: ["", "low", "medium", "high"]},
-    {key: "mimo-v2.6-flash", label: "MiMo V2.6 Flash", family: "mimo", providers: ["opencode"], ids: {opencode: "opencode-go/mimo-v2.6-flash"}, efforts: ["", "low", "medium", "high"]},
+    {key: "gpt-6-sol", label: "GPT-6 Sol", family: "gpt", providers: ["codex"], ids: {codex: "gpt-6-sol"}, efforts: ["medium"]},
+    {key: "gpt-6-luna", label: "GPT-6 Luna", family: "gpt", providers: ["codex"], ids: {codex: "gpt-6-luna"}, efforts: ["xhigh"]},
+    {key: "claude-opus-5-5", label: "Claude Opus 5.5", family: "claude", providers: ["claude"], ids: {claude: "claude-opus-5-5"}, efforts: ["medium"]},
+    {key: "glm-5.3-flash", label: "GLM 5.3 Flash", family: "glm", providers: ["opencode"], ids: {opencode: "opencode-go/glm-5.3-flash"}, efforts: ["xhigh"]},
   ],
 };
 let catalog = fallbackCatalog;

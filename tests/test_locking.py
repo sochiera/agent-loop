@@ -112,7 +112,7 @@ def test_orchestrator_acquires_ownership_before_persisting_run_state(tmp_path: P
     repo = initialized_repo(tmp_path)
     brief = tmp_path / "brief.md"
     brief.write_text("Build continuously.\n", encoding="utf-8")
-    models = {role: ModelSpec.parse("codex:gpt-5.6-sol:low") for role in ROLE_NAMES}
+    models = {role: ModelSpec.parse("codex:gpt-6-sol:medium") for role in ROLE_NAMES}
     config = RunConfig(str(repo), str(brief), "main", models, push=False)
     orchestrator = ForgeOrchestrator(
         config,

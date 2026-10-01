@@ -1,9 +1,11 @@
 """Jan's model routing policy for Forge runs.
 
-The policy is fail-closed. When the promotion state cannot be read, only the
-native Codex GPT models and the OpenCode Go GLM Flash reviewer stay available;
-Forge never guesses DeepSeek or MiMo. Every decision here is deterministic for a
-given RNG, so tests can seed it without touching Jan's home directory.
+The roster mirrors ~/.hermes/scripts/model_policy.py and is closed: exactly
+four models, each pinned to one harness and one reasoning effort. The legacy
+GPT-5.6 Sol/Terra/Luna, DeepSeek, and MiMo roster is retired and never
+selected. The promotion state is still read for audit display, but it no
+longer changes which models are eligible. Every decision here is deterministic
+for a given RNG, so tests can seed it without touching Jan's home directory.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .catalog import model_identity
+from .catalog import model_family, model_identity
 from .models import CODER_ROLES, ROLE_NAMES, ModelSpec
 
 DEFAULT_POLICY_PATH = Path("/home/jan/.hermes/state/model-policy.json")
@@ -25,29 +27,28 @@ PROMOTION_ACTIVE = "active"
 PROMOTION_INACTIVE = "inactive"
 PROMOTION_UNKNOWN = "unknown"
 
-OPENAI_FAMILY = "gpt"
-GLM_FAMILY = "glm"
+SOL = ModelSpec("codex", "gpt-6-sol", "medium")
+LUNA = ModelSpec("codex", "gpt-6-luna", "xhigh")
+OPUS = ModelSpec("claude", "claude-opus-5-5", "medium")
+GLM = ModelSpec("opencode", "opencode-go/glm-5.3-flash", "xhigh")
 
-SOL = ModelSpec("codex", "gpt-5.6-sol", "high")
-TERRA = ModelSpec("codex", "gpt-5.6-terra", "high")
-LUNA = ModelSpec("codex", "gpt-5.6-luna", "high")
-GLM = ModelSpec("opencode", "opencode-go/glm-5.3-flash", "high")
-DEEPSEEK = ModelSpec("opencode", "opencode-go/deepseek-v4.1-flash", "high")
-MIMO = ModelSpec("opencode", "opencode-go/mimo-v2.6-flash", "high")
+ALLOWED_MODELS: tuple[ModelSpec, ...] = (SOL, LUNA, OPUS, GLM)
 
-# Weighted pools. ``cheap`` is replaced by the promotion-state coder.
-STRONG_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((SOL, 45), (TERRA, 55))
-REVIEW_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((TERRA, 55), (SOL, 45))
-CODER_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((LUNA, 45), (GLM, 15))
-TEST_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((LUNA, 35), (GLM, 35))
-REVIEW_DIVERSITY_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((GLM, 55),)
+# Exact identifiers used by the central Hermes policy.
+POLICY_IDS = {
+    model_identity(SOL): "openai-codex/gpt-6-sol",
+    model_identity(LUNA): "openai-codex/gpt-6-luna",
+    model_identity(OPUS): "claude-code/claude-opus-5-5",
+    model_identity(GLM): "opencode-go/glm-5.3-flash",
+}
 
-CHEAP_CODER_WEIGHT = 40
-CHEAP_TEST_WEIGHT = 30
-CHEAP_REVIEW_WEIGHT = 45
+# Weighted pools, copied from the central policy's role weights.
+STRONG_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((SOL, 50), (GLM, 50))
+REVIEW_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((SOL, 50), (GLM, 50))
+CODER_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((OPUS, 25), (LUNA, 50), (GLM, 25))
+TEST_WEIGHTS: tuple[tuple[ModelSpec, int], ...] = ((OPUS, 20), (LUNA, 55), (GLM, 25))
 
-ALWAYS_AVAILABLE: tuple[ModelSpec, ...] = (SOL, TERRA, LUNA, GLM)
-
+_PINNED_EFFORTS = {model_identity(spec): spec.effort for spec in ALLOWED_MODELS}
 _WORKER_ROLES = frozenset({*CODER_ROLES, "test_author", "tester"})
 
 
@@ -75,41 +76,41 @@ def _unique(
 
 @dataclass(frozen=True)
 class PromotionSnapshot:
-    """Immutable view of the active promotion state and derived policy."""
+    """Immutable view of the promotion state and the closed model roster."""
 
     state: str = PROMOTION_UNKNOWN
     path: str = ""
     source: str = "default"
-    cheap_coder: ModelSpec | None = None
 
     # Catalog ---------------------------------------------------------
 
     def allowed_models(self) -> tuple[ModelSpec, ...]:
-        models = list(ALWAYS_AVAILABLE)
-        if self.cheap_coder is not None:
-            models.append(self.cheap_coder)
-        return tuple(models)
+        return ALLOWED_MODELS
 
     def allows(self, spec: ModelSpec) -> bool:
-        identity = model_identity(spec)
-        return any(identity == model_identity(item) for item in self.allowed_models())
+        """Allow only a roster model at its pinned effort (empty means pinned)."""
+
+        pinned = _PINNED_EFFORTS.get(model_identity(spec))
+        return pinned is not None and spec.effort in {"", pinned}
 
     def identity_allowed(self, identity: str) -> bool:
-        return any(identity == model_identity(item) for item in self.allowed_models())
+        return identity in _PINNED_EFFORTS
+
+    def pin(self, spec: ModelSpec) -> ModelSpec:
+        """Fill an empty effort with the policy effort for a roster model."""
+
+        pinned = _PINNED_EFFORTS.get(model_identity(spec))
+        if pinned is None or spec.effort:
+            return spec
+        return ModelSpec(spec.provider, spec.model, pinned)
 
     # Weighted pools --------------------------------------------------
 
     def coder_options(self) -> list[tuple[ModelSpec, int]]:
-        options = list(CODER_WEIGHTS)
-        if self.cheap_coder is not None:
-            options.append((self.cheap_coder, CHEAP_CODER_WEIGHT))
-        return options
+        return list(CODER_WEIGHTS)
 
     def test_options(self) -> list[tuple[ModelSpec, int]]:
-        options = list(TEST_WEIGHTS)
-        if self.cheap_coder is not None:
-            options.append((self.cheap_coder, CHEAP_TEST_WEIGHT))
-        return options
+        return list(TEST_WEIGHTS)
 
     def strong_options(self) -> list[tuple[ModelSpec, int]]:
         return list(STRONG_WEIGHTS)
@@ -157,7 +158,7 @@ class PromotionSnapshot:
         coders = self.select_coder_roster(rng)
         for role in ROLE_NAMES:
             if role in overrides:
-                models[role] = overrides[role]
+                models[role] = self.pin(overrides[role])
             elif role in CODER_ROLES:
                 models[role] = coders[role]
             else:
@@ -169,8 +170,8 @@ class PromotionSnapshot:
             "brain": SOL,
             "planner": SOL,
             "test_author": LUNA,
-            "reviewer": TERRA,
-            "tester": TERRA,
+            "reviewer": SOL,
+            "tester": LUNA,
         }
         for role in CODER_ROLES:
             defaults[role] = LUNA
@@ -189,18 +190,11 @@ class PromotionSnapshot:
         self, winner_family: str, *, disabled: Sequence[str] = (), rng: Any = None
     ) -> tuple[ModelSpec | None, str]:
         disabled_ids = {str(item) for item in disabled}
-        if winner_family == OPENAI_FAMILY:
-            options = list(REVIEW_DIVERSITY_WEIGHTS)
-            if self.cheap_coder is not None:
-                options.append((self.cheap_coder, CHEAP_REVIEW_WEIGHT))
-        else:
-            options = list(REVIEW_WEIGHTS)
-            if winner_family != GLM_FAMILY:
-                options.append((GLM, 20))
         healthy = [
             (spec, weight)
-            for spec, weight in options
-            if model_identity(spec) not in disabled_ids
+            for spec, weight in self.review_options()
+            if model_family(spec) != winner_family
+            and model_identity(spec) not in disabled_ids
         ]
         if not healthy:
             return (
@@ -216,8 +210,10 @@ class PromotionSnapshot:
             "promotion_state": self.state,
             "path": self.path,
             "source": self.source,
-            "cheap_coder": self.cheap_coder.display() if self.cheap_coder else "",
             "allowed_models": [spec.display() for spec in self.allowed_models()],
+            "policy_ids": [
+                POLICY_IDS[model_identity(spec)] for spec in self.allowed_models()
+            ],
         }
 
 
@@ -236,14 +232,6 @@ def _read_promotion_state(path: Path) -> tuple[str, str]:
     return PROMOTION_UNKNOWN, "default"
 
 
-def cheap_coder_for(state: str) -> ModelSpec | None:
-    if state == PROMOTION_ACTIVE:
-        return DEEPSEEK
-    if state == PROMOTION_INACTIVE:
-        return MIMO
-    return None
-
-
 def load_policy(path: str | Path | None = None) -> PromotionSnapshot:
     if path:
         target = Path(path).expanduser()
@@ -255,7 +243,6 @@ def load_policy(path: str | Path | None = None) -> PromotionSnapshot:
         state=state,
         path=str(target),
         source=source,
-        cheap_coder=cheap_coder_for(state),
     )
 
 
@@ -273,7 +260,6 @@ def snapshot_from_dict(data: Mapping[str, Any]) -> PromotionSnapshot:
         state=state,
         path=str(data.get("path") or ""),
         source=str(data.get("source") or "default"),
-        cheap_coder=cheap_coder_for(state),
     )
 
 

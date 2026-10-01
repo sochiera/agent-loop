@@ -67,7 +67,7 @@ def test_brain_commands_are_restricted(tmp_path: Path):
     codex = runner._command(
         AgentRequest(
             "brain",
-            ModelSpec.parse("codex:gpt-5.6-sol:high"),
+            ModelSpec.parse("codex:gpt-6-sol:medium"),
             "x",
             tmp_path,
             access="none",
@@ -95,7 +95,7 @@ def test_codex_resume_uses_configured_sandbox_not_unsupported_flag(tmp_path: Pat
     command = AgentRunner()._command(
         AgentRequest(
             "coder",
-            ModelSpec.parse("codex:gpt-5.6-luna:medium"),
+            ModelSpec.parse("codex:gpt-6-luna:xhigh"),
             "continue",
             tmp_path,
             session_id="session-1",
@@ -107,15 +107,15 @@ def test_codex_resume_uses_configured_sandbox_not_unsupported_flag(tmp_path: Pat
     assert "--sandbox" not in command
     assert any("sandbox_mode" in item for item in command)
     assert any('sandbox_mode="workspace-write"' == item for item in command)
-    assert "openai/gpt-5.6-luna" not in command
-    assert "gpt-5.6-luna" in command
+    assert "gpt-6-luna" in command
+    assert 'model_reasoning_effort="xhigh"' in command
 
 
 def test_codex_coder_uses_lean_cached_tool_surface(tmp_path: Path):
     command = AgentRunner()._command(
         AgentRequest(
             "coder",
-            ModelSpec.parse("codex:gpt-5.6-luna:high"),
+            ModelSpec.parse("codex:gpt-6-luna:xhigh"),
             "implement",
             tmp_path,
             access="write",
@@ -130,7 +130,7 @@ def test_codex_coder_uses_lean_cached_tool_surface(tmp_path: Path):
 def test_opencode_writer_denies_git_delivery_and_external_paths(tmp_path: Path):
     request = AgentRequest(
         "coder",
-        ModelSpec.parse("opencode:glm-5.3-flash:high"),
+        ModelSpec.parse("opencode:glm-5.3-flash:xhigh"),
         "implement",
         tmp_path,
         access="write",
@@ -149,7 +149,7 @@ def test_opencode_writer_denies_git_delivery_and_external_paths(tmp_path: Path):
 def test_opencode_tester_can_execute_inside_disposable_copy(tmp_path: Path):
     request = AgentRequest(
         "tester",
-        ModelSpec.parse("opencode:glm-5.3-flash:high"),
+        ModelSpec.parse("opencode:glm-5.3-flash:xhigh"),
         "exercise public behavior",
         tmp_path,
         access="test",
@@ -242,17 +242,27 @@ def test_kimi_billing_cycle_limit_is_usage_limit():
     assert failure_type_for(message) is AgentUsageLimit
 
 
-def test_runner_rejects_off_policy_models_at_the_command_boundary(tmp_path, monkeypatch):
+RETIRED_SELECTORS = (
+    "codex:gpt-5.6-sol:high",
+    "codex:gpt-5.6-terra:high",
+    "codex:gpt-5.6-luna:high",
+    "opencode:deepseek-v4.1-flash",
+    "opencode:mimo-v2.6-flash",
+    "opencode:grok-4.6",
+    "opencode:kimi-k3",
+)
+
+
+@pytest.mark.parametrize("state", ["active", "inactive"])
+def test_runner_rejects_off_policy_models_at_the_command_boundary(
+    tmp_path, monkeypatch, state
+):
     policy_file = tmp_path / "policy.json"
-    policy_file.write_text('{"promotion_state": "inactive"}', encoding="utf-8")
+    policy_file.write_text(f'{{"promotion_state": "{state}"}}', encoding="utf-8")
     monkeypatch.setenv("FORGE_MODEL_POLICY_PATH", str(policy_file))
     runner = AgentRunner()
 
-    for selector in (
-        "opencode:deepseek-v4.1-flash",
-        "opencode:grok-4.6",
-        "opencode:kimi-k3",
-    ):
+    for selector in (*RETIRED_SELECTORS, "codex:gpt-6-sol:high"):
         request = AgentRequest(
             "coder_tdd", ModelSpec.parse(selector), "x", tmp_path
         )
@@ -261,19 +271,20 @@ def test_runner_rejects_off_policy_models_at_the_command_boundary(tmp_path, monk
         with pytest.raises(AgentConfigurationFailure):
             runner.run(request)
 
-    allowed = AgentRequest(
-        "coder_tdd", ModelSpec.parse("opencode:mimo-v2.6-flash"), "x", tmp_path
-    )
-    assert runner._command(allowed)[0] == "opencode"
-
-
-def test_runner_fails_closed_when_the_policy_is_missing(tmp_path):
-    runner = AgentRunner()
-    for selector in (
-        "opencode:deepseek-v4.1-flash",
-        "opencode:mimo-v2.6-flash",
-        "opencode:grok-4.6",
+    for selector, binary in (
+        ("codex:gpt-6-sol:medium", "codex"),
+        ("codex:gpt-6-luna:xhigh", "codex"),
+        ("claude:claude-opus-5-5:medium", "claude"),
+        ("opencode:glm-5.3-flash:xhigh", "opencode"),
     ):
+        allowed = AgentRequest("coder_tdd", ModelSpec.parse(selector), "x", tmp_path)
+        assert runner._command(allowed)[0] == binary
+
+
+def test_runner_fails_closed_when_the_policy_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("FORGE_MODEL_POLICY_PATH", str(tmp_path / "absent.json"))
+    runner = AgentRunner()
+    for selector in RETIRED_SELECTORS:
         request = AgentRequest(
             "coder_tdd", ModelSpec.parse(selector), "x", tmp_path
         )
@@ -281,19 +292,79 @@ def test_runner_fails_closed_when_the_policy_is_missing(tmp_path):
             runner._command(request)
 
 
-def test_runner_accepts_an_injected_policy_for_hermetic_tests(tmp_path):
-    from forge.policy import (
-        PROMOTION_ACTIVE,
-        PromotionSnapshot,
-        cheap_coder_for,
-    )
+def test_runner_pins_an_empty_effort_to_the_policy_effort(tmp_path):
+    from forge.policy import PROMOTION_ACTIVE, PromotionSnapshot
 
-    runner = AgentRunner(
-        policy=PromotionSnapshot(
-            state=PROMOTION_ACTIVE, cheap_coder=cheap_coder_for(PROMOTION_ACTIVE)
+    runner = AgentRunner(policy=PromotionSnapshot(state=PROMOTION_ACTIVE))
+    request = AgentRequest(
+        "coder_tdd", ModelSpec.parse("opencode:glm-5.3-flash"), "x", tmp_path
+    )
+    command = runner._command(request)
+    assert command[command.index("--variant") + 1] == "xhigh"
+    assert request.model.effort == "xhigh"
+
+
+def test_claude_command_uses_explicit_opus_slug_and_restricted_tools(tmp_path):
+    runner = AgentRunner()
+    brain = runner._command(
+        AgentRequest(
+            "brain",
+            ModelSpec.parse("claude:claude-opus-5-5"),
+            "x",
+            tmp_path,
+            access="none",
+            schema={"type": "object"},
         )
     )
-    request = AgentRequest(
-        "coder_tdd", ModelSpec.parse("opencode:deepseek-v4.1-flash"), "x", tmp_path
+    assert brain[:2] == ["claude", "--print"]
+    assert brain[brain.index("--model") + 1] == "claude-opus-5-5"
+    assert brain[brain.index("--effort") + 1] == "medium"
+    assert brain[brain.index("--permission-mode") + 1] == "dontAsk"
+    assert brain[brain.index("--tools") + 1] == ""
+    assert "--allowedTools" not in brain
+    assert "--safe-mode" in brain
+    assert "--json-schema" in brain
+    assert "--session-id" in brain
+
+    coder = runner._command(
+        AgentRequest(
+            "coder_tdd",
+            ModelSpec.parse("claude:claude-opus-5-5:medium"),
+            "x",
+            tmp_path,
+            session_id="abc",
+            access="write",
+        )
     )
-    assert runner._command(request)[0] == "opencode"
+    assert coder[coder.index("--resume") + 1] == "abc"
+    assert coder[coder.index("--allowedTools") + 1] == "Read,Edit,Write,Glob,Grep,Bash"
+    reader = runner._command(
+        AgentRequest(
+            "reviewer",
+            ModelSpec.parse("claude:claude-opus-5-5:medium"),
+            "x",
+            tmp_path,
+            access="read",
+        )
+    )
+    assert reader[reader.index("--tools") + 1] == "Read,Glob,Grep"
+
+
+def test_claude_stream_json_is_parsed():
+    from forge.agents import _claude_parse
+
+    events = [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1"}]}},
+        {
+            "type": "result",
+            "result": "done",
+            "session_id": "s1",
+            "usage": {"input_tokens": 10, "cache_read_input_tokens": 4, "output_tokens": 3},
+            "total_cost_usd": 0.5,
+        },
+    ]
+    text, usage, tools = _claude_parse(events)
+    assert text == "done"
+    assert (usage.input_tokens, usage.cached_input_tokens, usage.output_tokens) == (10, 4, 3)
+    assert usage.cost_usd == 0.5
+    assert tools == 1
