@@ -9,7 +9,7 @@ import random
 from pathlib import Path
 
 from .access import GATE_ENV, gate_from_env
-from .models import DEFAULT_MODEL_SELECTORS, ModelSpec, ROLE_NAMES, RunConfig
+from .models import CODER_ROLES, DEFAULT_MODEL_SELECTORS, ModelSpec, ROLE_NAMES, RunConfig
 from .orchestrator import ForgeOrchestrator
 from .policy import PromotionSnapshot, load_policy
 from .web import serve
@@ -160,6 +160,12 @@ def main(argv: list[str] | None = None) -> int:
         backup=ModelSpec.parse(args.backup) if args.backup else None,
         shuffle_coders=args.shuffle_coders,
         policy_path=args.policy_path,
+        # Explicit coder flags pin the run; otherwise redraw from the cheap pool.
+        coder_pool=(
+            []
+            if any(getattr(args, role) for role in CODER_ROLES)
+            else list(snapshot.coder_pool())
+        ),
     )
     orchestrator = ForgeOrchestrator(config, on_event=on_event)
     state = orchestrator.run()

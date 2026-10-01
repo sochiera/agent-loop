@@ -261,7 +261,7 @@ class AgentRunner:
 
     def _ensure_policy(self, request: AgentRequest) -> None:
         snapshot = self._current_policy()
-        if not snapshot.allows(request.model):
+        if not snapshot.allows(request.model, request.role):
             raise AgentConfigurationFailure(
                 f"{request.role} model {request.model.display()} is not allowed by "
                 f"the active model policy (promotion_state={snapshot.state})"

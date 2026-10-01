@@ -6,8 +6,11 @@ import pytest
 
 from forge.models import CODER_ROLES, ModelSpec
 from forge.policy import (
+    CHEAP_CODER_POOL,
+    DEEPSEEK,
     GLM,
     LUNA,
+    MIMO,
     OPUS,
     PROMOTION_ACTIVE,
     PROMOTION_INACTIVE,
@@ -20,9 +23,12 @@ RETIRED = (
     ModelSpec("codex", "gpt-5.6-sol", "high"),
     ModelSpec("codex", "gpt-5.6-terra", "high"),
     ModelSpec("codex", "gpt-5.6-luna", "high"),
-    ModelSpec("opencode", "opencode-go/deepseek-v4.1-flash", "high"),
-    ModelSpec("opencode", "opencode-go/mimo-v2.6-flash", "high"),
+    ModelSpec("opencode", "opencode-go/deepseek-v4-flash", "xhigh"),
+    ModelSpec("opencode", "opencode-go/mimo-v2.5", "xhigh"),
 )
+
+ROSTER = (SOL, LUNA, OPUS, GLM, DEEPSEEK, MIMO)
+STAFF_ROLES = ("brain", "planner", "test_author", "reviewer", "tester")
 
 
 def write_policy(tmp_path: Path, payload) -> Path:
@@ -34,34 +40,62 @@ def write_policy(tmp_path: Path, payload) -> Path:
     return path
 
 
-def test_roster_is_exactly_the_four_policy_models():
+def test_roster_is_the_smart_four_plus_the_cheap_coders():
     assert SOL == ModelSpec("codex", "gpt-6-sol", "medium")
     assert LUNA == ModelSpec("codex", "gpt-6-luna", "xhigh")
     assert OPUS == ModelSpec("claude", "claude-opus-5-5", "medium")
     assert GLM == ModelSpec("opencode", "opencode-go/glm-5.3-flash", "xhigh")
+    assert DEEPSEEK == ModelSpec("opencode", "opencode-go/deepseek-v4.1-flash", "xhigh")
+    assert MIMO == ModelSpec("opencode", "opencode-go/mimo-v2.6-flash", "xhigh")
     payload = load_policy(None).to_dict()
     assert payload["allowed_models"] == [
         "codex:gpt-6-sol:medium",
         "codex:gpt-6-luna:xhigh",
         "claude:claude-opus-5-5:medium",
         "opencode:opencode-go/glm-5.3-flash:xhigh",
+        "opencode:opencode-go/deepseek-v4.1-flash:xhigh",
+        "opencode:opencode-go/mimo-v2.6-flash:xhigh",
     ]
     assert payload["policy_ids"] == [
         "openai-codex/gpt-6-sol",
         "openai-codex/gpt-6-luna",
         "claude-code/claude-opus-5-5",
         "opencode-go/glm-5.3-flash",
+        "opencode-go/deepseek-v4.1-flash",
+        "opencode-go/mimo-v2.6-flash",
     ]
+    assert payload["coder_only_models"] == [DEEPSEEK.display(), MIMO.display()]
+    assert payload["coder_pool"] == [spec.display() for spec in CHEAP_CODER_POOL]
+
+
+def test_cheap_coder_pool_is_six_slots_with_three_lunas():
+    assert CHEAP_CODER_POOL == (DEEPSEEK, MIMO, GLM, LUNA, LUNA, LUNA)
+    assert load_policy(None).coder_pool() == CHEAP_CODER_POOL
+
+
+def test_coder_only_models_never_staff_other_roles():
+    snapshot = load_policy(None)
+    for spec in (DEEPSEEK, MIMO):
+        assert snapshot.allows(spec)
+        for role in (*CODER_ROLES, "probe"):
+            assert snapshot.allows(spec, role)
+        for role in (*STAFF_ROLES, "backup"):
+            assert not snapshot.allows(spec, role)
+    for role in (*STAFF_ROLES, *CODER_ROLES, "backup"):
+        assert snapshot.allows(GLM, role)
+        assert snapshot.allows(LUNA, role)
 
 
 @pytest.mark.parametrize("state", ["active", "inactive", "unknown"])
 def test_promotion_state_never_admits_the_retired_roster(tmp_path, state):
     snapshot = load_policy(write_policy(tmp_path, {"promotion_state": state}))
-    assert snapshot.allowed_models() == (SOL, LUNA, OPUS, GLM)
+    assert snapshot.allowed_models() == ROSTER
     for spec in RETIRED:
         assert not snapshot.allows(spec)
-    for role in ("brain", "planner", "reviewer", "tester", "test_author", *CODER_ROLES):
+    for role in STAFF_ROLES:
         assert {spec for spec, _ in snapshot.role_options(role)} <= {SOL, LUNA, OPUS, GLM}
+    for role in CODER_ROLES:
+        assert {spec for spec, _ in snapshot.role_options(role)} == {DEEPSEEK, MIMO, GLM, LUNA}
 
 
 def test_promotion_state_is_still_reported(tmp_path):
@@ -76,7 +110,7 @@ def test_promotion_state_is_still_reported(tmp_path):
 def test_invalid_policy_state_keeps_the_same_roster(tmp_path, payload):
     snapshot = load_policy(write_policy(tmp_path, payload))
     assert snapshot.state == PROMOTION_UNKNOWN
-    assert snapshot.allowed_models() == (SOL, LUNA, OPUS, GLM)
+    assert snapshot.allowed_models() == ROSTER
 
 
 def test_missing_policy_file_is_unknown(tmp_path):
@@ -90,6 +124,9 @@ def test_effort_is_pinned_per_model():
     assert not snapshot.allows(ModelSpec("codex", "gpt-6-luna", "medium"))
     assert snapshot.pin(ModelSpec("codex", "gpt-6-luna", "")) == LUNA
     assert snapshot.pin(ModelSpec("claude", "claude-opus-5-5", "")) == OPUS
+    assert snapshot.pin(ModelSpec("opencode", "opencode-go/deepseek-v4.1-flash", "")) == DEEPSEEK
+    assert snapshot.pin(ModelSpec("opencode", "opencode-go/mimo-v2.6-flash", "")) == MIMO
+    assert not snapshot.allows(ModelSpec("opencode", "opencode-go/mimo-v2.6-flash", "high"))
 
 
 def test_role_pools_follow_the_central_weights():
@@ -97,7 +134,8 @@ def test_role_pools_follow_the_central_weights():
     assert dict(snapshot.role_options("brain")) == {SOL: 50, GLM: 50}
     assert dict(snapshot.role_options("planner")) == {SOL: 50, GLM: 50}
     assert dict(snapshot.role_options("reviewer")) == {SOL: 50, GLM: 50}
-    assert dict(snapshot.role_options("coder_tdd")) == {OPUS: 25, LUNA: 50, GLM: 25}
+    for role in CODER_ROLES:
+        assert dict(snapshot.role_options(role)) == {DEEPSEEK: 1, MIMO: 1, GLM: 1, LUNA: 3}
     assert dict(snapshot.role_options("test_author")) == {OPUS: 20, LUNA: 55, GLM: 25}
     assert dict(snapshot.role_options("tester")) == {OPUS: 20, LUNA: 55, GLM: 25}
 
@@ -109,15 +147,50 @@ def test_seeded_weighted_chooser_is_deterministic_and_covers_the_pool():
     assert first == second
     assert set(first) == {SOL, GLM}
     coder = [snapshot.select_role("coder_tdd", random.Random(seed)) for seed in range(80)]
-    assert set(coder) == {OPUS, LUNA, GLM}
+    assert set(coder) == {DEEPSEEK, MIMO, GLM, LUNA}
 
 
-def test_coder_roster_is_family_diverse():
+def test_coder_roster_draws_three_slots_without_replacement():
     snapshot = load_policy(None)
-    for seed in range(25):
-        roster = snapshot.select_coder_roster(random.Random(seed))
+    draws = [snapshot.select_coder_roster(random.Random(seed)) for seed in range(400)]
+    assert draws[:20] == [
+        snapshot.select_coder_roster(random.Random(seed)) for seed in range(20)
+    ]
+    luna_counts = set()
+    seen = set()
+    for roster in draws:
         assert set(roster) == set(CODER_ROLES)
-        assert set(roster.values()) == {OPUS, LUNA, GLM}
+        values = list(roster.values())
+        for spec in (DEEPSEEK, MIMO, GLM):
+            assert values.count(spec) <= 1
+        assert values.count(LUNA) <= 3
+        luna_counts.add(values.count(LUNA))
+        seen.update(values)
+    assert seen == {DEEPSEEK, MIMO, GLM, LUNA}
+    assert luna_counts == {0, 1, 2, 3}
+    assert OPUS not in seen and SOL not in seen
+
+
+def test_coder_slot_draw_matches_the_hypergeometric_odds():
+    snapshot = load_policy(None)
+    trials = 6000
+    luna_total = 0
+    deepseek_drawn = 0
+    for seed in range(trials):
+        values = list(snapshot.select_coder_roster(random.Random(seed)).values())
+        luna_total += values.count(LUNA)
+        deepseek_drawn += DEEPSEEK in values
+    # Three of six slots are Luna: 1.5 Lunas per draw; each single slot is drawn half the time.
+    assert abs(luna_total / trials - 1.5) < 0.06
+    assert abs(deepseek_drawn / trials - 0.5) < 0.03
+
+
+def test_new_run_staff_never_draws_coder_only_models():
+    snapshot = load_policy(None)
+    for seed in range(200):
+        models = snapshot.select_new_run_models(random.Random(seed))
+        for role in STAFF_ROLES:
+            assert models[role] not in (DEEPSEEK, MIMO)
 
 
 def test_new_run_overrides_are_pinned():
@@ -157,8 +230,10 @@ def test_reviewer_exception_is_recorded_when_no_independent_family_is_healthy():
 
 def test_failover_options_stay_inside_the_roster():
     snapshot = load_policy(None)
-    assert set(snapshot.failover_options("coder_tdd")) == {OPUS, LUNA, GLM, SOL}
+    assert set(snapshot.failover_options("coder_tdd")) == {DEEPSEEK, MIMO, LUNA, GLM, SOL}
     assert set(snapshot.failover_options("reviewer")) == {SOL, GLM, OPUS, LUNA}
+    for role in STAFF_ROLES:
+        assert not {DEEPSEEK, MIMO} & set(snapshot.failover_options(role))
 
 
 def test_policy_snapshot_round_trips_without_secrets():

@@ -142,6 +142,8 @@ def preferences_from_config(config: RunConfig) -> dict[str, Any]:
             if role in config.models
         },
         "coder_models": [
+            spec.display() for spec in config.coder_pool
+        ] or [
             config.models[role].display()
             for role in CODER_ROLES
             if role in config.models
@@ -228,6 +230,44 @@ def restart_payload(active_runs: int, confirm: bool) -> dict[str, Any]:
     return {"restarting": True, "active_runs": active_runs}
 
 
+def coder_pool_from_payload(payload: dict[str, Any]) -> list[ModelSpec]:
+    """Parse the UI coder pool; every entry is one slot of the draw."""
+
+    pool: list[ModelSpec] = []
+    raw_pool = payload.get("coder_models")
+    if isinstance(raw_pool, list):
+        for item in raw_pool:
+            value = str(item).strip()
+            if value:
+                pool.append(ModelSpec.parse(value))
+    if len(pool) > MAX_CODER_PREFERENCES:
+        raise ValueError(
+            f"the coder pool accepts at most {MAX_CODER_PREFERENCES} models"
+        )
+    return pool
+
+
+def run_coder_pool(
+    payload: dict[str, Any], snapshot: PromotionSnapshot | None = None
+) -> list[ModelSpec]:
+    """The slots a new run redraws its coders from each sprint.
+
+    Explicit per-role coders pin the run (no pool); an empty UI pool falls back
+    to the policy's cheap coder pool.
+    """
+
+    raw_models = payload.get("models")
+    if isinstance(raw_models, dict) and any(
+        str(raw_models.get(role) or "").strip() for role in CODER_ROLES
+    ):
+        return []
+    snapshot = snapshot or load_policy(str(payload.get("policy_path") or "") or None)
+    pool = coder_pool_from_payload(payload)
+    if pool:
+        return [snapshot.pin(spec) for spec in pool]
+    return list(snapshot.coder_pool())
+
+
 def models_from_payload(
     payload: dict[str, Any],
     *,
@@ -253,29 +293,14 @@ def models_from_payload(
             if value:
                 overrides[role] = ModelSpec.parse(value)
     else:
-        pool: list[ModelSpec] = []
-        raw_pool = payload.get("coder_models")
-        if isinstance(raw_pool, list):
-            for item in raw_pool:
-                value = str(item).strip()
-                if value:
-                    pool.append(ModelSpec.parse(value))
-        if len(pool) > MAX_CODER_PREFERENCES:
-            raise ValueError(
-                f"the coder pool accepts at most {MAX_CODER_PREFERENCES} models"
-            )
+        pool = coder_pool_from_payload(payload)
         if pool:
             seed = ",".join(spec.display() for spec in pool)
-            weights = {
-                f"{spec.provider}:{spec.model}": weight
-                for spec, weight in snapshot.coder_options()
-            }
             overrides.update(
                 assign_coder_models(
                     {role: ModelSpec.parse(DEFAULTS[role]) for role in CODER_ROLES},
                     pool,
                     rng=random.Random(seed),
-                    weights=weights,
                 )
             )
     rng = random.Random(json.dumps(payload, sort_keys=True, default=str))
@@ -321,6 +346,7 @@ class RunRegistry:
             agent_timeout_seconds=int(payload.get("agent_timeout_seconds", 3600)),
             backup=ModelSpec.parse(backup_raw) if backup_raw else None,
             policy_path=str(payload.get("policy_path") or ""),
+            coder_pool=run_coder_pool(payload),
         )
         orchestrator = ForgeOrchestrator(config, state_home=self.state_home)
         live = LiveRun(orchestrator=orchestrator, thread=threading.Thread())

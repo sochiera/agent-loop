@@ -9,7 +9,7 @@ never selected as a fallback.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 PROVIDERS = ("codex", "claude", "opencode")
 
@@ -22,6 +22,8 @@ class CatalogEntry:
     providers: tuple[str, ...]
     ids: dict[str, str]
     efforts: tuple[str, ...] = ("", "low", "medium", "high")
+    # Coder-only models staff the tournament coders and nothing else.
+    coder_only: bool = False
 
     def id_for(self, provider: str) -> str:
         return self.ids[provider]
@@ -30,7 +32,8 @@ class CatalogEntry:
 # The active Forge catalog mirrors ~/.hermes/scripts/model_policy.py. Each model
 # runs on exactly one harness at exactly one reasoning effort: GPT-6 through
 # native Codex, Opus 5.5 through Claude Code by its explicit slug (never the
-# ``opus`` alias), and GLM Flash through OpenCode Go.
+# ``opus`` alias), and GLM Flash through OpenCode Go. DeepSeek and MiMo Flash are
+# Forge's cheap OpenCode Go coders: active only for the tournament coder roles.
 CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="gpt-6-sol",
@@ -64,17 +67,14 @@ CATALOG: tuple[CatalogEntry, ...] = (
         ids={"opencode": "opencode-go/glm-5.3-flash"},
         efforts=("xhigh",),
     ),
-)
-
-# Parse-only history. These identities load old artifacts and preferences but
-# are never part of the active catalog and never become a fallback.
-LEGACY_CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="deepseek-v4.1-flash",
         label="DeepSeek V4.1 Flash",
         family="deepseek",
         providers=("opencode",),
         ids={"opencode": "opencode-go/deepseek-v4.1-flash"},
+        efforts=("xhigh",),
+        coder_only=True,
     ),
     CatalogEntry(
         key="mimo-v2.6-flash",
@@ -82,7 +82,14 @@ LEGACY_CATALOG: tuple[CatalogEntry, ...] = (
         family="mimo",
         providers=("opencode",),
         ids={"opencode": "opencode-go/mimo-v2.6-flash"},
+        efforts=("xhigh",),
+        coder_only=True,
     ),
+)
+
+# Parse-only history. These identities load old artifacts and preferences but
+# are never part of the active catalog and never become a fallback.
+LEGACY_CATALOG: tuple[CatalogEntry, ...] = (
     CatalogEntry(
         key="gpt-5.6-sol",
         label="GPT-5.6 Sol",
@@ -260,7 +267,8 @@ def resolve_identity(provider: str, model: str) -> tuple[str, str]:
         raise ValueError(
             f"unsupported model {provider}:{model or '(empty)'}; "
             "choose an active policy model "
-            "(Codex GPT-6 Sol/Luna, Claude Code Opus 5.5, or OpenCode Go GLM Flash)"
+            "(Codex GPT-6 Sol/Luna, Claude Code Opus 5.5, or OpenCode Go "
+            "GLM/DeepSeek/MiMo Flash)"
         )
     return provider, entry.id_for(provider)
 
@@ -301,67 +309,34 @@ def spec_with_effort(spec: Any, effort: str = "") -> Any:
     return ModelSpec(spec.provider, spec.model, effort or spec.effort)
 
 
-def _weighted_sample_without_replacement(
-    options: Sequence[tuple[Any, int]], needed: int, picker: Any
-) -> list[Any]:
-    pool = [(spec, max(1, int(weight))) for spec, weight in options]
-    chosen: list[Any] = []
-    while pool and len(chosen) < needed:
-        specs = [spec for spec, _ in pool]
-        weights = [weight for _, weight in pool]
-        pick = picker.choices(specs, weights=weights, k=1)[0]
-        chosen.append(pick)
-        pool = [
-            (spec, weight)
-            for spec, weight in pool
-            if model_identity(spec) != model_identity(pick)
-        ]
-    return chosen
-
-
 def assign_coder_models(
     models: dict[str, Any],
     pool: list[Any] | None = None,
     *,
     rng: Any = None,
-    weights: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Draw the three coder roles from a pool, weighted and family-diverse.
+    """Draw the three coder roles from a pool of slots without replacement.
 
-    The pool is de-duplicated by identity so distinct families are preferred;
-    when it is too small the remaining roles reuse the available models.
+    Every pool entry is one slot, so listing a model twice doubles its odds and
+    lets it fill two roles. A pool shorter than the roles is used whole and the
+    remaining roles reuse its slots.
     """
 
     import random
 
     from .models import CODER_ROLES
 
-    source = list(pool) if pool is not None else [models[role] for role in CODER_ROLES]
-    unique: list[Any] = []
-    seen: set[str] = set()
-    for spec in source:
-        identity = model_identity(spec)
-        if identity not in seen:
-            unique.append(spec)
-            seen.add(identity)
-    if not unique:
+    slots = list(pool) if pool is not None else [models[role] for role in CODER_ROLES]
+    if not slots:
         raise ValueError("at least one coder model is required")
     picker = rng or random.Random()
-    weight_map = weights or {}
-    options = [
-        (spec, int(weight_map.get(model_identity(spec), 1))) for spec in unique
-    ]
     needed = len(CODER_ROLES)
-    if len(options) >= needed:
-        chosen = _weighted_sample_without_replacement(options, needed, picker)
+    if len(slots) >= needed:
+        chosen = picker.sample(slots, needed)
     else:
-        chosen = list(unique)
+        chosen = list(slots)
         while len(chosen) < needed:
-            chosen.append(picker.choices(
-                [spec for spec, _ in options],
-                weights=[weight for _, weight in options],
-                k=1,
-            )[0])
+            chosen.append(picker.choice(slots))
         picker.shuffle(chosen)
     updated = dict(models)
     for role, spec in zip(CODER_ROLES, chosen):
@@ -369,10 +344,8 @@ def assign_coder_models(
     return updated
 
 
-def shuffle_coder_models(
-    models: dict[str, Any], *, rng: Any = None, weights: Mapping[str, int] | None = None
-) -> dict[str, Any]:
-    return assign_coder_models(models, rng=rng, weights=weights)
+def shuffle_coder_models(models: dict[str, Any], *, rng: Any = None) -> dict[str, Any]:
+    return assign_coder_models(models, rng=rng)
 
 
 def catalog_payload(policy_snapshot: Any = None) -> dict[str, Any]:
@@ -387,6 +360,7 @@ def catalog_payload(policy_snapshot: Any = None) -> dict[str, Any]:
                 "providers": list(entry.providers),
                 "ids": dict(entry.ids),
                 "efforts": [item for item in entry.efforts],
+                "coder_only": entry.coder_only,
             }
             for entry in CATALOG
         ],

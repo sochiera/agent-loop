@@ -14,13 +14,19 @@ const defaults = {
   tester: "codex:gpt-6-luna:xhigh",
 };
 const defaultCoder = "codex:gpt-6-luna:xhigh";
-const defaultCoderPool = [defaultCoder, defaultCoder, defaultCoder];
+// The cheap coder pool: six slots, three drawn per sprint without replacement.
+const defaultCoderPool = [
+  "opencode:opencode-go/deepseek-v4.1-flash:xhigh",
+  "opencode:opencode-go/mimo-v2.6-flash:xhigh",
+  "opencode:opencode-go/glm-5.3-flash:xhigh",
+  defaultCoder, defaultCoder, defaultCoder,
+];
 const maxCoderModels = 12;
 const phases = ["preflight", "product-owner", "planning", "test-authoring", "coding", "selection", "review", "testing", "delivery", "finalizing"];
 const phaseLabels = ["Preflight", "Product owner", "Plan", "Tests (RED)", "Code ×3", "Select", "Review", "Test", "Deliver", "Finalize"];
 const storageKey = "forge-control-room-v5";
 const providerLabels = {codex: "Codex", claude: "Claude Code", opencode: "OpenCode"};
-const familyLabels = {gpt: "GPT", claude: "Claude", glm: "GLM"};
+const familyLabels = {gpt: "GPT", claude: "Claude", glm: "GLM", deepseek: "DeepSeek", mimo: "MiMo"};
 const effortLabels = {"": "Default", low: "Low", medium: "Medium", high: "High", xhigh: "XHigh"};
 const fallbackCatalog = {
   providers: ["codex", "claude", "opencode"],
@@ -29,6 +35,8 @@ const fallbackCatalog = {
     {key: "gpt-6-luna", label: "GPT-6 Luna", family: "gpt", providers: ["codex"], ids: {codex: "gpt-6-luna"}, efforts: ["xhigh"]},
     {key: "claude-opus-5-5", label: "Claude Opus 5.5", family: "claude", providers: ["claude"], ids: {claude: "claude-opus-5-5"}, efforts: ["medium"]},
     {key: "glm-5.3-flash", label: "GLM 5.3 Flash", family: "glm", providers: ["opencode"], ids: {opencode: "opencode-go/glm-5.3-flash"}, efforts: ["xhigh"]},
+    {key: "deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash", family: "deepseek", providers: ["opencode"], ids: {opencode: "opencode-go/deepseek-v4.1-flash"}, efforts: ["xhigh"], coder_only: true},
+    {key: "mimo-v2.6-flash", label: "MiMo V2.6 Flash", family: "mimo", providers: ["opencode"], ids: {opencode: "opencode-go/mimo-v2.6-flash"}, efforts: ["xhigh"], coder_only: true},
   ],
 };
 let catalog = fallbackCatalog;
@@ -81,8 +89,17 @@ function providerOptions(selectedProvider) {
   ).join("");
 }
 
-function modelOptions(provider, selectedKey) {
-  const available = catalog.models.filter(entry => entry.providers.includes(provider));
+function isCoderCard(card) {
+  return card?.dataset.role === "coder";
+}
+
+// Coder-only models (DeepSeek, MiMo) are offered to coder cards alone.
+function cardModels(card) {
+  return isCoderCard(card) ? catalog.models : catalog.models.filter(entry => !entry.coder_only);
+}
+
+function modelOptions(provider, selectedKey, card) {
+  const available = cardModels(card).filter(entry => entry.providers.includes(provider));
   const groups = [];
   available.forEach(entry => {
     const last = groups[groups.length - 1];
@@ -107,17 +124,18 @@ function effortOptions(entry, selectedEffort) {
 function applySelector(card, value) {
   const parsed = parseSelector(value);
   let provider = parsed.provider;
-  let entry = parsed.entry;
+  const models = cardModels(card);
+  let entry = parsed.entry && models.includes(parsed.entry) ? parsed.entry : null;
   if (entry && !entry.providers.includes(provider)) provider = entry.providers[0];
   if (!entry || !entry.providers.includes(provider)) {
-    entry = catalog.models.find(item => item.providers.includes(provider)) || catalog.models[0];
+    entry = models.find(item => item.providers.includes(provider)) || models[0];
   }
   const providerSelect = card.querySelector(".model-provider");
   const modelSelect = card.querySelector(".model-name");
   const effortSelect = card.querySelector(".model-effort");
   providerSelect.innerHTML = providerOptions(provider);
   providerSelect.value = provider;
-  modelSelect.innerHTML = modelOptions(provider, entry?.key);
+  modelSelect.innerHTML = modelOptions(provider, entry?.key, card);
   if (entry) modelSelect.value = entry.key;
   effortSelect.innerHTML = effortOptions(entry, parsed.effort);
 }
@@ -133,11 +151,12 @@ function syncModelCard(card) {
   const provider = card.querySelector(".model-provider").value;
   const currentModel = card.querySelector(".model-name").value;
   const currentEffort = card.querySelector(".model-effort").value;
+  const models = cardModels(card);
   const entry = resolveEntry(currentModel);
-  const nextKey = entry && entry.providers.includes(provider)
+  const nextKey = entry && models.includes(entry) && entry.providers.includes(provider)
     ? entry.key
-    : (catalog.models.find(item => item.providers.includes(provider)) || catalog.models[0])?.key;
-  card.querySelector(".model-name").innerHTML = modelOptions(provider, nextKey);
+    : (models.find(item => item.providers.includes(provider)) || models[0])?.key;
+  card.querySelector(".model-name").innerHTML = modelOptions(provider, nextKey, card);
   if (nextKey) card.querySelector(".model-name").value = nextKey;
   card.querySelector(".model-effort").innerHTML = effortOptions(resolveEntry(nextKey), currentEffort);
 }

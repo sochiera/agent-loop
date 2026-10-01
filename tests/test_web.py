@@ -143,7 +143,15 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
             "gpt-6-luna",
             "claude-opus-5-5",
             "glm-5.3-flash",
+            "deepseek-v4.1-flash",
+            "mimo-v2.6-flash",
         }
+        assert by_key["deepseek-v4.1-flash"]["ids"]["opencode"] == "opencode-go/deepseek-v4.1-flash"
+        assert by_key["mimo-v2.6-flash"]["ids"]["opencode"] == "opencode-go/mimo-v2.6-flash"
+        assert [key for key, item in by_key.items() if item["coder_only"]] == [
+            "deepseek-v4.1-flash",
+            "mimo-v2.6-flash",
+        ]
         assert by_key["gpt-6-sol"]["providers"] == ["codex"]
         assert by_key["gpt-6-sol"]["efforts"] == ["medium"]
         assert by_key["gpt-6-luna"]["providers"] == ["codex"]
@@ -154,20 +162,33 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         assert by_key["glm-5.3-flash"]["ids"]["opencode"] == "opencode-go/glm-5.3-flash"
         assert by_key["glm-5.3-flash"]["efforts"] == ["xhigh"]
         for retired in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-                        "deepseek-v4.1-flash", "mimo-v2.6-flash", "grok-4.6", "kimi-k3"):
+                        "grok-4.6", "kimi-k3"):
             assert retired not in by_key
         assert catalog["policy"]["allowed_models"] == [
             "codex:gpt-6-sol:medium",
             "codex:gpt-6-luna:xhigh",
             "claude:claude-opus-5-5:medium",
             "opencode:opencode-go/glm-5.3-flash:xhigh",
+            "opencode:opencode-go/deepseek-v4.1-flash:xhigh",
+            "opencode:opencode-go/mimo-v2.6-flash:xhigh",
         ]
         assert catalog["policy"]["policy_ids"] == [
             "openai-codex/gpt-6-sol",
             "openai-codex/gpt-6-luna",
             "claude-code/claude-opus-5-5",
             "opencode-go/glm-5.3-flash",
+            "opencode-go/deepseek-v4.1-flash",
+            "opencode-go/mimo-v2.6-flash",
         ]
+        assert catalog["policy"]["coder_pool"] == [
+            "opencode:opencode-go/deepseek-v4.1-flash:xhigh",
+            "opencode:opencode-go/mimo-v2.6-flash:xhigh",
+            "opencode:opencode-go/glm-5.3-flash:xhigh",
+            *["codex:gpt-6-luna:xhigh"] * 3,
+        ]
+        assert "opencode:opencode-go/deepseek-v4.1-flash:xhigh" in script
+        assert "opencode:opencode-go/mimo-v2.6-flash:xhigh" in script
+        assert "entry.coder_only" in script
         assert catalog["defaults"]["coder_tdd"] == "codex:gpt-6-luna:xhigh"
         assert catalog["defaults"]["coder_explore"] == "codex:gpt-6-luna:xhigh"
         assert catalog["defaults"]["coder_classic"] == "codex:gpt-6-luna:xhigh"
@@ -449,7 +470,8 @@ def test_preferences_round_trip_and_run_fallback(tmp_path, monkeypatch):
     (tmp_path / "ui-preferences.json").unlink()
     fallback = registry.load_preferences()
     assert fallback["models"]["brain"] == "codex:gpt-6-sol:medium"
-    assert fallback["coder_models"] == ["opencode:opencode-go/glm-5.3-flash:xhigh"] * 3
+    # The run remembers its slot pool, so the fallback restores the pool itself.
+    assert fallback["coder_models"] == ["opencode:opencode-go/glm-5.3-flash:xhigh"]
 
 
 def test_concurrent_recover_live_launches_exactly_one_thread(tmp_path):
