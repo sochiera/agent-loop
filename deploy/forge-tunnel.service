@@ -1,0 +1,14 @@
+[Unit]
+Description=Forge control-room reverse tunnel to sochiera.pl VPS
+Comment=Exposes laptop 127.0.0.1:8787 as VPS 127.0.0.1:8791 (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/jan/Sources/agent-loop/deploy/tunnelforge.sh up
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
