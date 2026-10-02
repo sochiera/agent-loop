@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 from forge.agents import (
     AgentCancelled,
     AgentConfigurationFailure,
+    AgentFailure,
     AgentRequest,
     AgentRunner,
     AgentUsageLimit,
@@ -290,22 +292,16 @@ def test_runner_rejects_off_policy_models_at_the_command_boundary(
 @pytest.mark.parametrize(
     "selector", ["opencode:deepseek-v4.1-flash", "opencode:mimo-v2.6-flash:xhigh"]
 )
-def test_runner_keeps_swarm_only_models_in_the_swarm_roles(tmp_path, selector):
-    from forge.policy import PROMOTION_ACTIVE, PromotionSnapshot
-
-    runner = AgentRunner(policy=PromotionSnapshot(state=PROMOTION_ACTIVE))
+def test_runner_refuses_models_outside_the_central_allowlist(tmp_path, selector):
+    runner = AgentRunner()
     for role in (
         "brain", "planner", "test_author", "reviewer", "tester",
         "coder_tdd", "coder_explore", "coder_classic",
+        "swarm_coder", "swarm_reviewer", "probe",
     ):
         request = AgentRequest(role, ModelSpec.parse(selector), "x", tmp_path)
         with pytest.raises(AgentConfigurationFailure):
             runner._command(request)
-    for role in ("swarm_coder", "swarm_reviewer", "probe"):
-        request = AgentRequest(role, ModelSpec.parse(selector), "x", tmp_path)
-        command = runner._command(request)
-        assert command[0] == "opencode"
-        assert command[command.index("--variant") + 1] == "xhigh"
 
 
 def test_runner_fails_closed_when_the_policy_is_missing(tmp_path, monkeypatch):
@@ -395,3 +391,40 @@ def test_claude_stream_json_is_parsed():
     assert (usage.input_tokens, usage.cached_input_tokens, usage.output_tokens) == (10, 4, 3)
     assert usage.cost_usd == 0.5
     assert tools == 1
+
+
+def _fake_opencode(tmp_path, monkeypatch, body: str) -> None:
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    script = bindir / "opencode"
+    script.write_text("#!/bin/sh\ncat >/dev/null\n" + body, encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+
+
+def test_runner_maps_wrapper_exit_78_to_a_non_retryable_policy_refusal(tmp_path, monkeypatch):
+    from forge.agents import AgentPolicyRefused
+
+    _fake_opencode(
+        tmp_path,
+        monkeypatch,
+        "echo \"BLOCKED: model policy rejected 'opencode-go/glm-5.3-flash'\" >&2\nexit 78\n",
+    )
+    request = AgentRequest(
+        "swarm_coder", ModelSpec.parse("opencode:glm-5.3-flash"), "x", tmp_path, timeout_seconds=30
+    )
+    with pytest.raises(AgentPolicyRefused) as caught:
+        AgentRunner().run(request)
+    assert isinstance(caught.value, AgentConfigurationFailure)
+    assert "exit 78" in str(caught.value)
+    assert "BLOCKED" in caught.value.raw_output
+
+
+def test_runner_keeps_other_exit_codes_retryable(tmp_path, monkeypatch):
+    _fake_opencode(tmp_path, monkeypatch, "echo transient >&2\nexit 1\n")
+    request = AgentRequest(
+        "swarm_coder", ModelSpec.parse("opencode:glm-5.3-flash"), "x", tmp_path, timeout_seconds=30
+    )
+    with pytest.raises(AgentFailure) as caught:
+        AgentRunner().run(request)
+    assert not isinstance(caught.value, AgentConfigurationFailure)

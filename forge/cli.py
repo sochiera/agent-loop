@@ -6,6 +6,8 @@ import argparse
 import json
 import os
 import random
+import signal
+import threading
 from pathlib import Path
 
 from .access import GATE_ENV, gate_from_env
@@ -118,7 +120,7 @@ def _parser() -> argparse.ArgumentParser:
                 "--pool",
                 default="",
                 metavar="SELECTOR[,SELECTOR...]",
-                help="override the six-slot cheap pool (defaults to the central policy pool)",
+                help="override the cheap pool (defaults to the central policy pool)",
             )
             swarm_parser.add_argument("--teams", type=int, default=3, help="parallel team count (cap 6 worktrees)")
             swarm_parser.add_argument(
@@ -220,6 +222,13 @@ def main(argv: list[str] | None = None) -> int:
         ).is_file():
             raise SystemExit(f"Forge run config does not exist for the swarm: {args.run_id}")
         controller = swarm_controller(args)
+        # A supervisor stops the swarm with SIGTERM; cancel cleanly so the
+        # durable state records a terminal status instead of "running". The
+        # cancel runs off the main thread, which may hold the runner's lock.
+        signal.signal(
+            signal.SIGTERM,
+            lambda _signum, _frame: threading.Thread(target=controller.cancel, daemon=True).start(),
+        )
         controller.run()
         summary = controller.summary()
         print(json.dumps(summary, indent=2, sort_keys=True))

@@ -1,8 +1,8 @@
 """Forge cheap-model swarm: three autonomous teams on isolated worktrees.
 
-The swarm consumes the six-slot cheap coder pool (DeepSeek V4.1 Flash, MiMo
-V2.6 Flash and GLM 5.3 Flash through OpenCode Go plus three slots of native
-Codex GPT-6 Luna) instead of the sprint tournament draw. A strong planner lays
+The swarm consumes the cheap coder pool (GLM 5.3 Flash through OpenCode Go plus
+three slots of native Codex GPT-6 Luna), filtered by the current central model
+policy at every claim, instead of the sprint tournament draw. A strong planner lays
 out a parallel-friendly backlog, then up to three teams run autonomously, each
 on its own task:
 
@@ -30,6 +30,7 @@ import json
 import os
 import random
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -57,7 +58,7 @@ from .contracts import (
 )
 from .locking import RepositoryExecutionLock
 from .models import ModelSpec, RunConfig
-from .policy import GLM, OPUS, SOL, SWARM_CODER_ROLE, SWARM_REVIEWER_ROLE
+from .policy import GLM, OPUS, SOL, SWARM_CODER_ROLE, SWARM_REVIEWER_ROLE, load_policy
 from .prompts import (
     swarm_backlog_prompt,
     swarm_coder_prompt,
@@ -251,6 +252,7 @@ class SwarmRunState:
         status: str = "running",
         message: str = "",
         warnings: list[str] | None = None,
+        preserved: list[dict[str, Any]] | None = None,
     ):
         self.tasks = tasks or []
         self.teams = teams or []
@@ -259,6 +261,8 @@ class SwarmRunState:
         self.status = status
         self.message = message
         self.warnings = warnings or []
+        # Worktrees Forge left in place because they hold unmerged work.
+        self.preserved = preserved or []
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -270,6 +274,7 @@ class SwarmRunState:
             "status": self.status,
             "message": self.message,
             "warnings": list(self.warnings),
+            "preserved": [dict(entry) for entry in self.preserved],
         }
 
     @classmethod
@@ -286,6 +291,7 @@ class SwarmRunState:
             status=str(value.get("status", "running")),
             message=str(value.get("message", "")),
             warnings=[str(item) for item in value.get("warnings", [])],
+            preserved=[dict(item) for item in value.get("preserved", [])],
         )
 
 
@@ -339,7 +345,7 @@ class SwarmController:
         self.strong_reviewer = self._staff_model("reviewer", allowed={SOL, OPUS})
         if len(config.cheap_pool) < 4:
             raise ValueError(
-                "the swarm consumes the six-slot cheap pool; RunConfig.cheap_pool must "
+                "the swarm consumes the cheap pool; RunConfig.cheap_pool must "
                 "hold at least four slots (two coder slots plus two reviewer slots)"
             )
         if resume:
@@ -373,6 +379,11 @@ class SwarmController:
             names = ", ".join(sorted(model.display() for model in allowed))
             raise ValueError(
                 f"swarm {role} must be a strong model ({names}); got {spec.display()}"
+            )
+        # A resumed config skips validate(); the current policy still decides.
+        if not load_policy(self.config.policy_path or None).allows(spec, role):
+            raise ValueError(
+                f"swarm {role} {spec.display()} is outside the current model policy"
             )
         return spec
 
@@ -424,6 +435,11 @@ class SwarmController:
     def cancel(self) -> None:
         with self._control:
             self._cancel_requested = True
+        # Stop in-flight agents too, so a SIGTERM reaches the terminal state
+        # before the supervisor escalates to SIGKILL.
+        cancel_agents = getattr(self.runner, "cancel", None)
+        if callable(cancel_agents):
+            cancel_agents()
 
     def _checkpoint(self) -> None:
         with self._control:
@@ -435,13 +451,25 @@ class SwarmController:
     # ------------------------------------------------------------------
     # Git helpers
 
-    def _git(self, *args: str, cwd: Path | None = None, check: bool = True) -> str:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=str(cwd or self.repo),
-            text=True,
-            capture_output=True,
-        )
+    def _git(
+        self,
+        *args: str,
+        cwd: Path | None = None,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> str:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=str(cwd or self.repo),
+                text=True,
+                capture_output=True,
+                env=env,
+            )
+        except OSError as exc:  # e.g. the worktree directory vanished
+            if check:
+                raise SwarmGitError(f"git {' '.join(args)} failed in {cwd or self.repo}: {exc}")
+            return str(exc)
         if result.returncode != 0:
             if check:
                 raise SwarmGitError(
@@ -450,18 +478,21 @@ class SwarmController:
             return result.stderr.strip()
         return result.stdout.strip()
 
-    def _component(self, task_id: str, mode: str) -> str:
-        return f"{task_id}-{mode}".replace("/", "_")
+    def _component(self, task_id: str, mode: str, attempt: int = 0) -> str:
+        # A retried pair gets fresh names: an earlier attempt's worktree and
+        # branch may be preserved in place.
+        suffix = f"-a{attempt + 1}" if attempt else ""
+        return f"{task_id}-{mode}{suffix}".replace("/", "_")
 
-    def _candidate_branch(self, task_id: str, mode: str) -> str:
-        return f"forge/{self.run_id}/swarm/{self._component(task_id, mode)}"
+    def _candidate_branch(self, task_id: str, mode: str, attempt: int = 0) -> str:
+        return f"forge/{self.run_id}/swarm/{self._component(task_id, mode, attempt)}"
 
-    def _worktree_path(self, task_id: str, mode: str) -> Path:
-        return self.worktree_root / self._component(task_id, mode)
+    def _worktree_path(self, task_id: str, mode: str, attempt: int = 0) -> Path:
+        return self.worktree_root / self._component(task_id, mode, attempt)
 
-    def _create_worktree(self, task_id: str, mode: str, base_sha: str) -> Path:
-        path = self._worktree_path(task_id, mode)
-        branch = self._candidate_branch(task_id, mode)
+    def _create_worktree(self, task_id: str, mode: str, base_sha: str, attempt: int = 0) -> Path:
+        path = self._worktree_path(task_id, mode, attempt)
+        branch = self._candidate_branch(task_id, mode, attempt)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._git("check-ref-format", "--branch", branch)
         if path.exists():
@@ -477,18 +508,65 @@ class SwarmController:
         return self._git("rev-parse", "HEAD", cwd=path)
 
     def _patch_over_base(self, path: Path, base_sha: str) -> str:
-        working_tree = self._git("diff", base_sha, cwd=path)
-        committed = self._git("diff", f"{base_sha}..HEAD", cwd=path)
-        return committed if committed else working_tree
+        """Everything the worktree holds over the base: commits, edits and
+        untracked files (coders leave new files uncommitted). A throwaway
+        index keeps the worktree's own index untouched."""
 
-    def _cleanup_worktrees(self, team: SwarmTeam) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+            self._git("read-tree", "HEAD", cwd=path, env=env)
+            self._git("add", "-A", cwd=path, env=env)
+            return self._git("diff", "--cached", "--binary", base_sha, cwd=path, env=env)
+
+    def _holds_unmerged_work(self, path: Path, base_sha: str) -> bool:
+        """True unless the worktree provably holds nothing over its base; any
+        doubt (missing base, git error) counts as work to keep."""
+
+        if not path.exists():
+            return False
+        if not base_sha:
+            return True
+        try:
+            return bool(self._patch_over_base(path, base_sha))
+        except SwarmGitError:
+            return True
+
+    def _cleanup_worktrees(self, team: SwarmTeam, *, reason: str, merged: str = "") -> None:
+        """Release the team's worktrees. Only the merged winner and worktrees
+        with nothing over the base are removed; rejected or unfinished work
+        stays in place, recorded in the durable state for the operator."""
+
+        kept: list[dict[str, Any]] = []
         for mode, path in list(team.worktrees.items()):
+            branch = team.branches.get(mode) or self._candidate_branch(team.task_id, mode)
+            if mode != merged and self._holds_unmerged_work(Path(path), team.base_sha):
+                kept.append(
+                    {
+                        "task": team.task_id,
+                        "team": team.id,
+                        "mode": mode,
+                        "path": path,
+                        "branch": branch,
+                        "base_sha": team.base_sha,
+                        "reason": reason,
+                    }
+                )
+                continue
             self._git("worktree", "remove", "--force", path, check=False)
-            self._git("branch", "-D", self._candidate_branch(team.task_id, mode), check=False)
+            self._git("branch", "-D", branch, check=False)
         self._git("worktree", "prune", check=False)
         with self._lock:
+            self.state.preserved.extend(kept)
             team.worktrees.clear()
             team.branches.clear()
+        for entry in kept:
+            self.store_event(
+                "worktree-preserved",
+                f"kept {entry['path']} with unmerged {entry['mode']} work for "
+                f"{entry['task']}: {reason}",
+                task=entry["task"],
+                mode=entry["mode"],
+            )
 
     def _active_worktree_count(self) -> int:
         with self._lock:
@@ -717,15 +795,10 @@ class SwarmController:
             if not candidates:
                 return None
             task = sorted(candidates, key=lambda item: (item.priority, item.id))[0]
+            pool = self._allowed_pool()
             task.status = "in_progress"
             modes = self.rng.sample(list(CODER_CANDIDATES), 2)
-            slots = self.rng.sample(
-                [
-                    ModelSpec(spec.provider, spec.model, spec.effort)
-                    for spec in self.config.cheap_pool
-                ],
-                4,
-            )
+            slots = self.rng.sample(pool, 4)
             coders = [
                 {
                     "mode": mode,
@@ -754,6 +827,61 @@ class SwarmController:
         self.store_event("swarm.claim", f"team {team.id} claimed {task.id}", task=task.id)
         return team
 
+    def _allowed_pool(self) -> list[ModelSpec]:
+        """Cheap slots the current central policy allows; a persisted config
+        (resume) can still name models the policy has since removed."""
+
+        snapshot = load_policy(self.config.policy_path or None)
+        pool = [
+            ModelSpec(spec.provider, spec.model, spec.effort)
+            for spec in self.config.cheap_pool
+            if snapshot.allows(spec, SWARM_CODER_ROLE)
+        ]
+        if len(pool) < 4:
+            raise SwarmFailed(
+                f"the current model policy allows {len(pool)} of the cheap pool slots; "
+                "the swarm needs four"
+            )
+        return pool
+
+    def _restaff_off_policy(self) -> None:
+        """Before resuming, swap persisted team members the current policy
+        refuses for allowed cheap slots, so recovery never launches them."""
+
+        snapshot = load_policy(self.config.policy_path or None)
+        with self._lock:
+            teams = list(self.state.teams)
+        for team in teams:
+            for entry in (*team.coders, *team.reviewers):
+                spec = ModelSpec(**entry["spec"])
+                if snapshot.allows(spec, SWARM_CODER_ROLE):
+                    continue
+                slot = self.rng.choice(self._allowed_pool())
+                with self._lock:
+                    entry["spec"] = {
+                        "provider": slot.provider, "model": slot.model, "effort": slot.effort,
+                    }
+                    entry["display"] = slot.display()
+                self._warning(
+                    f"team {team.id} ({team.task_id}): {spec.display()} is outside the "
+                    f"current model policy; restaffed with {slot.display()}"
+                )
+
+    def _release_missing_worktrees(self) -> None:
+        """A resumed team whose worktree vanished cannot continue: drop it
+        instead of letting an agent run in a bare directory."""
+
+        with self._lock:
+            teams = list(self.state.teams)
+        for team in teams:
+            missing = [
+                mode for mode, path in team.worktrees.items() if not (Path(path) / ".git").exists()
+            ]
+            if not team.worktrees and team.phase not in {"code", "review", "revise"}:
+                missing = list(team.modes)
+            if missing:
+                self._drop_team(team, f"worktree missing on resume: {', '.join(missing)}")
+
     def _task_of(self, team: SwarmTeam) -> SwarmTask:
         with self._lock:
             for task in self.state.tasks:
@@ -763,13 +891,13 @@ class SwarmController:
 
     def _drop_team(self, team: SwarmTeam, reason: str) -> None:
         """Cheap-pair failure: the task re-enters the backlog for another pair."""
+        task = self._task_of(team)
         try:
-            self._capture_all_patches(team, counter=1)
+            self._capture_all_patches(team, counter=task.attempts + 1)
         finally:
-            self._cleanup_worktrees(team)
+            self._cleanup_worktrees(team, reason=f"pair dropped: {reason}")
         with self._lock:
             self.state.teams = [t for t in self.state.teams if t.id != team.id]
-            task = self._task_of(team)
             task.attempts += 1
             if task.attempts < self.max_pair_attempts:
                 task.status = "pending"
@@ -810,9 +938,9 @@ class SwarmController:
             team.base_sha = base
             for coder in team.coders:
                 mode = coder["mode"]
-                path = self._create_worktree(task.id, mode, base)
+                path = self._create_worktree(task.id, mode, base, task.attempts)
                 team.worktrees[mode] = str(path)
-                team.branches[mode] = self._candidate_branch(task.id, mode)
+                team.branches[mode] = self._candidate_branch(task.id, mode, task.attempts)
         self.store_event(
             "swarm.worktrees", f"prepared {len(team.worktrees)} worktrees for {task.id}"
         )
@@ -1039,9 +1167,19 @@ class SwarmController:
         self, results: list[tuple[dict[str, Any], AgentResult | Exception]]
     ) -> None:
         failed: dict[int, str] = {}
+        cancelled = False
         for job, outcome in results:
-            if isinstance(outcome, AgentCancelled):
-                raise SwarmCancelled()
+            # _invoke turns a requested cancel into SwarmCancelled. Finished
+            # siblings are still applied so their results are not lost.
+            if isinstance(outcome, (AgentCancelled, SwarmCancelled)):
+                cancelled = True
+                self.store_event(
+                    "agent-cancelled",
+                    f"{job['role']} cancelled {job['relative']}",
+                    team=job.get("team_id", 0),
+                    mode=job.get("mode", ""),
+                )
+                continue
             with self._lock:
                 team = next((t for t in self.state.teams if t.id == job["team_id"]), None)
             if team is None:
@@ -1056,8 +1194,17 @@ class SwarmController:
                     mode=job.get("mode", ""),
                 )
                 continue
+            self.store_event(
+                "agent-done",
+                f"{job['role']} finished {job['relative']}",
+                team=team.id,
+                mode=job.get("mode", ""),
+            )
             if job["role"] == SWARM_CODER_ROLE:
                 self._apply_code(team, job["mode"], outcome)
+                if team.phase == "winner-fix":
+                    with self._lock:
+                        team.selection["last_winner_job"] = "coder"
             elif job["role"] == SWARM_REVIEWER_ROLE:
                 if team.phase == "winner-fix":
                     self._apply_winner_review(team, outcome)
@@ -1065,11 +1212,20 @@ class SwarmController:
                     self._apply_review(team, job["mode"], outcome)
             elif job["role"] == "reviewer":
                 self._apply_selection(team, outcome)
+        # A cancelled round keeps every team and worktree for recovery; a
+        # failure may only be the cancellation's side effect.
+        if cancelled:
+            failed.clear()
         for team_id, reason in failed.items():
             with self._lock:
                 team = next((t for t in self.state.teams if t.id == team_id), None)
             if team is not None:
                 self._drop_team(team, reason)
+        # Every worker result reaches durable state, even when its phase
+        # does not advance this round.
+        self.persist(f"applied {len(results)} swarm agent results")
+        if cancelled:
+            raise SwarmCancelled()
 
     # Phase transitions -----------------------------------------------------
 
@@ -1136,10 +1292,10 @@ class SwarmController:
         if not last_job:
             return  # the coder fix job has not been applied yet
         if last_job == "coder":
+            # The winner-check reviewer runs next and records "reviewer".
             data["committed"] = True
             data["validation"] = self._run_validation(team, winner)
-            team.selection["last_winner_job"] = "reviewer"
-            self.persist()
+            self.persist(f"task {team.task_id} winner fix {team.fix_round} awaits its check")
             return
         reviews = data.get("winner_reviews", [])
         if not reviews:
@@ -1181,7 +1337,7 @@ class SwarmController:
             except SwarmGitError:
                 pass
         if not head:
-            self._complete(team, task, commit="", note="the winner produced no changes")
+            self._complete(team, task, commit="", note="the winner produced no changes", merged="")
             return
         if self._git("status", "--porcelain"):
             self._conflict(team, task, "the target checkout drifted; refusing an unsafe merge")
@@ -1195,11 +1351,11 @@ class SwarmController:
             self._conflict(team, task, "merge conflict")
             return
         commitment = self._git("rev-parse", "HEAD")
-        self._complete(team, task, commit=commitment, note=f"merged the {mode} version")
+        self._complete(team, task, commit=commitment, note=f"merged the {mode} version", merged=mode)
 
     def _conflict(self, team: SwarmTeam, task: SwarmTask, reason: str) -> None:
         self._capture_all_patches(team, counter=team.fix_round or 1)
-        self._cleanup_worktrees(team)
+        self._cleanup_worktrees(team, reason=f"conflict: {reason}")
         family = task.id.split("-R")[0]
         with self._lock:
             self.state.teams = [t for t in self.state.teams if t.id != team.id]
@@ -1254,8 +1410,10 @@ class SwarmController:
                 )
             )
 
-    def _complete(self, team: SwarmTeam, task: SwarmTask, *, commit: str, note: str) -> None:
-        self._cleanup_worktrees(team)
+    def _complete(
+        self, team: SwarmTeam, task: SwarmTask, *, commit: str, note: str, merged: str
+    ) -> None:
+        self._cleanup_worktrees(team, reason=f"task {task.id} done: {note}", merged=merged)
         with self._lock:
             self.state.teams = [t for t in self.state.teams if t.id != team.id]
             task.status = "done"
@@ -1272,14 +1430,24 @@ class SwarmController:
         try:
             self._executor = ThreadPoolExecutor(max_workers=SWARM_AGENTS_CAP)
             self._run_locked()
-        except SwarmCancelled:
+        except (SwarmCancelled, KeyboardInterrupt):
+            # Stop in-flight agents so the executor shutdown cannot hang.
+            self.cancel()
             with self._lock:
                 self.state.status = "cancelled"
             self.persist("cancelled")
-        except (SwarmFailed, ContractError) as exc:
+        except (SwarmFailed, ContractError, AgentFailure) as exc:
+            # AgentFailure reaches here from the planner, e.g. a central policy
+            # refusal (exit 78) that no retry can fix.
             with self._lock:
                 self.state.status = "failed"
             self.persist(str(exc))
+        except Exception as exc:
+            # Never leave a dead run marked "running".
+            with self._lock:
+                self.state.status = "failed"
+            self.persist(f"swarm controller crashed: {type(exc).__name__}: {exc}")
+            raise
         finally:
             executor, self._executor = self._executor, None
             if executor is not None:
@@ -1288,6 +1456,11 @@ class SwarmController:
         return self.state
 
     def _run_locked(self) -> None:
+        with self._lock:
+            self.state.status = "running"
+        self._restaff_off_policy()
+        self._release_missing_worktrees()
+        self.persist(f"swarm controller running (pid {os.getpid()})")
         planned = False
         while True:
             self._checkpoint()

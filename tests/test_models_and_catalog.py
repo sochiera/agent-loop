@@ -359,12 +359,13 @@ def _valid_run_paths(tmp_path):
 
 
 @pytest.mark.parametrize("cheap", [DEEPSEEK, MIMO])
-def test_run_config_keeps_swarm_only_models_in_the_cheap_pool(tmp_path, cheap):
+def test_run_config_refuses_models_outside_the_central_allowlist(tmp_path, cheap):
     paths = _valid_run_paths(tmp_path)
     models = {role: SOL for role in ROLE_NAMES}
     for role in CODER_ROLES:
         models[role] = LUNA
-    RunConfig(branch="main", models=dict(models), cheap_pool=[cheap, LUNA], **paths).validate()
+    with pytest.raises(ValueError, match="cheap pool model"):
+        RunConfig(branch="main", models=dict(models), cheap_pool=[cheap, LUNA], **paths).validate()
     for role in ROLE_NAMES:
         staffed = dict(models)
         staffed[role] = cheap
@@ -379,7 +380,7 @@ def test_run_config_round_trips_and_validates_the_cheap_pool(tmp_path):
     models = {role: SOL for role in ROLE_NAMES}
     for role in CODER_ROLES:
         models[role] = LUNA
-    pool = [DEEPSEEK, MIMO, GLM, LUNA, LUNA, LUNA]
+    pool = [GLM, LUNA, LUNA, LUNA]
     config = RunConfig(branch="main", models=models, cheap_pool=pool, **paths)
     config.validate()
     assert RunConfig.from_dict(config.to_dict()).cheap_pool == pool
