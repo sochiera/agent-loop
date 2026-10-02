@@ -86,7 +86,7 @@ function providerOptions(selectedProvider) {
   ).join("");
 }
 
-// Swarm-only models (DeepSeek, MiMo) live in the swarm's cheap pool alone, so
+// Catalog-only models (DeepSeek, MiMo) are outside the central allowlist, so
 // no tournament card offers them.
 function cardModels(_card) {
   return catalog.models.filter(entry => !entry.coder_only);

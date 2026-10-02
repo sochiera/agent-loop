@@ -231,8 +231,8 @@ def restart_payload(active_runs: int, confirm: bool) -> dict[str, Any]:
 def coder_pool_from_payload(payload: dict[str, Any]) -> list[ModelSpec]:
     """Parse the UI tournament coder pool; every entry is one slot of the draw.
 
-    The cheap pool belongs to the swarm; run validation refuses swarm-only
-    models (DeepSeek, MiMo) for the tournament coders.
+    The cheap pool belongs to the swarm; run validation refuses any model
+    outside the central allowlist (DeepSeek and MiMo included).
     """
 
     pool: list[ModelSpec] = []

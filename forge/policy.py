@@ -2,19 +2,23 @@
 
 The smart roster mirrors ~/.hermes/scripts/model_policy.py and is closed:
 four models, each pinned to one harness and one reasoning effort. Forge adds a
-cheap pool of six slots (DeepSeek, MiMo and GLM Flash through OpenCode Go plus
-three slots of native Codex Luna) that only the cheap-model swarm consumes: its
-coders and cheap reviewers draw from it. The sprint tournament keeps drawing
-its coders from the smart worker roster. DeepSeek and MiMo are swarm-only and
-never staff a tournament coder, planner, reviewer, or any other role. The legacy GPT-5.6 Sol/Terra/Luna roster
-is retired and never selected. The promotion state is still read for audit
-display, but it no longer changes which models are eligible. Every decision
-here is deterministic for a given RNG, so tests can seed it without touching
-Jan's home directory.
+cheap pool of four slots (GLM Flash through OpenCode Go plus three slots of
+native Codex Luna) that only the cheap-model swarm consumes: its coders and
+cheap reviewers draw from it. The sprint tournament keeps drawing its coders
+from the smart worker roster. DeepSeek and MiMo stay in the catalog for
+identity resolution but are outside the central allowlist, so they are never
+allowed. The mirror alone can drift, so ``load_policy`` also asks the central
+module which models it allows right now, on the harness each one requires; a
+missing or broken central module allows nothing. The legacy GPT-5.6
+Sol/Terra/Luna roster is retired and never selected. The promotion state is
+still read for audit display, but it no longer changes which models are
+eligible. Every decision here is deterministic for a given RNG, so tests can
+seed it without touching Jan's home directory.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import random
@@ -27,6 +31,8 @@ from .models import CODER_ROLES, ROLE_NAMES, ModelSpec
 
 DEFAULT_POLICY_PATH = Path("/home/jan/.hermes/state/model-policy.json")
 POLICY_PATH_ENV = "FORGE_MODEL_POLICY_PATH"
+DEFAULT_CENTRAL_POLICY_SCRIPT = Path("/home/jan/.hermes/scripts/model_policy.py")
+CENTRAL_POLICY_ENV = "FORGE_CENTRAL_POLICY_SCRIPT"
 
 PROMOTION_ACTIVE = "active"
 PROMOTION_INACTIVE = "inactive"
@@ -39,14 +45,15 @@ GLM = ModelSpec("opencode", "opencode-go/glm-5.3-flash", "xhigh")
 DEEPSEEK = ModelSpec("opencode", "opencode-go/deepseek-v4.1-flash", "xhigh")
 MIMO = ModelSpec("opencode", "opencode-go/mimo-v2.6-flash", "xhigh")
 
-ALLOWED_MODELS: tuple[ModelSpec, ...] = (SOL, LUNA, OPUS, GLM, DEEPSEEK, MIMO)
+ALLOWED_MODELS: tuple[ModelSpec, ...] = (SOL, LUNA, OPUS, GLM)
 
-# Forge-only cheap models: allowed for the swarm's cheap roles, nowhere else.
-CODER_ONLY_MODELS: tuple[ModelSpec, ...] = (DEEPSEEK, MIMO)
+# Forge-only cheap models allowed for the swarm's cheap roles alone. Empty while
+# the central policy allowlists no such model.
+CODER_ONLY_MODELS: tuple[ModelSpec, ...] = ()
 
 # The cheap pool is a list of slots; Luna's large limits earn it three. Only the
 # swarm consumes it: each team draws two coder and two reviewer slots.
-CHEAP_CODER_POOL: tuple[ModelSpec, ...] = (DEEPSEEK, MIMO, GLM, LUNA, LUNA, LUNA)
+CHEAP_CODER_POOL: tuple[ModelSpec, ...] = (GLM, LUNA, LUNA, LUNA)
 
 # Exact identifiers used by the central Hermes policy.
 POLICY_IDS = {
@@ -78,6 +85,8 @@ _CODER_ONLY_ROLES = frozenset({SWARM_CODER_ROLE, SWARM_REVIEWER_ROLE, "probe"})
 def _weighted_pick(
     options: Sequence[tuple[ModelSpec, int]], rng: Any
 ) -> ModelSpec:
+    if not options:
+        raise ValueError("the central model policy allows no model for this role")
     specs = [spec for spec, _ in options]
     weights = [max(1, int(weight)) for _, weight in options]
     return rng.choices(specs, weights=weights, k=1)[0]
@@ -104,6 +113,9 @@ class PromotionSnapshot:
     state: str = PROMOTION_UNKNOWN
     path: str = ""
     source: str = "default"
+    # Forge identities the central policy allows on their required harness;
+    # ``None`` means the central module was not consulted (hermetic snapshots).
+    central: frozenset[str] | None = None
 
     # Catalog ---------------------------------------------------------
 
@@ -113,13 +125,16 @@ class PromotionSnapshot:
     def allows(self, spec: ModelSpec, role: str | None = None) -> bool:
         """Allow only a roster model at its pinned effort (empty means pinned).
 
-        With a role, coder-only models are refused outside the swarm roles;
-        ``None`` checks catalog membership alone.
+        A model must also be in the central allowlist when it was loaded. With
+        a role, coder-only models are refused outside the swarm roles; ``None``
+        checks catalog membership alone.
         """
 
         identity = model_identity(spec)
         pinned = _PINNED_EFFORTS.get(identity)
         if pinned is None or spec.effort not in {"", pinned}:
+            return False
+        if not self._centrally_allowed(spec):
             return False
         return role is None or identity not in _CODER_ONLY or role in _CODER_ONLY_ROLES
 
@@ -136,22 +151,31 @@ class PromotionSnapshot:
 
     # Weighted pools --------------------------------------------------
 
-    def cheap_pool(self) -> tuple[ModelSpec, ...]:
-        """The six cheap slots; only the swarm draws from them."""
+    def _centrally_allowed(self, spec: ModelSpec) -> bool:
+        return self.central is None or model_identity(spec) in self.central
 
-        return CHEAP_CODER_POOL
+    def _weighted(
+        self, options: Iterable[tuple[ModelSpec, int]]
+    ) -> list[tuple[ModelSpec, int]]:
+        return [(spec, weight) for spec, weight in options if self._centrally_allowed(spec)]
+
+    def cheap_pool(self) -> tuple[ModelSpec, ...]:
+        """The cheap slots the central policy allows; only the swarm draws
+        from them."""
+
+        return tuple(spec for spec in CHEAP_CODER_POOL if self._centrally_allowed(spec))
 
     def coder_options(self) -> list[tuple[ModelSpec, int]]:
-        return list(CODER_WEIGHTS)
+        return self._weighted(CODER_WEIGHTS)
 
     def test_options(self) -> list[tuple[ModelSpec, int]]:
-        return list(TEST_WEIGHTS)
+        return self._weighted(TEST_WEIGHTS)
 
     def strong_options(self) -> list[tuple[ModelSpec, int]]:
-        return list(STRONG_WEIGHTS)
+        return self._weighted(STRONG_WEIGHTS)
 
     def review_options(self) -> list[tuple[ModelSpec, int]]:
-        return list(REVIEW_WEIGHTS)
+        return self._weighted(REVIEW_WEIGHTS)
 
     def role_options(self, role: str) -> list[tuple[ModelSpec, int]]:
         if role in {"brain", "planner"}:
@@ -269,6 +293,38 @@ def _read_promotion_state(path: Path) -> tuple[str, str]:
     return PROMOTION_UNKNOWN, "default"
 
 
+def central_allowed_identities(script: str | Path | None = None) -> frozenset[str]:
+    """Forge identities the central policy allows now, on their own harness.
+
+    Each candidate goes through the central ``validate_model(id, harness)``
+    gate, the same one the harness wrappers run before launch. Any failure to
+    load the module allows nothing (fail closed).
+    """
+
+    if script:
+        target = Path(script).expanduser()
+    else:
+        override = os.environ.get(CENTRAL_POLICY_ENV)
+        target = Path(override).expanduser() if override else DEFAULT_CENTRAL_POLICY_SCRIPT
+    try:
+        module_spec = importlib.util.spec_from_file_location("_forge_central_policy", target)
+        if module_spec is None or module_spec.loader is None:
+            return frozenset()
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    except Exception:
+        return frozenset()
+    allowed: set[str] = set()
+    for identity, policy_id in POLICY_IDS.items():
+        harness = identity.split(":", 1)[0]
+        try:
+            module.validate_model(policy_id, harness)
+        except Exception:
+            continue
+        allowed.add(identity)
+    return frozenset(allowed)
+
+
 def load_policy(path: str | Path | None = None) -> PromotionSnapshot:
     if path:
         target = Path(path).expanduser()
@@ -280,6 +336,7 @@ def load_policy(path: str | Path | None = None) -> PromotionSnapshot:
         state=state,
         path=str(target),
         source=source,
+        central=central_allowed_identities(),
     )
 
 

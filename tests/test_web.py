@@ -170,20 +170,14 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
             "codex:gpt-6-luna:xhigh",
             "claude:claude-opus-5-5:medium",
             "opencode:opencode-go/glm-5.3-flash:xhigh",
-            "opencode:opencode-go/deepseek-v4.1-flash:xhigh",
-            "opencode:opencode-go/mimo-v2.6-flash:xhigh",
         ]
         assert catalog["policy"]["policy_ids"] == [
             "openai-codex/gpt-6-sol",
             "openai-codex/gpt-6-luna",
             "claude-code/claude-opus-5-5",
             "opencode-go/glm-5.3-flash",
-            "opencode-go/deepseek-v4.1-flash",
-            "opencode-go/mimo-v2.6-flash",
         ]
         assert catalog["policy"]["cheap_pool"] == [
-            "opencode:opencode-go/deepseek-v4.1-flash:xhigh",
-            "opencode:opencode-go/mimo-v2.6-flash:xhigh",
             "opencode:opencode-go/glm-5.3-flash:xhigh",
             *["codex:gpt-6-luna:xhigh"] * 3,
         ]

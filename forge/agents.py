@@ -37,8 +37,17 @@ class AgentUsageLimit(AgentConfigurationFailure):
     """Provider quota/usage limit; retrying the same model will not help."""
 
 
+class AgentPolicyRefused(AgentConfigurationFailure):
+    """The harness wrapper's central policy gate refused the model (exit 78)."""
+
+
 class AgentCancelled(AgentFailure):
     """Operator cancelled the run while this process was still working."""
+
+
+# EX_CONFIG: the Hermes harness wrappers exit 78 when the central model policy
+# refuses the model (not allowlisted, wrong harness, or quota-blocked).
+POLICY_REFUSED_EXIT = 78
 
 
 _USAGE_LIMIT_MARKERS = (
@@ -348,6 +357,12 @@ class AgentRunner:
         if self._cancelled.is_set():
             raise AgentCancelled(f"{request.role} cancelled", raw_output=raw)
         elapsed = time.monotonic() - started
+        if process.returncode == POLICY_REFUSED_EXIT:
+            raise AgentPolicyRefused(
+                f"{request.role} model {request.model.display()} was refused by the "
+                f"central model policy (exit {POLICY_REFUSED_EXIT})",
+                raw_output=raw,
+            )
         if process.returncode != 0:
             raise failure_type_for(raw)(
                 f"{request.role} exited with code {process.returncode}", raw_output=raw

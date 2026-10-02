@@ -30,7 +30,7 @@ RETIRED = (
     ModelSpec("opencode", "opencode-go/mimo-v2.5", "xhigh"),
 )
 
-ROSTER = (SOL, LUNA, OPUS, GLM, DEEPSEEK, MIMO)
+ROSTER = (SOL, LUNA, OPUS, GLM)
 STAFF_ROLES = ("brain", "planner", "test_author", "reviewer", "tester")
 
 
@@ -43,7 +43,7 @@ def write_policy(tmp_path: Path, payload) -> Path:
     return path
 
 
-def test_roster_is_the_smart_four_plus_the_swarm_only_models():
+def test_roster_is_the_smart_four_inside_the_central_allowlist():
     assert SOL == ModelSpec("codex", "gpt-6-sol", "medium")
     assert LUNA == ModelSpec("codex", "gpt-6-luna", "xhigh")
     assert OPUS == ModelSpec("claude", "claude-opus-5-5", "medium")
@@ -56,35 +56,29 @@ def test_roster_is_the_smart_four_plus_the_swarm_only_models():
         "codex:gpt-6-luna:xhigh",
         "claude:claude-opus-5-5:medium",
         "opencode:opencode-go/glm-5.3-flash:xhigh",
-        "opencode:opencode-go/deepseek-v4.1-flash:xhigh",
-        "opencode:opencode-go/mimo-v2.6-flash:xhigh",
     ]
     assert payload["policy_ids"] == [
         "openai-codex/gpt-6-sol",
         "openai-codex/gpt-6-luna",
         "claude-code/claude-opus-5-5",
         "opencode-go/glm-5.3-flash",
-        "opencode-go/deepseek-v4.1-flash",
-        "opencode-go/mimo-v2.6-flash",
     ]
-    assert payload["coder_only_models"] == [DEEPSEEK.display(), MIMO.display()]
+    assert payload["coder_only_models"] == []
     assert payload["cheap_pool"] == [spec.display() for spec in CHEAP_CODER_POOL]
 
 
-def test_cheap_pool_is_six_slots_with_three_lunas():
-    assert CHEAP_CODER_POOL == (DEEPSEEK, MIMO, GLM, LUNA, LUNA, LUNA)
+def test_cheap_pool_is_glm_plus_three_lunas():
+    assert CHEAP_CODER_POOL == (GLM, LUNA, LUNA, LUNA)
     assert load_policy(None).cheap_pool() == CHEAP_CODER_POOL
     assert LUNA == ModelSpec("codex", "gpt-6-luna", "xhigh")
     assert POLICY_IDS["codex:gpt-6-luna"] == "openai-codex/gpt-6-luna"
 
 
-def test_swarm_only_models_never_staff_tournament_or_staff_roles():
+def test_models_outside_the_central_allowlist_are_never_allowed():
     snapshot = load_policy(None)
     for spec in (DEEPSEEK, MIMO):
-        assert snapshot.allows(spec)
-        for role in (SWARM_CODER_ROLE, SWARM_REVIEWER_ROLE, "probe"):
-            assert snapshot.allows(spec, role)
-        for role in (*STAFF_ROLES, *CODER_ROLES, "backup"):
+        assert not snapshot.allows(spec)
+        for role in (*STAFF_ROLES, *CODER_ROLES, SWARM_CODER_ROLE, SWARM_REVIEWER_ROLE, "probe", "backup"):
             assert not snapshot.allows(spec, role)
     for role in (*STAFF_ROLES, *CODER_ROLES, SWARM_CODER_ROLE, SWARM_REVIEWER_ROLE, "backup"):
         assert snapshot.allows(GLM, role)
@@ -129,9 +123,8 @@ def test_effort_is_pinned_per_model():
     assert not snapshot.allows(ModelSpec("codex", "gpt-6-luna", "medium"))
     assert snapshot.pin(ModelSpec("codex", "gpt-6-luna", "")) == LUNA
     assert snapshot.pin(ModelSpec("claude", "claude-opus-5-5", "")) == OPUS
-    assert snapshot.pin(ModelSpec("opencode", "opencode-go/deepseek-v4.1-flash", "")) == DEEPSEEK
-    assert snapshot.pin(ModelSpec("opencode", "opencode-go/mimo-v2.6-flash", "")) == MIMO
-    assert not snapshot.allows(ModelSpec("opencode", "opencode-go/mimo-v2.6-flash", "high"))
+    assert snapshot.pin(ModelSpec("opencode", "opencode-go/glm-5.3-flash", "")) == GLM
+    assert not snapshot.allows(ModelSpec("opencode", "opencode-go/glm-5.3-flash", "high"))
 
 
 def test_role_pools_follow_the_central_weights():
@@ -228,3 +221,62 @@ def test_policy_snapshot_round_trips_without_secrets():
     restored = snapshot_from_dict(snapshot.to_dict())
     assert restored.state == snapshot.state
     assert restored.allowed_models() == snapshot.allowed_models()
+
+
+CENTRAL_WITHOUT_GLM = """
+HARNESSES = {
+    "openai-codex/gpt-6-sol": "codex",
+    "openai-codex/gpt-6-luna": "codex",
+    "claude-code/claude-opus-5-5": "claude",
+}
+
+
+def validate_model(model, harness=None):
+    if HARNESSES.get(model) is None or (harness and harness != HARNESSES[model]):
+        raise ValueError(model)
+    return model
+"""
+
+
+def test_central_policy_is_the_source_of_truth_for_selection(tmp_path, monkeypatch):
+    from forge.policy import CENTRAL_POLICY_ENV
+
+    central = tmp_path / "narrow_policy.py"
+    central.write_text(CENTRAL_WITHOUT_GLM, encoding="utf-8")
+    monkeypatch.setenv(CENTRAL_POLICY_ENV, str(central))
+    snapshot = load_policy(None)
+    assert not snapshot.allows(GLM) and snapshot.allows(LUNA) and snapshot.allows(SOL)
+    assert snapshot.cheap_pool() == (LUNA, LUNA, LUNA)
+    for role in (*STAFF_ROLES, *CODER_ROLES):
+        assert GLM not in {spec for spec, _ in snapshot.role_options(role)}
+        assert GLM not in snapshot.failover_options(role)
+    for seed in range(50):
+        assert GLM not in snapshot.select_new_run_models(random.Random(seed)).values()
+
+
+@pytest.mark.parametrize("content", [None, "raise RuntimeError('broken')\n", "VALUE = 1\n"])
+def test_missing_or_broken_central_policy_allows_nothing(tmp_path, monkeypatch, content):
+    from forge.policy import CENTRAL_POLICY_ENV, central_allowed_identities
+
+    central = tmp_path / "central.py"
+    if content is not None:
+        central.write_text(content, encoding="utf-8")
+    monkeypatch.setenv(CENTRAL_POLICY_ENV, str(central))
+    assert central_allowed_identities() == frozenset()
+    snapshot = load_policy(None)
+    assert snapshot.cheap_pool() == ()
+    assert not any(snapshot.allows(spec) for spec in ROSTER)
+    with pytest.raises(ValueError, match="central model policy"):
+        snapshot.select_role("planner", random.Random(0))
+
+
+def test_central_gate_checks_the_required_harness(tmp_path, monkeypatch):
+    from forge.policy import CENTRAL_POLICY_ENV, central_allowed_identities
+
+    central = tmp_path / "central.py"
+    central.write_text(
+        CENTRAL_WITHOUT_GLM.replace('"openai-codex/gpt-6-luna": "codex"', '"openai-codex/gpt-6-luna": "opencode"'),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(CENTRAL_POLICY_ENV, str(central))
+    assert central_allowed_identities() == frozenset({"codex:gpt-6-sol", "claude:claude-opus-5-5"})

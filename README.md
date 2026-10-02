@@ -165,6 +165,17 @@ providers, and local models are never part of active routing. Legacy identities 
 run state and old UI preferences stay readable, but they are rejected for a new run, for recovery,
 and at the agent runner, and are never selected as a fallback.
 
+The central policy module (`/home/jan/.hermes/scripts/model_policy.py`, or the path in
+`FORGE_CENTRAL_POLICY_SCRIPT`) is the source of truth: every policy load asks its
+`validate_model(id, harness)` which roster models it allows right now, and selection pools, the
+swarm's cheap pool (GLM Flash plus three Luna slots), resume restaffing and the agent runner all
+drop anything it refuses. A missing or broken central module allows nothing. A harness wrapper that
+exits 78 (the central gate refused the model) is a non-retryable policy refusal.
+
+The cheap swarm never destroys unmerged work: a dropped, conflicted or losing candidate worktree that
+holds anything over its base (untracked files included) stays in place, listed under `preserved` in
+`swarm/state.json`, and a retried pair gets fresh worktree and branch names.
+
 The promotion state in `/home/jan/.hermes/state/model-policy.json` (or the path in `--policy-path` /
 `FORGE_MODEL_POLICY_PATH`) is still recorded in the run snapshot, but it no longer changes which
 models are eligible.

@@ -330,3 +330,312 @@ def test_swarm_cli_builds_a_controller_on_the_cheap_pool(tmp_path):
     assert controller.config.cheap_pool == list(CHEAP_CODER_POOL)
     assert controller.strong_reviewer == SOL
     assert controller.teams_limit == 3
+
+
+# Regression tests: central policy, durable state, and worktree preservation.
+
+from forge.agents import AgentCancelled, AgentPolicyRefused
+from forge.policy import CENTRAL_POLICY_ENV, DEEPSEEK, LUNA
+from forge.swarm import SwarmFailed, SwarmTeam
+
+
+def events(box: SwarmController) -> list[dict]:
+    path = box.store.root / "events.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def disk_state(box: SwarmController) -> dict:
+    return json.loads((box.store.root / "swarm" / "state.json").read_text(encoding="utf-8"))
+
+
+def registered_worktrees(repo: Path) -> set[str]:
+    listing = git(repo, "worktree", "list", "--porcelain")
+    return {line.split(" ", 1)[1] for line in listing.splitlines() if line.startswith("worktree ")}
+
+
+class FeedbackRunner(SwarmRunner):
+    """The strong reviewer asks for one winner fix; the old controller never
+    recorded the fix coder's result and re-ran it forever."""
+
+    def __init__(self, backlog: str):
+        super().__init__(backlog)
+        self.winner_fixes = 0
+        self.winner_checks = 0
+
+    def _code(self, request: AgentRequest) -> AgentResult:
+        if "strong feedback" in request.prompt:
+            with self._lock:
+                self.winner_fixes += 1
+                assert self.winner_fixes <= 2, "winner-fix coder re-ran without progress"
+        return super()._code(request)
+
+    def _review(self, request: AgentRequest) -> AgentResult:
+        if "winner-check" in str(request.cwd) or self.winner_fixes:
+            with self._lock:
+                self.winner_checks += 1
+        return super()._review(request)
+
+    def _select(self, request: AgentRequest) -> AgentResult:
+        payload = json.loads(super()._select(request).text)
+        payload["feedback"] = ["name the output file in the summary"]
+        return result(request, json.dumps(payload))
+
+
+def test_swarm_winner_fix_records_the_coder_and_reaches_delivery(tmp_path: Path) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    runner = FeedbackRunner(backlog_json(count=1))
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=1, teams=1)
+    state = box.run()
+
+    assert state.status == "completed", state.message
+    assert [task.status for task in state.tasks] == ["done"]
+    assert runner.winner_fixes == 1
+    assert runner.winner_checks >= 1
+    kinds = [event["kind"] for event in events(box)]
+    assert "swarm.agent-done" in kinds
+
+
+class ReviewersDie(SwarmRunner):
+    def _review(self, request: AgentRequest) -> AgentResult:
+        raise AgentFailure("cheap reviewer died", raw_output="boom")
+
+
+def test_swarm_rejected_pair_keeps_worktrees_and_untracked_work(tmp_path: Path) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    runner = ReviewersDie(backlog_json(count=1))
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=1, teams=1)
+    state = box.run()
+
+    assert [task.status for task in state.tasks] == ["dropped"]
+    # Both attempts' worktrees stay, on distinct paths, still registered.
+    assert len(state.preserved) == 4
+    paths = {entry["path"] for entry in state.preserved}
+    assert len(paths) == 4
+    assert paths <= registered_worktrees(repo)
+    for entry in state.preserved:
+        assert (Path(entry["path"]) / "sw-01.txt").is_file(), "coder output was destroyed"
+        assert git(repo, "rev-parse", "--verify", entry["branch"])
+    assert disk_state(box)["preserved"] == state.preserved
+    # The attempt patches capture the coders' untracked files.
+    for attempt in (1, 2):
+        patches = sorted((box.store.root / "swarm/tasks/SW-01").glob(f"attempt-{attempt}-*.patch"))
+        assert len(patches) == 2
+        for patch in patches:
+            assert "sw-01.txt" in patch.read_text(encoding="utf-8")
+    assert any(e["kind"] == "swarm.worktree-preserved" for e in events(box))
+
+
+def test_swarm_completion_removes_the_merged_winner_and_keeps_the_loser(tmp_path: Path) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    runner = SwarmRunner(backlog_json(count=1))
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=1, teams=1)
+    state = box.run()
+
+    assert state.status == "completed"
+    assert (repo / "sw-01.txt").is_file()
+    assert len(state.preserved) == 1
+    loser = state.preserved[0]
+    assert Path(loser["path"]).is_dir() and loser["path"] in registered_worktrees(repo)
+    assert len(registered_worktrees(repo)) == 2  # the target checkout plus the loser
+
+
+class CancelMidRound(SwarmRunner):
+    """One coder finishes; the operator cancels while the other still runs."""
+
+    def __init__(self, backlog: str):
+        super().__init__(backlog)
+        self.box: SwarmController | None = None
+        self.finished = threading.Event()
+        self.first_mode = ""
+
+    def _code(self, request: AgentRequest) -> AgentResult:
+        with self._lock:
+            first = not self.first_mode
+            if first:
+                self.first_mode = str(request.cwd)
+        if first:
+            done = super()._code(request)
+            self.finished.set()
+            return done
+        assert self.finished.wait(5)
+        assert self.box is not None
+        self.box.cancel()
+        raise AgentCancelled("coder cancelled")
+
+
+def test_swarm_cancel_is_terminal_durable_and_keeps_finished_results(tmp_path: Path) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    runner = CancelMidRound(backlog_json(count=1))
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=1, teams=1)
+    runner.box = box
+    state = box.run()
+
+    assert state.status == "cancelled"
+    saved = disk_state(box)
+    assert saved["status"] == "cancelled"
+    [team] = saved["teams"]
+    assert [mode for mode, data in team["versions"].items() if data.get("summary")], (
+        "the finished coder's result must be durable"
+    )
+    assert all(Path(path).is_dir() for path in team["worktrees"].values())
+    assert [task["status"] for task in saved["tasks"]] == ["in_progress"]
+    kinds = [event["kind"] for event in events(box)]
+    assert "swarm.agent-done" in kinds and "swarm.agent-cancelled" in kinds
+
+
+def test_swarm_cancel_stops_in_flight_agents(tmp_path: Path) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    runner = SwarmRunner(backlog_json(count=1))
+    calls = []
+    runner.cancel = lambda: calls.append("cancel")  # type: ignore[attr-defined]
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=1)
+    box.cancel()
+    assert calls == ["cancel"]
+
+
+def test_swarm_crash_and_planner_policy_refusal_leave_a_terminal_state(tmp_path: Path) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+
+    class Refused(SwarmRunner):
+        def _plan(self, request):
+            raise AgentPolicyRefused("planner refused (exit 78)", raw_output="BLOCKED")
+
+    runner = Refused(backlog_json())
+    box = make_controller(repo, brief, runner, tmp_path)
+    assert box.run().status == "failed"
+    assert disk_state(box)["status"] == "failed"
+    assert "exit 78" in disk_state(box)["message"]
+    assert runner.planner_calls == 0 and len(runner.requests) == 1, "exit 78 is never retried"
+
+    class Crash(SwarmRunner):
+        def _plan(self, request):
+            raise KeyError("bug")
+
+    crashed = make_controller(repo, brief, Crash(backlog_json()), tmp_path)
+    with pytest.raises(KeyError):
+        crashed.run()
+    assert disk_state(crashed)["status"] == "failed"
+
+
+NARROW_CENTRAL = '''
+HARNESSES = {"openai-codex/gpt-6-sol": "codex", "openai-codex/gpt-6-luna": "codex"}
+
+
+def validate_model(model, harness=None):
+    if model not in HARNESSES or (harness and harness != HARNESSES[model]):
+        raise ValueError(model)
+    return model
+'''
+
+
+def test_swarm_claim_never_draws_outside_the_current_central_policy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    runner = SwarmRunner(backlog_json(count=1))
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=1)
+    # The central policy narrows after the run was configured: GLM leaves it.
+    central = tmp_path / "narrow.py"
+    central.write_text(NARROW_CENTRAL, encoding="utf-8")
+    monkeypatch.setenv(CENTRAL_POLICY_ENV, str(central))
+    state = box.run()
+
+    assert state.status == "failed"
+    assert "allows 3 of the cheap pool slots" in state.message
+    assert not [r for r in runner.requests if r.role.startswith("swarm_")]
+
+
+def test_swarm_resume_restaffs_members_outside_the_central_policy(tmp_path: Path) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    runner = SwarmRunner(backlog_json(count=1))
+    first = make_controller(repo, brief, runner, tmp_path, min_backlog=1, teams=1)
+    first.state.tasks = [
+        __import__("forge.swarm", fromlist=["SwarmTask"]).SwarmTask.from_dict(
+            {**swarm_task_json("SW-01", 1), "status": "in_progress"}
+        )
+    ]
+    off = {"provider": DEEPSEEK.provider, "model": DEEPSEEK.model, "effort": DEEPSEEK.effort}
+    ok = {"provider": LUNA.provider, "model": LUNA.model, "effort": LUNA.effort}
+    first.state.teams = [
+        SwarmTeam(
+            id=1,
+            task_id="SW-01",
+            phase="code",
+            modes=["tdd", "classic"],
+            coders=[
+                {"mode": "tdd", "spec": dict(off), "display": DEEPSEEK.display()},
+                {"mode": "classic", "spec": dict(ok), "display": LUNA.display()},
+            ],
+            reviewers=[
+                {"reviewer": 1, "spec": dict(off), "display": DEEPSEEK.display()},
+                {"reviewer": 2, "spec": dict(ok), "display": LUNA.display()},
+            ],
+        )
+    ]
+    first.persist("stopped mid-run")
+    # A persisted pool may still name a model the central policy removed.
+    first.config.cheap_pool = [DEEPSEEK, *CHEAP_CODER_POOL]
+    first.store.write_data("config.json", first.config.to_dict())
+
+    config = RunConfig.from_dict(json.loads((first.store.root / "config.json").read_text()))
+    resumed_runner = SwarmRunner(backlog_json(count=1))
+    resumed = SwarmController(
+        config,
+        run_id=first.run_id,
+        runner=resumed_runner,
+        state_home=tmp_path / "state",
+        resume=True,
+        teams=1,
+        min_backlog=1,
+    )
+    state = resumed.run()
+
+    assert state.status == "completed", state.message
+    launched = {r.model.display() for r in resumed_runner.requests if r.role.startswith("swarm_")}
+    assert launched and DEEPSEEK.display() not in launched
+    assert any("outside the current model policy" in warning for warning in state.warnings)
+
+
+def test_swarm_resume_drops_a_team_whose_worktree_vanished(tmp_path: Path) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    runner = SwarmRunner(backlog_json(count=1))
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=1, teams=1)
+    box.state.tasks = [
+        __import__("forge.swarm", fromlist=["SwarmTask"]).SwarmTask.from_dict(
+            {**swarm_task_json("SW-01", 1), "status": "in_progress"}
+        )
+    ]
+    spec = {"provider": LUNA.provider, "model": LUNA.model, "effort": LUNA.effort}
+    gone = tmp_path / "gone"
+    box.state.teams = [
+        SwarmTeam(
+            id=1,
+            task_id="SW-01",
+            phase="review",
+            modes=["tdd", "classic"],
+            coders=[
+                {"mode": "tdd", "spec": dict(spec), "display": LUNA.display()},
+                {"mode": "classic", "spec": dict(spec), "display": LUNA.display()},
+            ],
+            reviewers=[
+                {"reviewer": 1, "spec": dict(spec), "display": LUNA.display()},
+                {"reviewer": 2, "spec": dict(spec), "display": LUNA.display()},
+            ],
+            versions={"tdd": {"review": {}}, "classic": {"review": {}}},
+            base_sha=git(repo, "rev-parse", "HEAD"),
+            worktrees={"tdd": str(gone / "a"), "classic": str(gone / "b")},
+        )
+    ]
+    box.persist("stopped mid-run")
+    config = RunConfig.from_dict(json.loads((box.store.root / "config.json").read_text()))
+    resumed_runner = SwarmRunner(backlog_json(count=1))
+    resumed = SwarmController(
+        config, run_id=box.run_id, runner=resumed_runner,
+        state_home=tmp_path / "state", resume=True, teams=1, min_backlog=1,
+    )
+    state = resumed.run()
+
+    assert not gone.exists(), "no agent may run in a bare replacement directory"
+    assert any("worktree missing on resume" in warning for warning in state.warnings)
+    assert state.status == "completed"
+    assert [task.status for task in state.tasks] == ["done"]
