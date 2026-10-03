@@ -58,7 +58,11 @@ async function api(path, options = {}) {
   // Relative request targets keep working when the room is proxied under a
   // subpath (the /forge/ entrance) and when it is served directly from /.
   const target = path.startsWith("/") ? path.slice(1) : path;
-  const response = await fetch(target, {headers: {"Content-Type": "application/json"}, ...options});
+  const {headers = {}, ...rest} = options;
+  const response = await fetch(target, {
+    headers: {"Content-Type": "application/json", ...headers},
+    ...rest,
+  });
   const value = await response.json();
   if (!response.ok) throw new Error(value.error || response.statusText);
   return value;
@@ -569,6 +573,65 @@ function coderDraw(run) {
   return `<h3>Coder draw</h3><ul class="coder-draw">${rows}</ul>`;
 }
 
+function feedbackPanel(run) {
+  const roles = [
+    ["auto", "Forge routes at the next safe boundary"],
+    ["brain", "Product Owner"],
+    ["planner", "Planner"],
+    ["test_author", "Test author"],
+    ["coder_tdd", "TDD coder"],
+    ["coder_explore", "Explore coder"],
+    ["coder_classic", "Classic coder"],
+    ["reviewer", "Reviewer"],
+    ["tester", "Unified tester"],
+  ];
+  const feedback = (run.feedback || []).map(item => {
+    const decision = item.status === "needs_decision" ? `
+      <div class="feedback-decisions">
+        <p>Choose how Forge should handle this. Current work continues.</p>
+        <button class="button secondary" data-feedback-id="${escapeHtml(item.id)}" data-feedback-action="schedule_replan">Schedule at next Product Owner boundary</button>
+        <button class="button ghost" data-feedback-id="${escapeHtml(item.id)}" data-feedback-action="use_as_guidance">Use as guidance</button>
+        <button class="button ghost" data-feedback-id="${escapeHtml(item.id)}" data-feedback-action="defer">Defer</button>
+        <button class="button ghost" data-feedback-id="${escapeHtml(item.id)}" data-feedback-action="dismiss">Dismiss</button>
+      </div>` : "";
+    return `<article class="feedback-row">
+      <div class="feedback-row-top"><strong>${escapeHtml(item.kind === "scope_change" ? "Scope change" : "Feedback")}</strong><span class="status-pill ${escapeHtml(item.status)}">${escapeHtml(item.status.replaceAll("_", " "))}</span></div>
+      <p>${escapeHtml(item.message)}</p><small>${escapeHtml(item.explanation)} · ${escapeHtml(item.target_role)}</small>${decision}
+    </article>`;
+  }).join("");
+  const suggestions = (run.suggestions || []).map(item => {
+    const actions = item.status === "open" ? `
+      <div class="suggestion-actions">
+        ${item.kind !== "question" && item.kind !== "blocker" ? `<button class="button secondary" data-suggestion-id="${escapeHtml(item.id)}" data-suggestion-action="accept">Accept</button>` : ""}
+        <button class="button ghost" data-suggestion-id="${escapeHtml(item.id)}" data-suggestion-action="reject">Reject</button>
+        <button class="button ghost" data-suggestion-id="${escapeHtml(item.id)}" data-suggestion-action="defer">Defer</button>
+      </div>
+      <label class="field suggestion-answer"><span>Answer or add context</span><textarea rows="2" data-suggestion-answer="${escapeHtml(item.id)}" placeholder="Your answer goes through the run feedback queue"></textarea></label>
+      <button class="button ghost" data-suggestion-id="${escapeHtml(item.id)}" data-suggestion-action="answer">Send answer</button>` : "";
+    return `<article class="suggestion-card ${escapeHtml(item.kind)}">
+      <div class="feedback-row-top"><strong>${escapeHtml(item.kind)}</strong><span class="status-pill ${escapeHtml(item.status)}">${escapeHtml(item.status)}</span></div>
+      <h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.context)}</p>
+      <dl><dt>Why Forge raised this</dt><dd>${escapeHtml(item.rationale)}</dd><dt>Expected impact</dt><dd>${escapeHtml(item.expected_impact)}</dd><dt>Suggested next step</dt><dd>${escapeHtml(item.recommendation)}</dd></dl>
+      ${item.requires_decision ? `<p class="decision-note">This may change scope and needs an explicit decision. Forge will not apply it automatically.</p>` : ""}${actions}
+    </article>`;
+  }).join("");
+  const suppressed = safeInteger(run.suppressed_suggestions);
+  return `<section class="conversation-panel" aria-label="Run feedback and suggestions">
+    <div class="section-title compact"><div><span class="eyebrow">Two-way run communication</span><h3>Feedback and suggestions</h3></div><span class="conversation-count">${(run.feedback || []).length} messages · ${(run.suggestions || []).filter(item => item.status === "open").length} open</span></div>
+    <form id="feedback-form" class="feedback-form">
+      <label class="field"><span>Feedback for this run</span><textarea id="feedback-message" name="message" rows="3" maxlength="8000" placeholder="Add context or a correction. Forge records it and delivers it at a safe agent boundary." required></textarea></label>
+      <div class="feedback-form-controls">
+        <label class="field"><span>Type</span><select name="kind"><option value="guidance">Clarification or guidance</option><option value="scope_change">Possible scope change</option></select></label>
+        <label class="field"><span>Send to</span><select name="target_role">${roles.map(([value, label]) => `<option value="${value}">${escapeHtml(label)}</option>`).join("")}</select></label>
+        <button class="button primary" type="submit">Send feedback</button>
+      </div>
+      <p class="conversation-help">Scope changes wait for your decision. Scheduling a replan keeps current sprint work on its existing plan. Sending feedback never pauses, cancels, restarts, merges, or deploys a run.</p>
+    </form>
+    <h4>Forge suggestions and questions</h4>${suppressed ? `<p class="conversation-help">${suppressed} repeated or excess suggestion(s) were held back to keep this panel focused.</p>` : ""}${suggestions || `<p class="empty">Forge has no suggestions for this run.</p>`}
+    <h4>Feedback history</h4>${feedback || `<p class="empty">No feedback has been sent to this run.</p>`}
+  </section>`;
+}
+
 function eventsBox() {
   return document.querySelector("#detail-body .events");
 }
@@ -612,6 +675,7 @@ function detail(run) {
     ${activeAgents(run)}
     ${warnings ? `<ul class="warnings">${warnings}</ul>` : ""}
     ${run.error ? `<details><summary>Process error</summary><pre class="error-detail">${escapeHtml(run.error)}</pre></details>` : ""}
+    ${feedbackPanel(run)}
     ${iterations(run)}
     <h3>Recent events</h3><div class="events">${eventRows(run) || "No events yet."}</div>`;
 }
@@ -630,12 +694,57 @@ async function refresh() {
     indicator.textContent = run.alive ? "Live" : "Stopped";
     indicator.classList.toggle("live", run.alive);
     const eventsScroll = captureEventsScroll();
+    const feedbackDraft = document.querySelector("#feedback-message")?.value || "";
     document.querySelector("#detail-body").innerHTML = detail(run);
+    document.querySelector("#feedback-message").value = feedbackDraft;
     restoreEventsScroll(eventsScroll);
     document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", async () => {
       button.disabled = true;
       try { await api(`/api/runs/${selected}/${button.dataset.action}`, {method: "POST", body: "{}"}); }
       catch (error) { document.querySelector("#form-error").textContent = error.message; }
+      await refresh();
+    }));
+    document.querySelector("#feedback-form")?.addEventListener("submit", async event => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const data = new FormData(form);
+      const button = form.querySelector("button[type=submit]");
+      button.disabled = true;
+      try {
+        await api(`/api/runs/${encodeURIComponent(selected)}/feedback`, {
+          method: "POST",
+          headers: {"Idempotency-Key": crypto.randomUUID()},
+          body: JSON.stringify({message: data.get("message"), kind: data.get("kind"), target_role: data.get("target_role")}),
+        });
+        document.querySelector("#form-error").textContent = "Feedback saved. Forge will deliver it at a safe boundary.";
+      } catch (error) {
+        document.querySelector("#form-error").textContent = error.message;
+      }
+      await refresh();
+    });
+    document.querySelectorAll("[data-feedback-action]").forEach(button => button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await api(`/api/runs/${encodeURIComponent(selected)}/feedback/${encodeURIComponent(button.dataset.feedbackId)}/decision`, {
+          method: "POST", body: JSON.stringify({action: button.dataset.feedbackAction}),
+        });
+      } catch (error) {
+        document.querySelector("#form-error").textContent = error.message;
+      }
+      await refresh();
+    }));
+    document.querySelectorAll("[data-suggestion-action]").forEach(button => button.addEventListener("click", async () => {
+      button.disabled = true;
+      const action = button.dataset.suggestionAction;
+      const answer = document.querySelector(`[data-suggestion-answer="${CSS.escape(button.dataset.suggestionId)}"]`)?.value || "";
+      try {
+        await api(`/api/runs/${encodeURIComponent(selected)}/suggestions/${encodeURIComponent(button.dataset.suggestionId)}`, {
+          method: "POST", body: JSON.stringify({action, answer}),
+        });
+        document.querySelector("#form-error").textContent = action === "answer" ? "Answer saved in the run feedback queue." : "Suggestion decision saved.";
+      } catch (error) {
+        document.querySelector("#form-error").textContent = error.message;
+      }
       await refresh();
     }));
   } catch (error) {

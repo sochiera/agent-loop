@@ -20,6 +20,7 @@ from .artifacts import atomic_write
 from .access import REALM, AccessGate
 from .catalog import assign_coder_models, catalog_payload, DEFAULTS
 from .gitops import list_branches, repository_summary
+from .feedback import RunConversationStore
 from .locking import ExecutionLocked
 from .models import (
     CODER_ROLES,
@@ -493,6 +494,50 @@ class RunRegistry:
             raise KeyError(run_id)
         return self._describe(live, detailed=True)
 
+    def add_feedback(self, run_id: str, payload: dict[str, Any], *, idempotency_key: str = "") -> dict[str, Any]:
+        live = self._live_run(run_id)
+        state = live.orchestrator.state_snapshot()
+        item, created = live.orchestrator.conversation.add_feedback(
+            str(payload.get("message") or ""),
+            kind=str(payload.get("kind") or "guidance"),
+            target_role=str(payload.get("target_role") or "auto"),
+            phase=str(state.get("phase") or ""),
+            iteration_id=str((state.get("active_iteration") or {}).get("id") or ""),
+            idempotency_key=idempotency_key or str(payload.get("idempotency_key") or ""),
+        )
+        return {"feedback": item, "created": created}
+
+    def decide_feedback(self, run_id: str, feedback_id: str, action: str) -> dict[str, Any]:
+        live = self._live_run(run_id)
+        state = live.orchestrator.state_snapshot()
+        item = live.orchestrator.conversation.decide_feedback(
+            feedback_id,
+            action,
+            active_iteration_id=str((state.get("active_iteration") or {}).get("id") or ""),
+        )
+        return {"feedback": item}
+
+    def respond_to_suggestion(
+        self, run_id: str, suggestion_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        live = self._live_run(run_id)
+        state = live.orchestrator.state_snapshot()
+        suggestion, feedback = live.orchestrator.conversation.answer_suggestion(
+            suggestion_id,
+            str(payload.get("action") or ""),
+            answer=str(payload.get("answer") or ""),
+            phase=str(state.get("phase") or ""),
+            iteration_id=str((state.get("active_iteration") or {}).get("id") or ""),
+        )
+        return {"suggestion": suggestion, "feedback": feedback}
+
+    def _live_run(self, run_id: str) -> LiveRun:
+        with self._lock:
+            live = self._runs.get(run_id)
+        if live is None:
+            raise KeyError(run_id)
+        return live
+
     def recover(self, payload: dict[str, Any]) -> dict[str, Any]:
         repo = Path(str(payload["repo"])).expanduser().resolve()
         run_id = str(payload["run_id"])
@@ -557,6 +602,12 @@ class RunRegistry:
             value["error"] = live.error
         if detailed:
             value["active_agents"] = live.orchestrator.activity_snapshot()
+            conversation = getattr(live.orchestrator, "conversation", None)
+            value.update(
+                conversation.snapshot()
+                if conversation is not None
+                else {"feedback": [], "suggestions": [], "suppressed_suggestions": 0}
+            )
             for name in ("events.jsonl", "usage.jsonl"):
                 path = live.orchestrator.store.root / name
                 value[name.removesuffix(".jsonl")] = read_last_lines(path)
@@ -599,9 +650,15 @@ class ForgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/runs":
             return self._json(self.registry.list())
         if parsed.path.startswith("/api/runs/"):
-            run_id = parsed.path.split("/")[3]
+            parts = parsed.path.strip("/").split("/")
+            run_id = parts[2] if len(parts) >= 3 else ""
             try:
-                return self._json(self.registry.get(run_id))
+                detail = self.registry.get(run_id)
+                if len(parts) == 4 and parts[3] in {"feedback", "suggestions"}:
+                    return self._json({parts[3]: detail.get(parts[3], [])})
+                if len(parts) == 3:
+                    return self._json(detail)
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             except KeyError:
                 return self._json({"error": "run not found"}, HTTPStatus.NOT_FOUND)
         if parsed.path == "/api/catalog":
@@ -648,17 +705,33 @@ class ForgeHandler(BaseHTTPRequestHandler):
             return self._challenge_gate()
         try:
             payload = self._body()
-            if self.path == "/api/restart":
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/api/restart":
                 if self.request_restart is None:
                     return self._json({"error": "restart is unavailable"}, HTTPStatus.BAD_REQUEST)
                 return self._json(self.request_restart(bool(payload.get("confirm"))))
-            if self.path == "/api/preferences":
+            if path == "/api/preferences":
                 return self._json(self.registry.save_preferences(payload))
-            if self.path == "/api/runs":
+            if path == "/api/runs":
                 return self._json(self.registry.start(payload), HTTPStatus.CREATED)
-            if self.path == "/api/runs/recover":
+            if path == "/api/runs/recover":
                 return self._json(self.registry.recover(payload), HTTPStatus.CREATED)
-            parts = self.path.strip("/").split("/")
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "feedback":
+                key = self.headers.get("Idempotency-Key", "")
+                result = self.registry.add_feedback(parts[2], payload, idempotency_key=key)
+                return self._json(result, HTTPStatus.CREATED if result["created"] else HTTPStatus.OK)
+            if (
+                len(parts) == 6
+                and parts[:2] == ["api", "runs"]
+                and parts[3] == "feedback"
+                and parts[5] == "decision"
+            ):
+                return self._json(
+                    self.registry.decide_feedback(parts[2], parts[4], str(payload.get("action") or ""))
+                )
+            if len(parts) == 5 and parts[:2] == ["api", "runs"] and parts[3] == "suggestions":
+                return self._json(self.registry.respond_to_suggestion(parts[2], parts[4], payload))
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "recover":
                 return self._json(self.registry.recover_live(parts[2]))
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] in {

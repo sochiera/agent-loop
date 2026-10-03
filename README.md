@@ -229,6 +229,43 @@ more, three are drawn. Weighted coder reshuffling is enabled by default and redr
 each sprint (`--no-shuffle-coders` disables it). A single surviving eligible candidate still
 completes an iteration — the tournament degrades, it never silently becomes the design.
 
+### Feedback during a run
+
+The run detail view accepts clarifications and scope-change notes while Forge is working. Each note
+has a durable ID, status, explanation, and delivery history. Forge records it immediately, then adds
+it to the next matching agent prompt at a safe invocation boundary. A prompt already running is left
+alone. If a clarification arrives during the parallel coder tournament, Forge holds it for the
+reviewer so candidate work does not receive inconsistent input. The append-free conversation
+snapshot is written atomically to `.forge/runs/RUN_ID/conversation.json`, independently from the
+controller's run-state checkpoint, and is reloaded after recovery.
+
+Use the CLI when the control room is not open:
+
+```bash
+python3 -m forge feedback add --repo /path/to/product --run-id RUN_ID \
+  --message "Keep the existing error response shape." --target-role reviewer
+python3 -m forge feedback list --repo /path/to/product --run-id RUN_ID
+python3 -m forge feedback decide --repo /path/to/product --run-id RUN_ID \
+  --feedback-id FEEDBACK_ID --action schedule_replan
+```
+
+`--kind scope_change` places a note in `needs_decision`. The control room or `feedback decide`
+can schedule an approved replan for the next Product Owner boundary; the active iteration and the
+rest of the current sprint keep their existing plans. Clarifications move through `received`, `pending`, and `applied`. A
+deferred or rejected item remains in history, and duplicate request IDs or repeated open messages do
+not create duplicate records.
+
+Reviewers and testers can publish structured suggestions, questions, and blockers with the stage
+context, rationale, and expected impact. Non-blocking suggestions do not gate delivery. Accepting a
+suggestion or answering a question records a message through the same feedback queue. Scope changes
+still wait for a separate decision, and feedback never pauses, cancels, restarts, merges, or deploys a
+run. Repeated suggestion titles are deduplicated across the run, and the panel keeps at most 20 open
+suggestions; excess suggestions are counted and held back.
+
+The control-room API supports `GET /api/runs/RUN_ID/feedback`,
+`POST /api/runs/RUN_ID/feedback`, `POST /api/runs/RUN_ID/feedback/FEEDBACK_ID/decision`,
+`GET /api/runs/RUN_ID/suggestions`, and `POST /api/runs/RUN_ID/suggestions/SUGGESTION_ID`.
+
 ## Command-line run
 
 Unspecified role flags are drawn from the active model policy; explicit flags override the draw but

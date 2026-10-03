@@ -12,6 +12,7 @@ import pytest
 from pathlib import Path
 
 from forge.access import AccessGate, GateMisconfigured, gate_from_env, read_expected_value
+from forge.feedback import RunConversationStore
 from forge.models import CODER_ROLES, ROLE_NAMES, STAFF_ROLES, RunState
 from forge.web import (
     ForgeHandler,
@@ -247,6 +248,94 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
             ).read()
         )
         assert restart == {"restarting": True, "active_runs": 0}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_run_feedback_api_is_idempotent_and_suggestion_answers_join_same_queue(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    orchestrator = type("Orchestrator", (), {})()
+    orchestrator.run_id = "feedback-ui"
+    orchestrator.state = RunState(
+        run_id=orchestrator.run_id,
+        status="running",
+        phase="review",
+        created_at="now",
+        updated_at="now",
+        config={},
+        active_iteration={"id": "ITER-04", "story_id": "F05"},
+    )
+    orchestrator.store = type("Store", (), {"root": repo / ".forge" / "runs" / orchestrator.run_id})()
+    orchestrator.store.root.mkdir(parents=True)
+    orchestrator.conversation = RunConversationStore(repo, orchestrator.run_id)
+    orchestrator.state_snapshot = lambda: orchestrator.state.to_dict()
+    orchestrator.activity_snapshot = lambda: {}
+    live = LiveRun(orchestrator, threading.Thread())
+    registry = RunRegistry(state_home=tmp_path)
+    registry._runs[orchestrator.run_id] = live
+    suggestion, _ = orchestrator.conversation.publish_suggestion(
+        kind="question",
+        title="Should both response formats stay compatible?",
+        context="Reviewer is checking ITER-04, story F05.",
+        rationale="The API change touches an existing response shape.",
+        expected_impact="The answer will guide the reviewer without pausing the run.",
+        recommendation="Keep both response formats for this iteration.",
+        source="review:ITER-04",
+        target_role="reviewer",
+    )
+    handler = type("FeedbackHandler", (ForgeHandler,), {"registry": registry})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+
+    def post(path: str, payload: dict, *, headers: dict[str, str] | None = None):
+        request = urllib.request.Request(
+            base + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", **(headers or {})},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return response.status, json.loads(response.read())
+
+    try:
+        script = urllib.request.urlopen(base + "/app.js", timeout=2).read().decode()
+        assert "feedbackPanel(run)" in script
+        assert 'data-suggestion-action="answer"' in script
+        feedback_path = f"/api/runs/{orchestrator.run_id}/feedback"
+        body = {"message": "Preserve the old error envelope.", "kind": "guidance", "target_role": "reviewer"}
+        status, first = post(feedback_path, body, headers={"Idempotency-Key": "ui-feedback-1"})
+        assert status == 201
+        status, repeated = post(feedback_path, body, headers={"Idempotency-Key": "ui-feedback-1"})
+        assert status == 200
+        assert first["feedback"]["id"] == repeated["feedback"]["id"]
+        assert repeated["created"] is False
+
+        _status, answer = post(
+            f"/api/runs/{orchestrator.run_id}/suggestions/{suggestion['id']}",
+            {"action": "answer", "answer": "Keep both formats through this release."},
+        )
+        assert answer["suggestion"]["status"] == "answered"
+        assert answer["feedback"]["source"] == f"suggestion:{suggestion['id']}"
+
+        _status, scope = post(
+            feedback_path,
+            {"message": "Move the app to hosted multi-tenant SaaS.", "kind": "scope_change"},
+        )
+        assert scope["feedback"]["status"] == "needs_decision"
+        _status, decision = post(
+            f"/api/runs/{orchestrator.run_id}/feedback/{scope['feedback']['id']}/decision",
+            {"action": "schedule_replan"},
+        )
+        assert decision["feedback"]["status"] == "pending"
+        detail = json.loads(urllib.request.urlopen(base + f"/api/runs/{orchestrator.run_id}", timeout=2).read())
+        assert len(detail["feedback"]) == 3
+        assert detail["suggestions"][0]["status"] == "answered"
+        assert detail["status"] == "running"
     finally:
         server.shutdown()
         server.server_close()
