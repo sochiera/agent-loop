@@ -72,7 +72,8 @@ def _session_process_groups(session_id: int) -> set[int]:
             fields = stat_path.read_text(encoding="utf-8").rsplit(")", 1)[1].split()
             process_group = int(fields[2])
             process_session = int(fields[3])
-        except (FileNotFoundError, IndexError, ValueError):
+        # A process exiting mid-scan raises ENOENT or ESRCH.
+        except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
             continue
         if process_session == session_id:
             groups.add(process_group)

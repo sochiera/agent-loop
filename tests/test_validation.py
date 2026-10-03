@@ -122,3 +122,14 @@ def test_validation_does_not_fallback_for_other_failures(tmp_path: Path):
     # The fallback reruns the unexecutable script honestly; its real exit code wins.
     assert results[1]["return_code"] == 3
     assert results[1]["mode_fallback"]["original_return_code"] == 126
+
+
+def test_session_scan_skips_a_process_that_exits_mid_read(monkeypatch):
+    from forge import validation
+
+    class Vanishing:
+        def read_text(self, encoding=None):
+            raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(validation.Path, "glob", lambda self, pattern: iter([Vanishing()]))
+    assert validation._session_process_groups(1) == set()
