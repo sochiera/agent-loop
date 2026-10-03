@@ -43,11 +43,14 @@ from .agents import (
     AgentCancelled,
     AgentConfigurationFailure,
     AgentFailure,
+    AgentPolicyRefused,
     AgentRequest,
     AgentResult,
     AgentRunner,
+    AgentTimeout,
+    AgentUsageLimit,
 )
-from .artifacts import ArtifactStore
+from .artifacts import ArtifactStore, utc_now
 from .catalog import model_identity
 from .contracts import (
     ContractError,
@@ -78,7 +81,20 @@ DEFAULT_MIN_BACKLOG = 15
 DEFAULT_READY_THRESHOLD = 0.7
 DEFAULT_MAX_PAIR_ATTEMPTS = 2
 DEFAULT_MAX_FIX_ROUNDS = 2
+# A job whose agent timed out twice ends there: a third full timeout rarely
+# succeeds and only holds the team (run 20261003-000921: 3 x 3600s).
+MAX_TIMEOUTS_PER_JOB = 2
+# Consecutive cheap pairs lost to agent failures, with no agent success in
+# between, before the swarm stops instead of burning the backlog's attempts.
+DEFAULT_FAILURE_BREAKER = 3
+# Cheap reviewer answers Forge cannot read get one re-ask before a fallback.
+MAX_UNREADABLE_REVIEWS = 2
+HEARTBEAT_SECONDS = 30.0
 SWARM_SCHEMA = 1
+
+# Strong staff roles of the swarm, in migration preference order (the first
+# allowed model replaces an off-policy one).
+SWARM_STAFF = {"planner": (SOL, OPUS, GLM), "reviewer": (SOL, OPUS)}
 
 
 class SwarmCancelled(RuntimeError):
@@ -118,6 +134,63 @@ def environment_context() -> str:
         if shutil.which(command)
     ]
     return f"Available commands: {', '.join(available) or 'none'}."
+
+
+def off_policy_staff(config: RunConfig, snapshot: Any) -> list[str]:
+    """Roster roles the current policy (or the swarm's strong-staff rule)
+    refuses, plus ``cheap_pool`` when any cheap slot is refused."""
+
+    roles = []
+    for role, spec in config.models.items():
+        strong = SWARM_STAFF.get(role)
+        if not snapshot.allows(spec, role) or (
+            strong and model_identity(spec) not in {model_identity(m) for m in strong}
+        ):
+            roles.append(role)
+    if any(not snapshot.allows(spec, SWARM_CODER_ROLE) for spec in config.cheap_pool):
+        roles.append("cheap_pool")
+    return roles
+
+
+def migrate_swarm_config(config: RunConfig, run_id: str) -> dict[str, str]:
+    """Explicitly move a persisted swarm config onto the current policy.
+
+    Only refused entries change: a strong role takes the first allowed model
+    of its swarm preference (Sol, then Opus), any other role a deterministic
+    policy draw, and a refused cheap pool the current central pool. Returns
+    ``{role: "old -> new"}``; raises when the policy leaves no replacement.
+    """
+
+    snapshot = load_policy(config.policy_path or None)
+    changes: dict[str, str] = {}
+    for role in off_policy_staff(config, snapshot):
+        if role == "cheap_pool":
+            pool = list(snapshot.cheap_pool())
+            if len(pool) < 4:
+                raise SwarmFailed(
+                    f"the current model policy allows {len(pool)} cheap pool slots; "
+                    "the swarm needs four"
+                )
+            changes[role] = (
+                f"{', '.join(spec.display() for spec in config.cheap_pool)} -> "
+                f"{', '.join(spec.display() for spec in pool)}"
+            )
+            config.cheap_pool = pool
+            continue
+        previous = config.models[role]
+        preferred = SWARM_STAFF.get(role) or (
+            (SOL, OPUS) if role == "brain" else ()
+        )
+        options = [spec for spec in preferred if snapshot.allows(spec, role)]
+        if options:
+            replacement = options[0]
+        elif role in SWARM_STAFF:
+            raise SwarmFailed(f"the current model policy allows no swarm {role}")
+        else:
+            replacement = snapshot.select_role(role, random.Random(f"{run_id}:migrate:{role}"))
+        config.models[role] = replacement
+        changes[role] = f"{previous.display()} -> {replacement.display()}"
+    return changes
 
 
 @dataclass
@@ -187,6 +260,9 @@ class SwarmTeam:
     branches: dict[str, str] = field(default_factory=dict)
     sessions: dict[str, str] = field(default_factory=dict)
     arrivals: list[str] = field(default_factory=list)
+    # Artifact names of this phase's jobs whose results are applied. A resume
+    # dispatches only the rest; ``None`` marks state saved before tracking.
+    done_jobs: list[str] | None = None
 
     def coder(self, mode: str) -> dict[str, Any]:
         for entry in self.coders:
@@ -215,6 +291,7 @@ class SwarmTeam:
             "branches": dict(self.branches),
             "sessions": dict(self.sessions),
             "arrivals": list(self.arrivals),
+            **({} if self.done_jobs is None else {"done_jobs": list(self.done_jobs)}),
         }
 
     @classmethod
@@ -236,6 +313,11 @@ class SwarmTeam:
             branches={str(mode): str(branch) for mode, branch in value.get("branches", {}).items()},
             sessions={str(key): str(value) for key, value in value.get("sessions", {}).items()},
             arrivals=[str(item) for item in value.get("arrivals", [])],
+            done_jobs=(
+                None
+                if value.get("done_jobs") is None
+                else [str(item) for item in value["done_jobs"]]
+            ),
         )
 
 
@@ -313,6 +395,7 @@ class SwarmController:
         ready_threshold: float = DEFAULT_READY_THRESHOLD,
         max_pair_attempts: int = DEFAULT_MAX_PAIR_ATTEMPTS,
         max_fix_rounds: int = DEFAULT_MAX_FIX_ROUNDS,
+        failure_breaker: int = DEFAULT_FAILURE_BREAKER,
     ):
         if not resume:
             config.validate()
@@ -334,15 +417,20 @@ class SwarmController:
         self.ready_threshold = ready_threshold
         self.max_pair_attempts = max_pair_attempts
         self.max_fix_rounds = max_fix_rounds
+        self.failure_breaker = failure_breaker
         self._conflict_counts: dict[str, int] = {}
+        # Tasks whose pairs failed since the last agent success (the breaker).
+        self._failure_streak: list[str] = []
+        self._inflight: dict[str, dict[str, Any]] = {}
+        self._heartbeat_at = 0.0
         self._lock = threading.RLock()
         self._control = threading.Condition()
         self._executor: ThreadPoolExecutor | None = None
         self._paused = False
         self._cancel_requested = False
 
-        self.planner = self._staff_model("planner", allowed={SOL, OPUS, GLM})
-        self.strong_reviewer = self._staff_model("reviewer", allowed={SOL, OPUS})
+        self.planner = self._staff_model("planner", allowed=set(SWARM_STAFF["planner"]))
+        self.strong_reviewer = self._staff_model("reviewer", allowed=set(SWARM_STAFF["reviewer"]))
         if len(config.cheap_pool) < 4:
             raise ValueError(
                 "the swarm consumes the cheap pool; RunConfig.cheap_pool must "
@@ -350,9 +438,69 @@ class SwarmController:
             )
         if resume:
             self.state = SwarmRunState.from_dict(self._load_swarm_state())
+            # The conflict cap per task family survives a restart.
+            for task in self.state.tasks:
+                if task.status == "conflict":
+                    family = task.id.split("-R")[0]
+                    self._conflict_counts[family] = self._conflict_counts.get(family, 0) + 1
         else:
             self._install_local_excludes()
             self.state = SwarmRunState()
+
+    @classmethod
+    def resume_existing(
+        cls,
+        repo: Path | str,
+        run_id: str,
+        *,
+        migrate_models: bool = False,
+        policy_path: str = "",
+        **options: Any,
+    ) -> "SwarmController":
+        """Rebuild a persisted swarm for ``run()``.
+
+        An off-policy roster (e.g. a retired planner) is refused unless
+        ``migrate_models`` is set; the migration rewrites only the refused
+        entries, backs up the old config and is recorded in the run. Tasks,
+        teams, worktrees and patches are untouched.
+        """
+
+        repo = Path(repo).expanduser().resolve()
+        root = repo / ".forge" / "runs" / run_id
+        config_path = root / "config.json"
+        if not (root / "swarm" / "state.json").is_file() or not config_path.is_file():
+            raise SwarmFailed(f"no swarm run {run_id} under {repo}")
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        config = RunConfig.from_dict(raw)
+        config.repo = str(repo)
+        if policy_path:
+            config.policy_path = policy_path
+        changes: dict[str, str] = {}
+        if migrate_models:
+            changes = migrate_swarm_config(config, run_id)
+        else:
+            refused = off_policy_staff(config, load_policy(config.policy_path or None))
+            if refused:
+                raise SwarmFailed(
+                    f"run {run_id} names models the current policy refuses for "
+                    f"{', '.join(refused)}; resume with --migrate-models to move "
+                    "them onto the current policy"
+                )
+        if changes or config.policy_path != str(raw.get("policy_path") or ""):
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            (root / f"config.pre-migration-{stamp}.json").write_text(
+                config_path.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            ArtifactStore(repo, run_id).write_data("config.json", config.to_dict())
+        controller = cls(config, run_id=run_id, resume=True, **options)
+        if changes:
+            controller.store.append_jsonl(
+                "swarm/migrations.jsonl", {"at": utc_now(), "changes": changes}
+            )
+            for role, change in changes.items():
+                controller._warning(f"model migration on resume: {role} {change}")
+            controller.persist("migrated the roster to the current model policy")
+        return controller
 
     def _install_local_excludes(self) -> None:
         """Add the .forge artifact store to the local git excludes; do not
@@ -414,6 +562,32 @@ class SwarmController:
 
     def store_event(self, kind: str, message: str, **fields: Any) -> None:
         self.store.event(f"swarm.{kind}", message, **fields)
+        if self.on_event is not None:
+            self.on_event({"kind": f"swarm.{kind}", "message": message, **fields})
+
+    def heartbeat(self, *, force: bool = False) -> None:
+        """Write ``swarm/heartbeat.json``: the live pid and every running agent
+        with its start time, so an observer can tell a long agent from a
+        dead controller without reading worker logs."""
+
+        now = time.monotonic()
+        with self._lock:
+            if not force and now - self._heartbeat_at < HEARTBEAT_SECONDS:
+                return
+            self._heartbeat_at = now
+            payload = {
+                "pid": os.getpid(),
+                "updated_at": utc_now(),
+                "status": self.state.status,
+                "agent_timeout_seconds": self.config.agent_timeout_seconds,
+                "inflight": [dict(entry) for entry in self._inflight.values()],
+                "teams": [
+                    {"team": team.id, "task": team.task_id, "phase": team.phase,
+                     "review_round": team.review_round, "fix_round": team.fix_round}
+                    for team in self.state.teams
+                ],
+            }
+            self.store.write_data("swarm/heartbeat.json", payload)
 
     def _warning(self, message: str) -> None:
         with self._lock:
@@ -585,8 +759,19 @@ class SwarmController:
         attempts = self.config.retry_count + 1
         session = job.get("session_id")
         dropped_session = False
+        timeouts = 0
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
+            with self._lock:
+                self._inflight[relative] = {
+                    "relative": relative,
+                    "role": role,
+                    "model": spec.display(),
+                    "team": job.get("team_id", 0),
+                    "attempt": attempt,
+                    "started_at": utc_now(),
+                }
+            self.heartbeat()
             try:
                 result = self.runner.run(
                     AgentRequest(
@@ -617,7 +802,9 @@ class SwarmController:
             except AgentFailure as exc:
                 last_error = exc
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
-                if attempt < attempts:
+                if isinstance(exc, AgentTimeout):
+                    timeouts += 1
+                if attempt < attempts and timeouts < MAX_TIMEOUTS_PER_JOB:
                     # A retry can hold a team for another full agent timeout;
                     # make it visible instead of silent.
                     self.store_event(
@@ -633,6 +820,9 @@ class SwarmController:
                     )
                     continue
                 break
+            finally:
+                with self._lock:
+                    self._inflight.pop(relative, None)
             self.store.write_text(f"{relative}.response.md", result.text.rstrip() + "\n")
             self.store.record_agent_call(
                 role=role,
@@ -675,15 +865,12 @@ class SwarmController:
     def _collect_finished(
         self, in_flight: dict[int, list[tuple[dict[str, Any], Future[AgentResult]]]]
     ) -> None:
-        """Apply and advance every team whose agents of this round all finished."""
+        """Apply the results of every team whose agents of this round finished."""
         for team_id in list(in_flight):
             if not all(future.done() for _, future in in_flight[team_id]):
                 continue
-            results = self._outcomes(in_flight.pop(team_id))
-            self._apply_results(results)
-            for team in self._active_teams():
-                if team.id == team_id:
-                    self._advance(team)
+            # The main loop advances the team once no job of its phase remains.
+            self._apply_results(self._outcomes(in_flight.pop(team_id)))
 
     def _drain(
         self, in_flight: dict[int, list[tuple[dict[str, Any], Future[AgentResult]]]]
@@ -698,7 +885,7 @@ class SwarmController:
             return
         try:
             self._apply_results(results)
-        except SwarmCancelled:
+        except (SwarmCancelled, SwarmFailed):
             pass
 
     # ------------------------------------------------------------------
@@ -1080,7 +1267,9 @@ class SwarmController:
             "team_id": team.id,
         }
 
-    def _round_jobs(self, team: SwarmTeam) -> list[dict[str, Any]]:
+    def _phase_jobs(self, team: SwarmTeam) -> list[dict[str, Any]]:
+        """Every job the team's current phase consists of; no side effects."""
+
         task_id = team.task_id
         phase = team.phase
         jobs: list[dict[str, Any]] = []
@@ -1116,7 +1305,6 @@ class SwarmController:
                     )
                 )
         elif phase == "select":
-            team.selection["attempts"] = team.selection.get("attempts", 0) + 1
             jobs.append(self._selection_job(team))
         elif phase == "winner-fix":
             if not team.winner:
@@ -1135,7 +1323,8 @@ class SwarmController:
                         relative=f"swarm/tasks/{task_id}/winner-fix-{team.fix_round}",
                     )
                 )
-            elif last_job == "coder":
+            elif last_job == "coder" and team.versions[team.winner].get("committed"):
+                # The fix is applied and validated; its cheap check runs next.
                 jobs.append(
                     self._reviewer_job(
                         team,
@@ -1143,9 +1332,85 @@ class SwarmController:
                         f"swarm/tasks/{task_id}/winner-check-{team.fix_round}",
                     )
                 )
-            else:
-                raise SwarmFailed(f"team {team.id} winner-fix state is inconsistent")
+            # "coder" before its validation, or "reviewer": the round is done
+            # and only the controller's advance remains.
         return jobs
+
+    def _pending_jobs(self, team: SwarmTeam) -> list[dict[str, Any]]:
+        """The phase's jobs whose results are not applied yet. Empty means the
+        round is complete and the team advances without another agent."""
+
+        done = set(team.done_jobs or [])
+        return [job for job in self._phase_jobs(team) if job["relative"] not in done]
+
+    def _round_jobs(self, team: SwarmTeam) -> list[dict[str, Any]]:
+        jobs = self._pending_jobs(team)
+        if any(job["role"] == "reviewer" for job in jobs):
+            team.selection["attempts"] = team.selection.get("attempts", 0) + 1
+        return jobs
+
+    def _backfill_done_jobs(self) -> None:
+        """State saved before ``done_jobs`` existed: recover which of the
+        current phase's jobs finished from the durable event log, so a resume
+        does not pay for them again. Only events the state already persisted
+        (before the last ``swarm.state`` event) count."""
+
+        with self._lock:
+            legacy = [team for team in self.state.teams if team.done_jobs is None]
+        if not legacy:
+            return
+        path = self.store.root / "events.jsonl"
+        events: list[dict[str, Any]] = []
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    continue
+        last_state = max(
+            (index for index, event in enumerate(events) if event.get("kind") == "swarm.state"),
+            default=-1,
+        )
+        events = events[: last_state + 1]
+        for team in legacy:
+            if not team.worktrees:
+                # Nothing ran without worktrees; the team starts its phase.
+                with self._lock:
+                    team.done_jobs = []
+                continue
+            claim = f"team {team.id} claimed {team.task_id}"
+            start = max(
+                (index for index, event in enumerate(events) if event.get("message") == claim),
+                default=None,
+            )
+            finished: set[str] = set()
+            if start is not None:
+                for event in events[start:]:
+                    if event.get("kind") == "swarm.agent-done" and event.get("team") == team.id:
+                        finished.add(str(event.get("message", "")).rsplit(" ", 1)[-1])
+            done = [
+                job["relative"]
+                for job in self._phase_jobs(team)
+                if job["relative"] in finished and self._result_recorded(team, job)
+            ]
+            with self._lock:
+                team.done_jobs = done
+            if done:
+                self.store_event(
+                    "resume-reuse",
+                    f"team {team.id} ({team.task_id}) keeps {len(done)} finished "
+                    f"{team.phase} result(s): {', '.join(done)}",
+                    team=team.id,
+                )
+
+    @staticmethod
+    def _result_recorded(team: SwarmTeam, job: dict[str, Any]) -> bool:
+        data = team.versions.get(job.get("mode", ""), {})
+        if job["role"] == SWARM_CODER_ROLE:
+            return bool(data.get("summary"))
+        if job["role"] == SWARM_REVIEWER_ROLE:
+            return bool(data.get("review"))
+        return bool(team.selection)
 
     def _run_validation(self, team: SwarmTeam, mode: str) -> list[dict[str, Any]]:
         task = self._task_of(team)
@@ -1176,10 +1441,26 @@ class SwarmController:
             data["summary"] = result.text.strip()
             data["committed"] = False
 
-    def _apply_review(self, team: SwarmTeam, mode: str, result: AgentResult) -> None:
+    def _unreadable(self, team: SwarmTeam, mode: str, relative: str, exc: Exception) -> bool:
+        """Record an unreadable cheap review; True while it still gets a re-ask."""
+
+        with self._lock:
+            seen = team.versions[mode].setdefault("unreadable_reviews", [])
+            seen.append(relative)
+            count = seen.count(relative)
+        if count < MAX_UNREADABLE_REVIEWS:
+            self._warning(f"task {team.task_id}: unreadable review {relative} ({exc}); re-asked")
+            return True
+        return False
+
+    def _apply_review(
+        self, team: SwarmTeam, mode: str, result: AgentResult, relative: str = ""
+    ) -> bool:
         try:
             parsed = parse_swarm_review(result.text)
         except ContractError as exc:
+            if self._unreadable(team, mode, relative, exc):
+                return False
             parsed = {
                 "verdict": "fix",
                 "summary": "Forge could not read the review contract",
@@ -1187,19 +1468,27 @@ class SwarmController:
             }
         with self._lock:
             team.versions[mode]["review"] = parsed
+        return True
 
-    def _apply_winner_review(self, team: SwarmTeam, result: AgentResult) -> None:
+    def _apply_winner_review(
+        self, team: SwarmTeam, result: AgentResult, relative: str = ""
+    ) -> bool:
         try:
             parsed = parse_swarm_review(result.text)
         except ContractError as exc:
+            if self._unreadable(team, team.winner, relative, exc):
+                return False
+            # Never an approval Forge did not read: the open check runs
+            # through the bounded fix loop and its explicit merge warning.
             parsed = {
-                "verdict": "approve",
-                "summary": f"winner-check contract fallback: {exc}",
-                "blocking": [],
+                "verdict": "fix",
+                "summary": f"winner-check contract unreadable: {exc}",
+                "blocking": [{"problem": "unreadable winner check", "detail": str(exc)}],
             }
         with self._lock:
             team.versions[team.winner].setdefault("winner_reviews", []).append(parsed)
             team.selection["last_winner_job"] = "reviewer"
+        return True
 
     def _apply_selection(self, team: SwarmTeam, result: AgentResult) -> None:
         try:
@@ -1216,6 +1505,7 @@ class SwarmController:
     ) -> None:
         failed: dict[int, str] = {}
         cancelled = False
+        halt = ""
         for job, outcome in results:
             # _invoke turns a requested cancel into SwarmCancelled. Finished
             # siblings are still applied so their results are not lost.
@@ -1231,6 +1521,18 @@ class SwarmController:
             with self._lock:
                 team = next((t for t in self.state.teams if t.id == job["team_id"]), None)
             if team is None:
+                continue
+            if isinstance(outcome, (AgentUsageLimit, AgentPolicyRefused)):
+                # Quota or central policy: no other cheap pair fares better
+                # now, so keep the team intact and stop the swarm instead of
+                # charging the task an attempt.
+                halt = halt or f"{job['role']} {job['spec'].display()}: {outcome}"
+                self.store_event(
+                    "agent-halted",
+                    f"{job['role']} stopped the swarm: {outcome}",
+                    team=team.id,
+                    mode=job.get("mode", ""),
+                )
                 continue
             if isinstance(outcome, Exception):
                 if team.id not in failed:
@@ -1248,6 +1550,9 @@ class SwarmController:
                 team=team.id,
                 mode=job.get("mode", ""),
             )
+            with self._lock:
+                self._failure_streak.clear()
+            accepted = True
             if job["role"] == SWARM_CODER_ROLE:
                 self._apply_code(team, job["mode"], outcome)
                 if team.phase == "winner-fix":
@@ -1255,31 +1560,71 @@ class SwarmController:
                         team.selection["last_winner_job"] = "coder"
             elif job["role"] == SWARM_REVIEWER_ROLE:
                 if team.phase == "winner-fix":
-                    self._apply_winner_review(team, outcome)
+                    accepted = self._apply_winner_review(team, outcome, job["relative"])
                 else:
-                    self._apply_review(team, job["mode"], outcome)
+                    accepted = self._apply_review(team, job["mode"], outcome, job["relative"])
             elif job["role"] == "reviewer":
                 self._apply_selection(team, outcome)
-        # A cancelled round keeps every team and worktree for recovery; a
-        # failure may only be the cancellation's side effect.
-        if cancelled:
+            if accepted:
+                with self._lock:
+                    if team.done_jobs is None:
+                        team.done_jobs = []
+                    team.done_jobs.append(job["relative"])
+        # A cancelled or halted round keeps every team and worktree for
+        # recovery; a failure may only be the stop's side effect.
+        if cancelled or halt:
             failed.clear()
         for team_id, reason in failed.items():
             with self._lock:
                 team = next((t for t in self.state.teams if t.id == team_id), None)
             if team is not None:
                 self._drop_team(team, reason)
+                with self._lock:
+                    self._failure_streak.append(team.task_id)
+        tripped = self._trip_breaker() if not (cancelled or halt) else ""
         # Every worker result reaches durable state, even when its phase
         # does not advance this round.
         self.persist(f"applied {len(results)} swarm agent results")
         if cancelled:
             raise SwarmCancelled()
+        if halt:
+            raise SwarmFailed(
+                f"swarm stopped on a provider quota or policy refusal ({halt}); "
+                "every team and worktree is kept; resume with swarm-resume once it clears"
+            )
+        if tripped:
+            raise SwarmFailed(tripped)
+
+    def _trip_breaker(self) -> str:
+        """After ``failure_breaker`` consecutive pair failures with no agent
+        success, refund those tasks' attempts and stop: a systemic fault (a
+        broken provider, a full disk) must not drop the whole backlog."""
+
+        with self._lock:
+            streak = list(self._failure_streak)
+            if len(streak) < self.failure_breaker:
+                return ""
+            self._failure_streak.clear()
+            for task in self.state.tasks:
+                if task.id in streak:
+                    task.attempts = max(0, task.attempts - streak.count(task.id))
+                    if task.status == "dropped":
+                        task.status = "pending"
+        message = (
+            f"circuit breaker: {len(streak)} consecutive cheap pairs failed with no agent "
+            f"success ({', '.join(streak)}); their attempts are refunded and patches kept; "
+            "check provider health, then resume with swarm-resume"
+        )
+        self._warning(message)
+        return message
 
     # Phase transitions -----------------------------------------------------
 
     def _advance(self, team: SwarmTeam) -> None:
         with self._lock:
             phase = team.phase
+            # Every transition starts a fresh set of jobs.
+            team.done_jobs = []
         if phase == "code":
             for mode in team.modes:
                 data = team.versions[mode]
@@ -1508,7 +1853,14 @@ class SwarmController:
             self.state.status = "running"
         self._restaff_off_policy()
         self._release_missing_worktrees()
+        self._backfill_done_jobs()
+        with self._lock:
+            # The swarm never resumes a provider session: a stale session id
+            # must not survive a restart or a model migration.
+            for team in self.state.teams:
+                team.sessions.clear()
         self.persist(f"swarm controller running (pid {os.getpid()})")
+        self.heartbeat(force=True)
         planned = False
         # Each team advances as soon as its own agents finish: one slow or
         # retried agent must not hold every other team at a shared barrier.
@@ -1516,6 +1868,7 @@ class SwarmController:
         try:
             while True:
                 self._collect_finished(in_flight)
+                self.heartbeat()
                 with self._control:
                     cancel_requested = self._cancel_requested
                     paused = self._paused
@@ -1555,6 +1908,8 @@ class SwarmController:
                     jobs = self._round_jobs(team)
                     if jobs:
                         ready[team.id] = jobs
+                    else:
+                        self._advance_idle(team)
                 if claimed is not None or ready:
                     # Claims and worktrees reach durable state before agents
                     # that may run for a full timeout.
@@ -1581,9 +1936,22 @@ class SwarmController:
                 # Stop in-flight agents so the executor shutdown cannot hang
                 # for a full agent timeout.
                 self.cancel()
-                if isinstance(exc, (SwarmCancelled, KeyboardInterrupt)):
+                if isinstance(exc, (SwarmCancelled, SwarmFailed, KeyboardInterrupt)):
                     self._drain(in_flight)
             raise
+
+    def _advance_idle(self, team: SwarmTeam) -> None:
+        """Advance a team whose phase has no job left to run. A transition that
+        changes nothing would spin forever: drop that pair instead."""
+
+        with self._lock:
+            before = json.dumps(team.to_dict(), sort_keys=True)
+        self._advance(team)
+        with self._lock:
+            active = any(item is team for item in self.state.teams)
+            after = json.dumps(team.to_dict(), sort_keys=True)
+        if active and after == before:
+            self._drop_team(team, f"no progress possible in phase {team.phase}")
 
     def _active_teams(self) -> list[SwarmTeam]:
         with self._lock:
@@ -1601,4 +1969,8 @@ class SwarmController:
                 "tasks": counts,
                 "planner_visits": self.state.planner_visits,
                 "warnings": list(self.state.warnings),
+                "teams": [
+                    {"team": team.id, "task": team.task_id, "phase": team.phase}
+                    for team in self.state.teams
+                ],
             }

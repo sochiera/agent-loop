@@ -97,9 +97,26 @@ def _parser() -> argparse.ArgumentParser:
                 else "run the cheap-model swarm in the foreground"
             ),
         )
+        swarm_parser.add_argument(
+            "--policy-path",
+            default="",
+            metavar="PATH",
+            help=(
+                "model policy JSON path (a resume keeps the run's own path unless "
+                "this is given; both default to Jan's state file)"
+            ),
+        )
         if is_resume:
             swarm_parser.add_argument("--repo", required=True, help="target Git repository")
             swarm_parser.add_argument("--run-id", required=True, help="existing Forge run id")
+            swarm_parser.add_argument(
+                "--migrate-models",
+                action="store_true",
+                help=(
+                    "explicitly move roles the current policy refuses (e.g. a retired "
+                    "planner) onto it; tasks, worktrees and patches are kept"
+                ),
+            )
         else:
             swarm_parser.add_argument("--repo", required=True, help="target Git repository")
             swarm_parser.add_argument("--brief", required=True, help="(product) brief in Markdown")
@@ -130,29 +147,93 @@ def _parser() -> argparse.ArgumentParser:
                 help="top-priority done fraction that re-arms the planner",
             )
             swarm_parser.add_argument("--seed", type=int, default=None, help="deterministic RNG seed")
-            swarm_parser.add_argument(
-                "--policy-path",
-                default="",
-                metavar="PATH",
-                help="model policy JSON path (defaults to Jan's state file)",
-            )
             swarm_parser.add_argument("--no-push", action="store_true", help="deliver locally only")
             swarm_parser.add_argument("--agent-timeout", type=int, default=3600, metavar="SECONDS")
+    status = sub.add_parser(
+        "swarm-status", help="print a swarm run's durable progress and live agents"
+    )
+    status.add_argument("--repo", required=True, help="target Git repository")
+    status.add_argument("--run-id", required=True, help="existing Forge run id")
     return parser
 
 
-def swarm_controller(args: argparse.Namespace) -> "SwarmController":
+def swarm_status(repo: Path, run_id: str) -> dict:
+    """Bounded progress view from Forge's own durable files: task counts,
+    teams, live agents with their age and the controller heartbeat."""
+
+    import datetime as dt
+
+    root = repo / ".forge" / "runs" / run_id / "swarm"
+    state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+    heartbeat_path = root / "heartbeat.json"
+    heartbeat = (
+        json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        if heartbeat_path.is_file()
+        else {}
+    )
+    now = dt.datetime.now(dt.timezone.utc)
+
+    def age(stamp: str) -> int | None:
+        try:
+            return int((now - dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds())
+        except (TypeError, ValueError):
+            return None
+
+    pid = int(heartbeat.get("pid") or 0)
+    alive = False
+    if pid:
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True
+    counts: dict[str, int] = {}
+    for task in state.get("tasks", []):
+        counts[task["status"]] = counts.get(task["status"], 0) + 1
+    return {
+        "status": state.get("status"),
+        "message": state.get("message"),
+        "tasks": counts,
+        "teams": [
+            {
+                "team": team["id"],
+                "task": team["task_id"],
+                "phase": team["phase"],
+                "review_round": team.get("review_round", 0),
+                "fix_round": team.get("fix_round", 0),
+                "done_jobs": team.get("done_jobs"),
+            }
+            for team in state.get("teams", [])
+        ],
+        "controller": {
+            "pid": pid,
+            "alive": alive,
+            "heartbeat_age_seconds": age(heartbeat.get("updated_at", "")),
+        },
+        "inflight": [
+            {**entry, "elapsed_seconds": age(entry.get("started_at", ""))}
+            for entry in heartbeat.get("inflight", [])
+        ],
+        "agent_timeout_seconds": heartbeat.get("agent_timeout_seconds"),
+        "recent_warnings": state.get("warnings", [])[-5:],
+    }
+
+
+def swarm_controller(args: argparse.Namespace, on_event=None) -> "SwarmController":
     """Build the cheap-model swarm controller from CLI flags."""
     from forge.swarm import SwarmController
 
-    snapshot = load_policy(args.policy_path or None)
     if args.command == "swarm-resume":
-        repo = Path(args.repo).expanduser().resolve()
-        config_path = repo / ".forge" / "runs" / args.run_id / "config.json"
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-        config = RunConfig.from_dict(raw)
-        config.repo = str(repo)
-        return SwarmController(config, run_id=args.run_id, on_event=None, resume=True)
+        return SwarmController.resume_existing(
+            args.repo,
+            args.run_id,
+            migrate_models=args.migrate_models,
+            policy_path=args.policy_path,
+            on_event=on_event,
+        )
+    snapshot = load_policy(args.policy_path or None)
     rng = random.Random(args.seed) if args.seed is not None else random.Random()
     # The planner draws from the strong pool; the strong reviewer defaults to
     # Sol because the swarm's final reviewer must be Sol or Opus.
@@ -179,7 +260,7 @@ def swarm_controller(args: argparse.Namespace) -> "SwarmController":
     from forge.swarm import DEFAULT_SWARM_TEAMS
 
     teams = min(getattr(args, "teams", DEFAULT_SWARM_TEAMS), DEFAULT_SWARM_TEAMS)
-    return SwarmController(config, on_event=None, rng=rng, teams=teams)
+    return SwarmController(config, on_event=on_event, rng=rng, teams=teams)
 
 
 def select_cli_models(
@@ -212,7 +293,15 @@ def main(argv: list[str] | None = None) -> int:
         serve(args.host, args.port, open_browser=not args.no_browser, gate=gate)
         return 0
     on_event = lambda event: print(json.dumps(event, sort_keys=True), flush=True)
+    if args.command == "swarm-status":
+        repo = Path(args.repo).expanduser().resolve()
+        if not (repo / ".forge" / "runs" / args.run_id / "swarm" / "state.json").is_file():
+            raise SystemExit(f"Forge swarm run does not exist: {args.run_id}")
+        print(json.dumps(swarm_status(repo, args.run_id), indent=2, sort_keys=True))
+        return 0
     if args.command in {"swarm-run", "swarm-resume"}:
+        from forge.swarm import SwarmFailed
+
         if args.command == "swarm-resume" and not (
             Path(args.repo).expanduser().resolve()
             / ".forge"
@@ -221,7 +310,10 @@ def main(argv: list[str] | None = None) -> int:
             / "config.json"
         ).is_file():
             raise SystemExit(f"Forge run config does not exist for the swarm: {args.run_id}")
-        controller = swarm_controller(args)
+        try:
+            controller = swarm_controller(args, on_event)
+        except (SwarmFailed, ValueError) as exc:
+            raise SystemExit(f"forge {args.command}: {exc}")
         # A supervisor stops the swarm with SIGTERM; cancel cleanly so the
         # durable state records a terminal status instead of "running". The
         # cancel runs off the main thread, which may hold the runner's lock.

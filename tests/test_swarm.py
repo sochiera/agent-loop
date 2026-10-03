@@ -295,7 +295,8 @@ def test_swarm_conflict_reenters_task(tmp_path: Path, monkeypatch) -> None:
 def test_swarm_pair_failure_is_cheap_and_task_drops(tmp_path: Path) -> None:
     repo, brief = repo_and_brief(tmp_path)
     runner = SwarmRunner(backlog_json(count=2), fail_coders=True)
-    box = make_controller(repo, brief, runner, tmp_path, min_backlog=2)
+    # Isolated pair failures; the systemic case trips the breaker instead.
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=2, failure_breaker=99)
     state = box.run()
 
     assert state.status == "completed"
