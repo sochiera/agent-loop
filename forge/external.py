@@ -135,7 +135,7 @@ def _cmdline(pid: int) -> str:
         return ""
 
 
-def _process_start_ticks(pid: int) -> str:
+def process_start_ticks(pid: int) -> str:
     """Read /proc start ticks without depending on newer swarm-controller code."""
     try:
         fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
@@ -154,7 +154,7 @@ def swarm_controller_liveness(heartbeat: dict[str, Any], run_id: str) -> dict[st
     pid = _safe_int(heartbeat.get("pid"))
     alive = _pid_alive(pid)
     recorded = str(heartbeat.get("pid_start_ticks") or "")
-    verified = bool(alive and recorded and _process_start_ticks(pid) == recorded)
+    verified = bool(alive and recorded and process_start_ticks(pid) == recorded)
     if recorded and not verified:
         alive = False
     elif alive and not recorded:

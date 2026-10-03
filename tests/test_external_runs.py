@@ -292,7 +292,7 @@ def test_a_run_started_before_the_run_index_is_found_through_its_worktrees(
 
 HOLDER = """
 import json, os, sys, time
-from forge.swarm import process_start_ticks
+from forge.external import process_start_ticks
 path, run_id = sys.argv[1], sys.argv[2]
 beat = json.load(open(path))
 beat.update(pid=os.getpid(), pid_start_ticks=process_start_ticks(os.getpid()), run_id=run_id,
