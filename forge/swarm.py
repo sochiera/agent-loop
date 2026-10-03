@@ -60,6 +60,7 @@ from .contracts import (
     parse_swarm_review,
     parse_swarm_selection,
 )
+from .external import register_external_run
 from .locking import RepositoryExecutionLock
 from .models import ModelSpec, RunConfig
 from .policy import GLM, OPUS, SOL, SWARM_CODER_ROLE, SWARM_REVIEWER_ROLE, load_policy
@@ -1951,6 +1952,8 @@ class SwarmController:
         except BaseException:
             lock.release()
             raise
+        # Lets a control room started before or after this process show it.
+        register_external_run(self.repo, self.run_id, "swarm", state_home=self.state_home)
         stop_ticker = threading.Event()
         ticker = threading.Thread(
             target=self._heartbeat_loop, args=(stop_ticker,), name="forge-swarm-heartbeat",

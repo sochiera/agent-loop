@@ -11,6 +11,7 @@ import threading
 from pathlib import Path
 
 from .access import GATE_ENV, gate_from_env
+from .external import register_external_run, swarm_controller_liveness
 from .models import DEFAULT_MODEL_SELECTORS, ModelSpec, ROLE_NAMES, RunConfig
 from .orchestrator import ForgeOrchestrator
 from .policy import SOL, PromotionSnapshot, load_policy
@@ -78,6 +79,16 @@ def _parser() -> argparse.ArgumentParser:
     ui.add_argument("--host", default="127.0.0.1")
     ui.add_argument("--port", type=int, default=8787)
     ui.add_argument("--no-browser", action="store_true")
+    ui.add_argument(
+        "--watch-repo",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "also show CLI-started runs of this repository (repeatable; "
+            "FORGE_UI_WATCH_REPOS adds more, separated by the path separator)"
+        ),
+    )
     ui.add_argument(
         "--access-gate-file",
         default="",
@@ -179,24 +190,9 @@ def swarm_status(repo: Path, run_id: str) -> dict:
         except (TypeError, ValueError):
             return None
 
-    from forge.swarm import process_start_ticks
-
-    pid = int(heartbeat.get("pid") or 0)
-    alive = False
-    if pid:
-        try:
-            os.kill(pid, 0)
-            alive = True
-        except ProcessLookupError:
-            alive = False
-        except PermissionError:
-            alive = True
-    # A live pid alone may be a later process reusing it: the controller is
-    # the process whose start time the heartbeat recorded.
-    recorded = str(heartbeat.get("pid_start_ticks") or "")
-    identity_verified = bool(alive and recorded and process_start_ticks(pid) == recorded)
-    if recorded and not identity_verified:
-        alive = False
+    controller = swarm_controller_liveness(heartbeat, run_id)
+    pid, alive = controller["pid"], controller["alive"]
+    identity_verified = controller["identity_verified"]
     counts: dict[str, int] = {}
     for task in state.get("tasks", []):
         counts[task["status"]] = counts.get(task["status"], 0) + 1
@@ -301,7 +297,13 @@ def main(argv: list[str] | None = None) -> int:
             gate = gate_from_env(env)
         except Exception as exc:
             raise SystemExit(f"forge ui: access gate misconfigured: {exc}")
-        serve(args.host, args.port, open_browser=not args.no_browser, gate=gate)
+        serve(
+            args.host,
+            args.port,
+            open_browser=not args.no_browser,
+            gate=gate,
+            watch_repos=args.watch_repo,
+        )
         return 0
     on_event = lambda event: print(json.dumps(event, sort_keys=True), flush=True)
     if args.command == "swarm-status":
@@ -365,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
             migrated = orchestrator.migrate_models()
             if migrated:
                 print(json.dumps({"migrated_models": migrated}, sort_keys=True), flush=True)
+        register_external_run(repo, orchestrator.run_id, "forge", state_home=orchestrator.state_home)
         state = (
             orchestrator.recover_failed()
             if args.command == "recover"
@@ -386,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
         policy_path=args.policy_path,
     )
     orchestrator = ForgeOrchestrator(config, on_event=on_event)
+    register_external_run(config.repo, orchestrator.run_id, "forge", state_home=orchestrator.state_home)
     state = orchestrator.run()
     print(json.dumps(state.to_dict(), indent=2))
     return 0 if state.status in {"cancelled", "paused"} else 1

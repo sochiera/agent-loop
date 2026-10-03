@@ -234,7 +234,7 @@ def test_web_control_room_serves_ui_and_api(tmp_path):
         loaded_prefs = json.loads(urllib.request.urlopen(base + "/api/preferences", timeout=2).read())
         assert loaded_prefs["coder_models"] == ["opencode:kimi-k3:high"]
         health = json.loads(urllib.request.urlopen(base + "/api/health", timeout=2).read())
-        assert health == {"ok": True, "active_runs": 0}
+        assert health == {"ok": True, "active_runs": 0, "external_active_runs": 0}
         restart = json.loads(
             urllib.request.urlopen(
                 urllib.request.Request(
