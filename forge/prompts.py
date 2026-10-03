@@ -340,7 +340,10 @@ Accept only when every task meets its acceptance criteria and there are no serio
 with concrete evidence and a bounded suggested fix. Use `blocked` only when review itself cannot be
 performed because of an external condition. Never edit files, commit, push, switch branches, alter
 Git refs, or touch another worktree. Every task result needs concrete evidence. A rejection must
-include an actionable blocking finding.
+include an actionable blocking finding. You may include up to three `operator_suggestions` when a
+specific user answer or non-blocking next step would help. Give each one context, rationale, and
+expected impact. Mark scope-changing suggestions as requiring a decision; Forge records them for the
+user and never stops, replans, merges, or deploys from a suggestion alone.
 
 IMPLEMENTATION FINGERPRINT
 {fingerprint}
@@ -358,7 +361,13 @@ Return exactly:
 {{"verdict":"accept|reject|blocked","summary":"...","implementation_fingerprint":"{fingerprint}",
 "task_results":[{{"task_id":"TASK-001","verdict":"accept|reject","evidence":["..."]}}],
 "blocking_findings":[{{"id":"REV-001","summary":"...","evidence":"...","suggested_fix":"...","task_ids":["TASK-001"]}}],
-"nits":["non-blocking observation"],"blocker":""}}
+"nits":["non-blocking observation"],"blocker":"",
+"operator_suggestions":[{{"id":"SUG-001","kind":"suggestion|question|blocker","title":"...",
+"context":"...","rationale":"...","expected_impact":"...","recommendation":"...",
+"target_role":"auto|brain|planner|test_author|coder_tdd|coder_explore|coder_classic|reviewer|tester",
+"feedback_kind":"guidance|scope_change","requires_decision":false}}]}}
+
+Always include `operator_suggestions`; use an empty array when there is nothing concrete to raise.
 """
 
 
@@ -389,8 +398,11 @@ require another review. Record small polish observations as non-blocking nits. U
 a genuine external condition that prevents testing. Exercise every `public_checks` entry and repeat
 its exact text in `blackbox.scenarios`. Accepted reports need non-empty task evidence, white-box
 checks, black-box scenarios, and black-box evidence. A rejection must include an actionable blocking
-finding. Never commit, push, alter Git refs, or access another worktree; the current directory is a
-disposable copy.
+finding. You may include up to three `operator_suggestions` when a specific user answer or a
+non-blocking next step would help. Give each one context, rationale, and expected impact. Mark
+scope-changing suggestions as requiring a decision; Forge records them for the user and never stops,
+replans, merges, or deploys from a suggestion alone. Never commit, push, alter Git refs, or access
+another worktree; the current directory is a disposable copy.
 
 {display}
 Evidence directory: {evidence_dir}
@@ -411,7 +423,13 @@ Return exactly:
 "whitebox":{{"summary":"...","checks":["..."],"observations":["..."]}},
 "blackbox":{{"summary":"...","happy_path":"exercised|unreachable|missing","scenarios":["..."],"evidence":["..."],"observations":["..."]}},
 "blocking_findings":[{{"id":"TEST-001","summary":"...","evidence":"...","suggested_fix":"...","task_ids":["TASK-001"]}}],
-"nits":[],"blocker":""}}
+"nits":[],"blocker":"",
+"operator_suggestions":[{{"id":"SUG-001","kind":"suggestion|question|blocker","title":"...",
+"context":"...","rationale":"...","expected_impact":"...","recommendation":"...",
+"target_role":"auto|brain|planner|test_author|coder_tdd|coder_explore|coder_classic|reviewer|tester",
+"feedback_kind":"guidance|scope_change","requires_decision":false}}]}}
+
+Always include `operator_suggestions`; use an empty array when there is nothing concrete to raise.
 """
 
 

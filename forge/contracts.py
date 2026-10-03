@@ -121,6 +121,33 @@ _FINDING_SCHEMA: dict[str, Any] = {
     "required": ["id", "summary", "evidence", "suggested_fix", "task_ids"],
 }
 
+_OPERATOR_SUGGESTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "id": {"type": "string"},
+        "kind": {"type": "string", "enum": ["suggestion", "question", "blocker"]},
+        "title": {"type": "string"},
+        "context": {"type": "string"},
+        "rationale": {"type": "string"},
+        "expected_impact": {"type": "string"},
+        "recommendation": {"type": "string"},
+        "target_role": {
+            "type": "string",
+            "enum": [
+                "auto", "brain", "planner", "test_author", "coder_tdd",
+                "coder_explore", "coder_classic", "reviewer", "tester",
+            ],
+        },
+        "feedback_kind": {"type": "string", "enum": ["guidance", "scope_change"]},
+        "requires_decision": {"type": "boolean"},
+    },
+    "required": [
+        "id", "kind", "title", "context", "rationale", "expected_impact",
+        "recommendation", "target_role", "feedback_kind", "requires_decision",
+    ],
+}
+
 ITERATION_REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -132,6 +159,7 @@ ITERATION_REVIEW_SCHEMA: dict[str, Any] = {
         "blocking_findings": {"type": "array", "items": _FINDING_SCHEMA},
         "nits": {"type": "array", "items": {"type": "string"}},
         "blocker": {"type": "string"},
+        "operator_suggestions": {"type": "array", "items": _OPERATOR_SUGGESTION_SCHEMA},
     },
     "required": [
         "verdict",
@@ -141,6 +169,7 @@ ITERATION_REVIEW_SCHEMA: dict[str, Any] = {
         "blocking_findings",
         "nits",
         "blocker",
+        "operator_suggestions",
     ],
 }
 
@@ -180,6 +209,7 @@ ITERATION_TEST_SCHEMA: dict[str, Any] = {
         "blocking_findings": {"type": "array", "items": _FINDING_SCHEMA},
         "nits": {"type": "array", "items": {"type": "string"}},
         "blocker": {"type": "string"},
+        "operator_suggestions": {"type": "array", "items": _OPERATOR_SUGGESTION_SCHEMA},
     },
     "required": [
         "verdict",
@@ -191,6 +221,7 @@ ITERATION_TEST_SCHEMA: dict[str, Any] = {
         "blocking_findings",
         "nits",
         "blocker",
+        "operator_suggestions",
     ],
 }
 
@@ -346,6 +377,67 @@ def _exact_object(value: dict[str, Any], keys: set[str], context: str) -> None:
         raise ContractError(f"{context} is missing: {', '.join(sorted(missing))}")
     if extra:
         raise ContractError(f"{context} has unsupported fields: {', '.join(sorted(extra))}")
+
+
+def _exact_object_with_optional(
+    value: dict[str, Any], required: set[str], optional: set[str], context: str
+) -> None:
+    missing = required - set(value)
+    extra = set(value) - required - optional
+    if missing:
+        raise ContractError(f"{context} is missing: {', '.join(sorted(missing))}")
+    if extra:
+        raise ContractError(f"{context} has unsupported fields: {', '.join(sorted(extra))}")
+
+
+def _operator_suggestions(value: Any, context: str) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 10:
+        raise ContractError(f"{context} must be an array with at most 10 entries")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    keys = {
+        "id", "kind", "title", "context", "rationale", "expected_impact",
+        "recommendation", "target_role", "feedback_kind", "requires_decision",
+    }
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise ContractError(f"{context} entries must be objects")
+        _exact_object(raw, keys, context)
+        suggestion_id = _required_text(raw, "id", context)
+        if suggestion_id in seen:
+            raise ContractError(f"{context} contains duplicate id {suggestion_id}")
+        seen.add(suggestion_id)
+        kind = raw.get("kind")
+        if kind not in {"suggestion", "question", "blocker"}:
+            raise ContractError(f"{context} kind must be suggestion, question, or blocker")
+        target_role = raw.get("target_role")
+        if target_role not in {
+            "auto", "brain", "planner", "test_author", "coder_tdd",
+            "coder_explore", "coder_classic", "reviewer", "tester",
+        }:
+            raise ContractError(f"{context} has an unknown target role")
+        feedback_kind = raw.get("feedback_kind")
+        if feedback_kind not in {"guidance", "scope_change"}:
+            raise ContractError(f"{context} feedback_kind must be guidance or scope_change")
+        if not isinstance(raw.get("requires_decision"), bool):
+            raise ContractError(f"{context} requires_decision must be boolean")
+        result.append(
+            {
+                "id": suggestion_id,
+                "kind": kind,
+                "title": _required_text(raw, "title", context),
+                "context": _required_text(raw, "context", context),
+                "rationale": _required_text(raw, "rationale", context),
+                "expected_impact": _required_text(raw, "expected_impact", context),
+                "recommendation": _required_text(raw, "recommendation", context),
+                "target_role": target_role,
+                "feedback_kind": feedback_kind,
+                "requires_decision": raw["requires_decision"],
+            }
+        )
+    return result
 
 
 def parse_product_owner(
@@ -628,7 +720,7 @@ def parse_iteration_review(
     validation_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     value = _extract_json(text)
-    _exact_object(
+    _exact_object_with_optional(
         value,
         {
             "verdict",
@@ -639,6 +731,7 @@ def parse_iteration_review(
             "nits",
             "blocker",
         },
+        {"operator_suggestions"},
         "review",
     )
     verdict = value.get("verdict")
@@ -652,6 +745,9 @@ def parse_iteration_review(
     findings = _parse_findings(value.get("blocking_findings"), task_ids, "review blocking_findings")
     nits = _string_list(value.get("nits"), "review.nits")
     blocker = str(value.get("blocker") or "").strip()
+    operator_suggestions = _operator_suggestions(
+        value.get("operator_suggestions"), "review.operator_suggestions"
+    )
     rejected = any(item["verdict"] == "reject" for item in results)
     failed_validation = any(
         item.get("return_code") != 0 or item.get("timed_out")
@@ -665,7 +761,13 @@ def parse_iteration_review(
         raise ContractError("review reject requires an actionable blocking finding")
     if verdict == "blocked" and not blocker:
         raise ContractError("review blocked requires a blocker")
-    value.update(task_results=results, blocking_findings=findings, nits=nits, blocker=blocker)
+    value.update(
+        task_results=results,
+        blocking_findings=findings,
+        nits=nits,
+        blocker=blocker,
+        operator_suggestions=operator_suggestions,
+    )
     return value
 
 
@@ -678,7 +780,7 @@ def parse_iteration_test(
     public_checks: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     value = _extract_json(text)
-    _exact_object(
+    _exact_object_with_optional(
         value,
         {
             "verdict",
@@ -691,6 +793,7 @@ def parse_iteration_test(
             "nits",
             "blocker",
         },
+        {"operator_suggestions"},
         "tester response",
     )
     verdict = value.get("verdict")
@@ -704,6 +807,9 @@ def parse_iteration_test(
     findings = _parse_findings(value.get("blocking_findings"), task_ids, "tester blocking_findings")
     nits = _string_list(value.get("nits"), "tester.nits")
     blocker = str(value.get("blocker") or "").strip()
+    operator_suggestions = _operator_suggestions(
+        value.get("operator_suggestions"), "tester.operator_suggestions"
+    )
     for section in ("whitebox", "blackbox"):
         if not isinstance(value.get(section), dict):
             raise ContractError(f"tester {section} must be an object")
@@ -749,7 +855,13 @@ def parse_iteration_test(
         raise ContractError("tester reject requires an actionable blocking finding")
     if verdict == "blocked" and not blocker:
         raise ContractError("tester blocked requires a blocker")
-    value.update(task_results=results, blocking_findings=findings, nits=nits, blocker=blocker)
+    value.update(
+        task_results=results,
+        blocking_findings=findings,
+        nits=nits,
+        blocker=blocker,
+        operator_suggestions=operator_suggestions,
+    )
     return value
 
 

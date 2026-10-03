@@ -11,6 +11,7 @@ import threading
 from pathlib import Path
 
 from .access import GATE_ENV, gate_from_env
+from .feedback import FEEDBACK_DECISIONS, FEEDBACK_KINDS, RunConversationStore
 from .models import DEFAULT_MODEL_SELECTORS, ModelSpec, ROLE_NAMES, RunConfig
 from .orchestrator import ForgeOrchestrator
 from .policy import SOL, PromotionSnapshot, load_policy
@@ -87,6 +88,21 @@ def _parser() -> argparse.ArgumentParser:
             f"(defaults to the {GATE_ENV} environment variable)"
         ),
     )
+
+    feedback = sub.add_parser("feedback", help="read or send feedback to an existing run")
+    feedback_commands = feedback.add_subparsers(dest="feedback_command", required=True)
+    feedback_add = feedback_commands.add_parser("add", help="durably queue feedback for a run")
+    feedback_list = feedback_commands.add_parser("list", help="show feedback and suggestions for a run")
+    feedback_decide = feedback_commands.add_parser("decide", help="resolve a scope-change decision")
+    for feedback_command in (feedback_add, feedback_list, feedback_decide):
+        feedback_command.add_argument("--repo", required=True, help="target Git repository")
+        feedback_command.add_argument("--run-id", required=True, help="existing Forge run id")
+    feedback_add.add_argument("--message", required=True)
+    feedback_add.add_argument("--kind", choices=sorted(FEEDBACK_KINDS), default="guidance")
+    feedback_add.add_argument("--target-role", choices=("auto", *ROLE_NAMES), default="auto")
+    feedback_add.add_argument("--idempotency-key", default="")
+    feedback_decide.add_argument("--feedback-id", required=True)
+    feedback_decide.add_argument("--action", required=True, choices=sorted(FEEDBACK_DECISIONS))
 
     for command, is_resume in (("swarm-run", False), ("swarm-resume", True)):
         swarm_parser = sub.add_parser(
@@ -200,6 +216,37 @@ def select_cli_models(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "feedback":
+        repo = Path(args.repo).expanduser().resolve()
+        store = RunConversationStore(repo, args.run_id)
+        state_path = repo / ".forge" / "runs" / args.run_id / "state.json"
+        if not state_path.is_file():
+            raise SystemExit(f"Forge run does not exist: {args.run_id}")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if args.feedback_command == "add":
+            active = state.get("active_iteration") or {}
+            item, created = store.add_feedback(
+                args.message,
+                kind=args.kind,
+                target_role=args.target_role,
+                phase=str(state.get("phase") or ""),
+                iteration_id=str(active.get("id") or ""),
+                source="cli",
+                idempotency_key=args.idempotency_key,
+            )
+            print(json.dumps({"feedback": item, "created": created}, indent=2, sort_keys=True))
+            return 0
+        if args.feedback_command == "decide":
+            active = state.get("active_iteration") or {}
+            item = store.decide_feedback(
+                args.feedback_id,
+                args.action,
+                active_iteration_id=str(active.get("id") or ""),
+            )
+            print(json.dumps({"feedback": item}, indent=2, sort_keys=True))
+            return 0
+        print(json.dumps(store.snapshot(), indent=2, sort_keys=True))
+        return 0
     if args.command == "ui":
         env: dict[str, str] | None = None
         if args.access_gate_file:
