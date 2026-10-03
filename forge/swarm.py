@@ -56,6 +56,7 @@ from .contracts import (
     parse_swarm_review,
     parse_swarm_selection,
 )
+from .external import register_external_run
 from .locking import RepositoryExecutionLock
 from .models import ModelSpec, RunConfig
 from .policy import GLM, OPUS, SOL, SWARM_CODER_ROLE, SWARM_REVIEWER_ROLE, load_policy
@@ -1428,6 +1429,7 @@ class SwarmController:
         lock = RepositoryExecutionLock(self.repo, self.config.branch, self.run_id)
         lock.acquire()
         try:
+            register_external_run(self.repo, self.run_id, "swarm", state_home=self.state_home)
             self._executor = ThreadPoolExecutor(max_workers=SWARM_AGENTS_CAP)
             self._run_locked()
         except (SwarmCancelled, KeyboardInterrupt):
