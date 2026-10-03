@@ -123,11 +123,16 @@ def process_start_ticks(pid: int) -> str:
     return fields[19] if len(fields) > 19 else ""
 
 
-def _digest(path: Path) -> str:
+def _file_bytes(path: Path) -> bytes | None:
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        return path.read_bytes()
     except OSError:
-        return ""
+        return None
+
+
+def _digest(path: Path) -> str:
+    data = _file_bytes(path)
+    return "" if data is None else hashlib.sha256(data).hexdigest()
 
 
 def repository_context(repo: Path) -> str:
@@ -457,6 +462,9 @@ class SwarmController:
         # The durable state this controller loaded or last wrote; run()
         # refuses to take over when another controller changed it since.
         self._state_digest = ""
+        # The config bytes a resume loaded; run() refuses to take over when
+        # another controller changed them since.
+        self._config_original: bytes | None = None
         # A resume migration, written only once run() owns the repository.
         self._migration: dict[str, Any] | None = None
 
@@ -469,7 +477,6 @@ class SwarmController:
             )
         if resume:
             self.state = SwarmRunState.from_dict(self._load_swarm_state())
-            self._state_digest = _digest(self.store.root / "swarm" / "state.json")
             # The conflict cap per task family survives a restart.
             for task in self.state.tasks:
                 if task.status == "conflict":
@@ -503,8 +510,8 @@ class SwarmController:
         config_path = root / "config.json"
         if not (root / "swarm" / "state.json").is_file() or not config_path.is_file():
             raise SwarmFailed(f"no swarm run {run_id} under {repo}")
-        original = config_path.read_text(encoding="utf-8")
-        raw = json.loads(original)
+        original = config_path.read_bytes()
+        raw = json.loads(original.decode("utf-8"))
         config = RunConfig.from_dict(raw)
         config.repo = str(repo)
         if policy_path:
@@ -521,8 +528,9 @@ class SwarmController:
                     "them onto the current policy"
                 )
         controller = cls(config, run_id=run_id, resume=True, **options)
+        controller._config_original = original
         if changes or config.policy_path != str(raw.get("policy_path") or ""):
-            controller._migration = {"original": original, "changes": changes}
+            controller._migration = {"changes": changes}
         return controller
 
     def _take_ownership(self) -> None:
@@ -535,19 +543,19 @@ class SwarmController:
                 f"swarm state of run {self.run_id} changed after this controller loaded "
                 "it (another controller ran meanwhile); start swarm-resume again"
             )
-        migration, self._migration = self._migration, None
-        if migration is None:
-            return
+        original = self._config_original
         config_path = self.store.root / "config.json"
-        if config_path.read_text(encoding="utf-8") != migration["original"]:
+        # Every resume, migrating or not: the run executes the config it loaded.
+        if original is not None and _file_bytes(config_path) != original:
             raise SwarmFailed(
                 f"config of run {self.run_id} changed after this controller loaded it; "
                 "start swarm-resume again"
             )
+        migration, self._migration = self._migration, None
+        if migration is None or original is None:
+            return
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        (self.store.root / f"config.pre-migration-{stamp}.json").write_text(
-            migration["original"], encoding="utf-8"
-        )
+        (self.store.root / f"config.pre-migration-{stamp}.json").write_bytes(original)
         self.store.write_data("config.json", self.config.to_dict())
         changes = migration["changes"]
         if changes:
@@ -598,7 +606,11 @@ class SwarmController:
         path = self.store.root / "swarm" / "state.json"
         if not path.is_file():
             raise SwarmFailed(f"swarm state does not exist: {path}")
-        return json.loads(path.read_text(encoding="utf-8"))
+        # One read: the digest describes exactly the bytes parsed, so a write
+        # by another owner after this read is still detected under the lock.
+        data = path.read_bytes()
+        self._state_digest = hashlib.sha256(data).hexdigest()
+        return json.loads(data.decode("utf-8"))
 
     def persist(self, message: str = "") -> None:
         with self._lock:

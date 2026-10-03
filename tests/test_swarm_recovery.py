@@ -659,3 +659,55 @@ def test_a_controller_refuses_state_another_controller_changed_since_loading(
     with pytest.raises(SwarmFailed, match="changed after this controller loaded"):
         stale.run()
     assert run_files(box) == before
+
+
+def test_a_state_write_between_load_and_digest_is_still_refused(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Another owner writes right after this controller parsed the state: the
+    # digest must describe the bytes parsed, not a later read.
+    repo, _, box = interrupted_run(tmp_path)
+    original = SwarmController._load_swarm_state
+
+    def load_then_newer_owner_writes(self):
+        loaded = original(self)
+        path = self.store.root / "swarm/state.json"
+        newer = json.loads(path.read_text())
+        newer["message"] = "a newer owner finished the task"
+        newer["tasks"][0]["status"] = "done"
+        newer["teams"] = []
+        path.write_text(json.dumps(newer))
+        return loaded
+
+    monkeypatch.setattr(SwarmController, "_load_swarm_state", load_then_newer_owner_writes)
+    stale = SwarmController.resume_existing(
+        repo, box.run_id, runner=SwarmRunner(backlog_json(count=1)),
+        state_home=tmp_path / "state", teams=1, min_backlog=1,
+    )
+    before = run_files(box)
+    monkeypatch.setattr(stale, "_run_locked", lambda: stale.persist("overwrote newer state"))
+    with pytest.raises(SwarmFailed, match="state of run .* changed"):
+        stale.run()
+    assert run_files(box) == before
+
+
+def test_a_plain_resume_refuses_a_config_changed_since_loading(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, _, box = interrupted_run(tmp_path)
+    stale = SwarmController.resume_existing(
+        repo, box.run_id, runner=SwarmRunner(backlog_json(count=1)),
+        state_home=tmp_path / "state", teams=1, min_backlog=1,
+    )
+    assert stale._migration is None
+    path = box.store.root / "config.json"
+    raw = json.loads(path.read_text())
+    raw["push"] = True
+    raw["agent_timeout_seconds"] = 17
+    path.write_text(json.dumps(raw))
+    before = run_files(box)
+    entered: list = []
+    monkeypatch.setattr(stale, "_run_locked", lambda: entered.append(True))
+    with pytest.raises(SwarmFailed, match="config of run .* changed"):
+        stale.run()
+    assert not entered and run_files(box) == before
