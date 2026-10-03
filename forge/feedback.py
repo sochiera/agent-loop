@@ -20,6 +20,7 @@ from .models import ROLE_NAMES
 MAX_FEEDBACK_LENGTH = 8000
 MAX_SUGGESTION_LENGTH = 4000
 MAX_OPEN_SUGGESTIONS = 20
+MAX_QUESTIONS_PER_RUN = 50
 FEEDBACK_KINDS = frozenset({"guidance", "scope_change"})
 SUGGESTION_KINDS = frozenset({"suggestion", "question", "blocker"})
 SUGGESTION_ACTIONS = frozenset({"accept", "reject", "defer", "answer"})
@@ -64,15 +65,84 @@ class RunConversationStore:
             if self.path.exists():
                 try:
                     state = json.loads(self.path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as exc:
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                     raise RuntimeError(f"run conversation state is unreadable: {self.path}") from exc
                 if not isinstance(state, dict):
                     raise RuntimeError("run conversation state must be an object")
                 state.setdefault("schema_version", 1)
                 state.setdefault("feedback", [])
                 state.setdefault("suggestions", [])
+                state.setdefault("suppressed_suggestion_keys", [])
             else:
-                state = {"schema_version": 1, "feedback": [], "suggestions": []}
+                state = {
+                    "schema_version": 1,
+                    "feedback": [],
+                    "suggestions": [],
+                    "suppressed_suggestion_keys": [],
+                }
+            for name in ("feedback", "suggestions"):
+                records = state[name]
+                if not isinstance(records, list) or any(not isinstance(item, dict) for item in records):
+                    raise RuntimeError(f"run conversation {name} must be a list of objects")
+            feedback_fields = {"id", "message", "kind", "target_role", "status", "deliveries", "history"}
+            for item in state["feedback"]:
+                item.setdefault("idempotency_keys", [])
+                if (
+                    not feedback_fields.issubset(item)
+                    or not isinstance(item["id"], str)
+                    or not isinstance(item["message"], str)
+                    or not isinstance(item["kind"], str)
+                    or item["kind"] not in FEEDBACK_KINDS
+                    or not isinstance(item["target_role"], str)
+                    or item["target_role"] not in {"auto", *ROLE_NAMES}
+                    or not isinstance(item["status"], str)
+                    or item["status"] not in {"received", "pending", "needs_decision", "applied", "dismissed", "not_applied"}
+                    or not isinstance(item["deliveries"], list)
+                    or any(not isinstance(entry, dict) for entry in item["deliveries"])
+                    or not isinstance(item["idempotency_keys"], list)
+                    or any(not isinstance(key, str) for key in item["idempotency_keys"])
+                    or any(
+                        not {"relative", "role"}.issubset(entry)
+                        or not isinstance(entry["relative"], str)
+                        or not isinstance(entry["role"], str)
+                        for entry in item["deliveries"]
+                    )
+                    or not isinstance(item["history"], list)
+                    or any(not isinstance(entry, dict) for entry in item["history"])
+                ):
+                    raise RuntimeError("run conversation contains an invalid feedback record")
+            suggestion_fields = {
+                "id", "title", "kind", "status", "dedupe_key", "history",
+                "target_role", "feedback_kind", "recommendation", "requires_decision",
+            }
+            for item in state["suggestions"]:
+                if (
+                    not suggestion_fields.issubset(item)
+                    or not isinstance(item["id"], str)
+                    or not isinstance(item["title"], str)
+                    or not isinstance(item["kind"], str)
+                    or item["kind"] not in SUGGESTION_KINDS
+                    or not isinstance(item["status"], str)
+                    or item["status"] not in {"open", "deferred", "accepted", "answered", "rejected", "superseded"}
+                    or not isinstance(item["dedupe_key"], str)
+                    or not isinstance(item["target_role"], str)
+                    or item["target_role"] not in {"auto", *ROLE_NAMES}
+                    or not isinstance(item["feedback_kind"], str)
+                    or item["feedback_kind"] not in FEEDBACK_KINDS
+                    or not isinstance(item["recommendation"], str)
+                    or not isinstance(item["requires_decision"], bool)
+                    or not isinstance(item.get("truncated_fields", []), list)
+                    or any(not isinstance(field, str) for field in item.get("truncated_fields", []))
+                    or not isinstance(item["history"], list)
+                    or any(not isinstance(entry, dict) for entry in item["history"])
+                ):
+                    raise RuntimeError("run conversation contains an invalid suggestion record")
+            suppressed = state.get("suppressed_suggestions", 0)
+            if not isinstance(suppressed, int) or suppressed < 0:
+                raise RuntimeError("run conversation suppressed_suggestions must be a non-negative integer")
+            suppressed_keys = state.get("suppressed_suggestion_keys", [])
+            if not isinstance(suppressed_keys, list) or any(not isinstance(key, str) for key in suppressed_keys):
+                raise RuntimeError("run conversation suppressed_suggestion_keys must be a list of strings")
             yield state
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -106,6 +176,54 @@ class RunConversationStore:
                 "suppressed_suggestions": int(state.get("suppressed_suggestions", 0)),
             }
 
+    @staticmethod
+    def _has_idempotency_key(item: dict[str, Any], key: str) -> bool:
+        return item.get("idempotency_key") == key or key in item.get("idempotency_keys", [])
+
+    @staticmethod
+    def _remember_idempotency_key(item: dict[str, Any], key: str) -> bool:
+        if not key or RunConversationStore._has_idempotency_key(item, key):
+            return False
+        keys = list(item.get("idempotency_keys") or [])
+        keys.append(key)
+        item["idempotency_keys"] = keys
+        return True
+
+    def mark_unapplied_coder_feedback(self, iteration_id: str) -> int:
+        if not iteration_id:
+            return 0
+        explanation = "The iteration was accepted without confirmed application of this feedback. "
+        with self._locked() as state:
+            changed = 0
+            for item in state["feedback"]:
+                if (
+                    item["status"] not in {"received", "pending"}
+                    or not item["target_role"].startswith("coder_")
+                    or item.get("iteration_received") != iteration_id
+                    or any(delivery.get("state") == "applied" for delivery in item["deliveries"])
+                ):
+                    continue
+                had_prepared_delivery = bool(item["deliveries"])
+                detail = (
+                    "Forge could not confirm a prepared delivery after recovery; it will not replay "
+                    "automatically. Submit it again if it is still needed."
+                    if had_prepared_delivery
+                    else explanation + " Submit it again if it is still needed."
+                )
+                self._mark_not_applied(item, detail)
+                changed += 1
+            if changed:
+                self._write(state)
+            return changed
+
+    @staticmethod
+    def _mark_not_applied(item: dict[str, Any], explanation: str) -> None:
+        now = utc_now()
+        item.update(status="not_applied", updated_at=now, explanation=explanation)
+        item["history"].append(
+            {"at": now, "status": "not_applied", "explanation": explanation}
+        )
+
     def add_feedback(
         self,
         message: str,
@@ -138,7 +256,7 @@ class RunConversationStore:
         )
         with self._locked() as state:
             for existing in state["feedback"]:
-                if existing.get("idempotency_key") == key:
+                if self._has_idempotency_key(existing, key):
                     if (
                         existing.get("message") != text
                         or existing.get("kind") != kind
@@ -153,6 +271,8 @@ class RunConversationStore:
                     and existing.get("kind") == kind
                     and existing.get("target_role") == target_role
                 ):
+                    if self._remember_idempotency_key(existing, key):
+                        self._write(state)
                     return dict(existing), False
             item = {
                 "id": uuid.uuid4().hex,
@@ -161,6 +281,7 @@ class RunConversationStore:
                 "target_role": target_role,
                 "source": source,
                 "idempotency_key": key,
+                "idempotency_keys": [],
                 "created_at": now,
                 "updated_at": now,
                 "status": initial_status,
@@ -218,6 +339,7 @@ class RunConversationStore:
                     decision=action,
                     deferred=False,
                     wait_for_iteration="",
+                    iteration_received="",
                 )
                 explanation = "Approved as guidance; waiting for the next safe agent boundary."
             item.update(updated_at=now, explanation=explanation)
@@ -236,6 +358,7 @@ class RunConversationStore:
         relative: str,
         active_roles: set[str] | None = None,
         code_started: bool = False,
+        winner_role: str = "",
     ) -> list[dict[str, Any]]:
         active_roles = active_roles or set()
         selected: list[dict[str, Any]] = []
@@ -244,7 +367,58 @@ class RunConversationStore:
             for item in state["feedback"]:
                 if item["status"] not in {"received", "pending"} or item.get("deferred"):
                     continue
-                if not self._targets(item, role, phase, iteration_id, active_roles, code_started):
+                is_coder_feedback = item["target_role"].startswith("coder_")
+                # Feedback submitted in the Product Owner gap has no active
+                # iteration yet. Bind coder-directed feedback to the first
+                # iteration boundary it can actually affect.
+                if (
+                    iteration_id
+                    and is_coder_feedback
+                    and not item.get("iteration_received")
+                ):
+                    item["iteration_received"] = iteration_id
+                    item["updated_at"] = utc_now()
+                    item["explanation"] = (
+                        f"Associated with {iteration_id}; waiting for a safe coder boundary."
+                    )
+                    item["history"].append(
+                        {
+                            "at": item["updated_at"],
+                            "status": item["status"],
+                            "explanation": item["explanation"],
+                        }
+                    )
+                    changed = True
+                elif (
+                    iteration_id
+                    and is_coder_feedback
+                    and item.get("iteration_received")
+                    and item["iteration_received"] != iteration_id
+                ):
+                    self._mark_not_applied(
+                        item,
+                        f"Feedback was bound to {item['iteration_received']} and was not delivered "
+                        f"before {iteration_id}; it will not be replayed automatically. Submit it "
+                        "again if it is still needed.",
+                    )
+                    changed = True
+                    continue
+                if not self._targets(
+                    item, role, phase, iteration_id, active_roles, code_started, winner_role
+                ):
+                    explanation = self._held_explanation(
+                        item, phase, active_roles, code_started, winner_role
+                    )
+                    if explanation and item.get("explanation") != explanation:
+                        item.update(updated_at=utc_now(), explanation=explanation)
+                        item["history"].append(
+                            {
+                                "at": item["updated_at"],
+                                "status": item["status"],
+                                "explanation": explanation,
+                            }
+                        )
+                        changed = True
                     continue
                 delivery = next(
                     (
@@ -280,6 +454,26 @@ class RunConversationStore:
             if changed:
                 self._write(state)
         return selected
+
+    @staticmethod
+    def _held_explanation(
+        item: dict[str, Any],
+        phase: str,
+        active_roles: set[str],
+        code_started: bool,
+        winner_role: str,
+    ) -> str:
+        target = item.get("target_role", "auto")
+        if not target.startswith("coder_"):
+            return ""
+        tournament_running = code_started or any(
+            role.startswith("coder_") for role in active_roles
+        )
+        if tournament_running or phase == "selection":
+            return "Held until the parallel coder tournament selects a winner."
+        if winner_role:
+            return "Waiting for a post-selection review, test, or single-writer fix boundary."
+        return "Held until Forge knows which candidate won the tournament."
 
     def complete_delivery(self, feedback_ids: list[str], *, relative: str, response_path: str) -> None:
         if not feedback_ids:
@@ -338,18 +532,56 @@ class RunConversationStore:
         }
         if any(not value for value in values.values()):
             raise ValueError("suggestions require a title, context, rationale, impact, and recommendation")
-        if any(len(value) > MAX_SUGGESTION_LENGTH for value in values.values()):
-            raise ValueError(f"suggestion fields may not exceed {MAX_SUGGESTION_LENGTH} characters")
-        dedupe_key = _digest(kind, values["title"].casefold())
+        truncated_fields = []
+        for field, value in values.items():
+            if len(value) > MAX_SUGGESTION_LENGTH:
+                values[field] = value[: MAX_SUGGESTION_LENGTH - 1] + "…"
+                truncated_fields.append(field)
+        dedupe_scope = values["title"].casefold()
+        if kind == "blocker":
+            # A changed blocker rationale needs a new card even within one
+            # iteration. Identical reports remain deduplicated by stage/source.
+            dedupe_scope += "\0" + _normalized(source).casefold()
+            dedupe_scope += "\0" + values["rationale"].casefold()
+        dedupe_key = _digest(kind, dedupe_scope)
         with self._locked() as state:
             state.setdefault("suppressed_suggestions", 0)
+            state.setdefault("suppressed_suggestion_keys", [])
             for existing in state["suggestions"]:
                 if existing.get("dedupe_key") == dedupe_key:
+                    if kind == "blocker" and existing.get("status") not in {"open", "deferred"}:
+                        continue
                     return dict(existing), False
-            open_count = sum(item.get("status") == "open" for item in state["suggestions"])
-            if open_count >= MAX_OPEN_SUGGESTIONS:
-                state["suppressed_suggestions"] += 1
-                self._write(state)
+            now = utc_now()
+            if kind == "blocker":
+                for existing in state["suggestions"]:
+                    if (
+                        existing.get("kind") == "blocker"
+                        and existing.get("title", "").casefold() == values["title"].casefold()
+                        and existing.get("status") in {"open", "deferred"}
+                    ):
+                        existing.update(status="superseded", updated_at=now)
+                        existing["history"].append(
+                            {
+                                "at": now,
+                                "status": "superseded",
+                                "explanation": "A newer blocker with this title replaced this report.",
+                            }
+                        )
+            active_count = sum(
+                item.get("status") in {"open", "deferred"} for item in state["suggestions"]
+            )
+            question_count = sum(
+                item.get("kind") == "question" for item in state["suggestions"]
+            )
+            suppress = (
+                kind == "suggestion" and active_count >= MAX_OPEN_SUGGESTIONS
+            ) or (kind == "question" and question_count >= MAX_QUESTIONS_PER_RUN)
+            if suppress:
+                if dedupe_key not in state["suppressed_suggestion_keys"]:
+                    state["suppressed_suggestion_keys"].append(dedupe_key)
+                    state["suppressed_suggestions"] += 1
+                    self._write(state)
                 return {
                     "id": "",
                     **values,
@@ -357,7 +589,6 @@ class RunConversationStore:
                     "status": "suppressed",
                     "source": source,
                 }, False
-            now = utc_now()
             item = {
                 "id": uuid.uuid4().hex,
                 **values,
@@ -367,6 +598,7 @@ class RunConversationStore:
                 "feedback_kind": feedback_kind,
                 "requires_decision": bool(requires_decision),
                 "dedupe_key": dedupe_key,
+                "truncated_fields": truncated_fields,
                 "status": "open",
                 "created_at": now,
                 "updated_at": now,
@@ -389,22 +621,38 @@ class RunConversationStore:
         if action not in SUGGESTION_ACTIONS:
             raise ValueError("suggestion action must be accept, reject, defer, or answer")
         answer_text = _normalized(answer)
+        if len(answer_text) > MAX_FEEDBACK_LENGTH:
+            raise ValueError(f"suggestion answer exceeds {MAX_FEEDBACK_LENGTH} characters")
         if action == "answer" and not answer_text:
             raise ValueError("an answer is required for this question")
         with self._locked() as state:
             suggestion = self._find(state["suggestions"], suggestion_id)
-            if suggestion["status"] != "open":
+            if suggestion["status"] not in {"open", "deferred"}:
+                completed_actions = {"accepted": "accept", "answered": "answer", "rejected": "reject"}
+                if (
+                    completed_actions.get(suggestion["status"]) == action
+                    and (action != "answer" or suggestion.get("answer") == answer_text)
+                ):
+                    feedback = next(
+                        (
+                            item
+                            for item in state["feedback"]
+                            if self._has_idempotency_key(
+                                item, f"suggestion:{suggestion_id}:{action}"
+                            )
+                        ),
+                        None,
+                    )
+                    return dict(suggestion), dict(feedback) if feedback else None
                 raise ValueError("suggestion is no longer open")
             now = utc_now()
             feedback: dict[str, Any] | None = None
             if action in {"accept", "answer"}:
                 message = answer_text if action == "answer" else suggestion["recommendation"]
-                kind = (
-                    "scope_change"
-                    if action == "accept"
-                    and (suggestion["requires_decision"] or suggestion["feedback_kind"] == "scope_change")
-                    else "guidance"
-                )
+                kind = "scope_change" if (
+                    suggestion["requires_decision"]
+                    or suggestion["feedback_kind"] == "scope_change"
+                ) else "guidance"
                 feedback = self._add_feedback_in_state(
                     state,
                     message,
@@ -453,7 +701,7 @@ class RunConversationStore:
         if len(text) > MAX_FEEDBACK_LENGTH:
             raise ValueError(f"feedback message exceeds {MAX_FEEDBACK_LENGTH} characters")
         for existing in state["feedback"]:
-            if existing.get("idempotency_key") == idempotency_key:
+            if RunConversationStore._has_idempotency_key(existing, idempotency_key):
                 return dict(existing)
             if (
                 existing.get("status") in {"received", "pending", "needs_decision"}
@@ -461,6 +709,7 @@ class RunConversationStore:
                 and existing.get("kind") == kind
                 and existing.get("target_role") == target_role
             ):
+                RunConversationStore._remember_idempotency_key(existing, idempotency_key)
                 return dict(existing)
         now = utc_now()
         status = "needs_decision" if kind == "scope_change" else "received"
@@ -476,6 +725,7 @@ class RunConversationStore:
             "target_role": target_role,
             "source": source,
             "idempotency_key": idempotency_key,
+            "idempotency_keys": [],
             "created_at": now,
             "updated_at": now,
             "status": status,
@@ -499,6 +749,7 @@ class RunConversationStore:
         iteration_id: str,
         active_roles: set[str],
         code_started: bool,
+        winner_role: str,
     ) -> bool:
         if item["kind"] == "scope_change":
             if item.get("decision") != "schedule_replan":
@@ -509,6 +760,25 @@ class RunConversationStore:
                 return False
             return True
         target = item.get("target_role", "auto")
+        tournament_running = code_started or any(
+            active_role.startswith("coder_") for active_role in active_roles
+        )
+        if target.startswith("coder_"):
+            received_iteration = str(item.get("iteration_received") or "")
+            if received_iteration and received_iteration != iteration_id:
+                return False
+            # Keep candidate-targeted feedback out of the parallel tournament
+            # and selection. Afterward, a current coder fix, reviewer, or tester
+            # can carry it forward without interrupting work already in flight.
+            if tournament_running or phase == "selection":
+                return False
+            if phase == "review":
+                return role == "reviewer"
+            if phase == "testing":
+                return role == "tester"
+            if winner_role and target == winner_role:
+                return role == target and phase == "coding"
+            return target == role
         if target != "auto":
             return target == role
         by_phase = {
@@ -528,10 +798,7 @@ class RunConversationStore:
         # A message that arrives while tournament workers are already active is
         # held for the selection reviewer instead of being injected into only a
         # subset of independent candidate worktrees.
-        if phase == "coding" and (
-            code_started
-            or any(active_role.startswith("coder_") for active_role in active_roles)
-        ):
+        if phase == "coding" and tournament_running:
             return False
         return True
 

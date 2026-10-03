@@ -496,38 +496,27 @@ class RunRegistry:
 
     def add_feedback(self, run_id: str, payload: dict[str, Any], *, idempotency_key: str = "") -> dict[str, Any]:
         live = self._live_run(run_id)
-        state = live.orchestrator.state_snapshot()
-        item, created = live.orchestrator.conversation.add_feedback(
+        item, created = live.orchestrator.add_feedback(
             str(payload.get("message") or ""),
             kind=str(payload.get("kind") or "guidance"),
             target_role=str(payload.get("target_role") or "auto"),
-            phase=str(state.get("phase") or ""),
-            iteration_id=str((state.get("active_iteration") or {}).get("id") or ""),
             idempotency_key=idempotency_key or str(payload.get("idempotency_key") or ""),
         )
         return {"feedback": item, "created": created}
 
     def decide_feedback(self, run_id: str, feedback_id: str, action: str) -> dict[str, Any]:
         live = self._live_run(run_id)
-        state = live.orchestrator.state_snapshot()
-        item = live.orchestrator.conversation.decide_feedback(
-            feedback_id,
-            action,
-            active_iteration_id=str((state.get("active_iteration") or {}).get("id") or ""),
-        )
+        item = live.orchestrator.decide_feedback(feedback_id, action)
         return {"feedback": item}
 
     def respond_to_suggestion(
         self, run_id: str, suggestion_id: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
         live = self._live_run(run_id)
-        state = live.orchestrator.state_snapshot()
-        suggestion, feedback = live.orchestrator.conversation.answer_suggestion(
+        suggestion, feedback = live.orchestrator.answer_suggestion(
             suggestion_id,
             str(payload.get("action") or ""),
             answer=str(payload.get("answer") or ""),
-            phase=str(state.get("phase") or ""),
-            iteration_id=str((state.get("active_iteration") or {}).get("id") or ""),
         )
         return {"suggestion": suggestion, "feedback": feedback}
 
@@ -603,11 +592,23 @@ class RunRegistry:
         if detailed:
             value["active_agents"] = live.orchestrator.activity_snapshot()
             conversation = getattr(live.orchestrator, "conversation", None)
-            value.update(
-                conversation.snapshot()
-                if conversation is not None
-                else {"feedback": [], "suggestions": [], "suppressed_suggestions": 0}
-            )
+            if conversation is None:
+                value.update({"feedback": [], "suggestions": [], "suppressed_suggestions": 0})
+            else:
+                try:
+                    value.update(conversation.snapshot())
+                except (OSError, RuntimeError):
+                    value.update(
+                        {
+                            "feedback": [],
+                            "suggestions": [],
+                            "suppressed_suggestions": 0,
+                            "conversation_error": (
+                                "Run conversation storage is unavailable or invalid. "
+                                "The run continues, but saved feedback and suggestions cannot be shown."
+                            ),
+                        }
+                    )
             for name in ("events.jsonl", "usage.jsonl"):
                 path = live.orchestrator.store.root / name
                 value[name.removesuffix(".jsonl")] = read_last_lines(path)
@@ -655,7 +656,11 @@ class ForgeHandler(BaseHTTPRequestHandler):
             try:
                 detail = self.registry.get(run_id)
                 if len(parts) == 4 and parts[3] in {"feedback", "suggestions"}:
-                    return self._json({parts[3]: detail.get(parts[3], [])})
+                    result = {parts[3]: detail.get(parts[3], [])}
+                    if detail.get("conversation_error"):
+                        result["error"] = detail["conversation_error"]
+                        return self._json(result, HTTPStatus.SERVICE_UNAVAILABLE)
+                    return self._json(result)
                 if len(parts) == 3:
                     return self._json(detail)
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -703,6 +708,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         if not self._gate_allowed():
             return self._challenge_gate()
+        path = ""
         try:
             payload = self._body()
             path = urllib.parse.urlparse(self.path).path
@@ -713,8 +719,12 @@ class ForgeHandler(BaseHTTPRequestHandler):
             if path == "/api/preferences":
                 return self._json(self.registry.save_preferences(payload))
             if path == "/api/runs":
+                if not payload.get("repo"):
+                    raise ValueError("repo is required")
                 return self._json(self.registry.start(payload), HTTPStatus.CREATED)
             if path == "/api/runs/recover":
+                if not payload.get("repo") or not payload.get("run_id"):
+                    raise ValueError("repo and run_id are required")
                 return self._json(self.registry.recover(payload), HTTPStatus.CREATED)
             parts = path.strip("/").split("/")
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "feedback":
@@ -742,7 +752,31 @@ class ForgeHandler(BaseHTTPRequestHandler):
             }:
                 return self._json(self.registry.control(parts[2], parts[3]))
             return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        except (OSError, RuntimeError) as exc:
+            parts = path.strip("/").split("/")
+            is_feedback_write = (
+                len(parts) == 4
+                and parts[:2] == ["api", "runs"]
+                and parts[3] == "feedback"
+            ) or (
+                len(parts) == 6
+                and parts[:2] == ["api", "runs"]
+                and parts[3] == "feedback"
+                and parts[5] == "decision"
+            ) or (
+                len(parts) == 5
+                and parts[:2] == ["api", "runs"]
+                and parts[3] == "suggestions"
+            )
+            if is_feedback_write:
+                return self._json(
+                    {"error": "Run feedback storage is unavailable."},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except KeyError as exc:
+            if path.startswith("/api/runs/"):
+                return self._json({"error": "run or conversation item not found"}, HTTPStatus.NOT_FOUND)
             return self._json({"error": f"missing field: {exc}"}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
             return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)

@@ -566,6 +566,44 @@ class ForgeOrchestrator:
         with self._state_lock:
             return self.state.to_dict()
 
+    def add_feedback(
+        self,
+        message: str,
+        *,
+        kind: str = "guidance",
+        target_role: str = "auto",
+        idempotency_key: str = "",
+    ) -> tuple[dict[str, Any], bool]:
+        with self._state_lock:
+            return self.conversation.add_feedback(
+                message,
+                kind=kind,
+                target_role=target_role,
+                phase=self.state.phase,
+                iteration_id=str((self.state.active_iteration or {}).get("id") or ""),
+                idempotency_key=idempotency_key,
+            )
+
+    def decide_feedback(self, feedback_id: str, action: str) -> dict[str, Any]:
+        with self._state_lock:
+            return self.conversation.decide_feedback(
+                feedback_id,
+                action,
+                active_iteration_id=str((self.state.active_iteration or {}).get("id") or ""),
+            )
+
+    def answer_suggestion(
+        self, suggestion_id: str, action: str, *, answer: str = ""
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        with self._state_lock:
+            return self.conversation.answer_suggestion(
+                suggestion_id,
+                action,
+                answer=answer,
+                phase=self.state.phase,
+                iteration_id=str((self.state.active_iteration or {}).get("id") or ""),
+            )
+
     # Run driver ------------------------------------------------------
 
     def _execute(self, *, recover: bool) -> RunState:
@@ -2191,6 +2229,17 @@ class ForgeOrchestrator:
         self.store.write_data(f"{iteration_rel}/acceptance.json", record)
         self._workspace.cleanup()
         with self._state_lock:
+            try:
+                not_applied = self.conversation.mark_unapplied_coder_feedback(str(active["id"]))
+                if not_applied:
+                    self._warning(
+                        f"{not_applied} coder-targeted feedback item(s) were not applied because "
+                        "the accepted iteration had no matching fix boundary."
+                    )
+            except (OSError, RuntimeError):
+                self._warn_conversation_storage(
+                    "pending coder feedback could not be settled at iteration acceptance."
+                )
             existing = next(
                 (
                     item
@@ -2477,17 +2526,33 @@ class ForgeOrchestrator:
                 candidate_records = self.state.active_iteration.get("candidates") or {}
                 code_started = any(
                     isinstance(record, dict)
-                    and record.get("status") in {"running", "complete", "failed"}
+                    and record.get("status") == "running"
                     for record in candidate_records.values()
                 )
-                feedback = self.conversation.prepare_feedback(
-                    role=role,
-                    phase=str(self.state.phase),
-                    iteration_id=iteration_id,
-                    relative=relative,
-                    active_roles=set(self.activity_snapshot()),
-                    code_started=code_started,
+                winner = str(self.state.active_iteration.get("winner") or "")
+                winner_role = (
+                    winner
+                    if winner in CODER_ROLES
+                    else f"coder_{winner}" if winner in CODER_CANDIDATES else ""
                 )
+                try:
+                    feedback = self.conversation.prepare_feedback(
+                        role=role,
+                        phase=str(self.state.phase),
+                        iteration_id=iteration_id,
+                        relative=relative,
+                        active_roles={
+                            str(entry.get("role") or key)
+                            for key, entry in self.activity_snapshot().items()
+                        },
+                        code_started=code_started,
+                        winner_role=winner_role,
+                    )
+                except (OSError, RuntimeError):
+                    feedback = []
+                    self._warn_conversation_storage(
+                        f"feedback delivery before the {role} boundary is deferred."
+                    )
                 if feedback:
                     feedback_ids = [str(item["id"]) for item in feedback]
                     current_prompt = self._feedback_prompt(current_prompt, feedback)
@@ -2571,11 +2636,16 @@ class ForgeOrchestrator:
                 self._activity_finished(activity_key)
             self.store.write_text(f"{relative}.raw.jsonl", result.raw_output)
             self.store.write_text(f"{relative}.response.md", result.text.rstrip() + "\n")
-            self.conversation.complete_delivery(
-                feedback_ids,
-                relative=relative,
-                response_path=f"{relative}.response.md",
-            )
+            try:
+                self.conversation.complete_delivery(
+                    feedback_ids,
+                    relative=relative,
+                    response_path=f"{relative}.response.md",
+                )
+            except (OSError, RuntimeError):
+                self._warn_conversation_storage(
+                    f"the {role} response is preserved, but feedback delivery is unconfirmed."
+                )
             self.store.record_agent_call(
                 role=role,
                 model=current_model,
@@ -2601,6 +2671,7 @@ class ForgeOrchestrator:
             {
                 "id": item["id"],
                 "kind": item["kind"],
+                "target_role": item.get("target_role", "auto"),
                 "message": item["message"],
                 "user_decision": item.get("decision") or "none",
                 "status_explanation": item.get("explanation") or "",
@@ -2651,6 +2722,10 @@ class ForgeOrchestrator:
                 )
             except ValueError as exc:
                 self._warning(f"Suppressed an invalid {role} suggestion: {exc}")
+            except (OSError, RuntimeError):
+                self._warn_conversation_storage(
+                    f"some {role} suggestions could not be saved."
+                )
         if blocker:
             try:
                 self.conversation.publish_suggestion(
@@ -2668,6 +2743,10 @@ class ForgeOrchestrator:
                 )
             except ValueError as exc:
                 self._warning(f"Could not publish the {role} blocker suggestion: {exc}")
+            except (OSError, RuntimeError):
+                self._warn_conversation_storage(
+                    f"the {role} blocker suggestion could not be saved."
+                )
 
     def _record_disabled(self, spec: ModelSpec) -> None:
         identity = model_identity(spec)
@@ -2855,6 +2934,32 @@ class ForgeOrchestrator:
                         "status": self.state.status,
                     }
                 )
+
+    def _warn_conversation_storage(self, detail: str) -> None:
+        prefix = "Run conversation storage unavailable:"
+        base = f"{prefix} {detail}"
+        with self._state_lock:
+            existing_index = next(
+                (
+                    index
+                    for index, message in enumerate(self.state.warnings)
+                    if str(message) == base or str(message).startswith(base + " [count=")
+                ),
+                None,
+            )
+            count = 1
+            if existing_index is not None:
+                existing = str(self.state.warnings[existing_index])
+                try:
+                    count = int(existing.split(" [count=", 1)[1].split(";", 1)[0]) + 1
+                except (IndexError, ValueError):
+                    count = 2
+            warning = f"{base} [count={count}; last={utc_now()}]"
+            if existing_index is None:
+                self._warning(warning)
+            else:
+                self.state.warnings[existing_index] = warning
+            self.store.save_state(self.state)
 
     def _save(self, message: str) -> None:
         with self._state_lock:

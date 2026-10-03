@@ -35,6 +35,17 @@ const fallbackCatalog = {
 };
 let catalog = fallbackCatalog;
 let selected = null;
+let renderedRunId = null;
+const conversationDrafts = new Map();
+let refreshSequence = 0;
+let composingRunId = "";
+
+document.addEventListener("compositionstart", event => {
+  if (event.target.closest?.("#detail-body .conversation-panel")) composingRunId = renderedRunId || "";
+});
+document.addEventListener("compositionend", event => {
+  if (event.target.closest?.("#detail-body .conversation-panel")) composingRunId = "";
+});
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, character => ({
@@ -586,6 +597,7 @@ function feedbackPanel(run) {
     ["tester", "Unified tester"],
   ];
   const feedback = (run.feedback || []).map(item => {
+    const feedbackStatus = item.deferred ? "deferred" : item.status;
     const decision = item.status === "needs_decision" ? `
       <div class="feedback-decisions">
         <p>Choose how Forge should handle this. Current work continues.</p>
@@ -595,29 +607,33 @@ function feedbackPanel(run) {
         <button class="button ghost" data-feedback-id="${escapeHtml(item.id)}" data-feedback-action="dismiss">Dismiss</button>
       </div>` : "";
     return `<article class="feedback-row">
-      <div class="feedback-row-top"><strong>${escapeHtml(item.kind === "scope_change" ? "Scope change" : "Feedback")}</strong><span class="status-pill ${escapeHtml(item.status)}">${escapeHtml(item.status.replaceAll("_", " "))}</span></div>
+      <div class="feedback-row-top"><strong>${escapeHtml(item.kind === "scope_change" ? "Scope change" : "Feedback")}</strong><span class="status-pill ${escapeHtml(feedbackStatus)}">${escapeHtml(feedbackStatus.replaceAll("_", " "))}</span></div>
       <p>${escapeHtml(item.message)}</p><small>${escapeHtml(item.explanation)} · ${escapeHtml(item.target_role)}</small>${decision}
     </article>`;
   }).join("");
   const suggestions = (run.suggestions || []).map(item => {
-    const actions = item.status === "open" ? `
+    const actions = ["open", "deferred"].includes(item.status) ? `
       <div class="suggestion-actions">
         ${item.kind !== "question" && item.kind !== "blocker" ? `<button class="button secondary" data-suggestion-id="${escapeHtml(item.id)}" data-suggestion-action="accept">Accept</button>` : ""}
         <button class="button ghost" data-suggestion-id="${escapeHtml(item.id)}" data-suggestion-action="reject">Reject</button>
         <button class="button ghost" data-suggestion-id="${escapeHtml(item.id)}" data-suggestion-action="defer">Defer</button>
       </div>
-      <label class="field suggestion-answer"><span>Answer or add context</span><textarea rows="2" data-suggestion-answer="${escapeHtml(item.id)}" placeholder="Your answer goes through the run feedback queue"></textarea></label>
+      <label class="field suggestion-answer"><span>Answer or add context</span><textarea rows="2" maxlength="8000" data-suggestion-answer="${escapeHtml(item.id)}" placeholder="Your answer goes through the run feedback queue"></textarea></label>
       <button class="button ghost" data-suggestion-id="${escapeHtml(item.id)}" data-suggestion-action="answer">Send answer</button>` : "";
     return `<article class="suggestion-card ${escapeHtml(item.kind)}">
       <div class="feedback-row-top"><strong>${escapeHtml(item.kind)}</strong><span class="status-pill ${escapeHtml(item.status)}">${escapeHtml(item.status)}</span></div>
       <h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.context)}</p>
+      ${item.truncated_fields?.length ? `<p class="truncated-note">Long text was shortened to fit the run panel (${item.truncated_fields.map(escapeHtml).join(", ")}).</p>` : ""}
       <dl><dt>Why Forge raised this</dt><dd>${escapeHtml(item.rationale)}</dd><dt>Expected impact</dt><dd>${escapeHtml(item.expected_impact)}</dd><dt>Suggested next step</dt><dd>${escapeHtml(item.recommendation)}</dd></dl>
       ${item.requires_decision ? `<p class="decision-note">This may change scope and needs an explicit decision. Forge will not apply it automatically.</p>` : ""}${actions}
     </article>`;
   }).join("");
   const suppressed = safeInteger(run.suppressed_suggestions);
+  const activeSuggestions = (run.suggestions || []).filter(item => ["open", "deferred"].includes(item.status)).length;
+  const conversationError = run.conversation_error ? `<p class="conversation-error" role="alert">${escapeHtml(run.conversation_error)}</p>` : "";
   return `<section class="conversation-panel" aria-label="Run feedback and suggestions">
-    <div class="section-title compact"><div><span class="eyebrow">Two-way run communication</span><h3>Feedback and suggestions</h3></div><span class="conversation-count">${(run.feedback || []).length} messages · ${(run.suggestions || []).filter(item => item.status === "open").length} open</span></div>
+    <div class="section-title compact"><div><span class="eyebrow">Two-way run communication</span><h3>Feedback and suggestions</h3></div><span class="conversation-count">${(run.feedback || []).length} messages · ${activeSuggestions} unresolved suggestions</span></div>
+    ${conversationError}
     <form id="feedback-form" class="feedback-form">
       <label class="field"><span>Feedback for this run</span><textarea id="feedback-message" name="message" rows="3" maxlength="8000" placeholder="Add context or a correction. Forge records it and delivers it at a safe agent boundary." required></textarea></label>
       <div class="feedback-form-controls">
@@ -627,7 +643,7 @@ function feedbackPanel(run) {
       </div>
       <p class="conversation-help">Scope changes wait for your decision. Scheduling a replan keeps current sprint work on its existing plan. Sending feedback never pauses, cancels, restarts, merges, or deploys a run.</p>
     </form>
-    <h4>Forge suggestions and questions</h4>${suppressed ? `<p class="conversation-help">${suppressed} repeated or excess suggestion(s) were held back to keep this panel focused.</p>` : ""}${suggestions || `<p class="empty">Forge has no suggestions for this run.</p>`}
+    <h4>Forge suggestions and questions</h4>${suppressed ? `<p class="conversation-help">${suppressed} excess non-blocking suggestion(s) or question(s) were held back to keep the run panel bounded. Blockers are retained.</p>` : ""}${suggestions || `<p class="empty">Forge has no suggestions for this run.</p>`}
     <h4>Feedback history</h4>${feedback || `<p class="empty">No feedback has been sent to this run.</p>`}
   </section>`;
 }
@@ -643,6 +659,67 @@ function captureEventsScroll() {
     top: box.scrollTop,
     atBottom: box.scrollHeight - box.scrollTop - box.clientHeight < 24,
   };
+}
+
+function captureConversationDrafts() {
+  const message = document.querySelector("#feedback-message");
+  return {
+    message: message?.value || "",
+    messageScroll: message?.scrollTop || 0,
+    kind: document.querySelector('#feedback-form select[name="kind"]')?.value || "guidance",
+    target: document.querySelector('#feedback-form select[name="target_role"]')?.value || "auto",
+    answers: Object.fromEntries(
+      [...document.querySelectorAll("[data-suggestion-answer]")].map(input => [
+        input.dataset.suggestionAnswer,
+        {value: input.value, scrollTop: input.scrollTop},
+      ]),
+    ),
+  };
+}
+
+function restoreConversationDrafts(draft) {
+  const message = document.querySelector("#feedback-message");
+  message.value = draft.message || "";
+  message.scrollTop = draft.messageScroll || 0;
+  document.querySelector('#feedback-form select[name="kind"]').value = draft.kind || "guidance";
+  document.querySelector('#feedback-form select[name="target_role"]').value = draft.target || "auto";
+  for (const [id, value] of Object.entries(draft.answers || {})) {
+    const input = document.querySelector(`[data-suggestion-answer="${CSS.escape(id)}"]`);
+    if (input) {
+      input.value = typeof value === "string" ? value : value.value || "";
+      input.scrollTop = typeof value === "string" ? 0 : value.scrollTop || 0;
+    }
+  }
+}
+
+function captureConversationFocus() {
+  const active = document.activeElement;
+  if (!document.querySelector("#detail-body")?.contains(active)) return null;
+  let selector = "";
+  if (active.id === "feedback-message") selector = "#feedback-message";
+  else if (active.dataset.suggestionAnswer) {
+    selector = `[data-suggestion-answer="${CSS.escape(active.dataset.suggestionAnswer)}"]`;
+  } else if (active.matches('#feedback-form select[name="kind"]')) {
+    selector = '#feedback-form select[name="kind"]';
+  } else if (active.matches('#feedback-form select[name="target_role"]')) {
+    selector = '#feedback-form select[name="target_role"]';
+  }
+  if (!selector) return null;
+  return {
+    selector,
+    start: typeof active.selectionStart === "number" ? active.selectionStart : null,
+    end: typeof active.selectionEnd === "number" ? active.selectionEnd : null,
+  };
+}
+
+function restoreConversationFocus(focus) {
+  if (!focus) return;
+  const active = document.querySelector(focus.selector);
+  if (!active) return;
+  active.focus({preventScroll: true});
+  if (focus.start !== null && typeof active.setSelectionRange === "function") {
+    active.setSelectionRange(focus.start, focus.end);
+  }
 }
 
 function restoreEventsScroll(state) {
@@ -681,22 +758,40 @@ function detail(run) {
 }
 
 async function refresh() {
+  const requestSequence = ++refreshSequence;
   try {
     const runs = await api("/api/runs");
+    if (requestSequence !== refreshSequence) return;
     document.querySelector("#run-count").textContent = runs.length;
     document.querySelector("#run-list").innerHTML = runs.length ? runs.map(runCard).join("") : `<p class="empty">No runs in this process yet.</p>`;
-    document.querySelectorAll(".run-card").forEach(card => card.addEventListener("click", () => { selected = card.dataset.id; refresh(); }));
+    document.querySelectorAll(".run-card").forEach(card => card.addEventListener("click", () => {
+      if (selected === card.dataset.id) return;
+      selected = card.dataset.id;
+      document.querySelector("#detail-body").inert = true;
+      refresh();
+    }));
     if (!selected && runs.length) selected = runs[0].run_id;
     if (!selected) return;
-    const run = await api(`/api/runs/${selected}`);
+    const runId = selected;
+    const run = await api(`/api/runs/${encodeURIComponent(runId)}`);
+    if (requestSequence !== refreshSequence || selected !== runId) return;
+    if (renderedRunId === selected && document.querySelector("#detail-body .conversation-panel select:focus")) return;
+    if (renderedRunId === selected && composingRunId === selected) return;
     document.querySelector("#detail").classList.remove("hidden");
     const indicator = document.querySelector("#live-indicator");
     indicator.textContent = run.alive ? "Live" : "Stopped";
     indicator.classList.toggle("live", run.alive);
     const eventsScroll = captureEventsScroll();
-    const feedbackDraft = document.querySelector("#feedback-message")?.value || "";
+    const priorRunId = renderedRunId;
+    const focus = captureConversationFocus();
+    if (priorRunId) conversationDrafts.set(priorRunId, captureConversationDrafts());
+    const draft = conversationDrafts.get(selected) || {};
     document.querySelector("#detail-body").innerHTML = detail(run);
-    document.querySelector("#feedback-message").value = feedbackDraft;
+    document.querySelector("#detail-body").inert = false;
+    restoreConversationDrafts(draft);
+    if (composingRunId && composingRunId !== selected) composingRunId = "";
+    renderedRunId = selected;
+    if (priorRunId === selected) restoreConversationFocus(focus);
     restoreEventsScroll(eventsScroll);
     document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", async () => {
       button.disabled = true;
@@ -708,14 +803,20 @@ async function refresh() {
       event.preventDefault();
       const form = event.currentTarget;
       const data = new FormData(form);
+      const runId = selected;
+      const submittedMessage = String(data.get("message") || "");
       const button = form.querySelector("button[type=submit]");
       button.disabled = true;
       try {
-        await api(`/api/runs/${encodeURIComponent(selected)}/feedback`, {
+        await api(`/api/runs/${encodeURIComponent(runId)}/feedback`, {
           method: "POST",
-          headers: {"Idempotency-Key": crypto.randomUUID()},
+          headers: {"Idempotency-Key": globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`},
           body: JSON.stringify({message: data.get("message"), kind: data.get("kind"), target_role: data.get("target_role")}),
         });
+        const savedDraft = conversationDrafts.get(runId);
+        if (savedDraft?.message === submittedMessage) savedDraft.message = "";
+        const liveComposer = renderedRunId === runId ? document.querySelector("#feedback-message") : null;
+        if (liveComposer?.value === submittedMessage) liveComposer.value = "";
         document.querySelector("#form-error").textContent = "Feedback saved. Forge will deliver it at a safe boundary.";
       } catch (error) {
         document.querySelector("#form-error").textContent = error.message;
@@ -749,6 +850,7 @@ async function refresh() {
     }));
   } catch (error) {
     console.error(error);
+    if (requestSequence === refreshSequence) document.querySelector("#detail-body").inert = false;
   }
 }
 

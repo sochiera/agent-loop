@@ -224,13 +224,15 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"Forge run does not exist: {args.run_id}")
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if args.feedback_command == "add":
-            active = state.get("active_iteration") or {}
+            # The CLI is a separate process and cannot lock the live
+            # orchestrator's iteration snapshot. Leave the item unbound so
+            # prepare_feedback associates it with the next safe boundary.
             item, created = store.add_feedback(
                 args.message,
                 kind=args.kind,
                 target_role=args.target_role,
                 phase=str(state.get("phase") or ""),
-                iteration_id=str(active.get("id") or ""),
+                iteration_id="",
                 source="cli",
                 idempotency_key=args.idempotency_key,
             )

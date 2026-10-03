@@ -232,6 +232,7 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 .status-pill.applied, .status-pill.accepted, .status-pill.answered { background: var(--green-soft); color: var(--green); }
 .status-pill.needs_decision, .status-pill.deferred { background: #f3e8cc; color: var(--amber); }
 .status-pill.dismissed, .status-pill.rejected { background: #f3ddd8; color: var(--red); }
+.status-pill.not_applied, .status-pill.superseded { background: #e9e8e3; color: var(--muted); }
 .feedback-decisions, .suggestion-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
 .feedback-decisions p { flex-basis: 100%; margin: 0 0 2px; color: var(--amber); font-size: 11px; }
 .suggestion-card h4 { margin: 9px 0 5px; }
@@ -242,6 +243,7 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 .suggestion-card.blocker { border-color: #e3b2a8; }
 .suggestion-answer { margin: 12px 0 8px; }
 .suggestion-answer textarea { min-height: 56px; font-family: inherit; }
+.conversation-error { border-left: 3px solid var(--red); color: var(--red); padding: 9px 12px; background: #fff0ed; }
 .decision-note { padding: 8px 10px; border-radius: 7px; background: #f3e8cc; color: var(--amber); font-size: 11px; }
 
 .active-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 10px 0 22px; }

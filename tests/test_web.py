@@ -14,6 +14,7 @@ from pathlib import Path
 from forge.access import AccessGate, GateMisconfigured, gate_from_env, read_expected_value
 from forge.feedback import RunConversationStore
 from forge.models import CODER_ROLES, ROLE_NAMES, STAFF_ROLES, RunState
+from forge.orchestrator import ForgeOrchestrator
 from forge.web import (
     ForgeHandler,
     LiveRun,
@@ -273,6 +274,16 @@ def test_run_feedback_api_is_idempotent_and_suggestion_answers_join_same_queue(t
     orchestrator.conversation = RunConversationStore(repo, orchestrator.run_id)
     orchestrator.state_snapshot = lambda: orchestrator.state.to_dict()
     orchestrator.activity_snapshot = lambda: {}
+    orchestrator._state_lock = threading.RLock()
+    orchestrator.add_feedback = ForgeOrchestrator.add_feedback.__get__(
+        orchestrator, ForgeOrchestrator
+    )
+    orchestrator.decide_feedback = ForgeOrchestrator.decide_feedback.__get__(
+        orchestrator, ForgeOrchestrator
+    )
+    orchestrator.answer_suggestion = ForgeOrchestrator.answer_suggestion.__get__(
+        orchestrator, ForgeOrchestrator
+    )
     live = LiveRun(orchestrator, threading.Thread())
     registry = RunRegistry(state_home=tmp_path)
     registry._runs[orchestrator.run_id] = live
@@ -336,6 +347,26 @@ def test_run_feedback_api_is_idempotent_and_suggestion_answers_join_same_queue(t
         assert len(detail["feedback"]) == 3
         assert detail["suggestions"][0]["status"] == "answered"
         assert detail["status"] == "running"
+        orchestrator.conversation.path.write_text("{malformed", encoding="utf-8")
+        degraded = json.loads(
+            urllib.request.urlopen(base + f"/api/runs/{orchestrator.run_id}", timeout=2).read()
+        )
+        assert degraded["status"] == "running"
+        assert degraded["feedback"] == []
+        assert "conversation storage is unavailable" in degraded["conversation_error"]
+        with pytest.raises(urllib.error.HTTPError) as feedback_error:
+            urllib.request.urlopen(base + f"/api/runs/{orchestrator.run_id}/feedback", timeout=2)
+        assert feedback_error.value.code == 503
+        assert "conversation storage is unavailable" in json.loads(feedback_error.value.read())["error"]
+        with pytest.raises(urllib.error.HTTPError) as post_error:
+            post(feedback_path, {"message": "A post after corruption."})
+        assert post_error.value.code == 503
+        post_body = json.loads(post_error.value.read())
+        assert post_body == {"error": "Run feedback storage is unavailable."}
+
+        with pytest.raises(urllib.error.HTTPError) as recovery_error:
+            post("/api/runs/recover", {"repo": str(repo), "run_id": "missing-run"})
+        assert recovery_error.value.code != 503
     finally:
         server.shutdown()
         server.server_close()
