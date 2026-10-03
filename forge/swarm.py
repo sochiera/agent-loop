@@ -34,7 +34,7 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -618,6 +618,14 @@ class SwarmController:
                 last_error = exc
                 self.store.write_text(f"{relative}.failure-{attempt}.log", exc.raw_output)
                 if attempt < attempts:
+                    # A retry can hold a team for another full agent timeout;
+                    # make it visible instead of silent.
+                    self.store_event(
+                        "agent-retry",
+                        f"{role} attempt {attempt}/{attempts} failed on {relative}: {exc}",
+                        team=job.get("team_id", 0),
+                        mode=job.get("mode", ""),
+                    )
                     prompt = (
                         f"Forge retried this swarm role because the provider process "
                         f"failed: {exc}. Continue from the durable worktree and answer "
@@ -637,14 +645,17 @@ class SwarmController:
         assert last_error is not None
         raise last_error
 
-    def _run_agents(
+    def _dispatch(
         self, jobs: list[dict[str, Any]]
-    ) -> list[tuple[dict[str, Any], AgentResult | Exception]]:
-        if not jobs:
-            return []
+    ) -> list[tuple[dict[str, Any], Future[AgentResult]]]:
         executor = self._executor
         assert executor is not None
-        futures = [(job, executor.submit(self._invoke, job)) for job in jobs]
+        return [(job, executor.submit(self._invoke, job)) for job in jobs]
+
+    @staticmethod
+    def _outcomes(
+        futures: list[tuple[dict[str, Any], Future[AgentResult]]]
+    ) -> list[tuple[dict[str, Any], AgentResult | Exception]]:
         results: list[tuple[dict[str, Any], AgentResult | Exception]] = []
         for job, future in futures:
             try:
@@ -652,6 +663,43 @@ class SwarmController:
             except Exception as exc:
                 results.append((job, exc))
         return results
+
+    @staticmethod
+    def _wait_for_any(
+        in_flight: dict[int, list[tuple[dict[str, Any], Future[AgentResult]]]]
+    ) -> None:
+        # The short timeout keeps operator pause and cancel responsive.
+        futures = [future for jobs in in_flight.values() for _, future in jobs]
+        wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
+
+    def _collect_finished(
+        self, in_flight: dict[int, list[tuple[dict[str, Any], Future[AgentResult]]]]
+    ) -> None:
+        """Apply and advance every team whose agents of this round all finished."""
+        for team_id in list(in_flight):
+            if not all(future.done() for _, future in in_flight[team_id]):
+                continue
+            results = self._outcomes(in_flight.pop(team_id))
+            self._apply_results(results)
+            for team in self._active_teams():
+                if team.id == team_id:
+                    self._advance(team)
+
+    def _drain(
+        self, in_flight: dict[int, list[tuple[dict[str, Any], Future[AgentResult]]]]
+    ) -> None:
+        """After a cancel, keep every finished agent result durable."""
+        results = [
+            outcome
+            for team_id in list(in_flight)
+            for outcome in self._outcomes(in_flight.pop(team_id))
+        ]
+        if not results:
+            return
+        try:
+            self._apply_results(results)
+        except SwarmCancelled:
+            pass
 
     # ------------------------------------------------------------------
     # Planner passes
@@ -1462,50 +1510,80 @@ class SwarmController:
         self._release_missing_worktrees()
         self.persist(f"swarm controller running (pid {os.getpid()})")
         planned = False
-        while True:
-            self._checkpoint()
-            if not planned:
-                with self._lock:
-                    fresh_state = not self.state.tasks
-                if fresh_state:
-                    self._plan_backlog()
-                planned = True
-            with self._lock:
-                pending = [t for t in self.state.tasks if t.status == "pending"]
-                busy = [t for t in self.state.tasks if t.status == "in_progress"]
-            if self._maybe_replan():
-                continue
-            if not pending and not busy:
-                with self._lock:
-                    self.state.status = "completed"
-                self.persist("the swarm finished its backlog")
-                return
-            self._claim_task()
-            teams = self._active_teams()
-            jobs: list[dict[str, Any]] = []
-            for team in teams:
-                try:
-                    self._prepare_worktrees(team)
-                except SwarmGitError as exc:
-                    self._drop_team(team, f"worktree preparation failed: {exc}")
+        # Each team advances as soon as its own agents finish: one slow or
+        # retried agent must not hold every other team at a shared barrier.
+        in_flight: dict[int, list[tuple[dict[str, Any], Future[AgentResult]]]] = {}
+        try:
+            while True:
+                self._collect_finished(in_flight)
+                with self._control:
+                    cancel_requested = self._cancel_requested
+                    paused = self._paused
+                if cancel_requested:
+                    raise SwarmCancelled()
+                if paused and in_flight:
+                    # Paused: dispatch nothing new, but keep applying results.
+                    self._wait_for_any(in_flight)
                     continue
-                jobs.extend(self._round_jobs(team))
-            if jobs:
-                results = self._run_agents(jobs)
-                self._apply_results(results)
-                dispatched = {job["team_id"] for job, _ in results}
-                for team in self._active_teams():
-                    if team.id in dispatched:
-                        self._advance(team)
-            working = bool(jobs) or bool(self._active_teams())
-            if not working and not pending:
+                self._checkpoint()
+                if not planned:
+                    with self._lock:
+                        fresh_state = not self.state.tasks
+                    if fresh_state:
+                        self._plan_backlog()
+                    planned = True
                 with self._lock:
-                    in_progress = [t for t in self.state.tasks if t.status == "in_progress"]
-                if not in_progress and not [t for t in self.state.tasks if t.status == "pending"]:
-                    self.state.status = "completed"
+                    pending = [t for t in self.state.tasks if t.status == "pending"]
+                    busy = [t for t in self.state.tasks if t.status == "in_progress"]
+                if self._maybe_replan():
+                    continue
+                if not pending and not busy and not in_flight:
+                    with self._lock:
+                        self.state.status = "completed"
                     self.persist("the swarm finished its backlog")
                     return
-            time.sleep(0.01)
+                claimed = self._claim_task()
+                ready: dict[int, list[dict[str, Any]]] = {}
+                for team in self._active_teams():
+                    if team.id in in_flight:
+                        continue
+                    try:
+                        self._prepare_worktrees(team)
+                    except SwarmGitError as exc:
+                        self._drop_team(team, f"worktree preparation failed: {exc}")
+                        continue
+                    jobs = self._round_jobs(team)
+                    if jobs:
+                        ready[team.id] = jobs
+                if claimed is not None or ready:
+                    # Claims and worktrees reach durable state before agents
+                    # that may run for a full timeout.
+                    count = sum(len(jobs) for jobs in ready.values())
+                    self.persist(f"dispatching {count} swarm agents")
+                for team_id, jobs in ready.items():
+                    in_flight[team_id] = self._dispatch(jobs)
+                if in_flight:
+                    self._wait_for_any(in_flight)
+                    continue
+                working = bool(self._active_teams())
+                if not working and not pending:
+                    with self._lock:
+                        in_progress = [t for t in self.state.tasks if t.status == "in_progress"]
+                    if not in_progress and not [
+                        t for t in self.state.tasks if t.status == "pending"
+                    ]:
+                        self.state.status = "completed"
+                        self.persist("the swarm finished its backlog")
+                        return
+                time.sleep(0.01)
+        except BaseException as exc:
+            if in_flight:
+                # Stop in-flight agents so the executor shutdown cannot hang
+                # for a full agent timeout.
+                self.cancel()
+                if isinstance(exc, (SwarmCancelled, KeyboardInterrupt)):
+                    self._drain(in_flight)
+            raise
 
     def _active_teams(self) -> list[SwarmTeam]:
         with self._lock:

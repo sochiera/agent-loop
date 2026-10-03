@@ -250,8 +250,10 @@ def test_swarm_full_flow_pool_and_cap(tmp_path: Path) -> None:
 def test_swarm_threshold_triggers_reprioritization(tmp_path: Path) -> None:
     repo, brief = repo_and_brief(tmp_path)
     runner = SwarmRunner(cohort_backlog_json())
+    # One team keeps completion order fixed: teams now finish independently,
+    # and the replan only covers unfinished tasks no team owns yet.
     box = make_controller(
-        repo, brief, runner, tmp_path, min_backlog=5, ready_threshold=0.7, teams=2
+        repo, brief, runner, tmp_path, min_backlog=5, ready_threshold=0.7, teams=1
     )
     state = box.run()
 
@@ -639,3 +641,69 @@ def test_swarm_resume_drops_a_team_whose_worktree_vanished(tmp_path: Path) -> No
     assert any("worktree missing on resume" in warning for warning in state.warnings)
     assert state.status == "completed"
     assert [task.status for task in state.tasks] == ["done"]
+
+
+class SlowTeam(SwarmRunner):
+    """SW-01's coders run until SW-02, claimed later, has reached review."""
+
+    def __init__(self, backlog: str, box_ref: list):
+        super().__init__(backlog)
+        self.box_ref = box_ref
+        self.other_reviewed = threading.Event()
+        self.released: bool | None = None
+        self.claim_on_disk = False
+
+    def _code(self, request: AgentRequest) -> AgentResult:
+        with self._lock:
+            first = '"id": "SW-01"' in request.prompt and self.released is None
+            if first:
+                self.released = False
+        if first:
+            saved = disk_state(self.box_ref[0])
+            self.claim_on_disk = any(
+                team["task_id"] == "SW-01" and team["worktrees"] for team in saved["teams"]
+            )
+            self.released = self.other_reviewed.wait(10)
+        return super()._code(request)
+
+    def _review(self, request: AgentRequest) -> AgentResult:
+        if '"id": "SW-02"' in request.prompt:
+            self.other_reviewed.set()
+        return super()._review(request)
+
+
+def test_swarm_teams_advance_without_waiting_for_a_slow_team(tmp_path: Path) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    box_ref: list = []
+    runner = SlowTeam(backlog_json(count=2), box_ref)
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=2, teams=2)
+    box_ref.append(box)
+    state = box.run()
+
+    assert state.status == "completed"
+    assert runner.released, "a slow team must not hold the other team at a round barrier"
+    assert runner.claim_on_disk, "the claim and its worktrees are durable before agents run"
+
+
+class FlakyCoder(SwarmRunner):
+    def __init__(self, backlog: str):
+        super().__init__(backlog)
+        self.failed_once = False
+
+    def _code(self, request: AgentRequest) -> AgentResult:
+        with self._lock:
+            fail, self.failed_once = not self.failed_once, True
+        if fail:
+            raise AgentFailure("swarm_coder timed out after 3600s", raw_output="slow")
+        return super()._code(request)
+
+
+def test_swarm_agent_retry_is_a_visible_event(tmp_path: Path) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    runner = FlakyCoder(backlog_json(count=1))
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=1, teams=1)
+    state = box.run()
+
+    assert state.status == "completed"
+    [retry] = [event for event in events(box) if event["kind"] == "swarm.agent-retry"]
+    assert "attempt 1/3" in retry["message"] and "timed out" in retry["message"]
