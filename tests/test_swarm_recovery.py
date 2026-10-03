@@ -7,19 +7,38 @@ in a row. These tests pin each of those paths.
 """
 
 import json
+import os
 import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
+from conftest import CENTRAL_STUB
 from forge import cli
-from forge.agents import AgentRequest, AgentTimeout, AgentUsageLimit
+from forge import swarm as swarm_module
+from forge.agents import (
+    AgentPolicyRefused,
+    AgentRequest,
+    AgentRunner,
+    AgentTimeout,
+    AgentUsageLimit,
+)
+from forge.locking import ExecutionLocked, RepositoryExecutionLock
 from forge.models import ModelSpec, RunConfig
-from forge.policy import CHEAP_CODER_POOL, LUNA, SOL, load_policy
-from forge.swarm import SwarmController, SwarmTask, SwarmTeam
+from forge.policy import (
+    CENTRAL_POLICY_ENV,
+    CHEAP_CODER_POOL,
+    LUNA,
+    PROMOTION_ACTIVE,
+    SOL,
+    PromotionSnapshot,
+    load_policy,
+)
+from forge.swarm import SwarmController, SwarmFailed, SwarmGitError, SwarmTask, SwarmTeam
 
 from test_swarm import (
     CancelMidRound,
@@ -351,3 +370,292 @@ def test_cli_swarm_status_reports_progress_and_a_dead_controller(tmp_path: Path,
     [team] = status["teams"]
     assert team["phase"] == "code" and len(team["done_jobs"]) == 1
     assert status["controller"]["pid"] and status["inflight"] == []
+
+
+# ---------------------------------------------------------------------------
+# Independent review findings on 9543e34: crash durability, live-policy and
+# quota refusals, systemic preparation faults, heartbeat, migration ownership
+
+
+class SlowSibling(SwarmRunner):
+    """The first coder finishes at once; its sibling waits for the test."""
+
+    def __init__(self, backlog: str):
+        super().__init__(backlog)
+        self.release = threading.Event()
+        self.first_mode = ""
+
+    def _code(self, request: AgentRequest):
+        with self._lock:
+            first = not self.first_mode
+            if first:
+                self.first_mode = str(request.cwd)
+        if not first:
+            assert self.release.wait(30)
+        return super()._code(request)
+
+
+def test_a_finished_sibling_is_durable_while_the_other_coder_still_runs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    runner = SlowSibling(backlog_json(count=1))
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=1, teams=1)
+    waits: list[float] = []
+    original_wait = SwarmController._wait_for_any
+
+    def counted(in_flight):
+        started = time.monotonic()
+        original_wait(in_flight)
+        waits.append(time.monotonic() - started)
+
+    monkeypatch.setattr(SwarmController, "_wait_for_any", staticmethod(counted))
+    outcome: dict = {}
+    thread = threading.Thread(target=lambda: outcome.setdefault("state", box.run()), daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 20
+        durable: list = []
+        while time.monotonic() < deadline:
+            path = box.store.root / "swarm/state.json"
+            teams = json.loads(path.read_text())["teams"] if path.is_file() else []
+            durable = teams[0].get("done_jobs") or [] if teams else []
+            if durable:
+                break
+            time.sleep(0.02)
+        # What a SIGKILL right now would leave on disk: the finished coder.
+        assert len(durable) == 1 and durable[0].startswith("swarm/tasks/SW-01/code-")
+        assert not runner.release.is_set()
+        count = len(waits)
+        time.sleep(0.5)
+        # A finished future held beside a running one must not spin the loop.
+        assert len(waits) - count <= 5, len(waits) - count
+    finally:
+        runner.release.set()
+        thread.join(30)
+    assert outcome["state"].status == "completed", outcome["state"].message
+    coders = [request for request in runner.requests if request.role == "swarm_coder"]
+    assert [str(request.cwd) for request in coders].count(runner.first_mode) == 2, (
+        "the finished coder ran once for code and once for its revision only"
+    )
+
+
+def closed_runner() -> AgentRunner:
+    # The real runner's own gate with a central policy that allows nothing.
+    return AgentRunner(policy=PromotionSnapshot(state=PROMOTION_ACTIVE, central=frozenset()))
+
+
+def test_the_runner_policy_refusal_stops_the_swarm_and_keeps_team_and_attempt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    box = make_controller(repo, brief, SwarmRunner(backlog_json(count=1)), tmp_path,
+                          min_backlog=1, teams=1)
+    team = winner_team(box, repo, done_jobs=[])
+    worktrees = dict(team.worktrees)
+    box.runner = closed_runner()
+    monkeypatch.setattr(
+        "forge.agents.subprocess.Popen",
+        lambda *a, **k: pytest.fail("a refused model must not launch"),
+    )
+    [first, second] = box._round_jobs(team)
+    outcomes = []
+    for job in (first, second):
+        try:
+            outcomes.append((job, box._invoke(job)))
+        except Exception as exc:  # the real exception type, not a stand-in
+            outcomes.append((job, exc))
+    assert all(isinstance(outcome, AgentPolicyRefused) for _, outcome in outcomes)
+
+    with pytest.raises(SwarmFailed, match="quota or policy"):
+        box._apply_results(outcomes)
+    assert box.state.teams == [team] and team.worktrees == worktrees
+    [task] = box.state.tasks
+    assert task.status == "in_progress" and task.attempts == 0
+    assert state_of(repo, box.run_id)["teams"][0]["worktrees"] == worktrees
+
+
+QUOTA_BLOCKED_STUB = CENTRAL_STUB.replace(
+    "def assert_launchable(model, now=None):\n    return model\n",
+    "def assert_launchable(model, now=None):\n"
+    "    if model.startswith('openai-codex/'):\n"
+    "        raise ValueError(f\"{model!r} quota account 'openai' is blocked until \"\n"
+    "                         \"2099-01-01T00:00:00+00:00 (quota: weekly)\")\n"
+    "    return model\n",
+)
+
+
+@pytest.mark.parametrize(
+    ("stub", "expected", "launches"),
+    [
+        (QUOTA_BLOCKED_STUB, AgentUsageLimit, False),
+        (CENTRAL_STUB.split("def assert_launchable")[0], AgentPolicyRefused, False),
+        (CENTRAL_STUB, None, True),
+    ],
+    ids=["quota-blocked", "no-central-quota-gate", "launchable"],
+)
+def test_the_runner_runs_the_central_quota_preflight_before_launch(
+    tmp_path: Path, monkeypatch, stub: str, expected, launches: bool
+) -> None:
+    central = tmp_path / "central_policy.py"
+    central.write_text(stub, encoding="utf-8")
+    monkeypatch.setenv(CENTRAL_POLICY_ENV, str(central))
+    launched: list = []
+
+    def popen(*args, **kwargs):
+        launched.append(args)
+        raise OSError("launch reached in test")
+
+    monkeypatch.setattr("forge.agents.subprocess.Popen", popen)
+    request = AgentRequest(role="swarm_coder", model=LUNA, prompt="x", cwd=tmp_path / "cwd")
+    if expected is None:
+        with pytest.raises(OSError, match="launch reached"):
+            AgentRunner().run(request)
+    else:
+        with pytest.raises(expected, match="not launchable"):
+            AgentRunner().run(request)
+    assert bool(launched) is launches
+
+
+def test_systemic_worktree_preparation_failures_trip_the_breaker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, brief = repo_and_brief(tmp_path)
+    box = make_controller(repo, brief, SwarmRunner(backlog_json(count=3)), tmp_path,
+                          min_backlog=3)
+
+    def broken(*_args, **_kwargs):
+        raise SwarmGitError("git worktree add failed: No space left on device")
+
+    monkeypatch.setattr(box, "_create_worktree", broken)
+    state = run_bounded(box)
+
+    assert state.status == "failed"
+    assert "circuit breaker" in state.message
+    assert all(task.status != "dropped" for task in state.tasks), "the backlog is kept"
+    assert all(task.attempts == 0 for task in state.tasks), "tripping failures are refunded"
+
+
+def heartbeat_of(box: SwarmController) -> dict:
+    return json.loads((box.store.root / "swarm/heartbeat.json").read_text())
+
+
+class SlowPlanner(SwarmRunner):
+    """A planner that blocks the controller thread for a while."""
+
+    def __init__(self, backlog: str, box_ref: dict):
+        super().__init__(backlog)
+        self.box_ref = box_ref
+        self.seen: list[dict] = []
+        self.written: set[int] = set()
+
+    def _plan(self, request: AgentRequest):
+        box = self.box_ref["box"]
+        for _ in range(8):
+            self.seen.append(heartbeat_of(box))
+            self.written.add((box.store.root / "swarm/heartbeat.json").stat().st_mtime_ns)
+            time.sleep(0.1)
+        return super()._plan(request)
+
+
+def test_heartbeat_shows_a_blocking_planner_ticks_and_ends_terminal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(swarm_module, "HEARTBEAT_SECONDS", 0.05)
+    repo, brief = repo_and_brief(tmp_path)
+    ref: dict = {}
+    runner = SlowPlanner(backlog_json(count=1), ref)
+    box = make_controller(repo, brief, runner, tmp_path, min_backlog=1, teams=1)
+    ref["box"] = box
+    state = run_bounded(box)
+    assert state.status == "completed", state.message
+
+    # Visible while it runs, even inside the throttle window, and the
+    # heartbeat keeps ticking while the planner blocks the controller.
+    assert all(
+        any(item["role"] == "planner" for item in beat["inflight"]) for beat in runner.seen
+    )
+    assert len(runner.written) > 1, "the heartbeat went stale"
+    final = heartbeat_of(box)
+    assert final["status"] == "completed" and final["inflight"] == []
+    assert final["run_id"] == box.run_id and final["controller_id"]
+    assert final["pid_start_ticks"] == swarm_module.process_start_ticks(os.getpid())
+
+
+def test_swarm_status_does_not_trust_a_reused_pid(tmp_path: Path, capsys) -> None:
+    repo, _, box = interrupted_run(tmp_path)
+    beat = heartbeat_of(box)
+    assert beat["status"] == "cancelled" and beat["inflight"] == []
+    # This test process is alive, but it is not the recorded controller.
+    beat["pid_start_ticks"] = "1"
+    (box.store.root / "swarm/heartbeat.json").write_text(json.dumps(beat))
+    assert cli.main(["swarm-status", "--repo", str(repo), "--run-id", box.run_id]) == 0
+    controller = json.loads(capsys.readouterr().out)["controller"]
+    assert controller["pid"] == os.getpid()
+    assert controller["alive"] is False and controller["identity_verified"] is False
+    assert controller["heartbeat_status"] == "cancelled"
+
+
+def run_files(box: SwarmController) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(box.store.root)): path.read_bytes()
+        for path in sorted(box.store.root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_a_resume_migration_writes_nothing_before_it_owns_the_repository(
+    tmp_path: Path,
+) -> None:
+    repo, _, box = interrupted_run(tmp_path)
+    retire_planner(repo, box.run_id)
+    before = run_files(box)
+    runner = SwarmRunner(backlog_json(count=1))
+    options = {"runner": runner, "state_home": tmp_path / "state", "teams": 1,
+               "min_backlog": 1}
+
+    holder = RepositoryExecutionLock(repo, "main", "other-controller")
+    holder.acquire()
+    try:
+        blocked = SwarmController.resume_existing(
+            repo, box.run_id, migrate_models=True, **options
+        )
+        assert blocked.config.models["planner"] == SOL
+        assert run_files(box) == before, "resume_existing wrote before owning the run"
+        with pytest.raises(ExecutionLocked):
+            blocked.run()
+        assert run_files(box) == before, "a refused takeover changed the run"
+    finally:
+        holder.release()
+
+    state = run_bounded(
+        SwarmController.resume_existing(repo, box.run_id, migrate_models=True, **options)
+    )
+    assert state.status == "completed", state.message
+    assert ModelSpec(**config_of(repo, box.run_id)["models"]["planner"]) == SOL
+    root = box.store.root
+    assert len(list(root.glob("config.pre-migration-*.json"))) == 1
+    assert len((root / "swarm/migrations.jsonl").read_text().splitlines()) == 1
+    # Repeating the explicit migration is a no-op: no second backup.
+    again = SwarmController.resume_existing(repo, box.run_id, migrate_models=True, **options)
+    assert again._migration is None
+    assert len(list(root.glob("config.pre-migration-*.json"))) == 1
+
+
+def test_a_controller_refuses_state_another_controller_changed_since_loading(
+    tmp_path: Path,
+) -> None:
+    repo, _, box = interrupted_run(tmp_path)
+    stale = SwarmController.resume_existing(
+        repo, box.run_id, runner=SwarmRunner(backlog_json(count=1)),
+        state_home=tmp_path / "state", teams=1, min_backlog=1,
+    )
+    # Another controller advanced the run after this one loaded it.
+    path = box.store.root / "swarm/state.json"
+    newer = json.loads(path.read_text())
+    newer["message"] = "written by a newer controller"
+    path.write_text(json.dumps(newer))
+    before = run_files(box)
+    with pytest.raises(SwarmFailed, match="changed after this controller loaded"):
+        stale.run()
+    assert run_files(box) == before

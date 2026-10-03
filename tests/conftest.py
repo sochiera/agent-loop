@@ -27,6 +27,10 @@ def validate_model(model, harness=None):
     if harness is not None and harness != HARNESSES[model]:
         raise ValueError(f"model {model!r} requires harness {HARNESSES[model]!r}")
     return model
+
+
+def assert_launchable(model, now=None):
+    return model
 '''
 
 

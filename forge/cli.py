@@ -179,6 +179,8 @@ def swarm_status(repo: Path, run_id: str) -> dict:
         except (TypeError, ValueError):
             return None
 
+    from forge.swarm import process_start_ticks
+
     pid = int(heartbeat.get("pid") or 0)
     alive = False
     if pid:
@@ -189,6 +191,12 @@ def swarm_status(repo: Path, run_id: str) -> dict:
             alive = False
         except PermissionError:
             alive = True
+    # A live pid alone may be a later process reusing it: the controller is
+    # the process whose start time the heartbeat recorded.
+    recorded = str(heartbeat.get("pid_start_ticks") or "")
+    identity_verified = bool(alive and recorded and process_start_ticks(pid) == recorded)
+    if recorded and not identity_verified:
+        alive = False
     counts: dict[str, int] = {}
     for task in state.get("tasks", []):
         counts[task["status"]] = counts.get(task["status"], 0) + 1
@@ -210,6 +218,9 @@ def swarm_status(repo: Path, run_id: str) -> dict:
         "controller": {
             "pid": pid,
             "alive": alive,
+            "identity_verified": identity_verified,
+            "controller_id": heartbeat.get("controller_id", ""),
+            "heartbeat_status": heartbeat.get("status"),
             "heartbeat_age_seconds": age(heartbeat.get("updated_at", "")),
         },
         "inflight": [
@@ -321,7 +332,13 @@ def main(argv: list[str] | None = None) -> int:
             signal.SIGTERM,
             lambda _signum, _frame: threading.Thread(target=controller.cancel, daemon=True).start(),
         )
-        controller.run()
+        from forge.locking import ExecutionLocked
+
+        try:
+            controller.run()
+        except (SwarmFailed, ExecutionLocked) as exc:
+            # Refused before taking over the run: nothing durable changed.
+            raise SystemExit(f"forge {args.command}: {exc}")
         summary = controller.summary()
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0 if summary["status"] in {"completed", "cancelled"} else 1

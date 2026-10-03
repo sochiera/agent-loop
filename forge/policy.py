@@ -293,13 +293,8 @@ def _read_promotion_state(path: Path) -> tuple[str, str]:
     return PROMOTION_UNKNOWN, "default"
 
 
-def central_allowed_identities(script: str | Path | None = None) -> frozenset[str]:
-    """Forge identities the central policy allows now, on their own harness.
-
-    Each candidate goes through the central ``validate_model(id, harness)``
-    gate, the same one the harness wrappers run before launch. Any failure to
-    load the module allows nothing (fail closed).
-    """
+def _central_module(script: str | Path | None = None) -> Any | None:
+    """Load the central policy module; ``None`` when it cannot be loaded."""
 
     if script:
         target = Path(script).expanduser()
@@ -309,10 +304,24 @@ def central_allowed_identities(script: str | Path | None = None) -> frozenset[st
     try:
         module_spec = importlib.util.spec_from_file_location("_forge_central_policy", target)
         if module_spec is None or module_spec.loader is None:
-            return frozenset()
+            return None
         module = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(module)
     except Exception:
+        return None
+    return module
+
+
+def central_allowed_identities(script: str | Path | None = None) -> frozenset[str]:
+    """Forge identities the central policy allows now, on their own harness.
+
+    Each candidate goes through the central ``validate_model(id, harness)``
+    gate, the same one the harness wrappers run before launch. Any failure to
+    load the module allows nothing (fail closed).
+    """
+
+    module = _central_module(script)
+    if module is None:
         return frozenset()
     allowed: set[str] = set()
     for identity, policy_id in POLICY_IDS.items():
@@ -323,6 +332,33 @@ def central_allowed_identities(script: str | Path | None = None) -> frozenset[st
             continue
         allowed.add(identity)
     return frozenset(allowed)
+
+
+def central_launch_refusal(
+    spec: ModelSpec, script: str | Path | None = None
+) -> tuple[str, str] | None:
+    """Ask the central ``assert_launchable`` whether ``spec`` may start now.
+
+    Returns ``None`` when it may, else ``(kind, reason)`` with kind ``quota``
+    (its subscription is hard-blocked) or ``policy`` (the central module, its
+    quota gate or the model's central id is unavailable: fail closed). This is
+    the quota preflight the harness wrappers run; Forge launches native
+    harness binaries, so it must run it itself.
+    """
+
+    policy_id = POLICY_IDS.get(model_identity(spec))
+    if policy_id is None:
+        return "policy", f"{spec.display()} has no central policy id"
+    module = _central_module(script)
+    gate = getattr(module, "assert_launchable", None) if module is not None else None
+    if not callable(gate):
+        return "policy", "the central policy quota gate (assert_launchable) is unavailable"
+    try:
+        gate(policy_id)
+    except Exception as exc:  # the central PolicyError, or a broken gate
+        kind = "quota" if "quota" in str(exc).lower() else "policy"
+        return kind, f"{policy_id}: {exc}"
+    return None
 
 
 def load_policy(path: str | Path | None = None) -> PromotionSnapshot:

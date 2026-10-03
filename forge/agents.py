@@ -15,7 +15,7 @@ from typing import Any
 
 from .artifacts import atomic_write
 from .models import AgentResult, ModelSpec, Usage
-from .policy import PromotionSnapshot, load_policy
+from .policy import PromotionSnapshot, central_launch_refusal, load_policy
 from .validation import _signal_session
 
 
@@ -38,7 +38,8 @@ class AgentUsageLimit(AgentConfigurationFailure):
 
 
 class AgentPolicyRefused(AgentConfigurationFailure):
-    """The harness wrapper's central policy gate refused the model (exit 78)."""
+    """The central policy refused the model: the runner's own gate before
+    launch, or the harness wrapper's gate (exit 78)."""
 
 
 class AgentCancelled(AgentFailure):
@@ -271,11 +272,24 @@ class AgentRunner:
     def _ensure_policy(self, request: AgentRequest) -> None:
         snapshot = self._current_policy()
         if not snapshot.allows(request.model, request.role):
-            raise AgentConfigurationFailure(
+            raise AgentPolicyRefused(
                 f"{request.role} model {request.model.display()} is not allowed by "
                 f"the active model policy (promotion_state={snapshot.state})"
             )
         request.model = snapshot.pin(request.model)
+
+    def _ensure_launchable(self, request: AgentRequest) -> None:
+        """Central quota preflight right before the native harness starts:
+        a hard-blocked subscription must not launch (fail closed)."""
+
+        refusal = central_launch_refusal(request.model)
+        if refusal is None:
+            return
+        kind, reason = refusal
+        failure = AgentUsageLimit if kind == "quota" else AgentPolicyRefused
+        raise failure(
+            f"{request.role} model {request.model.display()} is not launchable now: {reason}"
+        )
 
     def cancel(self) -> None:
         with self._lock:
@@ -311,6 +325,7 @@ class AgentRunner:
         self._ensure_policy(request)
         request.cwd.mkdir(parents=True, exist_ok=True)
         command = self._command(request)
+        self._ensure_launchable(request)
         environment = os.environ.copy()
         environment.update(request.environment)
         started = time.monotonic()

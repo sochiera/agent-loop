@@ -26,6 +26,7 @@ visit adds tasks and reprioritizes everything.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -107,6 +108,26 @@ class SwarmFailed(RuntimeError):
 
 class SwarmGitError(RuntimeError):
     pass
+
+
+def process_start_ticks(pid: int) -> str:
+    """The kernel start time of ``pid`` (``/proc/<pid>/stat`` field 22), so
+    an observer can tell the controller from a later process reusing its pid;
+    empty when unknown."""
+
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    fields = stat.rsplit(")", 1)[-1].split()
+    return fields[19] if len(fields) > 19 else ""
+
+
+def _digest(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
 
 
 def repository_context(repo: Path) -> str:
@@ -423,11 +444,21 @@ class SwarmController:
         self._failure_streak: list[str] = []
         self._inflight: dict[str, dict[str, Any]] = {}
         self._heartbeat_at = 0.0
+        self._heartbeat_write = threading.Lock()
+        # Set when an agent starts or ends: the heartbeat thread writes now.
+        self._heartbeat_wake = threading.Event()
         self._lock = threading.RLock()
         self._control = threading.Condition()
         self._executor: ThreadPoolExecutor | None = None
         self._paused = False
         self._cancel_requested = False
+        self._controller_id = uuid.uuid4().hex
+        self._pid_start_ticks = process_start_ticks(os.getpid())
+        # The durable state this controller loaded or last wrote; run()
+        # refuses to take over when another controller changed it since.
+        self._state_digest = ""
+        # A resume migration, written only once run() owns the repository.
+        self._migration: dict[str, Any] | None = None
 
         self.planner = self._staff_model("planner", allowed=set(SWARM_STAFF["planner"]))
         self.strong_reviewer = self._staff_model("reviewer", allowed=set(SWARM_STAFF["reviewer"]))
@@ -438,6 +469,7 @@ class SwarmController:
             )
         if resume:
             self.state = SwarmRunState.from_dict(self._load_swarm_state())
+            self._state_digest = _digest(self.store.root / "swarm" / "state.json")
             # The conflict cap per task family survives a restart.
             for task in self.state.tasks:
                 if task.status == "conflict":
@@ -462,7 +494,8 @@ class SwarmController:
         An off-policy roster (e.g. a retired planner) is refused unless
         ``migrate_models`` is set; the migration rewrites only the refused
         entries, backs up the old config and is recorded in the run. Tasks,
-        teams, worktrees and patches are untouched.
+        teams, worktrees and patches are untouched. Nothing is written here:
+        ``run()`` applies the migration once it owns the repository.
         """
 
         repo = Path(repo).expanduser().resolve()
@@ -470,7 +503,8 @@ class SwarmController:
         config_path = root / "config.json"
         if not (root / "swarm" / "state.json").is_file() or not config_path.is_file():
             raise SwarmFailed(f"no swarm run {run_id} under {repo}")
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        original = config_path.read_text(encoding="utf-8")
+        raw = json.loads(original)
         config = RunConfig.from_dict(raw)
         config.repo = str(repo)
         if policy_path:
@@ -486,21 +520,43 @@ class SwarmController:
                     f"{', '.join(refused)}; resume with --migrate-models to move "
                     "them onto the current policy"
                 )
-        if changes or config.policy_path != str(raw.get("policy_path") or ""):
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            (root / f"config.pre-migration-{stamp}.json").write_text(
-                config_path.read_text(encoding="utf-8"), encoding="utf-8"
-            )
-            ArtifactStore(repo, run_id).write_data("config.json", config.to_dict())
         controller = cls(config, run_id=run_id, resume=True, **options)
+        if changes or config.policy_path != str(raw.get("policy_path") or ""):
+            controller._migration = {"original": original, "changes": changes}
+        return controller
+
+    def _take_ownership(self) -> None:
+        """Under the repository lock: refuse a state another controller changed
+        since this one loaded it, then write the pending resume migration."""
+
+        state_path = self.store.root / "swarm" / "state.json"
+        if self._state_digest and _digest(state_path) != self._state_digest:
+            raise SwarmFailed(
+                f"swarm state of run {self.run_id} changed after this controller loaded "
+                "it (another controller ran meanwhile); start swarm-resume again"
+            )
+        migration, self._migration = self._migration, None
+        if migration is None:
+            return
+        config_path = self.store.root / "config.json"
+        if config_path.read_text(encoding="utf-8") != migration["original"]:
+            raise SwarmFailed(
+                f"config of run {self.run_id} changed after this controller loaded it; "
+                "start swarm-resume again"
+            )
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        (self.store.root / f"config.pre-migration-{stamp}.json").write_text(
+            migration["original"], encoding="utf-8"
+        )
+        self.store.write_data("config.json", self.config.to_dict())
+        changes = migration["changes"]
         if changes:
-            controller.store.append_jsonl(
+            self.store.append_jsonl(
                 "swarm/migrations.jsonl", {"at": utc_now(), "changes": changes}
             )
             for role, change in changes.items():
-                controller._warning(f"model migration on resume: {role} {change}")
-            controller.persist("migrated the roster to the current model policy")
-        return controller
+                self._warning(f"model migration on resume: {role} {change}")
+            self.persist("migrated the roster to the current model policy")
 
     def _install_local_excludes(self) -> None:
         """Add the .forge artifact store to the local git excludes; do not
@@ -548,7 +604,8 @@ class SwarmController:
         with self._lock:
             state = self.state
             state.message = message or state.message
-            self.store.write_data("swarm/state.json", state.to_dict())
+            path = self.store.write_data("swarm/state.json", state.to_dict())
+            self._state_digest = _digest(path)
             if not (self.store.root / "config.json").is_file():
                 self.store.write_data("config.json", self.config.to_dict())
         self.store.event(
@@ -570,13 +627,26 @@ class SwarmController:
         with its start time, so an observer can tell a long agent from a
         dead controller without reading worker logs."""
 
-        now = time.monotonic()
+        # Writers serialize on their own lock, so a slow disk never holds the
+        # state lock and the newest snapshot is always the last one written.
+        with self._heartbeat_write:
+            now = time.monotonic()
+            with self._lock:
+                if not force and now - self._heartbeat_at < HEARTBEAT_SECONDS:
+                    return
+                self._heartbeat_at = now
+                payload = self._heartbeat_payload()
+            self.store.write_data("swarm/heartbeat.json", payload)
+
+    def _heartbeat_payload(self) -> dict[str, Any]:
         with self._lock:
-            if not force and now - self._heartbeat_at < HEARTBEAT_SECONDS:
-                return
-            self._heartbeat_at = now
-            payload = {
+            return {
                 "pid": os.getpid(),
+                # With the pid start time, tells this controller from a later
+                # process that reuses its pid.
+                "pid_start_ticks": self._pid_start_ticks,
+                "controller_id": self._controller_id,
+                "run_id": self.run_id,
                 "updated_at": utc_now(),
                 "status": self.state.status,
                 "agent_timeout_seconds": self.config.agent_timeout_seconds,
@@ -587,7 +657,20 @@ class SwarmController:
                     for team in self.state.teams
                 ],
             }
-            self.store.write_data("swarm/heartbeat.json", payload)
+
+    def _heartbeat_loop(self, stop: threading.Event) -> None:
+        """Tick while the controller blocks in a planner call, validation or
+        a pause, where the dispatch loop writes no heartbeat."""
+
+        while True:
+            self._heartbeat_wake.wait(HEARTBEAT_SECONDS)
+            if stop.is_set():
+                return
+            self._heartbeat_wake.clear()
+            try:
+                self.heartbeat(force=True)
+            except OSError:
+                continue
 
     def _warning(self, message: str) -> None:
         with self._lock:
@@ -771,7 +854,7 @@ class SwarmController:
                     "attempt": attempt,
                     "started_at": utc_now(),
                 }
-            self.heartbeat()
+            self._job_heartbeat(job)
             try:
                 result = self.runner.run(
                     AgentRequest(
@@ -823,6 +906,7 @@ class SwarmController:
             finally:
                 with self._lock:
                     self._inflight.pop(relative, None)
+                self._job_heartbeat(job)
             self.store.write_text(f"{relative}.response.md", result.text.rstrip() + "\n")
             self.store.record_agent_call(
                 role=role,
@@ -834,6 +918,16 @@ class SwarmController:
             return result
         assert last_error is not None
         raise last_error
+
+    def _job_heartbeat(self, job: dict[str, Any]) -> None:
+        """Make an agent's start and end visible at once, inside the throttle
+        window too. A planner blocks the controller thread, so it writes
+        itself; team agents only wake the heartbeat thread, so their start
+        never waits for a disk write."""
+        if job.get("team_id", 0) == 0:
+            self.heartbeat(force=True)
+        else:
+            self._heartbeat_wake.set()
 
     def _dispatch(
         self, jobs: list[dict[str, Any]]
@@ -858,19 +952,37 @@ class SwarmController:
     def _wait_for_any(
         in_flight: dict[int, list[tuple[dict[str, Any], Future[AgentResult]]]]
     ) -> None:
-        # The short timeout keeps operator pause and cancel responsive.
-        futures = [future for jobs in in_flight.values() for _, future in jobs]
-        wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
+        # Only unfinished futures: a finished one held beside a running sibling
+        # would end every wait at once and spin the controller. The short
+        # timeout keeps operator pause and cancel responsive.
+        futures = [
+            future for jobs in in_flight.values() for _, future in jobs if not future.done()
+        ]
+        if futures:
+            wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
 
     def _collect_finished(
         self, in_flight: dict[int, list[tuple[dict[str, Any], Future[AgentResult]]]]
     ) -> None:
-        """Apply the results of every team whose agents of this round finished."""
+        """Apply and persist every finished agent result as soon as it exists,
+        so a controller crash never pays for it twice. A failure waits for its
+        team's other agents: dropping the pair must not pull a worktree from
+        under a running sibling."""
         for team_id in list(in_flight):
-            if not all(future.done() for _, future in in_flight[team_id]):
+            jobs = in_flight[team_id]
+            if all(future.done() for _, future in jobs):
+                # The main loop advances the team once no job of its phase remains.
+                self._apply_results(self._outcomes(in_flight.pop(team_id)))
                 continue
-            # The main loop advances the team once no job of its phase remains.
-            self._apply_results(self._outcomes(in_flight.pop(team_id)))
+            succeeded = [
+                (job, future)
+                for job, future in jobs
+                if future.done() and not future.cancelled() and future.exception() is None
+            ]
+            if not succeeded:
+                continue
+            in_flight[team_id] = [item for item in jobs if item not in succeeded]
+            self._apply_results(self._outcomes(succeeded))
 
     def _drain(
         self, in_flight: dict[int, list[tuple[dict[str, Any], Future[AgentResult]]]]
@@ -1821,6 +1933,19 @@ class SwarmController:
         lock = RepositoryExecutionLock(self.repo, self.config.branch, self.run_id)
         lock.acquire()
         try:
+            # Nothing durable changes before this: a refusal leaves the run
+            # exactly as the other controller wrote it.
+            self._take_ownership()
+        except BaseException:
+            lock.release()
+            raise
+        stop_ticker = threading.Event()
+        ticker = threading.Thread(
+            target=self._heartbeat_loop, args=(stop_ticker,), name="forge-swarm-heartbeat",
+            daemon=True,
+        )
+        ticker.start()
+        try:
             self._executor = ThreadPoolExecutor(max_workers=SWARM_AGENTS_CAP)
             self._run_locked()
         except (SwarmCancelled, KeyboardInterrupt):
@@ -1845,6 +1970,14 @@ class SwarmController:
             executor, self._executor = self._executor, None
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
+            stop_ticker.set()
+            self._heartbeat_wake.set()
+            ticker.join()
+            try:
+                # Terminal: the final status and no agent left in flight.
+                self.heartbeat(force=True)
+            except OSError:
+                pass
             lock.release()
         return self.state
 
@@ -1904,6 +2037,13 @@ class SwarmController:
                         self._prepare_worktrees(team)
                     except SwarmGitError as exc:
                         self._drop_team(team, f"worktree preparation failed: {exc}")
+                        # A systemic fault (full disk, broken repository)
+                        # fails every pair here; stop before the backlog drops.
+                        with self._lock:
+                            self._failure_streak.append(team.task_id)
+                        tripped = self._trip_breaker()
+                        if tripped:
+                            raise SwarmFailed(tripped)
                         continue
                     jobs = self._round_jobs(team)
                     if jobs:
