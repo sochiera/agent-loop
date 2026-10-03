@@ -19,6 +19,7 @@ from typing import Any, Callable
 from .artifacts import atomic_write
 from .access import REALM, AccessGate
 from .catalog import assign_coder_models, catalog_payload, DEFAULTS
+from .external import ExternalRunReadOnly, ExternalRunWatcher, WATCH_REPOS_ENV
 from .gitops import list_branches, repository_summary
 from .locking import ExecutionLocked
 from .models import (
@@ -298,10 +299,36 @@ class LiveRun:
 
 
 class RunRegistry:
-    def __init__(self, state_home: Path | None = None):
+    def __init__(
+        self,
+        state_home: Path | None = None,
+        *,
+        watch_repos: list[str] | tuple[str, ...] = (),
+    ):
         self.state_home = state_home
         self._runs: dict[str, LiveRun] = {}
         self._lock = threading.Lock()
+        # CLI-owned runs (swarm-run, swarm-resume, ...): observed, never owned.
+        self.external = ExternalRunWatcher(
+            state_home, watch_repos=watch_repos, known_repos=self._known_repos
+        )
+
+    def _known_repos(self) -> list[str]:
+        with self._lock:
+            repos = [live.orchestrator.config.repo for live in self._runs.values()]
+        preferred = self._read_preferences().get("repo")
+        return [*repos, preferred] if preferred else repos
+
+    def _panel_ids(self) -> list[str]:
+        with self._lock:
+            return list(self._runs)
+
+    def _refuse_external(self, run_id: str) -> None:
+        if not self.external.owns(run_id):
+            # A control request may arrive before any listing cached the run.
+            self.external.list(exclude=self._panel_ids())
+        if self.external.owns(run_id):
+            raise ExternalRunReadOnly(self.external.control_note(run_id))
 
     def start(self, payload: dict[str, Any]) -> dict[str, Any]:
         repo = Path(str(payload["repo"])).expanduser().resolve()
@@ -482,20 +509,36 @@ class RunRegistry:
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
             values = list(self._runs.values())
+            owned = list(self._runs)
         described = [self._describe(value) for value in values]
+        described += self.external.list(exclude=owned)
         described.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return described
 
     def get(self, run_id: str) -> dict[str, Any]:
         with self._lock:
             live = self._runs.get(run_id)
+            owned = list(self._runs)
         if live is None:
-            raise KeyError(run_id)
+            return self.external.get(run_id, exclude=owned)
         return self._describe(live, detailed=True)
 
     def recover(self, payload: dict[str, Any]) -> dict[str, Any]:
         repo = Path(str(payload["repo"])).expanduser().resolve()
         run_id = str(payload["run_id"])
+        if (repo / ".forge" / "runs" / run_id / "swarm" / "state.json").is_file():
+            raise ExternalRunReadOnly(
+                "swarm runs are resumed from the CLI (forge swarm-resume); "
+                "the control room only observes them"
+            )
+        owned = self._panel_ids()
+        if run_id not in owned and any(
+            item["run_id"] == run_id and item["alive"]
+            for item in self.external.list(exclude=owned)
+        ):
+            raise ExternalRunReadOnly(
+                    "another Forge process is executing this run; the control room only observes it"
+                )
         orchestrator = ForgeOrchestrator.from_existing(repo, run_id, state_home=self.state_home)
         if payload.get("migrate_models"):
             orchestrator.migrate_models()
@@ -514,12 +557,20 @@ class RunRegistry:
     def recover_live(self, run_id: str) -> dict[str, Any]:
         with self._lock:
             live = self._runs.get(run_id)
+        if live is None:
+            self._refuse_external(run_id)
+        with self._lock:
+            live = self._runs.get(run_id)
             if live is None:
                 raise KeyError(run_id)
             self._launch_locked(live, recover=True)
         return self._describe(live)
 
     def control(self, run_id: str, action: str) -> dict[str, Any]:
+        with self._lock:
+            panel = run_id in self._runs
+        if not panel:
+            self._refuse_external(run_id)
         if action == "recover":
             with self._lock:
                 live = self._runs.get(run_id)
@@ -595,7 +646,13 @@ class ForgeHandler(BaseHTTPRequestHandler):
             return self._challenge_gate()
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/health":
-            return self._json({"ok": True, "active_runs": self.registry.active_count()})
+            return self._json(
+                {
+                    "ok": True,
+                    "active_runs": self.registry.active_count(),
+                    "external_active_runs": self.registry.external.active_count(),
+                }
+            )
         if parsed.path == "/api/runs":
             return self._json(self.registry.list())
         if parsed.path.startswith("/api/runs/"):
@@ -659,16 +716,21 @@ class ForgeHandler(BaseHTTPRequestHandler):
             if self.path == "/api/runs/recover":
                 return self._json(self.registry.recover(payload), HTTPStatus.CREATED)
             parts = self.path.strip("/").split("/")
-            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "recover":
-                return self._json(self.registry.recover_live(parts[2]))
-            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] in {
-                "pause",
-                "resume",
-                "cancel",
-                "recover",
-            }:
-                return self._json(self.registry.control(parts[2], parts[3]))
+            try:
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "recover":
+                    return self._json(self.registry.recover_live(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] in {
+                    "pause",
+                    "resume",
+                    "cancel",
+                    "recover",
+                }:
+                    return self._json(self.registry.control(parts[2], parts[3]))
+            except KeyError:
+                return self._json({"error": "run not found"}, HTTPStatus.NOT_FOUND)
             return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        except ExternalRunReadOnly as exc:
+            return self._json({"error": str(exc), "read_only": True}, HTTPStatus.CONFLICT)
         except KeyError as exc:
             return self._json({"error": f"missing field: {exc}"}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
@@ -718,8 +780,12 @@ def serve(
     *,
     open_browser: bool = True,
     gate: AccessGate | None = None,
+    watch_repos: list[str] | tuple[str, ...] = (),
 ) -> None:
-    registry = RunRegistry()
+    configured = [
+        item for item in os.environ.get(WATCH_REPOS_ENV, "").split(os.pathsep) if item
+    ]
+    registry = RunRegistry(watch_repos=[*configured, *watch_repos])
     registry.restore_session()
     ctl: dict[str, Any] = {"server": None, "pending": False}
 
@@ -767,5 +833,6 @@ def serve(
                 "--port",
                 str(server.server_port),
                 "--no-browser",
+                *[argument for repo in watch_repos for argument in ("--watch-repo", repo)],
             ],
         )
