@@ -324,6 +324,9 @@ class RunRegistry:
             return list(self._runs)
 
     def _refuse_external(self, run_id: str) -> None:
+        if not self.external.owns(run_id):
+            # A control request may arrive before any listing cached the run.
+            self.external.list(exclude=self._panel_ids())
         if self.external.owns(run_id):
             raise ExternalRunReadOnly(self.external.control_note(run_id))
 
@@ -713,15 +716,18 @@ class ForgeHandler(BaseHTTPRequestHandler):
             if self.path == "/api/runs/recover":
                 return self._json(self.registry.recover(payload), HTTPStatus.CREATED)
             parts = self.path.strip("/").split("/")
-            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "recover":
-                return self._json(self.registry.recover_live(parts[2]))
-            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] in {
-                "pause",
-                "resume",
-                "cancel",
-                "recover",
-            }:
-                return self._json(self.registry.control(parts[2], parts[3]))
+            try:
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "recover":
+                    return self._json(self.registry.recover_live(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] in {
+                    "pause",
+                    "resume",
+                    "cancel",
+                    "recover",
+                }:
+                    return self._json(self.registry.control(parts[2], parts[3]))
+            except KeyError:
+                return self._json({"error": "run not found"}, HTTPStatus.NOT_FOUND)
             return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except ExternalRunReadOnly as exc:
             return self._json({"error": str(exc), "read_only": True}, HTTPStatus.CONFLICT)
