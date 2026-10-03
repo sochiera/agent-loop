@@ -409,3 +409,16 @@ def test_the_access_gate_still_guards_external_runs(tmp_path: Path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_a_control_request_before_any_listing_is_refused_as_read_only(tmp_path: Path) -> None:
+    repo, _runner, box = interrupted_run(tmp_path)
+    server, base = serve(RunRegistry(state_home=tmp_path / "state"))
+    try:
+        # No /api/runs call first: the run is not cached by the watcher yet.
+        status, value = call(base, f"/api/runs/{box.run_id}/pause", body={})
+        assert status == 409 and value["read_only"] is True
+        assert call(base, "/api/runs/no-such-run/cancel", body={})[0] == 404
+    finally:
+        server.shutdown()
+        server.server_close()
