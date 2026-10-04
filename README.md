@@ -229,6 +229,59 @@ more, three are drawn. Weighted coder reshuffling is enabled by default and redr
 each sprint (`--no-shuffle-coders` disables it). A single surviving eligible candidate still
 completes an iteration — the tournament degrades, it never silently becomes the design.
 
+### Feedback during a run
+
+The run detail view accepts clarifications and scope-change notes while Forge is working. Each note
+has a durable ID, status, explanation, and delivery history. Forge records it immediately, then adds
+it to the next matching agent prompt at a safe invocation boundary. A prompt already running is left
+alone. If a clarification arrives during the parallel coder tournament, Forge holds it for the
+reviewer so candidate work does not receive inconsistent input. The append-free conversation
+snapshot is written atomically to `.forge/runs/RUN_ID/conversation.json`, independently from the
+controller's run-state checkpoint, and is reloaded after recovery.
+Coder-targeted feedback waits through the parallel tournament and selection. After a winner is known,
+pending notes reach the post-selection reviewer (or the tester if review has already passed); an active
+single-writer fix boundary can receive the note directly. The agent prompt preserves the requested
+target role so the reviewer can assess it.
+If an iteration is accepted without a matching coder boundary, Forge records the item as
+`not_applied` with an explanation instead of carrying it into an unrelated iteration. If recovery
+cannot confirm a prepared prompt was completed, Forge does not replay it automatically; the
+explanation tells the user when to submit the note again.
+
+Use the CLI when the control room is not open:
+
+```bash
+python3 -m forge feedback add --repo /path/to/product --run-id RUN_ID \
+  --message "Keep the existing error response shape." --target-role reviewer
+python3 -m forge feedback list --repo /path/to/product --run-id RUN_ID
+python3 -m forge feedback decide --repo /path/to/product --run-id RUN_ID \
+  --feedback-id FEEDBACK_ID --action schedule_replan
+```
+
+`--kind scope_change` places a note in `needs_decision`. The control room or `feedback decide`
+can schedule an approved replan for the next Product Owner boundary; the active iteration and the
+rest of the current sprint keep their existing plans. CLI coder notes are bound by the orchestrator
+at the next safe boundary, so a stale state-file snapshot cannot attach them to a finished iteration.
+Clarifications move through `received`, `pending`, and `applied`. A
+deferred or rejected item remains in history, and duplicate request IDs or repeated open messages do
+not create duplicate records.
+
+Reviewers and testers can publish structured suggestions, questions, and blockers with the stage
+context, rationale, and expected impact. Non-blocking suggestions do not gate delivery. Accepting a
+suggestion or answering a question records a message through the same feedback queue. Scope changes
+still wait for a separate decision, and feedback never pauses, cancels, restarts, merges, or deploys a
+run. Repeated ordinary suggestion titles and question titles are deduplicated across the run, even
+after a question is answered. Identical blockers from the same stage are deduplicated. A later blocker
+from another iteration or with a different rationale is published separately; a blocker can be raised
+again after its earlier card was answered or rejected, and the older same-title card is marked
+superseded. Long suggestion fields are shortened to
+fit the panel and labeled. The panel limits ordinary open suggestions to 20 and questions to 50 per
+run; excess non-blocking items are counted as suppressed. Questions and blockers remain available
+when the ordinary suggestion limit is reached, while blockers are always retained.
+
+The control-room API supports `GET /api/runs/RUN_ID/feedback`,
+`POST /api/runs/RUN_ID/feedback`, `POST /api/runs/RUN_ID/feedback/FEEDBACK_ID/decision`,
+`GET /api/runs/RUN_ID/suggestions`, and `POST /api/runs/RUN_ID/suggestions/SUGGESTION_ID`.
+
 ## Command-line run
 
 Unspecified role flags are drawn from the active model policy; explicit flags override the draw but

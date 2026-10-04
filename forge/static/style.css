@@ -224,6 +224,39 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 .artifact-path { padding: 9px 11px; overflow: auto; border-radius: 8px; background: var(--soft); white-space: nowrap; font-size: 11px; }
 .run-actions { display: flex; gap: 8px; margin: 14px 0 20px; }
 
+.conversation-panel { margin: 24px 0; padding: 20px; border: 1px solid var(--line); border-radius: 13px; background: #fbfcf8; }
+.conversation-panel h3 { font-size: 20px; }
+.conversation-panel > h4 { margin: 24px 0 10px; }
+.conversation-count, .conversation-help { color: var(--muted); font-size: 11px; }
+.feedback-form { display: grid; gap: 10px; padding: 15px; border: 1px solid var(--line); border-radius: 11px; background: white; }
+.feedback-form textarea { min-height: 76px; font-family: inherit; }
+.feedback-form-controls { display: grid; grid-template-columns: minmax(170px, .7fr) minmax(210px, 1fr) auto; align-items: end; gap: 10px; }
+.feedback-form-controls select { padding: 9px 10px; font-size: 12px; }
+.conversation-help { margin: 0; }
+.feedback-row, .suggestion-card { margin: 9px 0; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: white; }
+.feedback-row > p, .suggestion-card > p { margin: 8px 0; overflow-wrap: anywhere; }
+.feedback-row-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.feedback-row-top strong { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.feedback-row > small { color: var(--muted); }
+.status-pill { padding: 4px 8px; border-radius: 999px; background: var(--soft); color: var(--muted); font-size: 10px; font-weight: 750; text-transform: uppercase; }
+.status-pill.received, .status-pill.pending { background: #e5eef8; color: var(--blue); }
+.status-pill.applied, .status-pill.accepted, .status-pill.answered { background: var(--green-soft); color: var(--green); }
+.status-pill.needs_decision, .status-pill.deferred { background: #f3e8cc; color: var(--amber); }
+.status-pill.dismissed, .status-pill.rejected { background: #f3ddd8; color: var(--red); }
+.status-pill.not_applied, .status-pill.superseded { background: #e9e8e3; color: var(--muted); }
+.feedback-decisions, .suggestion-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.feedback-decisions p { flex-basis: 100%; margin: 0 0 2px; color: var(--amber); font-size: 11px; }
+.suggestion-card h4 { margin: 9px 0 5px; }
+.suggestion-card dl { display: grid; grid-template-columns: minmax(130px, .25fr) 1fr; gap: 6px 12px; margin: 12px 0; font-size: 11px; }
+.suggestion-card dt { color: var(--muted); font-weight: 750; }
+.suggestion-card dd { margin: 0; overflow-wrap: anywhere; }
+.suggestion-card.question { border-color: #dfcca9; }
+.suggestion-card.blocker { border-color: #e3b2a8; }
+.suggestion-answer { margin: 12px 0 8px; }
+.suggestion-answer textarea { min-height: 56px; font-family: inherit; }
+.conversation-error { border-left: 3px solid var(--red); color: var(--red); padding: 9px 12px; background: #fff0ed; }
+.decision-note { padding: 8px 10px; border-radius: 7px; background: #f3e8cc; color: var(--amber); font-size: 11px; }
+
 .active-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 10px 0 22px; }
 .agent-card { position: relative; overflow: hidden; padding: 13px; border: 1px solid #b8d7c9; border-radius: 11px; background: #f4fbf7; }
 .agent-card::after { content: ""; position: absolute; left: 0; bottom: 0; width: 30%; height: 3px; background: var(--green); animation: agent-scan 1.8s ease-in-out infinite alternate; }
@@ -262,4 +295,7 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
   .section-title, .brief-head, .model-head, .submit-row { align-items: stretch; flex-direction: column; }
   .phase-rail { grid-template-columns: repeat(4, 1fr); }
   .stats, .coder-draw { grid-template-columns: repeat(2, 1fr); }
+  .feedback-form-controls { grid-template-columns: 1fr; }
+  .suggestion-card dl { grid-template-columns: 1fr; gap: 3px; }
+  .suggestion-card dd { margin-bottom: 7px; }
 }
