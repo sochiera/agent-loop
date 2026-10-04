@@ -237,8 +237,15 @@ class RunConversationStore:
                 continue
             for delivery in item["deliveries"]:
                 relative = str(delivery.get("relative") or "")
-                if delivery.get("state") != "prepared" or not relative or not delivered(
-                    relative, str(delivery.get("response_marker") or "")
+                # A delivery without a recorded marker predates this check and
+                # cannot be told apart from a stale response; leave it pending.
+                marker = delivery.get("response_marker")
+                if (
+                    delivery.get("state") != "prepared"
+                    or not relative
+                    or not isinstance(marker, str)
+                    or not marker
+                    or not delivered(relative, marker)
                 ):
                     continue
                 now = utc_now()
@@ -404,7 +411,7 @@ class RunConversationStore:
         code_started: bool = False,
         winner_role: str = "",
         delivered: Callable[[str, str], bool] | None = None,
-        response_marker: str = "",
+        response_marker: str = "absent",
     ) -> list[dict[str, Any]]:
         active_roles = active_roles or set()
         selected: list[dict[str, Any]] = []

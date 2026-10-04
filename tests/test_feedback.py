@@ -1247,7 +1247,8 @@ def test_stale_response_artifact_never_confirms_a_new_delivery(tmp_path: Path) -
     assert not orchestrator._response_after(relative, marker)
     orchestrator.store.write_text(f"{relative}.response.md", "answer with feedback\n")
     assert orchestrator._response_after(relative, marker)
-    assert not orchestrator._response_after("iteration/missing", "")
+    assert not orchestrator._response_after("iteration/missing", "absent")
+    assert orchestrator._response_marker("iteration/missing") == "absent"
 
 
 def test_repeated_deferral_with_a_different_note_is_refused(tmp_path: Path) -> None:
@@ -1268,3 +1269,26 @@ def test_repeated_deferral_with_a_different_note_is_refused(tmp_path: Path) -> N
         store.answer_suggestion(suggestion["id"], "defer", answer="Next sprint.")
     same, repeated = store.answer_suggestion(suggestion["id"], "defer", answer="After release.")
     assert same["answer"] == "After release." and repeated["id"] == first["id"]
+
+
+def test_markerless_prepared_delivery_is_not_confirmed_by_an_existing_response(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = RunConversationStore(repo, "run-legacy")
+    item, _ = store.add_feedback("Check the retry path.")
+    store.prepare_feedback(
+        role="reviewer", phase="review", iteration_id="ITER-01", relative="iteration/review-1"
+    )
+    with store._locked() as state:
+        state["feedback"][0]["deliveries"][0].pop("response_marker")
+        store._write(state)
+    store.prepare_feedback(
+        role="reviewer",
+        phase="review",
+        iteration_id="ITER-01",
+        relative="iteration/review-2",
+        delivered=lambda _relative, _marker: True,
+    )
+    assert store.snapshot()["feedback"][0]["status"] == "pending"

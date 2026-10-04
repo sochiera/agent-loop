@@ -2670,11 +2670,11 @@ class ForgeOrchestrator:
         raise AssertionError("unreachable")
 
     def _response_marker(self, relative: str) -> str:
-        """Identity of the response artifact for ``relative``; empty when absent."""
+        """Identity of the response artifact for ``relative``; ``absent`` when missing."""
         try:
             stat = (self.store.root / f"{relative}.response.md").stat()
         except OSError:
-            return ""
+            return "absent"
         return f"{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_size}"
 
     def _response_after(self, relative: str, marker_at_prepare: str) -> bool:
@@ -2684,7 +2684,7 @@ class ForgeOrchestrator:
         marker recorded when the delivery was prepared.
         """
         current = self._response_marker(relative)
-        return bool(current) and current != marker_at_prepare
+        return current != "absent" and current != marker_at_prepare
 
     @staticmethod
     def _feedback_prompt(prompt: str, feedback: list[dict[str, Any]]) -> str:
