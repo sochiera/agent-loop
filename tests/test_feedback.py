@@ -1235,3 +1235,36 @@ def test_unconfirmed_delivery_with_durable_response_is_not_sent_to_another_role(
     record = store.snapshot()["feedback"][0]
     assert record["status"] == "applied"
     assert [entry["role"] for entry in record["deliveries"]] == ["reviewer"]
+
+
+def test_stale_response_artifact_never_confirms_a_new_delivery(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path, RecordingRunner())
+    relative = "iteration/review-1"
+    orchestrator.store.write_text(f"{relative}.response.md", "earlier answer\n")
+    marker = orchestrator._response_marker(relative)
+    assert marker
+    # The earlier artifact predates this delivery, so it is no evidence.
+    assert not orchestrator._response_after(relative, marker)
+    orchestrator.store.write_text(f"{relative}.response.md", "answer with feedback\n")
+    assert orchestrator._response_after(relative, marker)
+    assert not orchestrator._response_after("iteration/missing", "")
+
+
+def test_repeated_deferral_with_a_different_note_is_refused(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = RunConversationStore(repo, "run-defer")
+    suggestion, _ = store.publish_suggestion(
+        kind="suggestion",
+        title="Split the web module.",
+        context="c",
+        rationale="r",
+        expected_impact="i",
+        recommendation="Split it.",
+        source="review:S2",
+    )
+    _, first = store.answer_suggestion(suggestion["id"], "defer", answer="After release.")
+    with pytest.raises(ValueError, match="already deferred"):
+        store.answer_suggestion(suggestion["id"], "defer", answer="Next sprint.")
+    same, repeated = store.answer_suggestion(suggestion["id"], "defer", answer="After release.")
+    assert same["answer"] == "After release." and repeated["id"] == first["id"]

@@ -17,7 +17,6 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -2551,6 +2550,7 @@ class ForgeOrchestrator:
                         code_started=code_started,
                         winner_role=winner_role,
                         delivered=self._response_after,
+                        response_marker=self._response_marker(relative),
                     )
                 except (OSError, RuntimeError):
                     feedback = []
@@ -2669,14 +2669,22 @@ class ForgeOrchestrator:
             return result
         raise AssertionError("unreachable")
 
-    def _response_after(self, relative: str, prepared_at: str) -> bool:
-        """True when the agent response for ``relative`` was written after delivery was prepared."""
-        path = self.store.root / f"{relative}.response.md"
+    def _response_marker(self, relative: str) -> str:
+        """Identity of the response artifact for ``relative``; empty when absent."""
         try:
-            prepared = datetime.fromisoformat(prepared_at).timestamp()
-            return path.stat().st_mtime >= prepared
-        except (OSError, ValueError):
-            return False
+            stat = (self.store.root / f"{relative}.response.md").stat()
+        except OSError:
+            return ""
+        return f"{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_size}"
+
+    def _response_after(self, relative: str, marker_at_prepare: str) -> bool:
+        """True when a response for ``relative`` was written after delivery was prepared.
+
+        Responses are replaced atomically, so a new answer always changes the
+        marker recorded when the delivery was prepared.
+        """
+        current = self._response_marker(relative)
+        return bool(current) and current != marker_at_prepare
 
     @staticmethod
     def _feedback_prompt(prompt: str, feedback: list[dict[str, Any]]) -> str:

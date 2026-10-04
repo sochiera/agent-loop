@@ -238,7 +238,7 @@ class RunConversationStore:
             for delivery in item["deliveries"]:
                 relative = str(delivery.get("relative") or "")
                 if delivery.get("state") != "prepared" or not relative or not delivered(
-                    relative, str(delivery.get("at") or "")
+                    relative, str(delivery.get("response_marker") or "")
                 ):
                     continue
                 now = utc_now()
@@ -404,6 +404,7 @@ class RunConversationStore:
         code_started: bool = False,
         winner_role: str = "",
         delivered: Callable[[str, str], bool] | None = None,
+        response_marker: str = "",
     ) -> list[dict[str, Any]]:
         active_roles = active_roles or set()
         selected: list[dict[str, Any]] = []
@@ -480,6 +481,9 @@ class RunConversationStore:
                         "phase": phase,
                         "at": utc_now(),
                         "state": "prepared",
+                        # Identity of any response artifact already on disk, so
+                        # recovery never mistakes it for this delivery's answer.
+                        "response_marker": response_marker,
                     }
                     item["deliveries"].append(delivery)
                     changed = True
@@ -673,6 +677,20 @@ class RunConversationStore:
             raise ValueError("an answer is required for this question")
         with self._locked() as state:
             suggestion = self._find(state["suggestions"], suggestion_id)
+            if suggestion["status"] == "deferred" and action == "defer":
+                if suggestion.get("answer") != answer_text:
+                    raise ValueError(
+                        "suggestion is already deferred; accept, reject, or answer it instead"
+                    )
+                feedback = next(
+                    (
+                        item
+                        for item in state["feedback"]
+                        if self._has_idempotency_key(item, f"suggestion:{suggestion_id}:defer")
+                    ),
+                    None,
+                )
+                return dict(suggestion), dict(feedback) if feedback else None
             if suggestion["status"] not in {"open", "deferred"}:
                 completed_actions = {"accepted": "accept", "answered": "answer", "rejected": "reject"}
                 if (
