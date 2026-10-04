@@ -515,7 +515,35 @@ function phaseRail(run) {
   }).join("")}</div>`;
 }
 
+function ageText(seconds) {
+  if (seconds === null || seconds === undefined) return "never";
+  const value = safeInteger(seconds);
+  if (value < 90) return `${value}s ago`;
+  if (value < 5400) return `${Math.round(value / 60)}m ago`;
+  return `${Math.round(value / 3600)}h ago`;
+}
+
+function externalRunCard(run) {
+  const total = safeInteger(run.tasks_total);
+  const done = safeInteger(run.tasks_done);
+  const progress = run.kind === "swarm"
+    ? Math.max(4, Math.min(100, total ? (done / total) * 100 : 0))
+    : Math.max(4, Math.min(100, (safeInteger(run.sprint_iteration) / 10) * 100));
+  const active = Object.keys(run.active_agents || {}).length;
+  const summary = run.kind === "swarm"
+    ? `${done}/${total} tasks · ${(run.teams || []).length} team(s)`
+    : `${run.phase} · sprint ${safeInteger(run.sprint_number)} · iteration ${safeInteger(run.sprint_iteration)}/10`;
+  const status = run.display_status || run.status;
+  return `<article class="run-card ${selected === run.run_id ? "selected" : ""}" data-id="${escapeHtml(run.run_id)}">
+    <div class="run-top"><span class="run-id">${escapeHtml(run.run_id)}</span><span class="badge ${escapeHtml(status)}">${escapeHtml(status)}</span></div>
+    <p class="phase"><span class="source-chip" title="${escapeHtml(run.control_note)}">CLI · ${escapeHtml(run.kind)}</span> ${escapeHtml(run.project)}</p>
+    <p class="phase">${escapeHtml(summary)}${active ? ` · ${active} active` : ""} · updated ${escapeHtml(ageText(run.freshness?.updated_age_seconds))}</p>
+    <div class="run-progress ${run.alive ? "animated" : ""}"><span style="width:${progress}%"></span></div>
+  </article>`;
+}
+
 function runCard(run) {
+  if (run.external) return externalRunCard(run);
   const sprint = safeInteger(run.sprint_number);
   const iteration = safeInteger(run.sprint_iteration);
   const progress = Math.max(4, Math.min(100, (iteration / 10) * 100));
@@ -757,13 +785,83 @@ function detail(run) {
     <h3>Recent events</h3><div class="events">${eventRows(run) || "No events yet."}</div>`;
 }
 
+function readOnlyActions(run) {
+  const note = escapeHtml(run.control_note);
+  return `<div class="control-note">${note}</div>
+    <div class="run-actions">${["Pause", "Resume", "Cancel", "Recover"].map(label =>
+      `<button class="button ghost" disabled title="${note}">${label}</button>`).join("")}</div>`;
+}
+
+function freshnessLine(run) {
+  const fresh = run.freshness || {};
+  const observed = fresh.observed_at ? new Date(fresh.observed_at).toLocaleTimeString() : "";
+  const parts = [`Read ${escapeHtml(observed)}`, `state written ${escapeHtml(ageText(fresh.state_age_seconds))}`];
+  if (run.kind === "swarm") parts.push(`heartbeat ${escapeHtml(ageText(fresh.heartbeat_age_seconds))}`);
+  const stale = fresh.heartbeat_stale ? ` <strong class="stale">heartbeat is stale</strong>` : "";
+  return `<p class="freshness">${parts.join(" · ")}${stale}</p>`;
+}
+
+function processText(run) {
+  const pid = run.controller?.pid ? ` · pid ${safeInteger(run.controller.pid)}` : "";
+  if (run.liveness === "active") return `Active${pid}`;
+  if (run.liveness === "orphaned") return "Orphaned";
+  return "Ended";
+}
+
+function swarmTeams(run) {
+  const teams = run.teams || [];
+  if (!teams.length) return `<p class="empty">No team is working right now.</p>`;
+  return `<h3>Teams</h3><table class="team-table"><thead><tr><th>Team</th><th>Task</th><th>Stage</th><th>Rounds</th><th>Coders</th></tr></thead><tbody>${teams.map(team =>
+    `<tr><td>${escapeHtml(team.team)}</td><td><strong>${escapeHtml(team.task)}</strong> ${escapeHtml(team.title)}</td><td>${escapeHtml(team.phase)}</td><td>review ${safeInteger(team.review_round)} · fix ${safeInteger(team.fix_round)}</td><td>${escapeHtml((team.coders || []).join(", "))}</td></tr>`
+  ).join("")}</tbody></table>`;
+}
+
+function swarmAgents(run) {
+  const entries = Object.entries(run.active_agents || {});
+  if (!entries.length) return "";
+  return `<h3>Active workers</h3><div class="active-grid">${entries.map(([key, agent]) =>
+    `<article class="agent-card"><strong>${escapeHtml(agent.role || key)} · team ${escapeHtml(agent.team)}</strong><span>${escapeHtml(agent.model)}</span><span>${escapeHtml(key)}</span><div class="agent-meta"><b>attempt ${safeInteger(agent.attempt)}</b><b>${escapeHtml(ageText(agent.elapsed_seconds).replace(" ago", ""))} running</b></div></article>`
+  ).join("")}</div>`;
+}
+
+function swarmTasks(run) {
+  const chips = Object.entries(run.tasks || {}).map(([status, count]) =>
+    `<span class="summary-chip">${escapeHtml(status)} ${safeInteger(count)}</span>`).join("");
+  const rows = (run.task_list || []).map(task =>
+    `<li class="task-${escapeHtml(task.status)}"><code>${escapeHtml(task.id)}</code> ${escapeHtml(task.title)} <em>${escapeHtml(task.status)}</em></li>`).join("");
+  return `<h3>Tasks</h3><div class="repo-summary">${chips || "No tasks planned yet."}</div>${rows ? `<details><summary>All tasks</summary><ul class="task-list">${rows}</ul></details>` : ""}`;
+}
+
+function externalDetail(run) {
+  const usage = usageSummary(run);
+  const warnings = (run.warnings || []).slice(-20).map(item => `<li>${escapeHtml(item)}</li>`).join("");
+  const progress = run.kind === "swarm"
+    ? `${safeInteger(run.tasks_done)}/${safeInteger(run.tasks_total)} tasks`
+    : `${safeInteger(run.sprint_iteration)}/10`;
+  return `${run.kind === "swarm" ? "" : phaseRail(run)}
+    <div class="stats">
+      <div class="stat"><small>Status</small><strong>${escapeHtml(run.display_status || run.status)}</strong></div>
+      <div class="stat"><small>Process</small><strong>${escapeHtml(processText(run))}</strong></div>
+      <div class="stat"><small>Progress</small><strong>${escapeHtml(progress)}</strong></div>
+      <div class="stat"><small>Input / cached</small><strong>${formatTokens(usage.input)} / ${formatTokens(usage.cached)}</strong></div>
+      <div class="stat"><small>Output tokens</small><strong>${formatTokens(usage.output)}</strong></div>
+    </div>
+    <p class="run-message"><strong>${escapeHtml(run.project)}</strong> · ${escapeHtml(run.message)}</p>
+    ${freshnessLine(run)}
+    <div class="artifact-path"><code>${escapeHtml(run.artifact_dir)}</code></div>
+    ${readOnlyActions(run)}
+    ${run.kind === "swarm" ? `${swarmAgents(run)}${swarmTeams(run)}${swarmTasks(run)}` : iterations(run)}
+    ${warnings ? `<ul class="warnings">${warnings}</ul>` : ""}
+    <h3>Recent events</h3><div class="events">${eventRows(run) || "No events yet."}</div>`;
+}
+
 async function refresh() {
   const requestSequence = ++refreshSequence;
   try {
     const runs = await api("/api/runs");
     if (requestSequence !== refreshSequence) return;
     document.querySelector("#run-count").textContent = runs.length;
-    document.querySelector("#run-list").innerHTML = runs.length ? runs.map(runCard).join("") : `<p class="empty">No runs in this process yet.</p>`;
+    document.querySelector("#run-list").innerHTML = runs.length ? runs.map(runCard).join("") : `<p class="empty">No runs yet.</p>`;
     document.querySelectorAll(".run-card").forEach(card => card.addEventListener("click", () => {
       if (selected === card.dataset.id) return;
       selected = card.dataset.id;
@@ -779,14 +877,14 @@ async function refresh() {
     if (renderedRunId === selected && composingRunId === selected) return;
     document.querySelector("#detail").classList.remove("hidden");
     const indicator = document.querySelector("#live-indicator");
-    indicator.textContent = run.alive ? "Live" : "Stopped";
+    indicator.textContent = run.alive ? "Live" : run.orphaned ? "Orphaned" : "Stopped";
     indicator.classList.toggle("live", run.alive);
     const eventsScroll = captureEventsScroll();
     const priorRunId = renderedRunId;
     const focus = captureConversationFocus();
     if (priorRunId) conversationDrafts.set(priorRunId, captureConversationDrafts());
     const draft = conversationDrafts.get(selected) || {};
-    document.querySelector("#detail-body").innerHTML = detail(run);
+    document.querySelector("#detail-body").innerHTML = run.external ? externalDetail(run) : detail(run);
     document.querySelector("#detail-body").inert = false;
     restoreConversationDrafts(draft);
     if (composingRunId && composingRunId !== selected) composingRunId = "";

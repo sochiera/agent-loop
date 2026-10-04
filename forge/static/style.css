@@ -187,6 +187,17 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--a
 .badge.running, .badge.complete { background: var(--green-soft); color: var(--green); }
 .badge.failed, .badge.cancelled { background: #f3ddd8; color: var(--red); }
 .badge.paused { background: #f3e8cc; color: var(--amber); }
+.badge.orphaned { background: #f3e8cc; color: var(--amber); }
+.badge.completed { background: var(--green-soft); color: var(--green); }
+.source-chip { display: inline-block; margin-right: 4px; padding: 2px 6px; border-radius: 999px; background: #e3ebf4; color: var(--blue); font-size: 9px; font-weight: 800; text-transform: uppercase; }
+.control-note { margin: 14px 0 0; padding: 10px 12px; border-left: 3px solid var(--blue); border-radius: 6px; background: #eef3f9; color: #26476d; font-size: 12px; }
+.freshness { margin: 6px 0 12px; color: var(--muted); font-size: 11px; }
+.freshness .stale { color: var(--amber); }
+.team-table { width: 100%; margin: 8px 0 18px; border-collapse: collapse; font-size: 11px; }
+.team-table th, .team-table td { padding: 7px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.team-table th { color: var(--muted); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+.task-list { max-height: 320px; overflow: auto; margin: 8px 0 18px; padding-left: 18px; font-size: 11px; }
+.task-list em { color: var(--muted); }
 .phase { margin: 7px 0 0; color: var(--muted); font-size: 11px; }
 .run-progress { height: 3px; margin-top: 10px; overflow: hidden; border-radius: 2px; background: var(--line); }
 .run-progress span { display: block; height: 100%; background: var(--accent); transition: width .4s; }
