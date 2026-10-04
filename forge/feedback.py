@@ -12,7 +12,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .models import ROLE_NAMES
 
@@ -189,11 +189,14 @@ class RunConversationStore:
         item["idempotency_keys"] = keys
         return True
 
-    def mark_unapplied_coder_feedback(self, iteration_id: str) -> int:
+    def mark_unapplied_coder_feedback(
+        self, iteration_id: str, *, delivered: Callable[[str, str], bool] | None = None
+    ) -> int:
         if not iteration_id:
             return 0
         explanation = "The iteration was accepted without confirmed application of this feedback. "
         with self._locked() as state:
+            reconciled = self._reconcile_deliveries(state, delivered)
             changed = 0
             for item in state["feedback"]:
                 if (
@@ -212,9 +215,50 @@ class RunConversationStore:
                 )
                 self._mark_not_applied(item, detail)
                 changed += 1
-            if changed:
+            if changed or reconciled:
                 self._write(state)
             return changed
+
+    @staticmethod
+    def _reconcile_deliveries(
+        state: dict[str, Any], delivered: Callable[[str, str], bool] | None
+    ) -> bool:
+        """Confirm prepared deliveries whose agent response is already durable.
+
+        A failed acknowledgement write leaves the item pending although the
+        agent answered; without this the next boundary (or a recovered run)
+        would hand the same feedback to a different role.
+        """
+        if delivered is None:
+            return False
+        changed = False
+        for item in state["feedback"]:
+            if item["status"] not in {"received", "pending"}:
+                continue
+            for delivery in item["deliveries"]:
+                relative = str(delivery.get("relative") or "")
+                if delivery.get("state") != "prepared" or not relative or not delivered(
+                    relative, str(delivery.get("at") or "")
+                ):
+                    continue
+                now = utc_now()
+                delivery.update(
+                    state="applied", response_path=f"{relative}.response.md", applied_at=now
+                )
+                item.update(
+                    status="applied",
+                    updated_at=now,
+                    explanation=(
+                        f"Delivered to {delivery['role']}; confirmed from its durable response "
+                        "after an unconfirmed acknowledgement."
+                    ),
+                )
+                item["history"].append(
+                    {"at": now, "status": "applied", "explanation": item["explanation"]}
+                )
+                changed = True
+                break
+        return changed
 
     @staticmethod
     def _mark_not_applied(item: dict[str, Any], explanation: str) -> None:
@@ -359,11 +403,12 @@ class RunConversationStore:
         active_roles: set[str] | None = None,
         code_started: bool = False,
         winner_role: str = "",
+        delivered: Callable[[str, str], bool] | None = None,
     ) -> list[dict[str, Any]]:
         active_roles = active_roles or set()
         selected: list[dict[str, Any]] = []
         with self._locked() as state:
-            changed = False
+            changed = self._reconcile_deliveries(state, delivered)
             for item in state["feedback"]:
                 if item["status"] not in {"received", "pending"} or item.get("deferred"):
                     continue
@@ -569,7 +614,8 @@ class RunConversationStore:
                             }
                         )
             active_count = sum(
-                item.get("status") in {"open", "deferred"} for item in state["suggestions"]
+                item.get("kind") == "suggestion" and item.get("status") in {"open", "deferred"}
+                for item in state["suggestions"]
             )
             question_count = sum(
                 item.get("kind") == "question" for item in state["suggestions"]
@@ -670,12 +716,34 @@ class RunConversationStore:
                     if action == "accept"
                     else "Answer saved in the durable feedback path for the relevant agent."
                 )
-            elif action == "reject":
-                new_status = "rejected"
-                explanation = "Rejected by the user; no run action was taken."
             else:
-                new_status = "deferred"
-                explanation = "Deferred by the user; the active run continues."
+                # A rejection or deferral is also an answer the agent must see,
+                # so it does not pursue or re-ask the same thing.
+                title = suggestion.get("title") or suggestion.get("recommendation") or "this item"
+                if action == "reject":
+                    new_status = "rejected"
+                    explanation = "Rejected by the user; the decision entered the durable feedback path."
+                    message = f'The user rejected the {suggestion["kind"]} "{title}". Do not pursue it.'
+                else:
+                    new_status = "deferred"
+                    explanation = "Deferred by the user; the decision entered the durable feedback path."
+                    message = (
+                        f'The user deferred the {suggestion["kind"]} "{title}". Continue the '
+                        "current plan without acting on it and do not raise it again for now."
+                    )
+                if answer_text:
+                    message += f" User note: {answer_text}"
+                feedback = self._add_feedback_in_state(
+                    state,
+                    message[:MAX_FEEDBACK_LENGTH],
+                    kind="guidance",
+                    target_role=suggestion["target_role"],
+                    phase=phase,
+                    iteration_id=iteration_id,
+                    source=f"suggestion:{suggestion_id}",
+                    idempotency_key=f"suggestion:{suggestion_id}:{action}",
+                )
+                suggestion["answer"] = answer_text
             suggestion.update(status=new_status, updated_at=now)
             suggestion["history"].append(
                 {"at": now, "status": new_status, "explanation": explanation}

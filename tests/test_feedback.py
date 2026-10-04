@@ -11,7 +11,7 @@ from forge.agents import AgentFailure, AgentRequest
 from forge.artifacts import ArtifactStore
 from forge.cli import main as cli_main
 from forge.contracts import parse_iteration_review
-from forge.feedback import MAX_SUGGESTION_LENGTH, RunConversationStore
+from forge.feedback import MAX_OPEN_SUGGESTIONS, MAX_SUGGESTION_LENGTH, RunConversationStore
 from forge.models import AgentResult, ModelSpec, ROLE_NAMES, RunConfig, Usage
 from forge.orchestrator import ForgeOrchestrator
 
@@ -501,10 +501,10 @@ def test_finalizing_settles_unapplied_and_unconfirmed_coder_feedback(tmp_path: P
     release_settlement = threading.Event()
     original_settle = orchestrator.conversation.mark_unapplied_coder_feedback
 
-    def pause_settlement(active_iteration_id: str) -> int:
+    def pause_settlement(active_iteration_id: str, **kwargs: Any) -> int:
         settling.set()
         assert release_settlement.wait(3)
-        return original_settle(active_iteration_id)
+        return original_settle(active_iteration_id, **kwargs)
 
     orchestrator.conversation.mark_unapplied_coder_feedback = pause_settlement
     finalizer_errors: list[BaseException] = []
@@ -799,7 +799,8 @@ def test_accepting_a_scope_suggestion_still_requires_explicit_replan_decision(tm
     assert no_feedback is True
     rejected, feedback = store.answer_suggestion(rejected["id"], "reject")
     assert rejected["status"] == "rejected"
-    assert feedback is None
+    assert feedback is not None and feedback["kind"] == "guidance"
+    assert "rejected" in feedback["message"] and "Do not pursue it" in feedback["message"]
 
 
 def test_answering_a_scope_suggestion_still_requires_explicit_replan_decision(tmp_path: Path) -> None:
@@ -854,8 +855,11 @@ def test_deferred_suggestion_can_be_answered_later(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="exceeds 8000 characters"):
         store.answer_suggestion(suggestion["id"], "accept", answer="x" * 8001)
-    deferred, no_feedback = store.answer_suggestion(suggestion["id"], "defer")
-    assert deferred["status"] == "deferred" and no_feedback is None
+    deferred, deferral = store.answer_suggestion(suggestion["id"], "defer")
+    assert deferred["status"] == "deferred"
+    assert deferral is not None and "deferred" in deferral["message"]
+    again, repeated = store.answer_suggestion(suggestion["id"], "defer")
+    assert again["status"] == "deferred" and repeated["id"] == deferral["id"]
     answered, feedback = store.answer_suggestion(
         suggestion["id"], "answer", answer="Keep both formats for this release."
     )
@@ -1154,3 +1158,80 @@ def test_feedback_delivery_status_write_failure_preserves_agent_result(tmp_path:
     assert item["id"] in runner.requests[0].prompt
     assert "response is preserved" in orchestrator.state.warnings[0]
     assert str(orchestrator.conversation.path) not in orchestrator.state.warnings[0]
+
+
+def test_rejected_and_deferred_suggestions_reach_the_agent_feedback_path(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = RunConversationStore(repo, "run-k4")
+    question, _ = store.publish_suggestion(
+        kind="question",
+        title="Drop the legacy endpoint?",
+        context="Reviewer completed ITER-01.",
+        rationale="Nobody calls it.",
+        expected_impact="Smaller surface.",
+        recommendation="Remove it.",
+        source="review:ITER-01",
+        target_role="planner",
+    )
+    _, rejection = store.answer_suggestion(question["id"], "reject", answer="Callers exist.")
+    assert rejection is not None and "Callers exist." in rejection["message"]
+    delivered = store.prepare_feedback(
+        role="planner", phase="planning", iteration_id="", relative="planner/round-2"
+    )
+    assert [item["id"] for item in delivered] == [rejection["id"]]
+    replay, replayed = store.answer_suggestion(question["id"], "reject", answer="Callers exist.")
+    assert replay["status"] == "rejected" and replayed["id"] == rejection["id"]
+
+
+def test_open_questions_do_not_count_against_the_suggestion_limit(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = RunConversationStore(repo, "run-k5")
+    for index in range(MAX_OPEN_SUGGESTIONS):
+        _, created = store.publish_suggestion(
+            kind="question",
+            title=f"Question {index}?",
+            context="c",
+            rationale="r",
+            expected_impact="i",
+            recommendation="a",
+            source=f"review:Q{index}",
+        )
+        assert created
+    suggestion, created = store.publish_suggestion(
+        kind="suggestion",
+        title="Cache the catalog.",
+        context="c",
+        rationale="r",
+        expected_impact="i",
+        recommendation="Add a cache.",
+        source="review:S1",
+    )
+    assert created and suggestion["status"] == "open"
+
+
+def test_unconfirmed_delivery_with_durable_response_is_not_sent_to_another_role(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = RunConversationStore(repo, "run-k2")
+    item, _ = store.add_feedback("Check the retry path.")
+    first = store.prepare_feedback(
+        role="reviewer", phase="review", iteration_id="ITER-01", relative="iteration/review-1"
+    )
+    assert [entry["id"] for entry in first] == [item["id"]]
+    # complete_delivery() failed after the reviewer response became durable.
+    answered = {"iteration/review-1"}
+    later = store.prepare_feedback(
+        role="tester",
+        phase="testing",
+        iteration_id="ITER-01",
+        relative="iteration/test-1",
+        delivered=lambda relative, _at: relative in answered,
+    )
+    assert later == []
+    record = store.snapshot()["feedback"][0]
+    assert record["status"] == "applied"
+    assert [entry["role"] for entry in record["deliveries"]] == ["reviewer"]

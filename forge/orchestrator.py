@@ -17,6 +17,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -2230,7 +2231,9 @@ class ForgeOrchestrator:
         self._workspace.cleanup()
         with self._state_lock:
             try:
-                not_applied = self.conversation.mark_unapplied_coder_feedback(str(active["id"]))
+                not_applied = self.conversation.mark_unapplied_coder_feedback(
+                    str(active["id"]), delivered=self._response_after
+                )
                 if not_applied:
                     self._warning(
                         f"{not_applied} coder-targeted feedback item(s) were not applied because "
@@ -2547,6 +2550,7 @@ class ForgeOrchestrator:
                         },
                         code_started=code_started,
                         winner_role=winner_role,
+                        delivered=self._response_after,
                     )
                 except (OSError, RuntimeError):
                     feedback = []
@@ -2664,6 +2668,15 @@ class ForgeOrchestrator:
             )
             return result
         raise AssertionError("unreachable")
+
+    def _response_after(self, relative: str, prepared_at: str) -> bool:
+        """True when the agent response for ``relative`` was written after delivery was prepared."""
+        path = self.store.root / f"{relative}.response.md"
+        try:
+            prepared = datetime.fromisoformat(prepared_at).timestamp()
+            return path.stat().st_mtime >= prepared
+        except (OSError, ValueError):
+            return False
 
     @staticmethod
     def _feedback_prompt(prompt: str, feedback: list[dict[str, Any]]) -> str:
