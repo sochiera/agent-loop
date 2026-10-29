@@ -1,0 +1,17 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hireling's Oath - native desktop front end"
+
+[[bin]]
+name = "hirelings-oath"
+path = "src/main.rs"
+
+[dependencies]
+tactics-core = { path = "../tactics-core" }
+winit = { version = "0.30.12", default-features = false, features = ["x11", "wayland", "rwh_06"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["wgsl", "vulkan", "gles"] }
+pollster = "0.4.0"
+bytemuck = "1.25.2"
