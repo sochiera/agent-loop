@@ -1,0 +1,12 @@
+[package]
+name = "bb_game"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bb_rules = { path = "../bb_rules" }
+winit = "=0.30.12"
+wgpu = "=30.0.1"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
